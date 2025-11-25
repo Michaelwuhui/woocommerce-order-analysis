@@ -16,7 +16,7 @@ def export_enhanced_excel():
     
     # 获取所有订单数据
     query = """
-    SELECT id, number, status, date_created, total, source, 
+    SELECT id, number, status, date_created, total, shipping_total, source, 
            customer_id, payment_method, line_items, billing, shipping
     FROM orders 
     ORDER BY date_created DESC
@@ -126,7 +126,7 @@ def export_enhanced_excel():
     # 重新排列列的顺序
     columns_order = [
         'id', 'number', 'status', 'date_created', 'source',
-        '产品种类数', '产品数量', 'total', 
+        '产品种类数', '产品数量', 'total', 'shipping_total',
         '客户姓名', '客户邮箱', '客户电话', '配送地址',
         'customer_id', 'payment_method',
         '产品名称', '产品SKU'
@@ -142,6 +142,7 @@ def export_enhanced_excel():
         'date_created': '创建日期',
         'source': '来源网站',
         'total': '订单总额',
+        'shipping_total': '运费金额',
         'customer_id': '客户ID',
         'payment_method': '支付方式'
     }, inplace=True)
@@ -235,22 +236,94 @@ def create_summary_sheet(writer, df):
 
 def create_monthly_stats_sheet(writer, df):
     """创建月度统计表"""
-    
-    # 转换日期格式
+
     df['月份'] = pd.to_datetime(df['创建日期']).dt.to_period('M')
-    
-    # 按月统计
-    monthly_stats = df.groupby(['月份', '来源网站']).agg({
-        '订单ID': 'count',
-        '产品数量': 'sum',
-        '订单总额': 'sum'
-    }).rename(columns={'订单ID': '订单数'}).reset_index()
-    
-    # 添加目标完成度
-    monthly_stats['目标完成度(%)'] = (monthly_stats['产品数量'] / 2000 * 100).round(2)
-    
-    # 写入月度统计表
+
+    rows = []
+    for (month, source), gdf in df.groupby(['月份', '来源网站']):
+        total_orders = len(gdf)
+        total_products = gdf['产品数量'].sum()
+        total_amount = gdf['订单总额'].sum()
+
+        success_mask = ~gdf['订单状态'].isin(['failed', 'cancelled'])
+        success_orders = int(success_mask.sum())
+        success_amount = gdf.loc[success_mask, '订单总额'].sum()
+        success_products = gdf.loc[success_mask, '产品数量'].sum()
+        success_shipping_amount = gdf.loc[success_mask, '运费金额'].sum() if '运费金额' in gdf.columns else 0
+        success_net_amount = success_amount - success_shipping_amount
+
+        failed_mask = gdf['订单状态'] == 'failed'
+        failed_orders = int(failed_mask.sum())
+        failed_amount = gdf.loc[failed_mask, '订单总额'].sum()
+        failed_products = gdf.loc[failed_mask, '产品数量'].sum()
+
+        cancelled_mask = gdf['订单状态'] == 'cancelled'
+        cancelled_orders = int(cancelled_mask.sum())
+        cancelled_amount = gdf.loc[cancelled_mask, '订单总额'].sum()
+        cancelled_products = gdf.loc[cancelled_mask, '产品数量'].sum()
+
+        completion = round((total_products / 2000) * 100, 2)
+
+        rows.append({
+            '月份': str(month),
+            '来源网站': source,
+            '总订单数': total_orders,
+            '总产品数量': total_products,
+            '总订单总额': total_amount,
+            '目标完成度(%)': completion,
+            '失败订单总数': failed_orders,
+            '失败产品数量': failed_products,
+            '失败订单总金额': failed_amount,
+            '取消订单总数': cancelled_orders,
+            '取消产品数量': cancelled_products,
+            '取消订单总金额': cancelled_amount,
+            '成功订单数': success_orders,
+            '成功产品数量': success_products,
+            '成功销售金额': success_amount,
+            '扣除运费成功销售金额': success_net_amount,
+        })
+
+    monthly_stats = pd.DataFrame(rows)[[
+        '月份', '来源网站',
+        '总订单数', '总产品数量', '总订单总额', '目标完成度(%)',
+        '失败订单总数', '失败产品数量', '失败订单总金额',
+        '取消订单总数', '取消产品数量', '取消订单总金额',
+        '成功订单数', '成功产品数量', '成功销售金额', '扣除运费成功销售金额'
+    ]]
     monthly_stats.to_excel(writer, sheet_name='月度统计', index=False)
+
+    # 格式化月度统计表头为蓝色背景（与订单详情一致）
+    ws = writer.sheets['月度统计']
+    header_font = Font(bold=True, color='FFFFFF')
+    header_fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+    ws.freeze_panes = 'A2'
+    def _text_width(s):
+        if s is None:
+            return 0
+        t = str(s)
+        w = 0
+        for ch in t:
+            w += 2 if ord(ch) > 127 else 1
+        return w
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+    for column in ws.columns:
+        max_w = 0
+        col_letter = column[0].column_letter
+        for cell in column:
+            try:
+                tw = _text_width(cell.value)
+                if tw > max_w:
+                    max_w = tw
+            except:
+                pass
+        adjusted_width = min(max_w + 4, 100)
+        ws.column_dimensions[col_letter].width = adjusted_width
 
 def format_main_sheet(worksheet, df):
     """格式化主数据表"""
@@ -265,19 +338,29 @@ def format_main_sheet(worksheet, df):
         cell.alignment = Alignment(horizontal='center', vertical='center')
     
     # 自动调整列宽
+    def _text_width(s):
+        if s is None:
+            return 0
+        t = str(s)
+        w = 0
+        for ch in t:
+            w += 2 if ord(ch) > 127 else 1
+        return w
+    for row in worksheet.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(horizontal='center', vertical='center')
     for column in worksheet.columns:
-        max_length = 0
-        column_letter = column[0].column_letter
-        
+        max_w = 0
+        col_letter = column[0].column_letter
         for cell in column:
             try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
+                tw = _text_width(cell.value)
+                if tw > max_w:
+                    max_w = tw
             except:
                 pass
-        
-        adjusted_width = min(max_length + 2, 50)
-        worksheet.column_dimensions[column_letter].width = adjusted_width
+        adjusted_width = min(max_w + 4, 100)
+        worksheet.column_dimensions[col_letter].width = adjusted_width
     
     # 冻结首行
     worksheet.freeze_panes = 'A2'

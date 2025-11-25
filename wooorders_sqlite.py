@@ -5,6 +5,7 @@ import time
 import random
 import sqlite3
 from datetime import datetime, timedelta
+import argparse
 
 import httpx
 from httpx import HTTPError, TimeoutException
@@ -155,6 +156,26 @@ def get_last_order_date_from_db(site_url):
         if connection:
             connection.close()
 
+def get_last_modified_date_from_db(site_url):
+    connection = create_database_connection()
+    if not connection:
+        return None
+    try:
+        cursor = connection.cursor()
+        query = """
+        SELECT MAX(date_modified)
+        FROM orders
+        WHERE source = ?
+        """
+        cursor.execute(query, (site_url,))
+        result = cursor.fetchone()
+        return result[0] if result[0] else None
+    except Exception as e:
+        return None
+    finally:
+        if connection:
+            connection.close()
+
 def get_order_ids_from_db(site_url):
     """从数据库获取指定站点的所有订单ID"""
     connection = create_database_connection()
@@ -256,37 +277,37 @@ def save_orders_to_db(orders_data):
             connection.close()
 
 def fetch_orders_incrementally(wcapi, site_url, last_order_date=None):
-    """增量获取订单"""
+    """增量获取订单（逐页保存）"""
     orders = []
     page = 1
     per_page = 25
     max_retries = 3
     retry_count = 0
-    
+
     params = {
-        "per_page": per_page, 
+        "per_page": per_page,
         "page": page,
         "expand": "line_items,shipping_lines,tax_lines,fee_lines,coupon_lines,refunds"
     }
-    
+
     if last_order_date:
         params['after'] = last_order_date
         print(f"获取 {site_url} 站点 {last_order_date} 之后的订单...")
     else:
         print(f"获取 {site_url} 站点的所有订单...")
-    
+
     while True:
         try:
-            time.sleep(random.uniform(3, 6))
-            
+            time.sleep(random.uniform(1, 2))
+
             response = wcapi.get("orders", params=params)
-            
+
             if response.status_code == 403:
                 print(f"站点 {site_url} 返回 403 错误，可能启用了安全防护")
                 if retry_count < max_retries:
                     retry_count += 1
                     print(f"第 {retry_count} 次重试...")
-                    time.sleep(random.uniform(15, 30))
+                    time.sleep(random.uniform(5, 10))
                     continue
                 else:
                     break
@@ -295,36 +316,96 @@ def fetch_orders_incrementally(wcapi, site_url, last_order_date=None):
                 if response.status_code >= 500 and retry_count < max_retries:
                     retry_count += 1
                     print(f"第 {retry_count} 次重试...")
-                    time.sleep(random.uniform(10, 20))
+                    time.sleep(random.uniform(5, 10))
                     continue
                 else:
                     break
-                
+
             data = response.json()
             if not data:
                 break
-                
+
+            for order in data:
+                order['source'] = site_url
+
+            save_orders_to_db(data)
+
             orders.extend(data)
             print(f"已获取 {len(data)} 个订单，当前页: {page}")
             page += 1
             params['page'] = page
             retry_count = 0
-            
-            time.sleep(random.uniform(2, 5))
-            
+
+            time.sleep(random.uniform(1, 2))
+
         except Exception as e:
             print(f"获取站点 {site_url} 订单时发生错误: {e}")
             if retry_count < max_retries:
                 retry_count += 1
                 print(f"第 {retry_count} 次重试...")
-                time.sleep(random.uniform(15, 30))
+                time.sleep(random.uniform(5, 10))
                 continue
             else:
                 break
-    
+
     return orders
 
-def main(incremental=True, sync_status=True):
+def fetch_orders_modified_after(wcapi, site_url, modified_after=None):
+    orders = []
+    page = 1
+    per_page = 25
+    max_retries = 3
+    retry_count = 0
+    params = {
+        "per_page": per_page,
+        "page": page,
+        "expand": "line_items,shipping_lines,tax_lines,fee_lines,coupon_lines,refunds"
+    }
+    if modified_after:
+        params['modified_after'] = modified_after
+        print(f"获取 {site_url} 站点 {modified_after} 之后修改的订单...")
+    else:
+        print(f"获取 {site_url} 站点的近期修改订单...")
+    while True:
+        try:
+            time.sleep(random.uniform(1, 2))
+            response = wcapi.get("orders", params=params)
+            if response.status_code == 403:
+                if retry_count < max_retries:
+                    retry_count += 1
+                    time.sleep(random.uniform(5, 10))
+                    continue
+                else:
+                    break
+            elif response.status_code != 200:
+                if response.status_code >= 500 and retry_count < max_retries:
+                    retry_count += 1
+                    time.sleep(random.uniform(5, 10))
+                    continue
+                else:
+                    break
+            data = response.json()
+            if not data:
+                break
+            for order in data:
+                order['source'] = site_url
+            save_orders_to_db(data)
+            orders.extend(data)
+            print(f"已获取修改 {len(data)} 个订单，当前页: {page}")
+            page += 1
+            params['page'] = page
+            retry_count = 0
+            time.sleep(random.uniform(1, 2))
+        except Exception:
+            if retry_count < max_retries:
+                retry_count += 1
+                time.sleep(random.uniform(5, 10))
+                continue
+            else:
+                break
+    return orders
+
+def main(incremental=True, sync_status=True, start_date=None):
     """主函数"""
     print("开始 WooCommerce 订单同步程序（SQLite版本）...")
     
@@ -340,25 +421,24 @@ def main(incremental=True, sync_status=True):
             print(f"无法创建站点 {site['url']} 的 API 客户端，跳过...")
             continue
         
-        # 获取最新订单日期（如果是增量同步）
         last_order_date = None
-        if incremental:
+        if start_date:
+            last_order_date = start_date
+        elif incremental:
             last_order_date = get_last_order_date_from_db(site['url'])
         
         # 获取订单数据
         orders = fetch_orders_incrementally(wcapi, site['url'], last_order_date)
         
         if orders:
-            # 为每个订单添加来源站点信息
-            for order in orders:
-                order['source'] = site['url']
-            
             print(f"从站点 {site['url']} 获取到 {len(orders)} 个订单")
-            
-            # 保存到数据库
-            save_orders_to_db(orders)
         else:
             print(f"站点 {site['url']} 没有新订单")
+
+        modified_after = start_date or get_last_modified_date_from_db(site['url'])
+        updated_orders = fetch_orders_modified_after(wcapi, site['url'], modified_after)
+        if updated_orders:
+            print(f"站点 {site['url']} 获取到 {len(updated_orders)} 个修改更新的订单")
         
         print(f"站点 {site['url']} 处理完成，等待处理下一个站点...")
         time.sleep(random.uniform(5, 10))
@@ -366,5 +446,14 @@ def main(incremental=True, sync_status=True):
     print("\n所有站点处理完成！")
 
 if __name__ == "__main__":
-    # 运行主程序
-    main(incremental=True, sync_status=False)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", type=str, help="YYYY-MM-DD 起始日期")
+    args = parser.parse_args()
+    start_iso = None
+    if args.start:
+        try:
+            dt = datetime.strptime(args.start, "%Y-%m-%d")
+            start_iso = dt.strftime("%Y-%m-%dT00:00:00")
+        except Exception:
+            start_iso = None
+    main(incremental=True, sync_status=False, start_date=start_iso)

@@ -66,6 +66,8 @@ Thumbs.db
 # Configuration files with sensitive data
 config.ini
 .env
+.env.local
+woocommerce-dashboard/.env.local
 secrets.json
 
 # Generated reports and charts
