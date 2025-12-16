@@ -261,7 +261,39 @@ def create_product_analysis_sheet(writer, df):
 def format_analysis_sheets(writer):
     """格式化分析表格"""
     
-    # 格式化用户格式报告
+    def _text_width(s):
+        if s is None:
+            return 0
+        t = str(s)
+        w = 0
+        for ch in t:
+            w += 2 if ord(ch) > 127 else 1
+        return w
+
+    # 对所有工作表应用基本格式
+    for sheet_name in writer.sheets:
+        ws = writer.sheets[sheet_name]
+        
+        # 全局居中
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # 自动调整列宽
+        for column in ws.columns:
+            max_w = 0
+            col_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    tw = _text_width(cell.value)
+                    if tw > max_w:
+                        max_w = tw
+                except:
+                    pass
+            adjusted_width = min(max_w + 4, 100)
+            ws.column_dimensions[col_letter].width = adjusted_width
+
+    # 格式化用户格式报告的特殊样式
     if '用户格式报告' in writer.sheets:
         ws = writer.sheets['用户格式报告']
         
@@ -278,21 +310,6 @@ def format_analysis_sheets(writer):
                     cell = ws.cell(row=row_num, column=col)
                     cell.font = title_font
                     cell.fill = PatternFill(start_color='E6E6FA', end_color='E6E6FA', fill_type='solid')
-        
-        # 自动调整列宽
-        for column in ws.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            
-            adjusted_width = min(max_length + 2, 20)
-            ws.column_dimensions[column_letter].width = adjusted_width
 
 def print_analysis_summary(analysis_df, df):
     """打印分析摘要"""

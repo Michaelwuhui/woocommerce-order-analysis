@@ -159,7 +159,7 @@ def export_enhanced_excel():
         df.to_excel(writer, sheet_name='订单详情', index=False)
         
         # 创建统计汇总表
-        create_summary_sheet(writer, df)
+        # create_summary_sheet(writer, df)
         
         # 创建月度统计表
         create_monthly_stats_sheet(writer, df)
