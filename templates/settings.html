@@ -1,0 +1,626 @@
+{% extends "base.html" %}
+
+{% block title %}设置 - WooCommerce 订单分析
+<!-- Delete Confirmation Modal -->
+<div class="modal fade" id="deleteConfirmModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">确认删除</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-white">确定要删除这个站点吗？</p>
+                <p class="text-white-50 small mb-0">这将不会删除已同步的历史订单数据，但会移除站点的连接配置。</p>
+                <input type="hidden" id="deleteSiteId">
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-danger" id="confirmDeleteBtn">确认删除</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block content %}
+<!-- Sync Progress Modal -->
+<div class="modal fade" id="syncProgressModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">正在同步数据...</h5>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between mb-1">
+                        <span class="text-white-50" id="syncStatusText">准备中...</span>
+                        <span class="text-white-50" id="syncTimeText">00:00</span>
+                    </div>
+                    <div class="progress bg-secondary bg-opacity-25" style="height: 10px;">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary" id="syncProgressBar" style="width: 0%"></div>
+                    </div>
+                </div>
+                
+                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25">
+                    <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 py-2">
+                        <small class="text-white-50">同步日志</small>
+                    </div>
+                    <div class="card-body p-2" style="height: 200px; overflow-y: auto; font-family: monospace; font-size: 0.85rem;" id="syncLogConsole">
+                        <!-- Logs will appear here -->
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-primary" id="closeSyncModalBtn" disabled data-bs-dismiss="modal">完成</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="container-fluid py-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h1 class="h3 text-white mb-1">系统设置</h1>
+            <p class="text-white-50 mb-0">管理 WooCommerce 站点连接和数据同步</p>
+        </div>
+                        <div class="d-flex align-items-center me-3">
+            <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="autoSyncToggle">
+                <label class="form-check-label text-white-50" for="autoSyncToggle">自动同步 (每15分钟)</label>
+            </div>
+        </div>
+        <div class="d-flex gap-2">
+            <button class="btn btn-outline-primary" id="syncAllBtn">
+                <i class="bi bi-arrow-repeat me-1"></i> 同步所有站点
+            </button>
+            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addSiteModal">
+                <i class="bi bi-plus-lg me-1"></i> 添加站点
+            </button>
+        </div>
+    </div>
+
+    <!-- Sites List -->
+    <div class="card data-card mb-4">
+        <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
+            <h5 class="card-title text-white mb-0">已连接站点</h5>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-dark table-hover align-middle mb-0" style="--bs-table-bg: transparent;">
+                    <thead>
+                        <tr>
+                            <th class="ps-4">站点 URL</th>
+                            <th>Consumer Key</th>
+                            <th>上次同步时间</th>
+                            <th>状态</th>
+                            <th class="text-end pe-4">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for site in sites %}
+                        <tr>
+                            <td class="ps-4">
+                                <div class="d-flex align-items-center">
+                                    <div class="icon-box bg-primary bg-opacity-10 text-primary me-3"
+                                        style="width: 32px; height: 32px; font-size: 1rem;">
+                                        <i class="bi bi-globe"></i>
+                                    </div>
+                                    <span class="text-white">{{ site.url }}</span>
+                                </div>
+                            </td>
+                            <td class="text-white-50 font-monospace small">{{ site.consumer_key[:10] }}...</td>
+                            <td class="text-white-50">
+                                {% if site.last_sync %}
+                                {{ site.last_sync }}
+                                {% else %}
+                                <span class="text-muted fst-italic">从未同步</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <span
+                                    class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">已连接</span>
+                            </td>
+                            <td class="text-end pe-4">
+                                <button class="btn btn-sm btn-outline-primary me-2 sync-btn" data-site-id="{{ site.id }}"><i class="bi bi-arrow-repeat"></i> 同步</button>
+                                <button class="btn btn-sm btn-outline-info me-2 edit-btn" data-site-id="{{ site.id }}" data-url="{{ site.url }}" data-key="{{ site.consumer_key }}" data-secret="{{ site.consumer_secret }}"><i class="bi bi-pencil"></i></button>
+                                <button class="btn btn-sm btn-outline-danger delete-btn" data-site-id="{{ site.id }}"><i class="bi bi-trash"></i></button>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="5" class="text-center py-5 text-muted">
+                                <i class="bi bi-hdd-network display-4 d-block mb-3 opacity-50"></i>
+                                暂无已连接的站点，请点击右上角添加
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Add Site Modal -->
+<div class="modal fade" id="addSiteModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">添加 WooCommerce 站点</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="addSiteForm">
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">站点 URL</label>
+                        <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="url" placeholder="https://example.com" required>
+                        <div class="form-text text-muted">请输入完整的店铺网址，包含 https://</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">Consumer Key</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="consumer_key" placeholder="ck_..." required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">Consumer Secret</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="consumer_secret" placeholder="cs_..." required>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="saveSiteBtn">保存</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Edit Site Modal -->
+<div class="modal fade" id="editSiteModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">编辑 WooCommerce 站点</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="editSiteForm">
+                    <input type="hidden" name="site_id" id="editSiteId">
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">站点 URL</label>
+                        <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25" name="url" id="editSiteUrl" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">Consumer Key</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25" name="consumer_key" id="editSiteKey" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">Consumer Secret</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25" name="consumer_secret" id="editSiteSecret" required>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="updateSiteBtn">更新</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<!-- Delete Confirmation Modal -->
+<div class="modal fade" id="deleteConfirmModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">确认删除</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-white">确定要删除这个站点吗？</p>
+                <p class="text-white-50 small mb-0">这将不会删除已同步的历史订单数据，但会移除站点的连接配置。</p>
+                <input type="hidden" id="deleteSiteId">
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-danger" id="confirmDeleteBtn">确认删除</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    
+    // Auto Sync Toggle
+    const autoSyncToggle = document.getElementById('autoSyncToggle');
+    if (autoSyncToggle) {
+        // Fetch initial status
+        fetch('/api/settings/autosync')
+        .then(res => res.json())
+        .then(data => {
+            autoSyncToggle.checked = data.enabled;
+        });
+        
+        // Handle change
+        autoSyncToggle.addEventListener('change', function() {
+            const enabled = this.checked;
+            fetch('/api/settings/autosync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enabled })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    console.log('Auto sync set to:', data.enabled);
+                } else {
+                    alert('设置失败');
+                    this.checked = !enabled; // Revert
+                }
+            })
+            .catch(err => {
+                console.error('Error setting auto sync:', err);
+                alert('设置错误');
+                this.checked = !enabled; // Revert
+            });
+        });
+    }
+
+    // Sync All Button
+    const syncAllBtn = document.getElementById('syncAllBtn');
+    if (syncAllBtn) {
+        syncAllBtn.addEventListener('click', function() {
+
+            const modalEl = document.getElementById('syncProgressModal');
+            const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+            const progressBar = document.getElementById('syncProgressBar');
+            const statusText = document.getElementById('syncStatusText');
+            const logConsole = document.getElementById('syncLogConsole');
+            const closeBtn = document.getElementById('closeSyncModalBtn');
+            const timeText = document.getElementById('syncTimeText');
+            
+            // Reset UI
+            progressBar.style.width = '0%';
+            progressBar.classList.add('progress-bar-animated');
+            progressBar.classList.remove('bg-success', 'bg-danger');
+            progressBar.classList.add('bg-primary');
+            statusText.textContent = '正在启动全局同步任务...';
+            logConsole.innerHTML = '';
+            closeBtn.disabled = true;
+            const startTime = Date.now();
+            
+            modal.show();
+            
+            // Start Sync All
+            fetch('/api/sync/all', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            })
+            .then(response => response.json())
+            .then(result => {
+                if (result.success) {
+                    const syncId = result.sync_id;
+                    
+                    // Start Polling
+                    const syncPollInterval = setInterval(() => {
+                        // Update timer
+                        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                        const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
+                        const secs = (elapsed % 60).toString().padStart(2, '0');
+                        timeText.textContent = `${mins}:${secs}`;
+                        
+                        fetch(`/api/sync/status/${syncId}`)
+                        .then(res => res.json())
+                        .then(status => {
+                            // Update Logs
+                            if (status.logs && status.logs.length > 0) {
+                                logConsole.innerHTML = status.logs.map(log => 
+                                    `<div class="text-white-50 mb-1">${log}</div>`
+                                ).join('');
+                                logConsole.scrollTop = logConsole.scrollHeight;
+                            }
+                            
+                            // Update Status
+                            statusText.textContent = status.message;
+                            
+                            if (status.status === 'running') {
+                                if (progressBar.style.width === '0%') progressBar.style.width = '100%';
+                            } else if (status.status === 'success') {
+                                clearInterval(syncPollInterval);
+                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                progressBar.classList.add('bg-success');
+                                progressBar.style.width = '100%';
+                                statusText.textContent = '所有站点同步完成！';
+                                statusText.classList.add('text-success');
+                                closeBtn.disabled = false;
+                                closeBtn.textContent = '完成并刷新';
+                                closeBtn.onclick = () => location.reload();
+                            } else if (status.status === 'error') {
+                                clearInterval(syncPollInterval);
+                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                progressBar.classList.add('bg-danger');
+                                progressBar.style.width = '100%';
+                                statusText.textContent = '同步出错';
+                                statusText.classList.add('text-danger');
+                                closeBtn.disabled = false;
+                            }
+                        });
+                    }, 1000);
+                } else {
+                    statusText.textContent = '启动失败: ' + result.message;
+                    progressBar.classList.remove('bg-primary');
+                    progressBar.classList.add('bg-danger');
+                    progressBar.style.width = '100%';
+                    closeBtn.disabled = false;
+                }
+            })
+            .catch(error => {
+                statusText.textContent = '请求错误: ' + error;
+                closeBtn.disabled = false;
+            });
+        });
+    }
+
+    // Confirm Delete Button
+    const confirmDeleteBtn = document.getElementById('confirmDeleteBtn');
+    if (confirmDeleteBtn) {
+        confirmDeleteBtn.addEventListener('click', function() {
+            const siteId = document.getElementById('deleteSiteId').value;
+            const modalEl = document.getElementById('deleteConfirmModal');
+            const modal = bootstrap.Modal.getInstance(modalEl);
+            
+            console.log('Confirmed delete for siteId:', siteId);
+            
+            // Disable button to prevent double submit
+            confirmDeleteBtn.disabled = true;
+            confirmDeleteBtn.textContent = '删除中...';
+            
+            fetch(`/api/sites/${siteId}`, {
+                method: 'DELETE'
+            })
+            .then(response => response.json())
+            .then(result => {
+                console.log('Delete result:', result);
+                if (result.success) {
+                    location.reload();
+                } else {
+                    alert('删除失败: ' + (result.error || '未知错误'));
+                    confirmDeleteBtn.disabled = false;
+                    confirmDeleteBtn.textContent = '确认删除';
+                    if (modal) modal.hide();
+                }
+            })
+            .catch(error => {
+                console.error('Delete request error:', error);
+                alert('请求错误: ' + error);
+                confirmDeleteBtn.disabled = false;
+                confirmDeleteBtn.textContent = '确认删除';
+                if (modal) modal.hide();
+            });
+        });
+    }
+    // Helper to safely get bootstrap modal
+    function getModal(id) {
+        const el = document.getElementById(id);
+        if (!el) return null;
+        return bootstrap.Modal.getOrCreateInstance(el);
+    }
+
+    // Add Site
+    const saveBtn = document.getElementById('saveSiteBtn');
+    if (saveBtn) {
+        saveBtn.addEventListener('click', function() {
+            const form = document.getElementById('addSiteForm');
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+            
+            const formData = new FormData(form);
+            const data = Object.fromEntries(formData.entries());
+            
+            fetch('/api/sites', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(result => {
+                if (result.success) {
+                    location.reload();
+                } else {
+                    alert('添加失败: ' + (result.error || '未知错误'));
+                }
+            })
+            .catch(error => alert('发生错误: ' + error));
+        });
+    }
+
+    // Update Site
+    const updateBtn = document.getElementById('updateSiteBtn');
+    if (updateBtn) {
+        updateBtn.addEventListener('click', function() {
+            const form = document.getElementById('editSiteForm');
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+            
+            const formData = new FormData(form);
+            const data = Object.fromEntries(formData.entries());
+            const siteId = data.site_id;
+            
+            fetch(`/api/sites/${siteId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(result => {
+                if (result.success) {
+                    location.reload();
+                } else {
+                    alert('更新失败: ' + (result.error || '未知错误'));
+                }
+            })
+            .catch(error => alert('发生错误: ' + error));
+        });
+    }
+
+    // Global Event Delegation for Dynamic Buttons
+    document.body.addEventListener('click', function(e) {
+        // Edit Button
+        const editBtn = e.target.closest('.edit-btn');
+        if (editBtn) {
+            const siteId = editBtn.dataset.siteId;
+            const url = editBtn.dataset.url;
+            const key = editBtn.dataset.key;
+            const secret = editBtn.dataset.secret;
+            
+            document.getElementById('editSiteId').value = siteId;
+            document.getElementById('editSiteUrl').value = url;
+            document.getElementById('editSiteKey').value = key;
+            document.getElementById('editSiteSecret').value = secret;
+            
+            const modal = getModal('editSiteModal');
+            if (modal) modal.show();
+        }
+
+                        // Delete Button
+        const deleteBtn = e.target.closest('.delete-btn');
+        if (deleteBtn) {
+            const siteId = deleteBtn.dataset.siteId;
+            console.log('Delete button clicked for site:', siteId);
+            
+            document.getElementById('deleteSiteId').value = siteId;
+            const modal = getModal('deleteConfirmModal');
+            if (modal) modal.show();
+        }
+
+        // Sync Button
+        const syncBtn = e.target.closest('.sync-btn');
+        if (syncBtn) {
+            const siteId = syncBtn.dataset.siteId;
+            const modal = getModal('syncProgressModal');
+            const progressBar = document.getElementById('syncProgressBar');
+            const statusText = document.getElementById('syncStatusText');
+            const logConsole = document.getElementById('syncLogConsole');
+            const closeBtn = document.getElementById('closeSyncModalBtn');
+            const timeText = document.getElementById('syncTimeText');
+            
+            if (!modal) return;
+
+            // Reset UI
+            progressBar.style.width = '0%';
+            progressBar.classList.add('progress-bar-animated');
+            progressBar.classList.remove('bg-success', 'bg-danger');
+            progressBar.classList.add('bg-primary');
+            statusText.textContent = '正在启动同步任务...';
+            logConsole.innerHTML = '';
+            closeBtn.disabled = true;
+            const startTime = Date.now();
+            
+            modal.show();
+            
+            // Start Sync
+            fetch('/api/sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ site_id: siteId })
+            })
+            .then(response => response.json())
+            .then(result => {
+                if (result.success) {
+                    // Start Polling
+                    const syncPollInterval = setInterval(() => {
+                        // Update timer
+                        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                        const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
+                        const secs = (elapsed % 60).toString().padStart(2, '0');
+                        timeText.textContent = `${mins}:${secs}`;
+                        
+                        fetch(`/api/sync/status/${siteId}`)
+                        .then(res => res.json())
+                        .then(status => {
+                            // Update Logs
+                            if (status.logs && status.logs.length > 0) {
+                                logConsole.innerHTML = status.logs.map(log => 
+                                    `<div class="text-white-50 mb-1">${log}</div>`
+                                ).join('');
+                                logConsole.scrollTop = logConsole.scrollHeight;
+                            }
+                            
+                            // Update Status
+                            statusText.textContent = status.message;
+                            
+                            if (status.status === 'running') {
+                                if (progressBar.style.width === '0%') progressBar.style.width = '100%';
+                            } else if (status.status === 'success') {
+                                clearInterval(syncPollInterval);
+                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                progressBar.classList.add('bg-success');
+                                progressBar.style.width = '100%';
+                                statusText.textContent = '同步完成！';
+                                statusText.classList.add('text-success');
+                                closeBtn.disabled = false;
+                                closeBtn.textContent = '完成并刷新';
+                                closeBtn.onclick = () => location.reload();
+                            } else if (status.status === 'error') {
+                                clearInterval(syncPollInterval);
+                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                progressBar.classList.add('bg-danger');
+                                progressBar.style.width = '100%';
+                                statusText.textContent = '同步出错';
+                                statusText.classList.add('text-danger');
+                                closeBtn.disabled = false;
+                            }
+                        });
+                    }, 1000);
+                } else {
+                    statusText.textContent = '启动失败: ' + result.message;
+                    progressBar.classList.remove('bg-primary');
+                    progressBar.classList.add('bg-danger');
+                    progressBar.style.width = '100%';
+                    closeBtn.disabled = false;
+                }
+            })
+            .catch(error => {
+                statusText.textContent = '请求错误: ' + error;
+                closeBtn.disabled = false;
+            });
+        }
+    });
+});
+</script>
+
+<!-- Delete Confirmation Modal -->
+<div class="modal fade" id="deleteConfirmModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">确认删除</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-white">确定要删除这个站点吗？</p>
+                <p class="text-white-50 small mb-0">这将不会删除已同步的历史订单数据，但会移除站点的连接配置。</p>
+                <input type="hidden" id="deleteSiteId">
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-danger" id="confirmDeleteBtn">确认删除</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}

@@ -575,10 +575,12 @@ def customers():
     total_revenue = 0
     repeat_customers = 0
     new_customers_month = 0
+    new_customers_last_month = 0
     
     import datetime
     now = datetime.datetime.now()
     thirty_days_ago = (now - datetime.timedelta(days=30)).strftime('%Y-%m-%d')
+    sixty_days_ago = (now - datetime.timedelta(days=60)).strftime('%Y-%m-%d')
     ninety_days_ago = (now - datetime.timedelta(days=90)).strftime('%Y-%m-%d')
     
     tier_counts = {'VIP': 0, '优质': 0, '普通': 0, '新客': 0}
@@ -593,6 +595,8 @@ def customers():
             
         if c['first_order_date'] >= thirty_days_ago:
             new_customers_month += 1
+        elif c['first_order_date'] >= sixty_days_ago:
+            new_customers_last_month += 1
             
         # Calculate Tier (same logic as API)
         avg_days = 0
@@ -636,11 +640,20 @@ def customers():
         c['actions'] = actions
         customers_list.append(c)
         
+    # Calculate growth rate
+    if new_customers_last_month > 0:
+        growth_rate = ((new_customers_month - new_customers_last_month) / new_customers_last_month) * 100
+    else:
+        growth_rate = 100 if new_customers_month > 0 else 0
+
     stats = {
         'total_customers': total_customers,
         'avg_ltv': total_revenue / total_customers if total_customers > 0 else 0,
         'repeat_rate': (repeat_customers / total_customers * 100) if total_customers > 0 else 0,
         'new_customer_rate': (new_customers_month / total_customers * 100) if total_customers > 0 else 0,
+        'new_customers_month': new_customers_month,
+        'new_customers_last_month': new_customers_last_month,
+        'growth_rate': growth_rate,
         'tier_counts': tier_counts
     }
     
@@ -922,5 +935,389 @@ def format_date_filter(value):
         return value
 
 
+
+# -----------------------------
+# Data Synchronization Features
+# -----------------------------
+
+def init_sites_table():
+    """Initialize sites table"""
+    conn = get_db_connection()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            consumer_key TEXT NOT NULL,
+            consumer_secret TEXT NOT NULL,
+            last_sync TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Initialize sites table on startup
+with app.app_context():
+    init_sites_table()
+
+@app.route('/settings')
+@login_required
+def settings():
+    """Settings page for site management"""
+    conn = get_db_connection()
+    sites = conn.execute('SELECT * FROM sites').fetchall()
+    conn.close()
+    return render_template('settings.html', sites=sites)
+
+@app.route('/api/sites', methods=['POST'])
+@login_required
+def add_site():
+    """Add a new WooCommerce site"""
+    data = request.json
+    url = data.get('url')
+    ck = data.get('consumer_key')
+    cs = data.get('consumer_secret')
+    
+    if not all([url, ck, cs]):
+        return jsonify({'error': 'Missing required fields'}), 400
+        
+    # Remove trailing slash from URL
+    if url.endswith('/'):
+        url = url[:-1]
+        
+    conn = get_db_connection()
+    try:
+        conn.execute('INSERT INTO sites (url, consumer_key, consumer_secret) VALUES (?, ?, ?)',
+                     (url, ck, cs))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+
+@app.route('/api/sites/<int:site_id>', methods=['PUT'])
+@login_required
+def update_site(site_id):
+    """Update a WooCommerce site"""
+    data = request.json
+    url = data.get('url')
+    ck = data.get('consumer_key')
+    cs = data.get('consumer_secret')
+    
+    if not all([url, ck, cs]):
+        return jsonify({'error': 'Missing required fields'}), 400
+        
+    # Remove trailing slash from URL
+    if url.endswith('/'):
+        url = url[:-1]
+        
+    conn = get_db_connection()
+    try:
+        conn.execute('UPDATE sites SET url = ?, consumer_key = ?, consumer_secret = ? WHERE id = ?',
+                     (url, ck, cs, site_id))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/sites/<int:site_id>', methods=['DELETE'])
+@login_required
+def delete_site(site_id):
+    """Delete a WooCommerce site"""
+    print(f"Received delete request for site_id: {site_id}") # Debug log
+    conn = get_db_connection()
+    try:
+        conn.execute('DELETE FROM sites WHERE id = ?', (site_id,))
+        conn.commit()
+        print(f"Successfully deleted site_id: {site_id}") # Debug log
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"Error deleting site: {e}") # Debug log
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+# Global sync status storage
+# Format: {site_id: {'status': 'idle'|'running'|'success'|'error', 'progress': 0, 'message': '', 'logs': []}}
+SYNC_STATUS = {}
+AUTO_SYNC_ENABLED = False
+AUTO_SYNC_INTERVAL = 900  # 15 minutes
+
+@app.route('/api/sync/status/<int:site_id>')
+@login_required
+def get_sync_status(site_id):
+    """Get synchronization status for a site"""
+    status = SYNC_STATUS.get(site_id, {'status': 'idle', 'message': '', 'logs': []})
+    return jsonify(status)
+
+@app.route('/api/sync', methods=['POST'])
+@login_required
+def sync_data():
+    """Trigger data synchronization"""
+    import sync_utils
+    import threading
+    
+    site_id = request.json.get('site_id')
+    if not site_id:
+        return jsonify({'error': 'Missing site_id'}), 400
+        
+    site_id = int(site_id)
+    
+    # Initialize status
+    SYNC_STATUS[site_id] = {
+        'status': 'running',
+        'message': 'Starting synchronization...',
+        'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Job started"]
+    }
+    
+    def run_sync(app_context, site_id):
+        with app_context:
+            try:
+                conn = get_db_connection()
+                site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
+                conn.close()
+                
+                if not site:
+                    SYNC_STATUS[site_id]['status'] = 'error'
+                    SYNC_STATUS[site_id]['message'] = 'Site not found'
+                    return
+
+                def progress_callback(msg):
+                    timestamp = datetime.now().strftime('%H:%M:%S')
+                    log_entry = f"[{timestamp}] {msg}"
+                    SYNC_STATUS[site_id]['message'] = msg
+                    SYNC_STATUS[site_id]['logs'].append(log_entry)
+                    print(log_entry) # Keep console logging for debug
+
+                result = sync_utils.sync_site(
+                    site['url'], 
+                    site['consumer_key'], 
+                    site['consumer_secret'],
+                    progress_callback
+                )
+                
+                if result['status'] == 'success':
+                    # Update last sync time
+                    conn = get_db_connection()
+                    conn.execute('UPDATE sites SET last_sync = ? WHERE id = ?', 
+                                 (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), site_id))
+                    conn.commit()
+                    conn.close()
+                    
+                    SYNC_STATUS[site_id]['status'] = 'success'
+                    SYNC_STATUS[site_id]['message'] = 'Synchronization completed successfully'
+                    SYNC_STATUS[site_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Finished: New {result['new_orders']}, Updated {result['updated_orders']}")
+                else:
+                    SYNC_STATUS[site_id]['status'] = 'error'
+                    SYNC_STATUS[site_id]['message'] = result.get('message', 'Unknown error')
+                    SYNC_STATUS[site_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {result.get('message')}")
+                    
+            except Exception as e:
+                SYNC_STATUS[site_id]['status'] = 'error'
+                SYNC_STATUS[site_id]['message'] = str(e)
+                SYNC_STATUS[site_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+
+    # Run sync in background thread
+    thread = threading.Thread(target=run_sync, args=(app.app_context(), site_id))
+    thread.start()
+    
+    return jsonify({'success': True, 'message': 'Synchronization started'})
+
+@app.route('/api/sync/all', methods=['POST'])
+@login_required
+def sync_all_data():
+    """Trigger data synchronization for ALL sites"""
+    import sync_utils
+    import threading
+    
+    # Use a special ID for "all sites" sync status
+    ALL_SITES_ID = 999999
+    
+    # Initialize status
+    SYNC_STATUS[ALL_SITES_ID] = {
+        'status': 'running',
+        'message': 'Starting global synchronization...',
+        'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Global sync job started"]
+    }
+    
+    def run_sync_all(app_context):
+        with app_context:
+            try:
+                conn = get_db_connection()
+                sites = conn.execute('SELECT * FROM sites').fetchall()
+                conn.close()
+                
+                if not sites:
+                    SYNC_STATUS[ALL_SITES_ID]['status'] = 'error'
+                    SYNC_STATUS[ALL_SITES_ID]['message'] = 'No sites found to sync'
+                    return
+
+                total_sites = len(sites)
+                SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Found {total_sites} sites to sync")
+
+                for index, site in enumerate(sites):
+                    site_id = site['id']
+                    site_url = site['url']
+                    current_step = index + 1
+                    
+                    msg = f"Syncing site {current_step}/{total_sites}: {site_url}"
+                    SYNC_STATUS[ALL_SITES_ID]['message'] = msg
+                    SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] --- Starting {site_url} ---")
+                    
+                    def progress_callback(msg):
+                        timestamp = datetime.now().strftime('%H:%M:%S')
+                        # Prefix log with site info
+                        log_entry = f"[{timestamp}] [{site_url}] {msg}"
+                        SYNC_STATUS[ALL_SITES_ID]['logs'].append(log_entry)
+                        # Only update main message if it's significant, otherwise keep "Syncing site X/Y"
+                        # Actually, let's update the message to show detail
+                        SYNC_STATUS[ALL_SITES_ID]['message'] = f"[{current_step}/{total_sites}] {site_url}: {msg}"
+
+                    result = sync_utils.sync_site(
+                        site['url'], 
+                        site['consumer_key'], 
+                        site['consumer_secret'],
+                        progress_callback
+                    )
+                    
+                    if result['status'] == 'success':
+                        # Update last sync time
+                        conn = get_db_connection()
+                        conn.execute('UPDATE sites SET last_sync = ? WHERE id = ?', 
+                                     (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), site_id))
+                        conn.commit()
+                        conn.close()
+                        SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] {site_url} Completed")
+                    else:
+                        SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] {site_url} Failed: {result.get('message')}")
+                
+                SYNC_STATUS[ALL_SITES_ID]['status'] = 'success'
+                SYNC_STATUS[ALL_SITES_ID]['message'] = 'All sites synchronized successfully'
+                SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Global sync finished")
+                    
+            except Exception as e:
+                SYNC_STATUS[ALL_SITES_ID]['status'] = 'error'
+                SYNC_STATUS[ALL_SITES_ID]['message'] = str(e)
+                SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+
+    # Run sync in background thread
+    thread = threading.Thread(target=run_sync_all, args=(app.app_context(),))
+    thread.start()
+    
+    return jsonify({'success': True, 'message': 'Global synchronization started', 'sync_id': ALL_SITES_ID})
+
+
+@app.route('/api/settings/autosync', methods=['GET'])
+@login_required
+def get_autosync_status():
+    return jsonify({
+        'enabled': AUTO_SYNC_ENABLED,
+        'interval': AUTO_SYNC_INTERVAL
+    })
+
+@app.route('/api/settings/autosync', methods=['POST'])
+@login_required
+def set_autosync_status():
+    global AUTO_SYNC_ENABLED
+    data = request.json
+    if 'enabled' in data:
+        AUTO_SYNC_ENABLED = bool(data['enabled'])
+    return jsonify({'success': True, 'enabled': AUTO_SYNC_ENABLED})
+
+
+def auto_sync_loop(app_context):
+    import time
+    import sync_utils
+    
+    print("Auto-sync thread started")
+    while True:
+        try:
+            if AUTO_SYNC_ENABLED:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Auto-sync triggering...")
+                # We reuse the logic from sync_all_data but we need to call it directly or extract it.
+                # Since sync_all_data is a route, we can't call it easily.
+                # Let's extract the inner logic of sync_all_data or just hit the endpoint internally?
+                # Hitting endpoint requires a request context or running server.
+                # Better to duplicate the logic or extract it.
+                
+                # To avoid code duplication, let's just do a simplified version here.
+                # Or better, we can invoke the same function if we refactor.
+                # For now, I will copy the core logic since I can't easily refactor the route in this script.
+                
+                with app_context:
+                    # Check if a sync is already running?
+                    # For simplicity, we just run it.
+                    
+                    # We need to use the ALL_SITES_ID = 999999
+                    ALL_SITES_ID = 999999
+                    
+                    # Only run if not already running
+                    current_status = SYNC_STATUS.get(ALL_SITES_ID, {}).get('status')
+                    if current_status == 'running':
+                        print("Auto-sync skipped: Sync already in progress")
+                    else:
+                        # Initialize status
+                        SYNC_STATUS[ALL_SITES_ID] = {
+                            'status': 'running',
+                            'message': 'Auto-sync started...',
+                            'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Auto-sync job started"]
+                        }
+                        
+                        try:
+                            conn = get_db_connection()
+                            sites = conn.execute('SELECT * FROM sites').fetchall()
+                            conn.close()
+                            
+                            if sites:
+                                total_sites = len(sites)
+                                for index, site in enumerate(sites):
+                                    site_url = site['url']
+                                    current_step = index + 1
+                                    
+                                    SYNC_STATUS[ALL_SITES_ID]['message'] = f"Auto-syncing {current_step}/{total_sites}: {site_url}"
+                                    
+                                    def progress_callback(msg):
+                                        pass # Mute detailed logs for auto-sync to save memory? Or keep them?
+                                        # Let's keep them but minimal
+                                    
+                                    result = sync_utils.sync_site(
+                                        site['url'], 
+                                        site['consumer_key'], 
+                                        site['consumer_secret'],
+                                        progress_callback
+                                    )
+                                    
+                                    if result['status'] == 'success':
+                                        conn = get_db_connection()
+                                        conn.execute('UPDATE sites SET last_sync = ? WHERE id = ?', 
+                                                     (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), site['id']))
+                                        conn.commit()
+                                        conn.close()
+                                
+                                SYNC_STATUS[ALL_SITES_ID]['status'] = 'success'
+                                SYNC_STATUS[ALL_SITES_ID]['message'] = 'Auto-sync completed'
+                                SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Auto-sync finished")
+                                
+                        except Exception as e:
+                            print(f"Auto-sync error: {e}")
+                            SYNC_STATUS[ALL_SITES_ID]['status'] = 'error'
+            
+            # Sleep for interval
+            time.sleep(AUTO_SYNC_INTERVAL)
+            
+        except Exception as e:
+            print(f"Auto-sync loop error: {e}")
+            time.sleep(60) # Sleep on error
+
 if __name__ == '__main__':
+    # Start auto-sync thread
+    import threading
+    # Daemon thread so it dies when main thread dies
+    sync_thread = threading.Thread(target=auto_sync_loop, args=(app.app_context(),), daemon=True)
+    sync_thread.start()
+    
     app.run(debug=True, host='0.0.0.0', port=5000)
