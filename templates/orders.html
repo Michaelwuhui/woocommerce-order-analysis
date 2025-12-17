@@ -188,13 +188,17 @@
                     <tbody>
                         {% for order in orders %}
                         <tr>
-                            <td><strong>#{{ order.number }}</strong></td>
+                            <td><a href="javascript:void(0)" onclick="showOrderDetail('{{ order.id }}')"
+                                    class="text-info text-decoration-none"><strong>#{{ order.number }}</strong></a></td>
                             <td>{{ order.date_created|format_date }}</td>
                             <td><span class="source-badge">{{ order.source.replace('https://www.', '') }}</span></td>
                             <td><span class="status-badge status-{{ order.status }}">{{ order.status|status_label
                                     }}</span></td>
                             <td>
-                                <div>{{ order.customer_name or '-' }}</div>
+                                <div><a href="javascript:void(0)"
+                                        onclick="showCustomerDetail('{{ order.customer_email }}')"
+                                        class="text-light text-decoration-none">{{ order.customer_name or '-' }}</a>
+                                </div>
                                 <small class="text-muted">{{ order.customer_email }}</small>
                             </td>
                             <td class="product-cell">

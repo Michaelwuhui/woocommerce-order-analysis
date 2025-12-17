@@ -13,6 +13,95 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
     <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/zh.js"></script>
+    <style>
+        .order-modal .modal-content {
+            background: linear-gradient(145deg, #1e293b 0%, #0f172a 100%);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            border-radius: 16px;
+        }
+
+        .order-modal .modal-header {
+            background: linear-gradient(90deg, rgba(99, 102, 241, 0.2) 0%, rgba(139, 92, 246, 0.1) 100%);
+            border-bottom: 1px solid rgba(99, 102, 241, 0.2);
+            border-radius: 16px 16px 0 0;
+        }
+
+        .order-modal .modal-title {
+            color: #e2e8f0;
+            font-weight: 600;
+        }
+
+        .order-modal .modal-body {
+            color: #e2e8f0;
+        }
+
+        .order-modal .info-card {
+            background: rgba(30, 41, 59, 0.8);
+            border: 1px solid rgba(71, 85, 105, 0.5);
+            border-radius: 12px;
+            margin-bottom: 16px;
+            overflow: hidden;
+        }
+
+        .order-modal .info-card .card-header {
+            background: linear-gradient(90deg, rgba(99, 102, 241, 0.15) 0%, transparent 100%);
+            border-bottom: 1px solid rgba(71, 85, 105, 0.3);
+            padding: 12px 16px;
+        }
+
+        .order-modal .info-card .card-header h6 {
+            color: #a5b4fc;
+            font-weight: 600;
+            font-size: 14px;
+            margin: 0;
+        }
+
+        .order-modal .info-card .card-body {
+            padding: 16px;
+        }
+
+        .order-modal .info-card .card-body p {
+            margin-bottom: 8px;
+            color: #cbd5e1;
+            font-size: 14px;
+        }
+
+        .order-modal .info-card .card-body p strong {
+            color: #94a3b8;
+        }
+
+        .order-modal .product-table {
+            background: transparent;
+            margin: 0;
+        }
+
+        .order-modal .product-table thead th {
+            background: rgba(99, 102, 241, 0.1);
+            color: #a5b4fc;
+            font-weight: 600;
+            font-size: 13px;
+            border-bottom: 1px solid rgba(71, 85, 105, 0.3);
+            padding: 12px;
+        }
+
+        .order-modal .product-table tbody td {
+            color: #cbd5e1;
+            font-size: 14px;
+            border-bottom: 1px solid rgba(71, 85, 105, 0.2);
+            padding: 12px;
+            background: transparent;
+        }
+
+        .order-modal .product-table tbody tr:hover td {
+            background: rgba(99, 102, 241, 0.05);
+        }
+
+        .order-modal .total-amount {
+            font-size: 20px;
+            color: #34d399 !important;
+            font-weight: 700;
+        }
+    </style>
 </head>
 
 <body>
@@ -43,6 +132,12 @@
                         <a class="nav-link {% if request.endpoint == 'monthly' %}active{% endif %}"
                             href="{{ url_for('monthly') }}">
                             <i class="bi bi-calendar3 me-1"></i>月度统计
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint == 'customers' else '' }}"
+                            href="{{ url_for('customers') }}">
+                            <i class="bi bi-people me-1"></i>客户分析
                         </a>
                     </li>
                 </ul>
@@ -80,7 +175,309 @@
         {% block content %}{% endblock %}
     </main>
 
+    <!-- Order Detail Modal -->
+    <div class="modal fade order-modal" id="orderDetailModal" tabindex="-1" style="z-index: 1060;">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-receipt-cutoff me-2"></i>订单详情 <span class="text-info">#<span
+                                id="modalOrderNumber"></span></span></h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="orderDetailContent">
+                    <div class="text-center py-5">
+                        <div class="spinner-border text-primary" role="status"></div>
+                        <p class="mt-2 text-muted">加载中...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Customer Detail Modal -->
+    <div class="modal fade order-modal" id="customerDetailModal" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-person-lines-fill me-2"></i>客户分析 <span class="text-info"
+                            id="modalCustomerName"></span></h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="customerDetailContent">
+                    <div class="text-center py-5">
+                        <div class="spinner-border text-primary" role="status"></div>
+                        <p class="mt-2 text-muted">正在分析客户数据...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function showOrderDetail(orderId) {
+            var modal = new bootstrap.Modal(document.getElementById('orderDetailModal'));
+            document.getElementById('modalOrderNumber').textContent = orderId;
+            document.getElementById('orderDetailContent').innerHTML = '<div class="text-center py-5"><div class="spinner-border text-primary"></div><p class="mt-2 text-muted">加载中...</p></div>';
+            modal.show();
+
+            fetch('/api/order/' + orderId)
+                .then(function (response) { return response.json(); })
+                .then(function (order) {
+                    if (order.error) {
+                        document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger">订单未找到</div>';
+                        return;
+                    }
+
+                    var statusLabels = {
+                        'pending': '待处理', 'processing': '处理中', 'on-hold': '暂停',
+                        'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败'
+                    };
+                    var statusColors = {
+                        'pending': '#f59e0b', 'processing': '#3b82f6', 'on-hold': '#6b7280',
+                        'completed': '#10b981', 'cancelled': '#ef4444', 'refunded': '#f97316', 'failed': '#dc2626'
+                    };
+
+                    var billing = order.billing || {};
+                    var shipping = order.shipping || {};
+                    var lineItems = order.line_items || [];
+                    var shippingLines = order.shipping_lines || [];
+                    var metaData = order.meta_data || [];
+
+                    var html = '<div class="row g-3">';
+
+                    // Order Info
+                    html += '<div class="col-md-6">';
+                    html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-info-circle me-2"></i>订单信息</h6></div>';
+                    html += '<div class="card-body">';
+                    html += '<p><strong>订单号:</strong> #' + order.number + '</p>';
+                    html += '<p><strong>状态:</strong> <span style="background:' + (statusColors[order.status] || '#6b7280') + '; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; color: white;">' + (statusLabels[order.status] || order.status) + '</span></p>';
+                    html += '<p><strong>创建时间:</strong> ' + (order.date_created || '-').replace('T', ' ').substring(0, 16) + '</p>';
+                    html += '<p><strong>付款时间:</strong> ' + (order.date_paid ? order.date_paid.replace('T', ' ').substring(0, 16) : '-') + '</p>';
+                    html += '<p><strong>付款方式:</strong> ' + (order.payment_method_title || '-') + '</p>';
+                    html += '<p><strong>来源网站:</strong> <span style="color: #a5b4fc;">' + (order.source || '-').replace('https://www.', '') + '</span></p>';
+                    html += '</div></div></div>';
+
+                    // Customer Info
+                    html += '<div class="col-md-6">';
+                    html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-person me-2"></i>客户信息</h6></div>';
+                    html += '<div class="card-body">';
+                    html += '<p><strong>姓名:</strong> <a href="javascript:void(0)" onclick="showCustomerDetail(\'' + (billing.email || '') + '\')" class="text-info text-decoration-none">' + (billing.first_name || '') + ' ' + (billing.last_name || '') + '</a></p>';
+                    html += '<p><strong>邮箱:</strong> <a href="mailto:' + (billing.email || '') + '" style="color: #60a5fa;">' + (billing.email || '-') + '</a></p>';
+                    html += '<p><strong>电话:</strong> ' + (billing.phone || '-') + '</p>';
+                    if (order.customer_stats) {
+                        html += '<p><strong>历史消费:</strong> <span class="text-success fw-bold">' + order.customer_stats.total_spent.toFixed(2) + ' PLN</span> <span class="text-muted small">(' + order.customer_stats.total_orders + ' 单)</span></p>';
+                    }
+                    if (billing.company) html += '<p><strong>公司:</strong> ' + billing.company + '</p>';
+                    html += '</div></div></div>';
+
+                    // Billing Address
+                    html += '<div class="col-md-6">';
+                    html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-geo-alt me-2"></i>账单地址</h6></div>';
+                    html += '<div class="card-body">';
+                    html += '<p>' + (billing.address_1 || '-') + '</p>';
+                    if (billing.address_2) html += '<p>' + billing.address_2 + '</p>';
+                    html += '<p>' + (billing.postcode || '') + ' ' + (billing.city || '') + '</p>';
+                    html += '<p>' + (billing.country || '') + '</p>';
+                    html += '</div></div></div>';
+
+                    // Shipping Address
+                    html += '<div class="col-md-6">';
+                    html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-truck me-2"></i>配送地址</h6></div>';
+                    html += '<div class="card-body">';
+                    html += '<p><strong>收件人:</strong> ' + (shipping.first_name || '') + ' ' + (shipping.last_name || '') + '</p>';
+                    html += '<p>' + (shipping.address_1 || '-') + '</p>';
+                    if (shipping.address_2) html += '<p>' + shipping.address_2 + '</p>';
+                    html += '<p>' + (shipping.postcode || '') + ' ' + (shipping.city || '') + '</p>';
+                    html += '<p>' + (shipping.country || '') + '</p>';
+                    html += '</div></div></div>';
+
+                    // Line Items
+                    html += '<div class="col-12">';
+                    html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-box-seam me-2"></i>产品明细</h6></div>';
+                    html += '<div class="card-body p-0"><table class="table product-table mb-0">';
+                    html += '<thead><tr><th>产品名称</th><th>SKU</th><th class="text-center">数量</th><th class="text-end">单价</th><th class="text-end">小计</th></tr></thead><tbody>';
+                    lineItems.forEach(function (item) {
+                        html += '<tr><td>' + (item.name || '-') + '</td><td><code style="color: #94a3b8; background: rgba(99,102,241,0.1); padding: 2px 6px; border-radius: 4px;">' + (item.sku || '-') + '</code></td>';
+                        html += '<td class="text-center">' + (item.quantity || 0) + '</td>';
+                        html += '<td class="text-end">' + parseFloat(item.price || 0).toFixed(2) + '</td>';
+                        html += '<td class="text-end" style="color: #e2e8f0; font-weight: 500;">' + parseFloat(item.total || 0).toFixed(2) + '</td></tr>';
+                    });
+                    html += '</tbody></table></div></div></div>';
+
+                    // Shipping & Totals
+                    html += '<div class="col-md-6">';
+                    html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-send me-2"></i>配送方式</h6></div>';
+                    html += '<div class="card-body">';
+                    if (shippingLines.length > 0) {
+                        shippingLines.forEach(function (sl) {
+                            html += '<p><strong>' + (sl.method_title || '-') + '</strong></p>';
+                            html += '<p style="color: #60a5fa; font-size: 18px; font-weight: 600;">' + parseFloat(sl.total || 0).toFixed(2) + ' PLN</p>';
+                        });
+                    } else {
+                        html += '<p>-</p>';
+                    }
+                    html += '</div></div></div>';
+
+                    // Order Totals
+                    html += '<div class="col-md-6">';
+                    html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-calculator me-2"></i>订单金额</h6></div>';
+                    html += '<div class="card-body">';
+                    html += '<p><strong>商品小计:</strong> <span style="color: #e2e8f0;">' + (parseFloat(order.total) - parseFloat(order.shipping_total || 0)).toFixed(2) + ' PLN</span></p>';
+                    html += '<p><strong>运费:</strong> <span style="color: #e2e8f0;">' + parseFloat(order.shipping_total || 0).toFixed(2) + ' PLN</span></p>';
+                    if (order.discount_total > 0) html += '<p><strong>折扣:</strong> <span style="color: #f87171;">-' + parseFloat(order.discount_total).toFixed(2) + ' PLN</span></p>';
+                    html += '<hr style="border-color: rgba(71, 85, 105, 0.3);">';
+                    html += '<p class="mb-0"><strong>总计:</strong> <span class="total-amount">' + parseFloat(order.total).toFixed(2) + ' PLN</span></p>';
+                    html += '</div></div></div>';
+
+                    // Customer Note
+                    if (order.customer_note) {
+                        html += '<div class="col-12">';
+                        html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-chat-dots me-2"></i>客户备注</h6></div>';
+                        html += '<div class="card-body"><p style="color: #fbbf24; font-style: italic;">' + order.customer_note + '</p></div></div></div>';
+                    }
+
+                    // Meta Data (tracking info etc)
+                    var trackingInfo = metaData.filter(function (m) {
+                        return m.key && (m.key.indexOf('tracking') !== -1 || m.key.indexOf('shipment') !== -1 || m.key.indexOf('_wc_shipment') !== -1);
+                    });
+                    if (trackingInfo.length > 0) {
+                        html += '<div class="col-12">';
+                        html += '<div class="info-card" style="border-color: rgba(16, 185, 129, 0.3);"><div class="card-header" style="background: linear-gradient(90deg, rgba(16, 185, 129, 0.15) 0%, transparent 100%);"><h6 style="color: #34d399;"><i class="bi bi-geo-alt-fill me-2"></i>运单追踪</h6></div>';
+                        html += '<div class="card-body">';
+                        trackingInfo.forEach(function (t) {
+                            html += '<p><strong>' + t.key.replace('_', ' ') + ':</strong> ' + (typeof t.value === 'object' ? JSON.stringify(t.value) : t.value) + '</p>';
+                        });
+                        html += '</div></div></div>';
+                    }
+
+                    html += '</div>';
+
+                    document.getElementById('orderDetailContent').innerHTML = html;
+                })
+                .catch(function (err) {
+                    document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger">加载失败: ' + err.message + '</div>';
+                });
+        }
+
+        function showCustomerDetail(email) {
+            // Close order modal if open
+            var orderModalEl = document.getElementById('orderDetailModal');
+            var orderModal = bootstrap.Modal.getInstance(orderModalEl);
+            if (orderModal) {
+                orderModal.hide();
+            }
+
+            var modal = new bootstrap.Modal(document.getElementById('customerDetailModal'));
+            document.getElementById('modalCustomerName').textContent = '';
+            document.getElementById('customerDetailContent').innerHTML = '<div class="text-center py-5"><div class="spinner-border text-primary"></div><p class="mt-2 text-muted">正在分析客户数据...</p></div>';
+            modal.show();
+
+            fetch('/api/customer/' + encodeURIComponent(email))
+                .then(function (response) { return response.json(); })
+                .then(function (customer) {
+                    if (customer.error) {
+                        document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-danger">客户未找到</div>';
+                        return;
+                    }
+
+                    document.getElementById('modalCustomerName').textContent = '- ' + customer.name;
+
+                    var html = '<div class="row g-3">';
+
+                    // Overview Cards
+                    html += '<div class="col-md-3">';
+                    html += '<div class="info-card text-center"><div class="card-body">';
+                    html += '<h6 class="text-muted mb-2">客户等级</h6>';
+                    html += '<div class="h4 mb-0" style="color: ' + customer.customer_tier.color + '"><i class="bi bi-' + customer.customer_tier.icon + ' me-2"></i>' + customer.customer_tier.level + '</div>';
+                    html += '</div></div></div>';
+
+                    html += '<div class="col-md-3">';
+                    html += '<div class="info-card text-center"><div class="card-body">';
+                    html += '<h6 class="text-muted mb-2">总消费</h6>';
+                    html += '<div class="h4 text-success mb-0">' + customer.total_spending.toFixed(2) + ' PLN</div>';
+                    html += '</div></div></div>';
+
+                    html += '<div class="col-md-3">';
+                    html += '<div class="info-card text-center"><div class="card-body">';
+                    html += '<h6 class="text-muted mb-2">订单数</h6>';
+                    html += '<div class="h4 text-info mb-0">' + customer.successful_orders + ' <span class="fs-6 text-muted">/ ' + customer.total_orders + '</span></div>';
+                    html += '</div></div></div>';
+
+                    html += '<div class="col-md-3">';
+                    html += '<div class="info-card text-center"><div class="card-body">';
+                    html += '<h6 class="text-muted mb-2">客单价</h6>';
+                    html += '<div class="h4 text-warning mb-0">' + customer.avg_order_value.toFixed(2) + ' PLN</div>';
+                    html += '</div></div></div>';
+
+                    // Detailed Info
+                    html += '<div class="col-md-4">';
+                    html += '<div class="info-card h-100"><div class="card-header"><h6><i class="bi bi-person me-2"></i>基本信息</h6></div>';
+                    html += '<div class="card-body">';
+                    html += '<p><strong>邮箱:</strong> <a href="mailto:' + customer.email + '" class="text-info">' + customer.email + '</a></p>';
+                    html += '<p><strong>电话:</strong> ' + (customer.phone || '-') + '</p>';
+                    html += '<p><strong>首次购买:</strong> ' + (customer.first_order_date || '-') + '</p>';
+                    html += '<p><strong>最近购买:</strong> ' + (customer.last_order_date || '-') + '</p>';
+                    html += '<p><strong>购买频率:</strong> ' + (customer.avg_days_between_orders > 0 ? '平均 ' + customer.avg_days_between_orders + ' 天/单' : '仅一单') + '</p>';
+                    html += '</div></div></div>';
+
+                    // Site Distribution
+                    html += '<div class="col-md-4">';
+                    html += '<div class="info-card h-100"><div class="card-header"><h6><i class="bi bi-globe me-2"></i>来源分布</h6></div>';
+                    html += '<div class="card-body p-0"><table class="table product-table mb-0">';
+                    html += '<thead><tr><th>网站</th><th class="text-center">订单</th><th class="text-end">金额</th></tr></thead><tbody>';
+                    customer.site_spending.forEach(function (site) {
+                        html += '<tr><td>' + site.site + '</td><td class="text-center">' + site.orders + '</td><td class="text-end">' + site.amount.toFixed(2) + '</td></tr>';
+                    });
+                    html += '</tbody></table></div></div></div>';
+
+                    // Top Products
+                    html += '<div class="col-md-4">';
+                    html += '<div class="info-card h-100"><div class="card-header"><h6><i class="bi bi-trophy me-2"></i>常购商品 (Top 5)</h6></div>';
+                    html += '<div class="card-body p-0"><table class="table product-table mb-0">';
+                    html += '<thead><tr><th>商品</th><th class="text-center">数量</th></tr></thead><tbody>';
+                    customer.top_products.slice(0, 5).forEach(function (prod) {
+                        html += '<tr><td class="text-truncate" style="max-width: 200px;" title="' + prod.name + '">' + prod.name + '</td><td class="text-center">' + prod.quantity + '</td></tr>';
+                    });
+                    html += '</tbody></table></div></div></div>';
+
+                    // Recent Orders
+                    html += '<div class="col-12">';
+                    html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-clock-history me-2"></i>购买记录</h6></div>';
+                    html += '<div class="card-body p-0"><div class="table-responsive"><table class="table product-table mb-0">';
+                    html += '<thead><tr><th>订单号</th><th>日期</th><th>网站</th><th>状态</th><th>商品数</th><th class="text-end">金额</th><th>操作</th></tr></thead><tbody>';
+
+                    var statusColors = {
+                        'pending': '#f59e0b', 'processing': '#3b82f6', 'on-hold': '#6b7280',
+                        'completed': '#10b981', 'cancelled': '#ef4444', 'refunded': '#f97316', 'failed': '#dc2626'
+                    };
+                    var statusLabels = {
+                        'pending': '待处理', 'processing': '处理中', 'on-hold': '暂停',
+                        'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败'
+                    };
+
+                    customer.orders.forEach(function (order) {
+                        html += '<tr>';
+                        html += '<td><a href="#" onclick="showOrderDetail(\'' + order.id + '\'); return false;">#' + order.number + '</a></td>';
+                        html += '<td>' + order.date_created.replace('T', ' ').substring(0, 16) + '</td>';
+                        html += '<td>' + order.source + '</td>';
+                        html += '<td><span style="color:' + (statusColors[order.status] || '#ccc') + '">' + (statusLabels[order.status] || order.status) + '</span></td>';
+                        html += '<td>' + order.product_count + '</td>';
+                        html += '<td class="text-end">' + order.total.toFixed(2) + '</td>';
+                        html += '<td><button class="btn btn-sm btn-outline-info" onclick="showOrderDetail(\'' + order.id + '\')">查看</button></td>';
+                        html += '</tr>';
+                    });
+                    html += '</tbody></table></div></div></div></div>';
+
+                    html += '</div>';
+
+                    document.getElementById('customerDetailContent').innerHTML = html;
+                })
+                .catch(function (err) {
+                    document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-danger">加载失败: ' + err.message + '</div>';
+                });
+        }
+    </script>
     {% block scripts %}{% endblock %}
 </body>
 

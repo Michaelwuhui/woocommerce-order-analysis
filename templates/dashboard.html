@@ -173,7 +173,9 @@
                             <tbody>
                                 {% for order in recent_orders %}
                                 <tr>
-                                    <td><strong>#{{ order.number }}</strong></td>
+                                    <td><a href="javascript:void(0)" onclick="showOrderDetail('{{ order.id }}')"
+                                            class="text-info text-decoration-none"><strong>#{{ order.number
+                                                }}</strong></a></td>
                                     <td>{{ order.date_created|format_date }}</td>
                                     <td><span class="status-badge status-{{ order.status }}">{{
                                             order.status|status_label }}</span></td>

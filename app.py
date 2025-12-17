@@ -529,6 +529,124 @@ def monthly():
     return render_template('monthly.html', monthly_stats=rows, sources=all_sources, source_filter=source_filter, sort_by=sort_by)
 
 
+@app.route('/customers')
+@login_required
+def customers():
+    conn = get_db_connection()
+    
+    # Get source filter
+    source_filter = request.args.get('source', '')
+    
+    # Get all sources for dropdown
+    all_sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
+    
+    # Build query with optional source filter
+    query = '''
+        SELECT 
+            json_extract(billing, '$.email') as email,
+            json_extract(billing, '$.first_name') || ' ' || json_extract(billing, '$.last_name') as name,
+            json_extract(billing, '$.phone') as phone,
+            COUNT(*) as total_orders,
+            SUM(CASE WHEN status IN ('completed', 'processing') THEN 1 ELSE 0 END) as successful_orders,
+            SUM(CASE WHEN status IN ('completed', 'processing') THEN total ELSE 0 END) as total_spent,
+            MAX(date_created) as last_order_date,
+            MIN(date_created) as first_order_date,
+            GROUP_CONCAT(DISTINCT source) as sources
+        FROM orders
+        WHERE json_extract(billing, '$.email') IS NOT NULL AND json_extract(billing, '$.email') != ''
+    '''
+    
+    params = []
+    if source_filter:
+        query += ' AND source = ?'
+        params.append(source_filter)
+        
+    query += '''
+        GROUP BY email
+        ORDER BY total_spent DESC
+    '''
+    
+    customers_data = conn.execute(query, params).fetchall()
+    
+    conn.close()
+    
+    customers_list = []
+    total_customers = len(customers_data)
+    total_revenue = 0
+    repeat_customers = 0
+    new_customers_month = 0
+    
+    import datetime
+    now = datetime.datetime.now()
+    thirty_days_ago = (now - datetime.timedelta(days=30)).strftime('%Y-%m-%d')
+    ninety_days_ago = (now - datetime.timedelta(days=90)).strftime('%Y-%m-%d')
+    
+    tier_counts = {'VIP': 0, '优质': 0, '普通': 0, '新客': 0}
+    
+    for row in customers_data:
+        c = dict(row)
+        c['total_spent'] = float(c['total_spent'] or 0)
+        total_revenue += c['total_spent']
+        
+        if c['successful_orders'] > 1:
+            repeat_customers += 1
+            
+        if c['first_order_date'] >= thirty_days_ago:
+            new_customers_month += 1
+            
+        # Calculate Tier (same logic as API)
+        avg_days = 0
+        if c['successful_orders'] > 1:
+            first = datetime.datetime.fromisoformat(c['first_order_date'])
+            last = datetime.datetime.fromisoformat(c['last_order_date'])
+            days = (last - first).days or 1
+            avg_days = days / c['successful_orders']
+            
+        score = min(c['successful_orders'] * 10, 30) + min(c['total_spent'] / 100, 40)
+        score += 30 if avg_days > 0 and avg_days < 60 else (15 if avg_days < 120 else 0)
+        score = min(score, 100)
+        
+        if score >= 80: tier = 'VIP'
+        elif score >= 60: tier = '优质'
+        elif score >= 40: tier = '普通'
+        else: tier = '新客'
+        
+        c['tier'] = tier
+        tier_counts[tier] += 1
+        
+        # Smart Actions
+        actions = []
+        if tier == 'VIP':
+            actions.append({'type': 'success', 'icon': 'gift', 'text': '专属礼遇'})
+            actions.append({'type': 'primary', 'icon': 'people', 'text': '邀请入群'})
+        elif c['last_order_date'] < ninety_days_ago:
+            actions.append({'type': 'warning', 'icon': 'ticket-perforated', 'text': '召回优惠券'})
+        elif c['successful_orders'] == 1 and c['first_order_date'] >= thirty_days_ago:
+            actions.append({'type': 'info', 'icon': 'book', 'text': '欢迎指南'})
+            actions.append({'type': 'info', 'icon': 'bag-plus', 'text': '关联推荐'})
+        elif c['successful_orders'] > 3:
+             actions.append({'type': 'primary', 'icon': 'arrow-repeat', 'text': '订阅服务'})
+        
+        # Process sources
+        source_str = c.get('sources', '') or ''
+        sources = list(set([s.strip() for s in source_str.split(',') if s.strip()]))
+        c['source'] = sources[0] if sources else 'Unknown'
+        c['all_sources'] = sources
+
+        c['actions'] = actions
+        customers_list.append(c)
+        
+    stats = {
+        'total_customers': total_customers,
+        'avg_ltv': total_revenue / total_customers if total_customers > 0 else 0,
+        'repeat_rate': (repeat_customers / total_customers * 100) if total_customers > 0 else 0,
+        'new_customer_rate': (new_customers_month / total_customers * 100) if total_customers > 0 else 0,
+        'tier_counts': tier_counts
+    }
+    
+    return render_template('customers.html', customers=customers_list, stats=stats, sources=all_sources, source_filter=source_filter)
+
+
 @app.route('/api/chart-data')
 @login_required
 def chart_data():
@@ -574,6 +692,200 @@ def chart_data():
     
     conn.close()
     return jsonify({})
+
+
+@app.route('/api/order/<order_id>')
+@login_required
+def get_order_details(order_id):
+    """API endpoint to get order details"""
+    conn = get_db_connection()
+    
+    order = conn.execute('''
+        SELECT * FROM orders WHERE id = ?
+    ''', (order_id,)).fetchone()
+    
+    if not order:
+        return jsonify({'error': 'Order not found'}), 404
+    
+    order_dict = dict(order)
+    
+    # Parse JSON fields
+    order_dict['billing'] = parse_json_field(order['billing'])
+    order_dict['shipping'] = parse_json_field(order['shipping'])
+    order_dict['line_items'] = parse_json_field(order['line_items'])
+    order_dict['shipping_lines'] = parse_json_field(order['shipping_lines'])
+    order_dict['meta_data'] = parse_json_field(order['meta_data'])
+    order_dict['fee_lines'] = parse_json_field(order['fee_lines'])
+    order_dict['coupon_lines'] = parse_json_field(order['coupon_lines'])
+    order_dict['coupon_lines'] = parse_json_field(order['coupon_lines'])
+    order_dict['refunds'] = parse_json_field(order['refunds'])
+    
+    # Calculate customer total spending
+    if order_dict['billing'] and order_dict['billing'].get('email'):
+        email = order_dict['billing']['email']
+        customer_stats = conn.execute('''
+            SELECT COUNT(*) as count, SUM(total) as total
+            FROM orders 
+            WHERE billing LIKE ? AND status IN ('completed', 'processing')
+        ''', (f'%"{email}"%',)).fetchone()
+        
+        order_dict['customer_stats'] = {
+            'total_orders': customer_stats['count'] if customer_stats else 0,
+            'total_spent': float(customer_stats['total'] or 0) if customer_stats else 0
+        }
+    
+    conn.close()
+    
+    return jsonify(order_dict)
+
+
+@app.route('/api/customer/<email>')
+@login_required
+def get_customer_details(email):
+    """API endpoint to get customer analysis data"""
+    from urllib.parse import unquote
+    email = unquote(email)
+    
+    conn = get_db_connection()
+    
+    # Get all orders from this customer
+    orders = conn.execute('''
+        SELECT id, number, status, total, shipping_total, date_created, source, line_items, billing
+        FROM orders
+        WHERE billing LIKE ?
+        ORDER BY date_created DESC
+    ''', (f'%"{email}"%',)).fetchall()
+    
+    conn.close()
+    
+    if not orders:
+        return jsonify({'error': 'Customer not found'}), 404
+    
+    # Process orders
+    order_list = []
+    all_products = {}
+    site_spending = {}
+    total_spending = 0
+    successful_orders = 0
+    failed_orders = 0
+    cancelled_orders = 0
+    dates = []
+    
+    for order in orders:
+        order_dict = dict(order)
+        billing = parse_json_field(order['billing'])
+        line_items = parse_json_field(order['line_items'])
+        
+        # Get customer name
+        customer_name = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip()
+        customer_phone = billing.get('phone', '')
+        
+        # Calculate order products
+        order_products = []
+        order_qty = 0
+        for item in (line_items or []):
+            product_name = item.get('name', 'Unknown')
+            qty = item.get('quantity', 1)
+            total = float(item.get('total', 0))
+            order_products.append({
+                'name': product_name,
+                'quantity': qty,
+                'total': total
+            })
+            order_qty += qty
+            
+            # Aggregate products
+            if product_name in all_products:
+                all_products[product_name]['quantity'] += qty
+                all_products[product_name]['total'] += total
+            else:
+                all_products[product_name] = {'quantity': qty, 'total': total}
+        
+        # Site spending
+        source = order['source'] or 'Unknown'
+        if source in site_spending:
+            site_spending[source]['orders'] += 1
+            site_spending[source]['amount'] += float(order['total'] or 0)
+        else:
+            site_spending[source] = {'orders': 1, 'amount': float(order['total'] or 0)}
+        
+        # Status counting
+        status = order['status']
+        if status in ['completed', 'processing']:
+            successful_orders += 1
+            total_spending += float(order['total'] or 0)
+        elif status == 'failed':
+            failed_orders += 1
+        elif status == 'cancelled':
+            cancelled_orders += 1
+        
+        # Dates
+        if order['date_created']:
+            dates.append(order['date_created'][:10])
+        
+        order_list.append({
+            'id': order['id'],
+            'number': order['number'],
+            'status': status,
+            'total': float(order['total'] or 0),
+            'date_created': order['date_created'],
+            'source': source.replace('https://www.', ''),
+            'product_count': order_qty,
+            'products': order_products
+        })
+    
+    # Calculate frequency
+    unique_dates = sorted(set(dates))
+    if len(unique_dates) >= 2:
+        from datetime import datetime
+        first_date = datetime.fromisoformat(unique_dates[0])
+        last_date = datetime.fromisoformat(unique_dates[-1])
+        days_span = (last_date - first_date).days or 1
+        avg_days_between = days_span / len(unique_dates)
+    else:
+        avg_days_between = 0
+    
+    # Sort products by quantity
+    sorted_products = sorted(all_products.items(), key=lambda x: x[1]['quantity'], reverse=True)
+    
+    # Customer quality score (simple algorithm)
+    quality_score = 0
+    quality_score += min(successful_orders * 10, 30)  # Max 30 for orders
+    quality_score += min(total_spending / 100, 40)    # Max 40 for spending
+    quality_score += 30 if avg_days_between > 0 and avg_days_between < 60 else (15 if avg_days_between < 120 else 0)  # Frequency bonus
+    quality_score = min(quality_score, 100)
+    
+    # Determine customer tier
+    if quality_score >= 80:
+        customer_tier = {'level': 'VIP', 'color': '#f59e0b', 'icon': 'star-fill'}
+    elif quality_score >= 60:
+        customer_tier = {'level': '优质', 'color': '#10b981', 'icon': 'gem'}
+    elif quality_score >= 40:
+        customer_tier = {'level': '普通', 'color': '#3b82f6', 'icon': 'person-check'}
+    else:
+        customer_tier = {'level': '新客', 'color': '#6b7280', 'icon': 'person'}
+    
+    result = {
+        'email': email,
+        'name': customer_name,
+        'phone': customer_phone,
+        'total_orders': len(order_list),
+        'successful_orders': successful_orders,
+        'failed_orders': failed_orders,
+        'cancelled_orders': cancelled_orders,
+        'total_spending': total_spending,
+        'avg_order_value': total_spending / successful_orders if successful_orders > 0 else 0,
+        'first_order_date': unique_dates[0] if unique_dates else None,
+        'last_order_date': unique_dates[-1] if unique_dates else None,
+        'avg_days_between_orders': round(avg_days_between, 1),
+        'quality_score': round(quality_score),
+        'customer_tier': customer_tier,
+        'site_spending': [{'site': k.replace('https://www.', ''), 'orders': v['orders'], 'amount': v['amount']} for k, v in site_spending.items()],
+        'top_products': [{'name': k, 'quantity': v['quantity'], 'total': v['total']} for k, v in sorted_products[:10]],
+        'orders': order_list[:20]  # Limit to 20 most recent
+    }
+    
+    return jsonify(result)
 
 
 # Status translation
