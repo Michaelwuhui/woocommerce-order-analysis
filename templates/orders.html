@@ -65,11 +65,13 @@
                 </div>
                 <div class="col-md-2">
                     <label class="form-label">开始日期</label>
-                    <input type="date" name="date_from" class="form-control" value="{{ current_filters.date_from }}">
+                    <input type="text" name="date_from" id="dateFrom" class="form-control datepicker" placeholder="选择日期"
+                        value="{{ current_filters.date_from }}">
                 </div>
                 <div class="col-md-2">
                     <label class="form-label">结束日期</label>
-                    <input type="date" name="date_to" class="form-control" value="{{ current_filters.date_to }}">
+                    <input type="text" name="date_to" id="dateTo" class="form-control datepicker" placeholder="选择日期"
+                        value="{{ current_filters.date_to }}">
                 </div>
                 <div class="col-md-2">
                     <label class="form-label">搜索订单号</label>
@@ -312,4 +314,20 @@
         box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
     }
 </style>
+
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        var dateConfig = {
+            locale: 'zh',
+            dateFormat: 'Y-m-d',
+            altInput: true,
+            altFormat: 'Y年m月d日',
+            allowInput: true,
+            disableMobile: true
+        };
+
+        flatpickr('#dateFrom', dateConfig);
+        flatpickr('#dateTo', dateConfig);
+    });
+</script>
 {% endblock %}

@@ -106,8 +106,12 @@ def dashboard():
     from datetime import date, timedelta
     conn = get_db_connection()
     
-    # Get quick_date filter, default to this_month
+    # Get filters
     quick_date = request.args.get('quick_date', 'this_month')
+    source_filter = request.args.get('source', '')
+    
+    # Get available sources for dropdown
+    sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
     
     # Process quick date filter
     today = date.today()
@@ -132,12 +136,16 @@ def dashboard():
         date_from = ''
         date_to = ''
     
-    # Build date condition
-    date_condition = ''
+    # Build filter conditions
+    conditions = []
     if date_from and date_to:
-        date_condition = f"WHERE date_created >= '{date_from}' AND date_created <= '{date_to}T23:59:59'"
+        conditions.append(f"date_created >= '{date_from}' AND date_created <= '{date_to}T23:59:59'")
     elif date_from:
-        date_condition = f"WHERE date_created >= '{date_from}'"
+        conditions.append(f"date_created >= '{date_from}'")
+    if source_filter:
+        conditions.append(f"source = '{source_filter}'")
+    
+    date_condition = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
     
     # Get overall statistics
     stats = {}
@@ -167,13 +175,22 @@ def dashboard():
     ''').fetchall()
     source_data = [dict(row) for row in source_data_raw]
     
-    # Recent orders
-    recent_orders = conn.execute(f'''
-        SELECT id, number, status, total, date_created, source, line_items
-        FROM orders {date_condition}
-        ORDER BY date_created DESC
-        LIMIT 10
-    ''').fetchall()
+    # Recent orders - only filter by source, ignore date filter
+    if source_filter:
+        recent_orders = conn.execute(f'''
+            SELECT id, number, status, total, date_created, source, line_items
+            FROM orders
+            WHERE source = '{source_filter}'
+            ORDER BY date_created DESC
+            LIMIT 10
+        ''').fetchall()
+    else:
+        recent_orders = conn.execute('''
+            SELECT id, number, status, total, date_created, source, line_items
+            FROM orders
+            ORDER BY date_created DESC
+            LIMIT 10
+        ''').fetchall()
     
     # Process recent orders to get product count
     processed_orders = []
@@ -228,7 +245,9 @@ def dashboard():
                          recent_orders=processed_orders,
                          trend_data=trend_data,
                          trend_type=trend_type,
-                         quick_date=quick_date)
+                         quick_date=quick_date,
+                         sources=sources,
+                         source_filter=source_filter)
 
 
 @app.route('/orders')
@@ -426,16 +445,32 @@ def monthly():
     """Monthly statistics page"""
     conn = get_db_connection()
     
-    # Get all orders for processing
-    df = pd.read_sql_query('''
-        SELECT id, status, date_created, total, shipping_total, source, line_items
-        FROM orders
-        ORDER BY date_created DESC
-    ''', conn)
+    # Get source filter
+    source_filter = request.args.get('source', '')
+    
+    # Get all sources for dropdown
+    all_sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
+    
+    # Build query with optional source filter
+    if source_filter:
+        query = f'''
+            SELECT id, status, date_created, total, shipping_total, source, line_items
+            FROM orders
+            WHERE source = '{source_filter}'
+            ORDER BY date_created DESC
+        '''
+    else:
+        query = '''
+            SELECT id, status, date_created, total, shipping_total, source, line_items
+            FROM orders
+            ORDER BY date_created DESC
+        '''
+    
+    df = pd.read_sql_query(query, conn)
     conn.close()
     
     if len(df) == 0:
-        return render_template('monthly.html', monthly_stats=[], sources=[])
+        return render_template('monthly.html', monthly_stats=[], sources=all_sources, source_filter=source_filter)
     
     # Calculate product quantities
     def get_product_qty(line_items):
@@ -482,12 +517,16 @@ def monthly():
             'cancelled_orders': cancelled_orders
         })
     
-    # Sort by month descending
-    rows.sort(key=lambda x: x['month'], reverse=True)
+    # Get sort parameter
+    sort_by = request.args.get('sort', 'month')  # default: sort by month
     
-    sources = df['source'].unique().tolist()
+    # Sort based on parameter
+    if sort_by == 'source':
+        rows.sort(key=lambda x: (x['source'], x['month']), reverse=False)
+    else:
+        rows.sort(key=lambda x: (x['month'], x['source']), reverse=True)
     
-    return render_template('monthly.html', monthly_stats=rows, sources=sources)
+    return render_template('monthly.html', monthly_stats=rows, sources=all_sources, source_filter=source_filter, sort_by=sort_by)
 
 
 @app.route('/api/chart-data')

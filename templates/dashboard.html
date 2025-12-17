@@ -4,34 +4,36 @@
 
 {% block content %}
 <div class="container-fluid py-4">
-    <!-- Quick Date Filters -->
+    <!-- Filters -->
     <div class="quick-filters mb-4">
-        <div class="d-flex flex-wrap gap-2 align-items-center">
-            <span class="text-secondary me-2"><i class="bi bi-calendar-range me-1"></i>统计时间范围：</span>
-            <a href="{{ url_for('dashboard', quick_date='this_month') }}"
-                class="btn btn-quick {% if quick_date == 'this_month' %}active{% endif %}">
-                <i class="bi bi-calendar-check me-1"></i>本月至今
-            </a>
-            <a href="{{ url_for('dashboard', quick_date='last_month') }}"
-                class="btn btn-quick {% if quick_date == 'last_month' %}active{% endif %}">
-                <i class="bi bi-calendar-minus me-1"></i>上个月
-            </a>
-            <a href="{{ url_for('dashboard', quick_date='last_quarter') }}"
-                class="btn btn-quick {% if quick_date == 'last_quarter' %}active{% endif %}">
-                <i class="bi bi-calendar3 me-1"></i>近三个月
-            </a>
-            <a href="{{ url_for('dashboard', quick_date='half_year') }}"
-                class="btn btn-quick {% if quick_date == 'half_year' %}active{% endif %}">
-                <i class="bi bi-calendar2 me-1"></i>近半年
-            </a>
-            <a href="{{ url_for('dashboard', quick_date='one_year') }}"
-                class="btn btn-quick {% if quick_date == 'one_year' %}active{% endif %}">
-                <i class="bi bi-calendar-event me-1"></i>近一年
-            </a>
-            <a href="{{ url_for('dashboard', quick_date='all') }}"
-                class="btn btn-outline-secondary btn-sm ms-2 {% if quick_date == 'all' %}active{% endif %}">
-                <i class="bi bi-arrow-counterclockwise me-1"></i>全部
-            </a>
+        <div class="d-flex flex-wrap gap-3 align-items-center justify-content-between">
+            <div class="d-flex flex-wrap gap-2 align-items-center">
+                <span class="text-secondary me-2"><i class="bi bi-calendar-range me-1"></i>时间：</span>
+                <a href="{{ url_for('dashboard', quick_date='this_month', source=source_filter) }}"
+                    class="btn btn-quick {% if quick_date == 'this_month' %}active{% endif %}">本月至今</a>
+                <a href="{{ url_for('dashboard', quick_date='last_month', source=source_filter) }}"
+                    class="btn btn-quick {% if quick_date == 'last_month' %}active{% endif %}">上个月</a>
+                <a href="{{ url_for('dashboard', quick_date='last_quarter', source=source_filter) }}"
+                    class="btn btn-quick {% if quick_date == 'last_quarter' %}active{% endif %}">近三个月</a>
+                <a href="{{ url_for('dashboard', quick_date='half_year', source=source_filter) }}"
+                    class="btn btn-quick {% if quick_date == 'half_year' %}active{% endif %}">近半年</a>
+                <a href="{{ url_for('dashboard', quick_date='one_year', source=source_filter) }}"
+                    class="btn btn-quick {% if quick_date == 'one_year' %}active{% endif %}">近一年</a>
+                <a href="{{ url_for('dashboard', quick_date='all', source=source_filter) }}"
+                    class="btn btn-outline-secondary btn-sm {% if quick_date == 'all' %}active{% endif %}">全部</a>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+                <span class="text-secondary"><i class="bi bi-globe me-1"></i>网站：</span>
+                <select id="sourceFilter" class="form-select form-select-sm" style="width: auto; min-width: 180px;"
+                    onchange="window.location.href='{{ url_for('dashboard', quick_date=quick_date) }}&source=' + this.value">
+                    <option value="">全部网站</option>
+                    {% for source in sources %}
+                    <option value="{{ source.source }}" {% if source_filter==source.source %}selected{% endif %}>
+                        {{ source.source.replace('https://www.', '') }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
         </div>
     </div>
 
@@ -91,6 +93,8 @@
                 <div class="card-header">
                     <h5><i class="bi bi-bar-chart-line me-2"></i>
                         {% if trend_type == 'daily' %}日销售趋势{% else %}月度销售趋势{% endif %}
+                        {% if source_filter %}<small class="text-muted ms-2">({{ source_filter.replace('https://www.',
+                            '') }})</small>{% endif %}
                     </h5>
                 </div>
                 <div class="card-body">
@@ -227,11 +231,15 @@
                     grid: { color: 'rgba(255,255,255,0.1)' },
                     ticks: {
                         color: '#aaa',
-                        maxRotation: trendType === 'daily' ? 45 : 0,
+                        maxRotation: 0,
                         callback: function (value, index) {
                             if (trendType === 'daily') {
                                 var label = this.getLabelForValue(value);
-                                return label.split('-')[2];
+                                var date = new Date(label);
+                                var day = label.split('-')[2];
+                                var weekdays = ['日', '一', '二', '三', '四', '五', '六'];
+                                var weekday = weekdays[date.getDay()];
+                                return [day, weekday];
                             }
                             return this.getLabelForValue(value);
                         }
@@ -314,7 +322,6 @@
 </script>
 
 <style>
-    /* Legend styling for 2-row centered layout */
     #statusChart {
         max-height: 220px !important;
     }
