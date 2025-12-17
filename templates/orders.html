@@ -1,0 +1,315 @@
+{% extends "base.html" %}
+
+{% block title %}订单列表 - WooCommerce 订单分析{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+    <!-- Quick Date Filters -->
+    <div class="quick-filters mb-4">
+        <div class="d-flex flex-wrap gap-2 align-items-center">
+            <span class="text-secondary me-2"><i class="bi bi-calendar-range me-1"></i>快速筛选：</span>
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, quick_date='this_month') }}"
+                class="btn btn-quick {% if current_filters.quick_date == 'this_month' %}active{% endif %}">
+                <i class="bi bi-calendar-check me-1"></i>本月至今
+            </a>
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, quick_date='last_month') }}"
+                class="btn btn-quick {% if current_filters.quick_date == 'last_month' %}active{% endif %}">
+                <i class="bi bi-calendar-minus me-1"></i>上个月
+            </a>
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, quick_date='last_quarter') }}"
+                class="btn btn-quick {% if current_filters.quick_date == 'last_quarter' %}active{% endif %}">
+                <i class="bi bi-calendar3 me-1"></i>近三个月
+            </a>
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, quick_date='half_year') }}"
+                class="btn btn-quick {% if current_filters.quick_date == 'half_year' %}active{% endif %}">
+                <i class="bi bi-calendar2 me-1"></i>近半年
+            </a>
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, quick_date='one_year') }}"
+                class="btn btn-quick {% if current_filters.quick_date == 'one_year' %}active{% endif %}">
+                <i class="bi bi-calendar-event me-1"></i>近一年
+            </a>
+            <a href="{{ url_for('orders') }}" class="btn btn-outline-secondary btn-sm ms-2">
+                <i class="bi bi-arrow-counterclockwise me-1"></i>全部
+            </a>
+        </div>
+    </div>
+
+    <!-- Filter Section -->
+    <div class="card filter-card mb-4">
+        <div class="card-body">
+            <form method="GET" action="{{ url_for('orders') }}" class="row g-3 align-items-end">
+                <input type="hidden" name="quick_date" value="{{ current_filters.quick_date }}">
+                <div class="col-md-2">
+                    <label class="form-label">网站来源</label>
+                    <select name="source" class="form-select">
+                        <option value="">全部网站</option>
+                        {% for source in sources %}
+                        <option value="{{ source.source }}" {% if current_filters.source==source.source %}selected{%
+                            endif %}>
+                            {{ source.source.replace('https://www.', '') }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">订单状态</label>
+                    <select name="status" class="form-select">
+                        <option value="">全部状态</option>
+                        {% for status in statuses %}
+                        <option value="{{ status.status }}" {% if current_filters.status==status.status %}selected{%
+                            endif %}>
+                            {{ status.status|status_label }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">开始日期</label>
+                    <input type="date" name="date_from" class="form-control" value="{{ current_filters.date_from }}">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">结束日期</label>
+                    <input type="date" name="date_to" class="form-control" value="{{ current_filters.date_to }}">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">搜索订单号</label>
+                    <input type="text" name="search" class="form-control" placeholder="输入订单号..."
+                        value="{{ current_filters.search }}">
+                </div>
+                <div class="col-md-2">
+                    <button type="submit" class="btn btn-primary w-100">
+                        <i class="bi bi-search me-1"></i>筛选
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Summary Statistics Table -->
+    {% if summary_stats %}
+    <div class="card data-card mb-4">
+        <div class="card-header">
+            <h5 class="mb-0"><i class="bi bi-table me-2"></i>筛选结果统计</h5>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-dark table-hover mb-0 summary-table">
+                    <thead>
+                        <tr>
+                            <th rowspan="2" class="align-middle">来源网站</th>
+                            <th colspan="3" class="text-center border-start">总计</th>
+                            <th colspan="4" class="text-center border-start text-success">成功订单</th>
+                            <th colspan="2" class="text-center border-start text-danger">失败/取消</th>
+                        </tr>
+                        <tr>
+                            <th class="text-end border-start">订单数</th>
+                            <th class="text-end">产品数</th>
+                            <th class="text-end">金额</th>
+                            <th class="text-end border-start">订单数</th>
+                            <th class="text-end">产品数</th>
+                            <th class="text-end">金额</th>
+                            <th class="text-end">净金额</th>
+                            <th class="text-end border-start">失败</th>
+                            <th class="text-end">取消</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for stat in summary_stats %}
+                        <tr>
+                            <td><span class="source-badge">{{ stat.source.replace('https://www.', '') }}</span></td>
+                            <td class="text-end border-start">{{ "{:,}".format(stat.total_orders) }}</td>
+                            <td class="text-end">{{ "{:,}".format(stat.total_products) }}</td>
+                            <td class="text-end">{{ "{:,.2f}".format(stat.total_amount or 0) }}</td>
+                            <td class="text-end border-start text-success">{{ "{:,}".format(stat.success_orders) }}</td>
+                            <td class="text-end text-success">{{ "{:,}".format(stat.success_products) }}</td>
+                            <td class="text-end text-success">{{ "{:,.2f}".format(stat.success_amount or 0) }}</td>
+                            <td class="text-end text-success">{{ "{:,.2f}".format(stat.success_net_amount or 0) }}</td>
+                            <td class="text-end border-start text-danger">{{ stat.failed_orders }}</td>
+                            <td class="text-end text-warning">{{ stat.cancelled_orders }}</td>
+                        </tr>
+                        {% endfor %}
+                        <!-- Totals Row -->
+                        <tr class="totals-row">
+                            <td><strong>合计</strong></td>
+                            <td class="text-end border-start"><strong>{{ "{:,}".format(totals.total_orders) }}</strong>
+                            </td>
+                            <td class="text-end"><strong>{{ "{:,}".format(totals.total_products) }}</strong></td>
+                            <td class="text-end"><strong>{{ "{:,.2f}".format(totals.total_amount) }}</strong></td>
+                            <td class="text-end border-start text-success"><strong>{{
+                                    "{:,}".format(totals.success_orders) }}</strong></td>
+                            <td class="text-end text-success"><strong>{{ "{:,}".format(totals.success_products)
+                                    }}</strong></td>
+                            <td class="text-end text-success"><strong>{{ "{:,.2f}".format(totals.success_amount)
+                                    }}</strong></td>
+                            <td class="text-end text-success"><strong>{{ "{:,.2f}".format(totals.success_net_amount)
+                                    }}</strong></td>
+                            <td class="text-end border-start text-danger"><strong>{{ totals.failed_orders }}</strong>
+                            </td>
+                            <td class="text-end text-warning"><strong>{{ totals.cancelled_orders }}</strong></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Results Info -->
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h5 class="text-light mb-0">
+            <i class="bi bi-list-ul me-2"></i>订单列表
+            <span class="badge bg-primary ms-2">{{ "{:,}".format(total) }} 条记录</span>
+            {% if current_month %}
+            <span class="badge bg-info ms-2">{{ current_month }} ({{ orders|length }} 条)</span>
+            {% endif %}
+        </h5>
+    </div>
+
+    <!-- Orders Table -->
+    <div class="card data-card">
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-dark table-hover mb-0">
+                    <thead>
+                        <tr>
+                            <th>订单号</th>
+                            <th>创建日期</th>
+                            <th>来源</th>
+                            <th>状态</th>
+                            <th>客户</th>
+                            <th style="min-width: 350px;">产品明细</th>
+                            <th class="text-end">总数量</th>
+                            <th class="text-end">运费</th>
+                            <th class="text-end">订单金额</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for order in orders %}
+                        <tr>
+                            <td><strong>#{{ order.number }}</strong></td>
+                            <td>{{ order.date_created|format_date }}</td>
+                            <td><span class="source-badge">{{ order.source.replace('https://www.', '') }}</span></td>
+                            <td><span class="status-badge status-{{ order.status }}">{{ order.status|status_label
+                                    }}</span></td>
+                            <td>
+                                <div>{{ order.customer_name or '-' }}</div>
+                                <small class="text-muted">{{ order.customer_email }}</small>
+                            </td>
+                            <td class="product-cell">
+                                {% for product in order.products %}
+                                <div class="product-item">
+                                    <span class="product-name">{{ product.name[:50] }}{% if product.name|length > 50
+                                        %}...{% endif %}</span>
+                                    <span class="product-qty">×{{ product.quantity }}</span>
+                                    <span class="product-total">{{ "{:.2f}".format(product.total) }} PLN</span>
+                                </div>
+                                {% else %}
+                                <span class="text-muted">-</span>
+                                {% endfor %}
+                            </td>
+                            <td class="text-end align-middle">{{ order.product_count }}</td>
+                            <td class="text-end align-middle"><span class="text-info">{{
+                                    "{:.2f}".format(order.shipping_total or 0) }}</span></td>
+                            <td class="text-end align-middle"><strong>{{ order.total|format_currency }}</strong></td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="9" class="text-center py-5">
+                                <i class="bi bi-inbox display-4 text-muted"></i>
+                                <p class="text-muted mt-3">没有找到符合条件的订单</p>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Monthly Pagination -->
+    {% if available_months|length > 0 %}
+    <div class="mt-4">
+        <div class="d-flex justify-content-center align-items-center flex-wrap gap-2">
+            <span class="text-secondary me-2"><i class="bi bi-calendar3 me-1"></i>选择月份：</span>
+            {% for month in available_months %}
+            <a href="?month={{ month }}&source={{ current_filters.source }}&status={{ current_filters.status }}&date_from={{ current_filters.date_from }}&date_to={{ current_filters.date_to }}&search={{ current_filters.search }}&quick_date={{ current_filters.quick_date }}"
+                class="btn btn-month {% if month == current_month %}active{% endif %}">
+                {{ month }}
+            </a>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+<style>
+    /* Product cell styling */
+    .product-cell {
+        padding: 8px 16px !important;
+    }
+
+    .product-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 6px 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .product-item:last-child {
+        border-bottom: none;
+    }
+
+    .product-name {
+        flex: 1;
+        color: #c8d4e3;
+        font-size: 0.875rem;
+    }
+
+    .product-qty {
+        background: rgba(102, 126, 234, 0.2);
+        color: #a0aec0;
+        padding: 2px 8px;
+        border-radius: 10px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        min-width: 40px;
+        text-align: center;
+    }
+
+    .product-total {
+        color: #38ef7d;
+        font-weight: 500;
+        font-size: 0.85rem;
+        min-width: 80px;
+        text-align: right;
+    }
+
+    /* Month button styling */
+    .btn-month {
+        background: rgba(102, 126, 234, 0.1);
+        border: 1px solid rgba(102, 126, 234, 0.3);
+        color: var(--text-secondary);
+        padding: 6px 14px;
+        border-radius: 16px;
+        font-size: 0.8rem;
+        font-weight: 500;
+        transition: all 0.3s ease;
+        text-decoration: none;
+    }
+
+    .btn-month:hover {
+        background: rgba(102, 126, 234, 0.2);
+        border-color: var(--primary);
+        color: var(--text-primary);
+        transform: translateY(-2px);
+    }
+
+    .btn-month.active {
+        background: var(--gradient-primary);
+        border-color: transparent;
+        color: white;
+        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+    }
+</style>
+{% endblock %}

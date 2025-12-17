@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+
+{% block title %}月度统计 - WooCommerce 订单分析{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h5 class="text-light mb-0">
+            <i class="bi bi-calendar3 me-2"></i>月度统计分析
+        </h5>
+    </div>
+
+    <!-- Monthly Stats Table -->
+    <div class="card data-card">
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-dark table-hover mb-0 monthly-table">
+                    <thead>
+                        <tr>
+                            <th rowspan="2" class="align-middle">月份</th>
+                            <th rowspan="2" class="align-middle">网站</th>
+                            <th colspan="3" class="text-center border-start">总计</th>
+                            <th colspan="4" class="text-center border-start">成功订单</th>
+                            <th colspan="2" class="text-center border-start">失败/取消</th>
+                        </tr>
+                        <tr>
+                            <th class="text-end border-start">订单数</th>
+                            <th class="text-end">产品数</th>
+                            <th class="text-end">金额</th>
+                            <th class="text-end border-start">订单数</th>
+                            <th class="text-end">产品数</th>
+                            <th class="text-end">金额</th>
+                            <th class="text-end">净金额</th>
+                            <th class="text-end border-start">失败</th>
+                            <th class="text-end">取消</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in monthly_stats %}
+                        <tr>
+                            <td><strong>{{ row.month }}</strong></td>
+                            <td><span class="source-badge">{{ row.source.replace('https://www.', '') }}</span></td>
+                            <td class="text-end border-start">{{ "{:,}".format(row.total_orders) }}</td>
+                            <td class="text-end">{{ "{:,}".format(row.total_products) }}</td>
+                            <td class="text-end">{{ "{:,.2f}".format(row.total_amount) }}</td>
+                            <td class="text-end border-start text-success">{{ "{:,}".format(row.success_orders) }}</td>
+                            <td class="text-end text-success">{{ "{:,}".format(row.success_products) }}</td>
+                            <td class="text-end text-success">{{ "{:,.2f}".format(row.success_amount) }}</td>
+                            <td class="text-end text-success">{{ "{:,.2f}".format(row.success_net_amount) }}</td>
+                            <td class="text-end border-start text-danger">{{ row.failed_orders }}</td>
+                            <td class="text-end text-warning">{{ row.cancelled_orders }}</td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="11" class="text-center py-5">
+                                <i class="bi bi-inbox display-4 text-muted"></i>
+                                <p class="text-muted mt-3">暂无统计数据</p>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Monthly Chart -->
+    {% if monthly_stats %}
+    <div class="row mt-4">
+        <div class="col-12">
+            <div class="card chart-card">
+                <div class="card-header">
+                    <h5><i class="bi bi-bar-chart-line me-2"></i>月度趋势对比</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="monthlyCompareChart" height="350"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% if monthly_stats %}
+<script>
+    const monthlyStats = {{ monthly_stats| tojson | safe }};
+    const sources = {{ sources| tojson | safe }};
+
+    // Process data for chart
+    const months = [...new Set(monthlyStats.map(d => d.month))].sort();
+    const sourceColors = {
+        'https://www.buchmistrz.pl': { bg: 'rgba(102, 126, 234, 0.8)', border: '#667eea' },
+        'https://www.strefajednorazowek.pl': { bg: 'rgba(240, 147, 251, 0.8)', border: '#f093fb' }
+    };
+
+    const datasets = sources.map((source, idx) => {
+        const defaultColor = `hsl(${idx * 137}, 70%, 60%)`;
+        const colors = sourceColors[source] || { bg: defaultColor, border: defaultColor };
+
+        return {
+            label: source.replace('https://www.', ''),
+            data: months.map(month => {
+                const entry = monthlyStats.find(d => d.month === month && d.source === source);
+                return entry ? entry.success_net_amount : 0;
+            }),
+            backgroundColor: colors.bg,
+            borderColor: colors.border,
+            borderWidth: 2,
+            borderRadius: 6
+        };
+    });
+
+    const ctx = document.getElementById('monthlyCompareChart').getContext('2d');
+    new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: months,
+            datasets: datasets
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { intersect: false, mode: 'index' },
+            plugins: {
+                legend: {
+                    labels: { color: '#fff', padding: 20 }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function (context) {
+                            return context.dataset.label + ': ' + context.raw.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ' PLN';
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    grid: { color: 'rgba(255,255,255,0.1)' },
+                    ticks: { color: '#aaa' }
+                },
+                y: {
+                    grid: { color: 'rgba(255,255,255,0.1)' },
+                    ticks: {
+                        color: '#aaa',
+                        callback: function (value) {
+                            return value.toLocaleString() + ' PLN';
+                        }
+                    }
+                }
+            }
+        }
+    });
+</script>
+{% endif %}
+{% endblock %}

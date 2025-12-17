@@ -1,0 +1,322 @@
+{% extends "base.html" %}
+
+{% block title %}仪表板 - WooCommerce 订单分析{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+    <!-- Quick Date Filters -->
+    <div class="quick-filters mb-4">
+        <div class="d-flex flex-wrap gap-2 align-items-center">
+            <span class="text-secondary me-2"><i class="bi bi-calendar-range me-1"></i>统计时间范围：</span>
+            <a href="{{ url_for('dashboard', quick_date='this_month') }}"
+                class="btn btn-quick {% if quick_date == 'this_month' %}active{% endif %}">
+                <i class="bi bi-calendar-check me-1"></i>本月至今
+            </a>
+            <a href="{{ url_for('dashboard', quick_date='last_month') }}"
+                class="btn btn-quick {% if quick_date == 'last_month' %}active{% endif %}">
+                <i class="bi bi-calendar-minus me-1"></i>上个月
+            </a>
+            <a href="{{ url_for('dashboard', quick_date='last_quarter') }}"
+                class="btn btn-quick {% if quick_date == 'last_quarter' %}active{% endif %}">
+                <i class="bi bi-calendar3 me-1"></i>近三个月
+            </a>
+            <a href="{{ url_for('dashboard', quick_date='half_year') }}"
+                class="btn btn-quick {% if quick_date == 'half_year' %}active{% endif %}">
+                <i class="bi bi-calendar2 me-1"></i>近半年
+            </a>
+            <a href="{{ url_for('dashboard', quick_date='one_year') }}"
+                class="btn btn-quick {% if quick_date == 'one_year' %}active{% endif %}">
+                <i class="bi bi-calendar-event me-1"></i>近一年
+            </a>
+            <a href="{{ url_for('dashboard', quick_date='all') }}"
+                class="btn btn-outline-secondary btn-sm ms-2 {% if quick_date == 'all' %}active{% endif %}">
+                <i class="bi bi-arrow-counterclockwise me-1"></i>全部
+            </a>
+        </div>
+    </div>
+
+    <!-- Stats Cards -->
+    <div class="row g-4 mb-4">
+        <div class="col-xl-3 col-md-6">
+            <div class="stat-card stat-card-primary">
+                <div class="stat-icon">
+                    <i class="bi bi-cart-check"></i>
+                </div>
+                <div class="stat-content">
+                    <h3>{{ "{:,}".format(stats.total_orders) }}</h3>
+                    <p>总订单数</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <div class="stat-card stat-card-success">
+                <div class="stat-icon">
+                    <i class="bi bi-currency-dollar"></i>
+                </div>
+                <div class="stat-content">
+                    <h3>{{ "{:,.2f}".format(stats.total_revenue) }}</h3>
+                    <p>总销售额 (PLN)</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <div class="stat-card stat-card-info">
+                <div class="stat-icon">
+                    <i class="bi bi-shop"></i>
+                </div>
+                <div class="stat-content">
+                    <h3>{{ source_data|length }}</h3>
+                    <p>数据来源站点</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <div class="stat-card stat-card-warning">
+                <div class="stat-icon">
+                    <i class="bi bi-graph-up"></i>
+                </div>
+                <div class="stat-content">
+                    <h3>{{ "{:,.2f}".format(stats.total_revenue / stats.total_orders if stats.total_orders > 0 else 0)
+                        }}</h3>
+                    <p>平均订单金额</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4 mb-4">
+        <!-- Trend Chart -->
+        <div class="col-xl-8">
+            <div class="card chart-card">
+                <div class="card-header">
+                    <h5><i class="bi bi-bar-chart-line me-2"></i>
+                        {% if trend_type == 'daily' %}日销售趋势{% else %}月度销售趋势{% endif %}
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="trendChart" height="300"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Status Distribution -->
+        <div class="col-xl-4">
+            <div class="card chart-card">
+                <div class="card-header">
+                    <h5><i class="bi bi-pie-chart me-2"></i>订单状态分布</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="statusChart" height="300"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4">
+        <!-- Source Stats -->
+        <div class="col-xl-4">
+            <div class="card data-card">
+                <div class="card-header">
+                    <h5><i class="bi bi-globe me-2"></i>网站统计</h5>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-dark table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>网站</th>
+                                    <th class="text-end">订单数</th>
+                                    <th class="text-end">销售额</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for source in source_data %}
+                                <tr>
+                                    <td>
+                                        <span class="source-badge">{{ source.source.replace('https://www.', '')
+                                            }}</span>
+                                    </td>
+                                    <td class="text-end">{{ "{:,}".format(source.count) }}</td>
+                                    <td class="text-end">{{ "{:,.2f}".format(source.revenue or 0) }}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recent Orders -->
+        <div class="col-xl-8">
+            <div class="card data-card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5><i class="bi bi-clock-history me-2"></i>最近订单</h5>
+                    <a href="{{ url_for('orders') }}" class="btn btn-sm btn-outline-light">查看全部</a>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-dark table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>订单号</th>
+                                    <th>日期</th>
+                                    <th>状态</th>
+                                    <th class="text-end">产品数</th>
+                                    <th class="text-end">金额</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for order in recent_orders %}
+                                <tr>
+                                    <td><strong>#{{ order.number }}</strong></td>
+                                    <td>{{ order.date_created|format_date }}</td>
+                                    <td><span class="status-badge status-{{ order.status }}">{{
+                                            order.status|status_label }}</span></td>
+                                    <td class="text-end">{{ order.product_count }}</td>
+                                    <td class="text-end"><strong>{{ order.total|format_currency }}</strong></td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Trend Chart
+    var trendData = {{ trend_data | tojson | safe }};
+    var trendType = '{{ trend_type }}';
+    var trendCtx = document.getElementById('trendChart').getContext('2d');
+
+    new Chart(trendCtx, {
+        type: 'bar',
+        data: {
+            labels: trendData.map(function (d) { return d.period; }),
+            datasets: [{
+                label: '订单数',
+                data: trendData.map(function (d) { return d.orders; }),
+                backgroundColor: 'rgba(102, 126, 234, 0.8)',
+                borderRadius: trendType === 'daily' ? 4 : 8,
+                yAxisID: 'y'
+            }, {
+                label: '销售额',
+                data: trendData.map(function (d) { return d.revenue; }),
+                type: 'line',
+                borderColor: '#f093fb',
+                backgroundColor: 'rgba(240, 147, 251, 0.1)',
+                tension: 0.4,
+                fill: true,
+                yAxisID: 'y1'
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { intersect: false, mode: 'index' },
+            plugins: {
+                legend: { labels: { color: '#fff' } }
+            },
+            scales: {
+                x: {
+                    grid: { color: 'rgba(255,255,255,0.1)' },
+                    ticks: {
+                        color: '#aaa',
+                        maxRotation: trendType === 'daily' ? 45 : 0,
+                        callback: function (value, index) {
+                            if (trendType === 'daily') {
+                                var label = this.getLabelForValue(value);
+                                return label.split('-')[2];
+                            }
+                            return this.getLabelForValue(value);
+                        }
+                    }
+                },
+                y: {
+                    position: 'left',
+                    grid: { color: 'rgba(255,255,255,0.1)' },
+                    ticks: { color: '#aaa' },
+                    title: { display: true, text: '订单数', color: '#aaa' }
+                },
+                y1: {
+                    position: 'right',
+                    grid: { drawOnChartArea: false },
+                    ticks: { color: '#aaa' },
+                    title: { display: true, text: '销售额', color: '#aaa' }
+                }
+            }
+        }
+    });
+
+    // Status Chart with percentages
+    var statusData = {{ status_data | tojson | safe }};
+    var statusCtx = document.getElementById('statusChart').getContext('2d');
+    var total = statusData.reduce(function (sum, d) { return sum + d.count; }, 0);
+
+    var statusColors = {
+        'completed': '#28a745',
+        'processing': '#17a2b8',
+        'pending': '#ffc107',
+        'on-hold': '#6c757d',
+        'cancelled': '#dc3545',
+        'failed': '#721c24',
+        'refunded': '#fd7e14'
+    };
+
+    new Chart(statusCtx, {
+        type: 'doughnut',
+        data: {
+            labels: statusData.map(function (d) {
+                var percent = ((d.count / total) * 100).toFixed(1);
+                return d.status + ' (' + percent + '%)';
+            }),
+            datasets: [{
+                data: statusData.map(function (d) { return d.count; }),
+                backgroundColor: statusData.map(function (d) { return statusColors[d.status] || '#6c757d'; }),
+                borderWidth: 0,
+                spacing: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    align: 'center',
+                    labels: {
+                        color: '#fff',
+                        padding: 12,
+                        boxWidth: 12,
+                        boxHeight: 12,
+                        usePointStyle: true,
+                        pointStyle: 'rectRounded'
+                    }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function (context) {
+                            var value = context.raw;
+                            var percent = ((value / total) * 100).toFixed(1);
+                            return value + ' 订单 (' + percent + '%)';
+                        }
+                    }
+                }
+            },
+            cutout: '65%'
+        }
+    });
+</script>
+
+<style>
+    /* Legend styling for 2-row centered layout */
+    #statusChart {
+        max-height: 220px !important;
+    }
+</style>
+{% endblock %}
