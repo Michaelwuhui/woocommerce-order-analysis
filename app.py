@@ -73,6 +73,51 @@ def parse_json_field(value):
         return {}
 
 
+def get_user_allowed_sources(user_id, is_admin=False):
+    """
+    Get list of source URLs that a user has permission to access.
+    Admin users can access all sources.
+    Returns None if user has no restrictions (can see all), or a list of allowed URLs.
+    """
+    if is_admin:
+        return None  # No restrictions for admin
+    
+    conn = get_db_connection()
+    
+    # Get site_ids from user_site_permissions
+    perms = conn.execute('''
+        SELECT s.url FROM user_site_permissions p
+        JOIN sites s ON p.site_id = s.id
+        WHERE p.user_id = ?
+    ''', (user_id,)).fetchall()
+    
+    conn.close()
+    
+    if not perms:
+        # No permissions set - return empty list (no access)
+        return []
+    
+    return [p['url'] for p in perms]
+
+
+def build_source_filter_clause(allowed_sources, table_alias=''):
+    """
+    Build SQL WHERE clause for filtering by allowed sources.
+    Returns (clause_string, params_list)
+    """
+    if allowed_sources is None:
+        # No restrictions
+        return '', []
+    
+    if not allowed_sources:
+        # Empty list - no access to anything
+        return 'AND 1=0', []  # Always false condition
+    
+    prefix = f'{table_alias}.' if table_alias else ''
+    placeholders = ', '.join(['?' for _ in allowed_sources])
+    return f'AND {prefix}source IN ({placeholders})', allowed_sources
+
+
 # ============== ROUTES ==============
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -115,12 +160,26 @@ def dashboard():
     from datetime import date, timedelta
     conn = get_db_connection()
     
+    # Get user's allowed sources for permission filtering
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    source_clause, source_params = build_source_filter_clause(allowed_sources)
+    
     # Get filters
     quick_date = request.args.get('quick_date', 'this_month')
     source_filter = request.args.get('source', '')
     
-    # Get available sources for dropdown
-    sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
+    # Validate source_filter against allowed sources
+    if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
+        source_filter = ''  # Reset invalid filter
+    
+    # Get available sources for dropdown (filtered by permissions)
+    if allowed_sources is None:
+        sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
+    elif allowed_sources:
+        placeholders = ', '.join(['?' for _ in allowed_sources])
+        sources = conn.execute(f'SELECT DISTINCT source FROM orders WHERE source IN ({placeholders}) ORDER BY source', allowed_sources).fetchall()
+    else:
+        sources = []
     
     # Process quick date filter
     today = date.today()
@@ -145,26 +204,42 @@ def dashboard():
         date_from = ''
         date_to = ''
     
-    # Build filter conditions
-    conditions = []
-    if date_from and date_to:
-        conditions.append(f"date_created >= '{date_from}' AND date_created <= '{date_to}T23:59:59'")
-    elif date_from:
-        conditions.append(f"date_created >= '{date_from}'")
-    if source_filter:
-        conditions.append(f"source = '{source_filter}'")
+    # Build filter conditions with permission check
+    conditions = ['1=1']  # Base condition
+    params = []
     
-    date_condition = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
+    # Add permission filter
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')  # No access
+    
+    if date_from and date_to:
+        conditions.append(f"date_created >= ? AND date_created <= ?")
+        params.extend([date_from, date_to + 'T23:59:59'])
+    elif date_from:
+        conditions.append(f"date_created >= ?")
+        params.append(date_from)
+    if source_filter:
+        conditions.append("source = ?")
+        params.append(source_filter)
+    
+    date_condition = 'WHERE ' + ' AND '.join(conditions)
     
     # Get overall statistics
     stats = {}
     
     # Total orders
-    stats['total_orders'] = conn.execute(f'SELECT COUNT(*) FROM orders {date_condition}').fetchone()[0]
+    stats['total_orders'] = conn.execute(f'SELECT COUNT(*) FROM orders {date_condition}', params).fetchone()[0]
     
-    # Total revenue
-    revenue_where = date_condition.replace('WHERE', 'WHERE status NOT IN ("failed", "cancelled") AND') if date_condition else 'WHERE status NOT IN ("failed", "cancelled")'
-    result = conn.execute(f'SELECT SUM(total) FROM orders {revenue_where}').fetchone()[0]
+    # Total revenue - add status filter
+    revenue_conditions = conditions.copy()
+    revenue_conditions.append('status NOT IN ("failed", "cancelled")')
+    revenue_where = 'WHERE ' + ' AND '.join(revenue_conditions)
+    result = conn.execute(f'SELECT SUM(total) FROM orders {revenue_where}', params).fetchone()[0]
     stats['total_revenue'] = result or 0
     
     # Orders by status
@@ -173,7 +248,7 @@ def dashboard():
         FROM orders {date_condition}
         GROUP BY status
         ORDER BY count DESC
-    ''').fetchall()
+    ''', params).fetchall()
     status_data = [dict(row) for row in status_data_raw]
     
     # Orders by source
@@ -181,25 +256,33 @@ def dashboard():
         SELECT source, COUNT(*) as count, SUM(total) as revenue
         FROM orders {date_condition}
         GROUP BY source
-    ''').fetchall()
+    ''', params).fetchall()
     source_data = [dict(row) for row in source_data_raw]
     
-    # Recent orders - only filter by source, ignore date filter
+    # Recent orders - apply permission filter, optionally source filter
+    recent_conditions = ['1=1']
+    recent_params = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            recent_conditions.append(f'source IN ({placeholders})')
+            recent_params.extend(allowed_sources)
+        else:
+            recent_conditions.append('1=0')
+    
     if source_filter:
-        recent_orders = conn.execute(f'''
-            SELECT id, number, status, total, date_created, source, line_items
-            FROM orders
-            WHERE source = '{source_filter}'
-            ORDER BY date_created DESC
-            LIMIT 10
-        ''').fetchall()
-    else:
-        recent_orders = conn.execute('''
-            SELECT id, number, status, total, date_created, source, line_items
-            FROM orders
-            ORDER BY date_created DESC
-            LIMIT 10
-        ''').fetchall()
+        recent_conditions.append('source = ?')
+        recent_params.append(source_filter)
+    
+    recent_where = 'WHERE ' + ' AND '.join(recent_conditions)
+    recent_orders = conn.execute(f'''
+        SELECT id, number, status, total, date_created, source, line_items
+        FROM orders
+        {recent_where}
+        ORDER BY date_created DESC
+        LIMIT 10
+    ''', recent_params).fetchall()
     
     # Process recent orders to get product count
     processed_orders = []
@@ -212,7 +295,7 @@ def dashboard():
     # Trend data based on filter - daily for single month, monthly for longer periods
     trend_type = 'daily' if quick_date in ['this_month', 'last_month'] else 'monthly'
     
-    if trend_type == 'daily' and date_condition:
+    if trend_type == 'daily':
         # Daily trend for this_month or last_month
         trend_data_raw = conn.execute(f'''
             SELECT strftime('%Y-%m-%d', date_created) as period, 
@@ -221,9 +304,9 @@ def dashboard():
             FROM orders {date_condition}
             GROUP BY period
             ORDER BY period
-        ''').fetchall()
-    elif date_condition:
-        # Monthly trend for other filters
+        ''', params).fetchall()
+    else:
+        # Monthly trend - use same date_condition or default
         trend_data_raw = conn.execute(f'''
             SELECT strftime('%Y-%m', date_created) as period, 
                    COUNT(*) as orders,
@@ -231,18 +314,7 @@ def dashboard():
             FROM orders {date_condition}
             GROUP BY period
             ORDER BY period
-        ''').fetchall()
-    else:
-        # Default to last 6 months if no filter
-        trend_data_raw = conn.execute('''
-            SELECT strftime('%Y-%m', date_created) as period, 
-                   COUNT(*) as orders,
-                   SUM(total) as revenue
-            FROM orders
-            WHERE date_created >= date('now', '-6 months')
-            GROUP BY period
-            ORDER BY period
-        ''').fetchall()
+        ''', params).fetchall()
     trend_data = [dict(row) for row in trend_data_raw]
     
     # Get site managers mapping
@@ -271,6 +343,9 @@ def orders():
     from datetime import date, timedelta
     conn = get_db_connection()
     
+    # Get user's allowed sources for permission filtering
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    
     # Get filter parameters
     source_filter = request.args.get('source', '')
     status_filter = request.args.get('status', '')
@@ -280,6 +355,10 @@ def orders():
     quick_date = request.args.get('quick_date', '')
     page = int(request.args.get('page', 1))
     per_page = 20
+    
+    # Validate source_filter against allowed sources
+    if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
+        source_filter = ''
     
     # Process quick date filter
     today = date.today()
@@ -302,9 +381,18 @@ def orders():
         date_from = (today - timedelta(days=365)).isoformat()
         date_to = today.isoformat()
     
-    # Build base conditions
+    # Build base conditions with permission filter
     conditions = []
     params = []
+    
+    # Add permission filter first
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')  # No access
     
     if source_filter:
         conditions.append('source = ?')
@@ -411,6 +499,7 @@ def orders():
     total = conn.execute(count_query, params).fetchone()[0]
     
     processed_orders = []
+    # 嘻嘻嘻嘻嘻
     for order in orders_data:
         od = dict(order)
         items = parse_json_field(order['line_items'])
@@ -429,7 +518,14 @@ def orders():
         od['customer_email'] = billing.get('email', '')
         processed_orders.append(od)
     
-    sources = conn.execute('SELECT DISTINCT source FROM orders').fetchall()
+    # Get available sources filtered by permissions
+    if allowed_sources is None:
+        sources = conn.execute('SELECT DISTINCT source FROM orders').fetchall()
+    elif allowed_sources:
+        placeholders = ', '.join(['?' for _ in allowed_sources])
+        sources = conn.execute(f'SELECT DISTINCT source FROM orders WHERE source IN ({placeholders})', allowed_sources).fetchall()
+    else:
+        sources = []
     statuses = conn.execute('SELECT DISTINCT status FROM orders').fetchall()
     
     # Get site managers mapping (url -> manager)
@@ -465,28 +561,51 @@ def monthly():
     """Monthly statistics page"""
     conn = get_db_connection()
     
+    # Get user's allowed sources for permission filtering
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    
     # Get source filter
     source_filter = request.args.get('source', '')
     
-    # Get all sources for dropdown
-    all_sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
+    # Validate source_filter against allowed sources
+    if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
+        source_filter = ''
     
-    # Build query with optional source filter
-    if source_filter:
-        query = f'''
-            SELECT id, status, date_created, total, shipping_total, source, line_items
-            FROM orders
-            WHERE source = '{source_filter}'
-            ORDER BY date_created DESC
-        '''
+    # Get all sources for dropdown (filtered by permissions)
+    if allowed_sources is None:
+        all_sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
+    elif allowed_sources:
+        placeholders = ', '.join(['?' for _ in allowed_sources])
+        all_sources = conn.execute(f'SELECT DISTINCT source FROM orders WHERE source IN ({placeholders}) ORDER BY source', allowed_sources).fetchall()
     else:
-        query = '''
-            SELECT id, status, date_created, total, shipping_total, source, line_items
-            FROM orders
-            ORDER BY date_created DESC
-        '''
+        all_sources = []
     
-    df = pd.read_sql_query(query, conn)
+    # Build query with permission filter and optional source filter
+    conditions = []
+    params = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+    
+    if source_filter:
+        conditions.append('source = ?')
+        params.append(source_filter)
+    
+    where_clause = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
+    
+    query = f'''
+        SELECT id, status, date_created, total, shipping_total, source, line_items
+        FROM orders
+        {where_clause}
+        ORDER BY date_created DESC
+    '''
+    
+    df = pd.read_sql_query(query, conn, params=params if params else None)
     conn.close()
     
     if len(df) == 0:
@@ -560,14 +679,45 @@ def monthly():
 def customers():
     conn = get_db_connection()
     
+    # Get user's allowed sources for permission filtering
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    
     # Get source filter
     source_filter = request.args.get('source', '')
     
-    # Get all sources for dropdown
-    all_sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
+    # Validate source_filter against allowed sources
+    if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
+        source_filter = ''
     
-    # Build query with optional source filter
-    query = '''
+    # Get all sources for dropdown (filtered by permissions)
+    if allowed_sources is None:
+        all_sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
+    elif allowed_sources:
+        placeholders = ', '.join(['?' for _ in allowed_sources])
+        all_sources = conn.execute(f'SELECT DISTINCT source FROM orders WHERE source IN ({placeholders}) ORDER BY source', allowed_sources).fetchall()
+    else:
+        all_sources = []
+    
+    # Build query with permission filter and optional source filter
+    base_condition = "json_extract(billing, '$.email') IS NOT NULL AND json_extract(billing, '$.email') != ''"
+    conditions = [base_condition]
+    params = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+    
+    if source_filter:
+        conditions.append('source = ?')
+        params.append(source_filter)
+    
+    where_clause = 'WHERE ' + ' AND '.join(conditions)
+    
+    query = f'''
         SELECT 
             json_extract(billing, '$.email') as email,
             json_extract(billing, '$.first_name') || ' ' || json_extract(billing, '$.last_name') as name,
@@ -579,15 +729,7 @@ def customers():
             MIN(date_created) as first_order_date,
             GROUP_CONCAT(DISTINCT source) as sources
         FROM orders
-        WHERE json_extract(billing, '$.email') IS NOT NULL AND json_extract(billing, '$.email') != ''
-    '''
-    
-    params = []
-    if source_filter:
-        query += ' AND source = ?'
-        params.append(source_filter)
-        
-    query += '''
+        {where_clause}
         GROUP BY email
         ORDER BY total_spent DESC
     '''
@@ -1018,6 +1160,26 @@ def init_sync_logs_table():
     conn.close()
 
 
+def init_settings_table():
+    """Initialize settings table for storing app configuration"""
+    conn = get_db_connection()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    # Insert default autosync settings if not exist
+    conn.execute('''
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('autosync_enabled', 'false')
+    ''')
+    conn.execute('''
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('autosync_interval', '900')
+    ''')
+    conn.commit()
+    conn.close()
+
+
 def save_sync_log(site_id, site_url, status, message, new_orders=0, updated_orders=0, duration_seconds=0):
     """Save a sync log entry to the database"""
     conn = get_db_connection()
@@ -1067,6 +1229,7 @@ def init_users_table():
 with app.app_context():
     init_sites_table()
     init_sync_logs_table()
+    init_settings_table()
     init_users_table()
 
 @app.route('/settings')
@@ -1223,8 +1386,6 @@ def delete_site(site_id):
 # Global sync status storage
 # Format: {site_id: {'status': 'idle'|'running'|'success'|'error', 'progress': 0, 'message': '', 'logs': []}}
 SYNC_STATUS = {}
-AUTO_SYNC_ENABLED = False
-AUTO_SYNC_INTERVAL = 900  # 15 minutes
 
 @app.route('/api/sync/status/<int:site_id>')
 @login_required
@@ -1411,24 +1572,101 @@ def sync_all_data():
 @app.route('/api/settings/autosync', methods=['GET'])
 @login_required
 def get_autosync_status():
+    """Get autosync status from database and verify cron status"""
+    conn = get_db_connection()
+    enabled_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_enabled'").fetchone()
+    interval_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_interval'").fetchone()
+    conn.close()
+    
+    enabled = enabled_row['value'] == 'true' if enabled_row else False
+    interval = int(interval_row['value']) if interval_row else 900
+    
+    # Verify cron job exists if enabled
+    if enabled:
+        import subprocess
+        try:
+            result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+            if 'auto_sync.py' not in result.stdout:
+                enabled = False  # Cron was removed externally
+        except:
+            pass
+    
     return jsonify({
-        'enabled': AUTO_SYNC_ENABLED,
-        'interval': AUTO_SYNC_INTERVAL
+        'enabled': enabled,
+        'interval': interval
     })
 
 @app.route('/api/settings/autosync', methods=['POST'])
 @login_required
 def set_autosync_status():
-    global AUTO_SYNC_ENABLED, AUTO_SYNC_INTERVAL
+    """Set autosync status, save to database and manage cron job"""
+    import subprocess
+    
     data = request.json
-    if 'enabled' in data:
-        AUTO_SYNC_ENABLED = bool(data['enabled'])
+    conn = get_db_connection()
+    
+    # Get current values
+    enabled_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_enabled'").fetchone()
+    interval_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_interval'").fetchone()
+    
+    current_enabled = enabled_row['value'] == 'true' if enabled_row else False
+    current_interval = int(interval_row['value']) if interval_row else 900
+    
+    new_enabled = bool(data.get('enabled', current_enabled))
+    new_interval = current_interval
+    
     if 'interval' in data:
-        # Validate interval (minimum 5 minutes, maximum 24 hours)
         interval = int(data['interval'])
-        if 300 <= interval <= 86400:
-            AUTO_SYNC_INTERVAL = interval
-    return jsonify({'success': True, 'enabled': AUTO_SYNC_ENABLED, 'interval': AUTO_SYNC_INTERVAL})
+        if 300 <= interval <= 86400:  # 5 min to 24 hours
+            new_interval = interval
+    
+    # Save to database
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('autosync_enabled', ?)", 
+                 ('true' if new_enabled else 'false',))
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('autosync_interval', ?)", 
+                 (str(new_interval),))
+    conn.commit()
+    conn.close()
+    
+    # Manage cron job
+    try:
+        # Get existing crontab
+        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        existing_crontab = result.stdout if result.returncode == 0 else ''
+        
+        # Remove any existing auto_sync.py entries
+        lines = [line for line in existing_crontab.split('\n') 
+                 if line.strip() and 'auto_sync.py' not in line]
+        
+        if new_enabled:
+            # Convert interval (seconds) to cron expression
+            interval_mins = new_interval // 60
+            
+            if interval_mins < 60:
+                # Every X minutes
+                cron_schedule = f"*/{interval_mins} * * * *"
+            elif interval_mins < 1440:
+                # Every X hours
+                hours = interval_mins // 60
+                cron_schedule = f"0 */{hours} * * *"
+            else:
+                # Once a day at 6am
+                cron_schedule = "0 6 * * *"
+            
+            # Add new cron job
+            script_path = '/www/wwwroot/woo-analysis'
+            cron_line = f"{cron_schedule} cd {script_path} && {script_path}/venv/bin/python auto_sync.py >> {script_path}/auto_sync.log 2>&1"
+            lines.append(cron_line)
+        
+        # Write new crontab
+        new_crontab = '\n'.join(lines) + '\n' if lines else ''
+        process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+        process.communicate(input=new_crontab)
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'enabled': new_enabled, 'interval': new_interval}), 500
+    
+    return jsonify({'success': True, 'enabled': new_enabled, 'interval': new_interval})
 
 
 @app.route('/api/sync/logs')
@@ -1833,95 +2071,5 @@ def update_user_permissions(user_id):
     return jsonify({'success': True})
 
 
-def auto_sync_loop(app_context):
-    import time
-    import sync_utils
-    
-    print("Auto-sync thread started")
-    while True:
-        try:
-            if AUTO_SYNC_ENABLED:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Auto-sync triggering...")
-                # We reuse the logic from sync_all_data but we need to call it directly or extract it.
-                # Since sync_all_data is a route, we can't call it easily.
-                # Let's extract the inner logic of sync_all_data or just hit the endpoint internally?
-                # Hitting endpoint requires a request context or running server.
-                # Better to duplicate the logic or extract it.
-                
-                # To avoid code duplication, let's just do a simplified version here.
-                # Or better, we can invoke the same function if we refactor.
-                # For now, I will copy the core logic since I can't easily refactor the route in this script.
-                
-                with app_context:
-                    # Check if a sync is already running?
-                    # For simplicity, we just run it.
-                    
-                    # We need to use the ALL_SITES_ID = 999999
-                    ALL_SITES_ID = 999999
-                    
-                    # Only run if not already running
-                    current_status = SYNC_STATUS.get(ALL_SITES_ID, {}).get('status')
-                    if current_status == 'running':
-                        print("Auto-sync skipped: Sync already in progress")
-                    else:
-                        # Initialize status
-                        SYNC_STATUS[ALL_SITES_ID] = {
-                            'status': 'running',
-                            'message': 'Auto-sync started...',
-                            'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Auto-sync job started"]
-                        }
-                        
-                        try:
-                            conn = get_db_connection()
-                            sites = conn.execute('SELECT * FROM sites').fetchall()
-                            conn.close()
-                            
-                            if sites:
-                                total_sites = len(sites)
-                                for index, site in enumerate(sites):
-                                    site_url = site['url']
-                                    current_step = index + 1
-                                    
-                                    SYNC_STATUS[ALL_SITES_ID]['message'] = f"Auto-syncing {current_step}/{total_sites}: {site_url}"
-                                    
-                                    def progress_callback(msg):
-                                        pass # Mute detailed logs for auto-sync to save memory? Or keep them?
-                                        # Let's keep them but minimal
-                                    
-                                    result = sync_utils.sync_site(
-                                        site['url'], 
-                                        site['consumer_key'], 
-                                        site['consumer_secret'],
-                                        progress_callback
-                                    )
-                                    
-                                    if result['status'] == 'success':
-                                        conn = get_db_connection()
-                                        conn.execute('UPDATE sites SET last_sync = ? WHERE id = ?', 
-                                                     (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), site['id']))
-                                        conn.commit()
-                                        conn.close()
-                                
-                                SYNC_STATUS[ALL_SITES_ID]['status'] = 'success'
-                                SYNC_STATUS[ALL_SITES_ID]['message'] = 'Auto-sync completed'
-                                SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Auto-sync finished")
-                                
-                        except Exception as e:
-                            print(f"Auto-sync error: {e}")
-                            SYNC_STATUS[ALL_SITES_ID]['status'] = 'error'
-            
-            # Sleep for interval
-            time.sleep(AUTO_SYNC_INTERVAL)
-            
-        except Exception as e:
-            print(f"Auto-sync loop error: {e}")
-            time.sleep(60) # Sleep on error
-
 if __name__ == '__main__':
-    # Start auto-sync thread
-    import threading
-    # Daemon thread so it dies when main thread dies
-    sync_thread = threading.Thread(target=auto_sync_loop, args=(app.app_context(),), daemon=True)
-    sync_thread.start()
-    
     app.run(debug=True, host='0.0.0.0', port=5000)
