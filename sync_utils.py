@@ -261,8 +261,13 @@ def fetch_orders_modified_after(wcapi, site_url, modified_after=None, progress_c
                 
     return orders
 
-def sync_site(url, consumer_key, consumer_secret, progress_callback=None):
-    """Sync a single site"""
+def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_days=7):
+    """Sync a single site
+    
+    Args:
+        sync_days: Only sync orders modified in the last N days. 
+                   Set to 0 or None for full sync (no time limit).
+    """
     if progress_callback: progress_callback(f"Connecting to {url}...")
     
     wcapi = create_robust_wcapi(url, consumer_key, consumer_secret, PROXY_CONFIG)
@@ -270,19 +275,36 @@ def sync_site(url, consumer_key, consumer_secret, progress_callback=None):
         return {"status": "error", "message": "Failed to create API client"}
     
     try:
-        # 1. Fetch new orders
-        last_order_date = get_last_order_date_from_db(url)
-        if progress_callback: 
-            if last_order_date:
-                progress_callback(f"Last sync date: {last_order_date}")
-            else:
-                progress_callback("First time sync (full history)...")
-                
-        new_orders = fetch_orders_incrementally(wcapi, url, last_order_date, progress_callback)
+        # Calculate time window for modified_after
+        modified_after = None
+        if sync_days and sync_days > 0:
+            from datetime import timedelta
+            cutoff_date = datetime.now() - timedelta(days=sync_days)
+            modified_after = cutoff_date.strftime("%Y-%m-%dT00:00:00")
+            if progress_callback: 
+                progress_callback(f"Syncing orders modified in last {sync_days} days...")
+        else:
+            # Full sync: use last modified date from DB
+            modified_after = get_last_modified_date_from_db(url)
+            if progress_callback:
+                if modified_after:
+                    progress_callback(f"Full sync from {modified_after}...")
+                else:
+                    progress_callback("Full sync (all history)...")
         
-        # 2. Fetch updated orders
-        last_modified = get_last_modified_date_from_db(url)
-        updated_orders = fetch_orders_modified_after(wcapi, url, last_modified, progress_callback)
+        # 1. Fetch new orders (only for first-time sync or when no cutoff)
+        new_orders = []
+        if not sync_days or sync_days <= 0:
+            last_order_date = get_last_order_date_from_db(url)
+            if progress_callback: 
+                if last_order_date:
+                    progress_callback(f"Fetching new orders after {last_order_date}...")
+                else:
+                    progress_callback("First time sync (full history)...")
+            new_orders = fetch_orders_incrementally(wcapi, url, last_order_date, progress_callback)
+        
+        # 2. Fetch updated orders (within time window)
+        updated_orders = fetch_orders_modified_after(wcapi, url, modified_after, progress_callback)
         
         msg = f"Sync complete. New: {len(new_orders)}, Updated: {len(updated_orders)}"
         if progress_callback: progress_callback(msg)
@@ -295,3 +317,4 @@ def sync_site(url, consumer_key, consumer_secret, progress_callback=None):
     except Exception as e:
         if progress_callback: progress_callback(f"Critical Error: {str(e)}")
         return {"status": "error", "message": str(e)}
+

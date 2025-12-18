@@ -36,17 +36,23 @@ USERS = {
 
 
 class User(UserMixin):
-    def __init__(self, user_id, username, name):
+    def __init__(self, user_id, username, name, role='user'):
         self.id = user_id
         self.username = username
         self.name = name
+        self.role = role
+    
+    def is_admin(self):
+        return self.role == 'admin'
 
 
 @login_manager.user_loader
 def load_user(user_id):
-    for username, user_data in USERS.items():
-        if user_data['id'] == user_id:
-            return User(user_data['id'], username, user_data['name'])
+    conn = get_db_connection()
+    user_row = conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
+    conn.close()
+    if user_row:
+        return User(user_row['id'], user_row['username'], user_row['name'], user_row['role'])
     return None
 
 
@@ -78,9 +84,12 @@ def login():
         username = request.form.get('username', '')
         password = request.form.get('password', '')
         
-        if username in USERS and check_password_hash(USERS[username]['password'], password):
-            user_data = USERS[username]
-            user = User(user_data['id'], username, user_data['name'])
+        conn = get_db_connection()
+        user_row = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+        conn.close()
+        
+        if user_row and check_password_hash(user_row['password_hash'], password):
+            user = User(user_row['id'], username, user_row['name'], user_row['role'])
             login_user(user)
             flash('登录成功！', 'success')
             next_page = request.args.get('next')
@@ -955,9 +964,77 @@ def init_sites_table():
     conn.commit()
     conn.close()
 
-# Initialize sites table on startup
+
+def init_sync_logs_table():
+    """Initialize sync_logs table for storing synchronization history"""
+    conn = get_db_connection()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sync_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id INTEGER,
+            site_url TEXT,
+            status TEXT,
+            message TEXT,
+            new_orders INTEGER DEFAULT 0,
+            updated_orders INTEGER DEFAULT 0,
+            sync_time TEXT,
+            duration_seconds INTEGER
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+def save_sync_log(site_id, site_url, status, message, new_orders=0, updated_orders=0, duration_seconds=0):
+    """Save a sync log entry to the database"""
+    conn = get_db_connection()
+    conn.execute('''
+        INSERT INTO sync_logs (site_id, site_url, status, message, new_orders, updated_orders, sync_time, duration_seconds)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (site_id, site_url, status, message, new_orders, updated_orders, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), duration_seconds))
+    conn.commit()
+    conn.close()
+
+def init_users_table():
+    """Initialize users table"""
+    conn = get_db_connection()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            name TEXT,
+            role TEXT DEFAULT 'user',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS user_site_permissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            site_id INTEGER,
+            UNIQUE(user_id, site_id)
+        )
+    ''')
+    conn.commit()
+    
+    # Migrate default admin user if not exists
+    existing = conn.execute('SELECT id FROM users WHERE username = ?', ('admin',)).fetchone()
+    if not existing:
+        conn.execute('''
+            INSERT INTO users (username, password_hash, name, role)
+            VALUES (?, ?, ?, ?)
+        ''', ('admin', generate_password_hash('admin123'), '管理员', 'admin'))
+        conn.commit()
+    
+    conn.close()
+
+
+# Initialize tables on startup
 with app.app_context():
     init_sites_table()
+    init_sync_logs_table()
+    init_users_table()
 
 @app.route('/settings')
 @login_required
@@ -967,6 +1044,73 @@ def settings():
     sites = conn.execute('SELECT * FROM sites').fetchall()
     conn.close()
     return render_template('settings.html', sites=sites)
+
+
+@app.route('/api/sites/import-from-script', methods=['POST'])
+@login_required
+def import_sites_from_script():
+    """从 1.wooorders_sqlite.py 的硬编码配置导入站点到数据库"""
+    import ast
+    import re
+    
+    script_path = '1.wooorders_sqlite.py'
+    
+    try:
+        with open(script_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # 提取 HARDCODED_SITES 列表
+        pattern = r'HARDCODED_SITES\s*=\s*(\[[\s\S]*?\n\])'
+        match = re.search(pattern, content)
+        
+        if not match:
+            # 尝试旧格式 sites = [...]
+            pattern = r'^sites\s*=\s*(\[[\s\S]*?\n\])'
+            match = re.search(pattern, content, re.MULTILINE)
+        
+        if not match:
+            return jsonify({'error': '无法在脚本中找到站点配置'}), 400
+        
+        # 解析 Python 列表
+        sites_str = match.group(1)
+        sites_list = ast.literal_eval(sites_str)
+        
+        conn = get_db_connection()
+        imported = 0
+        skipped = 0
+        
+        for site in sites_list:
+            url = site.get('url', '')
+            ck = site.get('ck', '')
+            cs = site.get('cs', '')
+            
+            if not all([url, ck, cs]):
+                continue
+            
+            # 检查是否已存在
+            existing = conn.execute('SELECT id FROM sites WHERE url = ?', (url,)).fetchone()
+            if existing:
+                skipped += 1
+                continue
+            
+            conn.execute('INSERT INTO sites (url, consumer_key, consumer_secret) VALUES (?, ?, ?)',
+                        (url, ck, cs))
+            imported += 1
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'success': True, 
+            'imported': imported, 
+            'skipped': skipped,
+            'message': f'成功导入 {imported} 个站点，跳过 {skipped} 个已存在的站点'
+        })
+        
+    except FileNotFoundError:
+        return jsonify({'error': f'找不到脚本文件: {script_path}'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/sites', methods=['POST'])
 @login_required
@@ -1076,6 +1220,7 @@ def sync_data():
     
     def run_sync(app_context, site_id):
         with app_context:
+            sync_start_time = datetime.now()
             try:
                 conn = get_db_connection()
                 site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
@@ -1100,6 +1245,8 @@ def sync_data():
                     progress_callback
                 )
                 
+                duration = int((datetime.now() - sync_start_time).total_seconds())
+                
                 if result['status'] == 'success':
                     # Update last sync time
                     conn = get_db_connection()
@@ -1111,15 +1258,30 @@ def sync_data():
                     SYNC_STATUS[site_id]['status'] = 'success'
                     SYNC_STATUS[site_id]['message'] = 'Synchronization completed successfully'
                     SYNC_STATUS[site_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Finished: New {result['new_orders']}, Updated {result['updated_orders']}")
+                    
+                    # Save sync log to database
+                    save_sync_log(site_id, site['url'], 'success', 
+                                  f"New: {result['new_orders']}, Updated: {result['updated_orders']}", 
+                                  result['new_orders'], result['updated_orders'], duration)
                 else:
                     SYNC_STATUS[site_id]['status'] = 'error'
                     SYNC_STATUS[site_id]['message'] = result.get('message', 'Unknown error')
                     SYNC_STATUS[site_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {result.get('message')}")
                     
+                    # Save error log to database
+                    save_sync_log(site_id, site['url'], 'error', result.get('message', 'Unknown error'), 0, 0, duration)
+                    
             except Exception as e:
+                duration = int((datetime.now() - sync_start_time).total_seconds())
                 SYNC_STATUS[site_id]['status'] = 'error'
                 SYNC_STATUS[site_id]['message'] = str(e)
                 SYNC_STATUS[site_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+                
+                # Save error log to database
+                try:
+                    save_sync_log(site_id, '', 'error', str(e), 0, 0, duration)
+                except:
+                    pass
 
     # Run sync in background thread
     thread = threading.Thread(target=run_sync, args=(app.app_context(), site_id))
@@ -1222,11 +1384,418 @@ def get_autosync_status():
 @app.route('/api/settings/autosync', methods=['POST'])
 @login_required
 def set_autosync_status():
-    global AUTO_SYNC_ENABLED
+    global AUTO_SYNC_ENABLED, AUTO_SYNC_INTERVAL
     data = request.json
     if 'enabled' in data:
         AUTO_SYNC_ENABLED = bool(data['enabled'])
-    return jsonify({'success': True, 'enabled': AUTO_SYNC_ENABLED})
+    if 'interval' in data:
+        # Validate interval (minimum 5 minutes, maximum 24 hours)
+        interval = int(data['interval'])
+        if 300 <= interval <= 86400:
+            AUTO_SYNC_INTERVAL = interval
+    return jsonify({'success': True, 'enabled': AUTO_SYNC_ENABLED, 'interval': AUTO_SYNC_INTERVAL})
+
+
+@app.route('/api/sync/logs')
+@login_required
+def get_sync_logs():
+    """Get synchronization logs"""
+    site_id = request.args.get('site_id', '')
+    limit = int(request.args.get('limit', 50))
+    
+    conn = get_db_connection()
+    
+    if site_id:
+        logs = conn.execute('''
+            SELECT * FROM sync_logs 
+            WHERE site_id = ? 
+            ORDER BY sync_time DESC 
+            LIMIT ?
+        ''', (site_id, limit)).fetchall()
+    else:
+        logs = conn.execute('''
+            SELECT * FROM sync_logs 
+            ORDER BY sync_time DESC 
+            LIMIT ?
+        ''', (limit,)).fetchall()
+    
+    conn.close()
+    
+    return jsonify([dict(row) for row in logs])
+
+
+@app.route('/api/sync/summary')
+@login_required
+def get_sync_summary():
+    """Get sync summary for all sites"""
+    conn = get_db_connection()
+    
+    # Get all sites with their latest sync info
+    sites = conn.execute('SELECT * FROM sites').fetchall()
+    
+    summary = []
+    for site in sites:
+        # Get latest log for this site
+        latest_log = conn.execute('''
+            SELECT * FROM sync_logs 
+            WHERE site_id = ? 
+            ORDER BY sync_time DESC 
+            LIMIT 1
+        ''', (site['id'],)).fetchone()
+        
+        # Get stats for last 7 days
+        stats = conn.execute('''
+            SELECT 
+                COUNT(*) as total_syncs,
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
+                SUM(new_orders) as total_new_orders,
+                SUM(updated_orders) as total_updated_orders,
+                AVG(duration_seconds) as avg_duration
+            FROM sync_logs 
+            WHERE site_id = ? AND sync_time >= datetime('now', '-7 days')
+        ''', (site['id'],)).fetchone()
+        
+        summary.append({
+            'site_id': site['id'],
+            'url': site['url'],
+            'last_sync': site['last_sync'],
+            'latest_log': dict(latest_log) if latest_log else None,
+            'stats_7_days': dict(stats) if stats else None
+        })
+    
+    conn.close()
+    
+    return jsonify(summary)
+
+
+@app.route('/api/sync/deep', methods=['POST'])
+@login_required
+def trigger_deep_sync():
+    """Trigger deep sync using 1.wooorders_sqlite.py script"""
+    import subprocess
+    import threading
+    
+    DEEP_SYNC_ID = 888888
+    
+    SYNC_STATUS[DEEP_SYNC_ID] = {
+        'status': 'running',
+        'message': '正在启动深度同步...',
+        'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Deep sync job started"]
+    }
+    
+    def run_deep_sync(app_context):
+        with app_context:
+            try:
+                script_path = '/www/wwwroot/woo-analysis/1.wooorders_sqlite.py'
+                venv_python = '/www/wwwroot/woo-analysis/venv/bin/python'
+                
+                SYNC_STATUS[DEEP_SYNC_ID]['message'] = '正在执行深度同步脚本...'
+                SYNC_STATUS[DEEP_SYNC_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Running {script_path}")
+                
+                result = subprocess.run(
+                    [venv_python, script_path],
+                    cwd='/www/wwwroot/woo-analysis',
+                    capture_output=True,
+                    text=True,
+                    timeout=3600  # 1 hour timeout
+                )
+                
+                if result.returncode == 0:
+                    SYNC_STATUS[DEEP_SYNC_ID]['status'] = 'success'
+                    SYNC_STATUS[DEEP_SYNC_ID]['message'] = '深度同步完成'
+                    SYNC_STATUS[DEEP_SYNC_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Completed successfully")
+                    # Add last few lines of output
+                    output_lines = result.stdout.strip().split('\n')[-10:]
+                    for line in output_lines:
+                        SYNC_STATUS[DEEP_SYNC_ID]['logs'].append(line)
+                else:
+                    SYNC_STATUS[DEEP_SYNC_ID]['status'] = 'error'
+                    SYNC_STATUS[DEEP_SYNC_ID]['message'] = '深度同步失败'
+                    SYNC_STATUS[DEEP_SYNC_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {result.stderr[:500]}")
+                    
+            except subprocess.TimeoutExpired:
+                SYNC_STATUS[DEEP_SYNC_ID]['status'] = 'error'
+                SYNC_STATUS[DEEP_SYNC_ID]['message'] = '深度同步超时'
+            except Exception as e:
+                SYNC_STATUS[DEEP_SYNC_ID]['status'] = 'error'
+                SYNC_STATUS[DEEP_SYNC_ID]['message'] = str(e)
+    
+    thread = threading.Thread(target=run_deep_sync, args=(app.app_context(),))
+    thread.start()
+    
+    return jsonify({'success': True, 'sync_id': DEEP_SYNC_ID, 'message': 'Deep sync started'})
+
+
+@app.route('/api/cron/status')
+@login_required
+def get_cron_status():
+    """Get current cron job status for deep sync"""
+    import subprocess
+    
+    try:
+        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        crontab_content = result.stdout
+        
+        # Check if our deep sync job exists
+        job_pattern = '1.wooorders_sqlite.py'
+        has_job = job_pattern in crontab_content
+        
+        # Extract schedule if exists
+        schedule = None
+        if has_job:
+            for line in crontab_content.split('\n'):
+                if job_pattern in line and not line.startswith('#'):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        schedule = ' '.join(parts[:5])
+                    break
+        
+        return jsonify({
+            'enabled': has_job,
+            'schedule': schedule,
+            'raw': crontab_content if has_job else None
+        })
+    except Exception as e:
+        return jsonify({'enabled': False, 'error': str(e)})
+
+
+@app.route('/api/cron/setup', methods=['POST'])
+@login_required
+def setup_cron():
+    """Setup cron job for deep sync"""
+    import subprocess
+    
+    data = request.json
+    hour = int(data.get('hour', 3))  # Default 3 AM
+    minute = int(data.get('minute', 0))
+    
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return jsonify({'error': 'Invalid time'}), 400
+    
+    try:
+        # Get existing crontab
+        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        existing_crontab = result.stdout if result.returncode == 0 else ''
+        
+        # Remove existing deep sync job if any
+        lines = [line for line in existing_crontab.split('\n') 
+                 if '1.wooorders_sqlite.py' not in line and line.strip()]
+        
+        # Add new job
+        new_job = f"{minute} {hour} * * * cd /www/wwwroot/woo-analysis && /www/wwwroot/woo-analysis/venv/bin/python 1.wooorders_sqlite.py >> /www/wwwroot/woo-analysis/deep_sync.log 2>&1"
+        lines.append(new_job)
+        
+        # Write new crontab
+        new_crontab = '\n'.join(lines) + '\n'
+        process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+        process.communicate(input=new_crontab)
+        
+        if process.returncode == 0:
+            return jsonify({'success': True, 'message': f'Cron job set for {hour:02d}:{minute:02d}'})
+        else:
+            return jsonify({'error': 'Failed to set crontab'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cron/remove', methods=['DELETE'])
+@login_required
+def remove_cron():
+    """Remove cron job for deep sync"""
+    import subprocess
+    
+    try:
+        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        existing_crontab = result.stdout if result.returncode == 0 else ''
+        
+        # Remove deep sync job
+        lines = [line for line in existing_crontab.split('\n') 
+                 if '1.wooorders_sqlite.py' not in line and line.strip()]
+        
+        new_crontab = '\n'.join(lines) + '\n' if lines else ''
+        process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+        process.communicate(input=new_crontab)
+        
+        return jsonify({'success': True, 'message': 'Cron job removed'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============== USER MANAGEMENT API ==============
+
+def admin_required(f):
+    """Decorator to require admin role"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.is_admin():
+            return jsonify({'error': 'Admin access required'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+@app.route('/users')
+@login_required
+@admin_required
+def users_page():
+    """User management page"""
+    return render_template('users.html')
+
+
+@app.route('/api/users')
+@login_required
+@admin_required
+def get_users():
+    """Get all users"""
+    conn = get_db_connection()
+    users = conn.execute('SELECT id, username, name, role, created_at FROM users').fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in users])
+
+
+@app.route('/api/users', methods=['POST'])
+@login_required
+@admin_required
+def add_user():
+    """Add a new user"""
+    data = request.json
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    name = data.get('name', '').strip()
+    role = data.get('role', 'user')
+    
+    if not username or not password:
+        return jsonify({'error': 'Username and password required'}), 400
+    
+    if role not in ['admin', 'user']:
+        role = 'user'
+    
+    conn = get_db_connection()
+    try:
+        conn.execute('''
+            INSERT INTO users (username, password_hash, name, role)
+            VALUES (?, ?, ?, ?)
+        ''', (username, generate_password_hash(password), name, role))
+        conn.commit()
+        return jsonify({'success': True})
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'Username already exists'}), 400
+    finally:
+        conn.close()
+
+
+@app.route('/api/users/<int:user_id>', methods=['PUT'])
+@login_required
+@admin_required
+def update_user(user_id):
+    """Update a user"""
+    data = request.json
+    name = data.get('name', '').strip()
+    role = data.get('role', 'user')
+    password = data.get('password', '')
+    
+    if role not in ['admin', 'user']:
+        role = 'user'
+    
+    conn = get_db_connection()
+    try:
+        if password:
+            conn.execute('UPDATE users SET name = ?, role = ?, password_hash = ? WHERE id = ?',
+                        (name, role, generate_password_hash(password), user_id))
+        else:
+            conn.execute('UPDATE users SET name = ?, role = ? WHERE id = ?',
+                        (name, role, user_id))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/users/<int:user_id>', methods=['DELETE'])
+@login_required
+@admin_required
+def delete_user(user_id):
+    """Delete a user"""
+    # Prevent deleting yourself
+    if str(user_id) == str(current_user.id):
+        return jsonify({'error': 'Cannot delete yourself'}), 400
+    
+    conn = get_db_connection()
+    try:
+        conn.execute('DELETE FROM user_site_permissions WHERE user_id = ?', (user_id,))
+        conn.execute('DELETE FROM users WHERE id = ?', (user_id,))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/users/change-password', methods=['POST'])
+@login_required
+def change_own_password():
+    """Change current user's password"""
+    data = request.json
+    old_password = data.get('old_password', '')
+    new_password = data.get('new_password', '')
+    
+    if not old_password or not new_password:
+        return jsonify({'error': 'Both old and new password required'}), 400
+    
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM users WHERE id = ?', (current_user.id,)).fetchone()
+    
+    if not check_password_hash(user['password_hash'], old_password):
+        conn.close()
+        return jsonify({'error': 'Incorrect old password'}), 400
+    
+    conn.execute('UPDATE users SET password_hash = ? WHERE id = ?',
+                (generate_password_hash(new_password), current_user.id))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Password changed successfully'})
+
+
+@app.route('/api/users/<int:user_id>/permissions')
+@login_required
+@admin_required
+def get_user_permissions(user_id):
+    """Get user's site permissions"""
+    conn = get_db_connection()
+    permissions = conn.execute('''
+        SELECT site_id FROM user_site_permissions WHERE user_id = ?
+    ''', (user_id,)).fetchall()
+    sites = conn.execute('SELECT id, url FROM sites').fetchall()
+    conn.close()
+    
+    return jsonify({
+        'allowed_sites': [p['site_id'] for p in permissions],
+        'all_sites': [dict(s) for s in sites]
+    })
+
+
+@app.route('/api/users/<int:user_id>/permissions', methods=['PUT'])
+@login_required
+@admin_required
+def update_user_permissions(user_id):
+    """Update user's site permissions"""
+    data = request.json
+    site_ids = data.get('site_ids', [])
+    
+    conn = get_db_connection()
+    # Clear existing permissions
+    conn.execute('DELETE FROM user_site_permissions WHERE user_id = ?', (user_id,))
+    
+    # Add new permissions
+    for site_id in site_ids:
+        conn.execute('INSERT INTO user_site_permissions (user_id, site_id) VALUES (?, ?)',
+                    (user_id, site_id))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True})
 
 
 def auto_sync_loop(app_context):

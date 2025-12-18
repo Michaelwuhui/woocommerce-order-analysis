@@ -300,6 +300,30 @@ body {
     color: var(--text-primary);
 }
 
+/* Placeholder text styling for dark theme */
+.filter-card .form-control::placeholder,
+.form-control::placeholder {
+    color: rgba(160, 174, 192, 0.8) !important;
+    opacity: 1;
+}
+
+/* Flatpickr altInput styling */
+.flatpickr-input,
+.filter-card input.flatpickr-input {
+    color: var(--text-primary) !important;
+}
+
+.flatpickr-input::placeholder {
+    color: rgba(160, 174, 192, 0.8) !important;
+}
+
+/* Alt input (visible input) styling */
+input.flatpickr-input + input,
+.filter-card input[readonly] {
+    color: rgba(160, 174, 192, 0.9) !important;
+    background: rgba(0, 0, 0, 0.3) !important;
+}
+
 .filter-card .form-label {
     color: var(--text-secondary);
     font-size: 0.875rem;

@@ -1,0 +1,362 @@
+{% extends "base.html" %}
+
+{% block title %}用户管理 - WooCommerce 订单分析{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h1 class="h3 text-white mb-1">用户管理</h1>
+            <p class="text-white-50 mb-0">管理系统用户和权限</p>
+        </div>
+        <div class="d-flex gap-2">
+            <a href="/settings" class="btn btn-outline-secondary">
+                <i class="bi bi-arrow-left me-1"></i> 返回设置
+            </a>
+            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addUserModal">
+                <i class="bi bi-person-plus me-1"></i> 添加用户
+            </button>
+        </div>
+    </div>
+
+    <!-- Users List -->
+    <div class="card data-card mb-4">
+        <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
+            <h5 class="card-title text-white mb-0">用户列表</h5>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-dark table-hover align-middle mb-0" style="--bs-table-bg: transparent;">
+                    <thead>
+                        <tr>
+                            <th class="ps-4">用户名</th>
+                            <th>显示名称</th>
+                            <th>角色</th>
+                            <th>创建时间</th>
+                            <th class="text-end pe-4">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="usersTableBody">
+                        <tr>
+                            <td colspan="5" class="text-center py-4 text-muted">加载中...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Change Password Card -->
+    <div class="card data-card">
+        <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
+            <h5 class="card-title text-white mb-0"><i class="bi bi-key me-2"></i>修改我的密码</h5>
+        </div>
+        <div class="card-body">
+            <form id="changePasswordForm">
+                <div class="row g-3">
+                    <div class="col-md-4">
+                        <label class="form-label text-white-50">当前密码</label>
+                        <input type="password" class="form-control bg-dark text-white border-secondary" id="oldPassword"
+                            required>
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label text-white-50">新密码</label>
+                        <input type="password" class="form-control bg-dark text-white border-secondary" id="newPassword"
+                            required>
+                    </div>
+                    <div class="col-md-4 d-flex align-items-end">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="bi bi-check-lg me-1"></i>修改密码
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Add User Modal -->
+<div class="modal fade" id="addUserModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">添加用户</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <form id="addUserForm">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">用户名 *</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary" id="addUsername"
+                            required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">密码 *</label>
+                        <input type="password" class="form-control bg-dark text-white border-secondary" id="addPassword"
+                            required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">显示名称</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary" id="addName">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">角色</label>
+                        <select class="form-select bg-dark text-white border-secondary" id="addRole">
+                            <option value="user">普通用户</option>
+                            <option value="admin">管理员</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="modal-footer border-top border-secondary border-opacity-25">
+                    <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                    <button type="submit" class="btn btn-primary">添加</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Edit User Modal -->
+<div class="modal fade" id="editUserModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">编辑用户</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <form id="editUserForm">
+                <input type="hidden" id="editUserId">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">用户名</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary" id="editUsername"
+                            disabled>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">新密码（留空不修改）</label>
+                        <input type="password" class="form-control bg-dark text-white border-secondary"
+                            id="editPassword">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">显示名称</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary" id="editName">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">角色</label>
+                        <select class="form-select bg-dark text-white border-secondary" id="editRole">
+                            <option value="user">普通用户</option>
+                            <option value="admin">管理员</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="modal-footer border-top border-secondary border-opacity-25">
+                    <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                    <button type="submit" class="btn btn-primary">保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Permissions Modal -->
+<div class="modal fade" id="permissionsModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">站点权限</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="permUserId">
+                <p class="text-white-50 mb-3">选择该用户可以访问的站点：</p>
+                <div id="sitesCheckboxes">
+                    <p class="text-muted">加载中...</p>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="savePermissionsBtn">保存</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        loadUsers();
+
+        function loadUsers() {
+            fetch('/api/users')
+                .then(res => res.json())
+                .then(users => {
+                    const tbody = document.getElementById('usersTableBody');
+                    if (users.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-muted">暂无用户</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = users.map(u => `
+                    <tr>
+                        <td class="ps-4 text-white">${u.username}</td>
+                        <td class="text-white-50">${u.name || '-'}</td>
+                        <td>
+                            <span class="badge ${u.role === 'admin' ? 'bg-warning' : 'bg-secondary'}">${u.role === 'admin' ? '管理员' : '普通用户'}</span>
+                        </td>
+                        <td class="text-white-50">${u.created_at || '-'}</td>
+                        <td class="text-end pe-4">
+                            <button class="btn btn-sm btn-outline-info me-1" onclick="openPermissions(${u.id})" title="权限设置">
+                                <i class="bi bi-shield-lock"></i>
+                            </button>
+                            <button class="btn btn-sm btn-outline-primary me-1" onclick="openEditUser(${u.id}, '${u.username}', '${u.name || ''}', '${u.role}')" title="编辑">
+                                <i class="bi bi-pencil"></i>
+                            </button>
+                            <button class="btn btn-sm btn-outline-danger" onclick="deleteUser(${u.id})" title="删除">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </td>
+                    </tr>
+                `).join('');
+                });
+        }
+
+        // Add User
+        document.getElementById('addUserForm').addEventListener('submit', function (e) {
+            e.preventDefault();
+            fetch('/api/users', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    username: document.getElementById('addUsername').value,
+                    password: document.getElementById('addPassword').value,
+                    name: document.getElementById('addName').value,
+                    role: document.getElementById('addRole').value
+                })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        bootstrap.Modal.getInstance(document.getElementById('addUserModal')).hide();
+                        loadUsers();
+                        this.reset();
+                    } else {
+                        alert('添加失败: ' + (data.error || '未知错误'));
+                    }
+                });
+        });
+
+        // Edit User
+        window.openEditUser = function (id, username, name, role) {
+            document.getElementById('editUserId').value = id;
+            document.getElementById('editUsername').value = username;
+            document.getElementById('editName').value = name;
+            document.getElementById('editRole').value = role;
+            document.getElementById('editPassword').value = '';
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('editUserModal')).show();
+        };
+
+        document.getElementById('editUserForm').addEventListener('submit', function (e) {
+            e.preventDefault();
+            const id = document.getElementById('editUserId').value;
+            fetch(`/api/users/${id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: document.getElementById('editName').value,
+                    role: document.getElementById('editRole').value,
+                    password: document.getElementById('editPassword').value
+                })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        bootstrap.Modal.getInstance(document.getElementById('editUserModal')).hide();
+                        loadUsers();
+                    } else {
+                        alert('保存失败: ' + (data.error || '未知错误'));
+                    }
+                });
+        });
+
+        // Delete User
+        window.deleteUser = function (id) {
+            if (!confirm('确定要删除这个用户吗？')) return;
+            fetch(`/api/users/${id}`, { method: 'DELETE' })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        loadUsers();
+                    } else {
+                        alert('删除失败: ' + (data.error || '未知错误'));
+                    }
+                });
+        };
+
+        // Permissions
+        window.openPermissions = function (userId) {
+            document.getElementById('permUserId').value = userId;
+            fetch(`/api/users/${userId}/permissions`)
+                .then(res => res.json())
+                .then(data => {
+                    const container = document.getElementById('sitesCheckboxes');
+                    if (data.all_sites.length === 0) {
+                        container.innerHTML = '<p class="text-muted">暂无站点</p>';
+                        return;
+                    }
+                    container.innerHTML = data.all_sites.map(site => {
+                        const checked = data.allowed_sites.includes(site.id) ? 'checked' : '';
+                        const hostname = new URL(site.url).hostname;
+                        return `
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" value="${site.id}" id="site_${site.id}" ${checked}>
+                            <label class="form-check-label text-white" for="site_${site.id}">${hostname}</label>
+                        </div>
+                    `;
+                    }).join('');
+                    bootstrap.Modal.getOrCreateInstance(document.getElementById('permissionsModal')).show();
+                });
+        };
+
+        document.getElementById('savePermissionsBtn').addEventListener('click', function () {
+            const userId = document.getElementById('permUserId').value;
+            const checkboxes = document.querySelectorAll('#sitesCheckboxes input[type="checkbox"]:checked');
+            const siteIds = Array.from(checkboxes).map(cb => parseInt(cb.value));
+
+            fetch(`/api/users/${userId}/permissions`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ site_ids: siteIds })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        bootstrap.Modal.getInstance(document.getElementById('permissionsModal')).hide();
+                        alert('权限已保存');
+                    } else {
+                        alert('保存失败');
+                    }
+                });
+        });
+
+        // Change Password
+        document.getElementById('changePasswordForm').addEventListener('submit', function (e) {
+            e.preventDefault();
+            fetch('/api/users/change-password', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    old_password: document.getElementById('oldPassword').value,
+                    new_password: document.getElementById('newPassword').value
+                })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        alert('密码修改成功！');
+                        this.reset();
+                    } else {
+                        alert('修改失败: ' + (data.error || '未知错误'));
+                    }
+                });
+        });
+    });
+</script>
+{% endblock %}

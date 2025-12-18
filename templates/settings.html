@@ -39,21 +39,25 @@
                         <span class="text-white-50" id="syncTimeText">00:00</span>
                     </div>
                     <div class="progress bg-secondary bg-opacity-25" style="height: 10px;">
-                        <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary" id="syncProgressBar" style="width: 0%"></div>
+                        <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary"
+                            id="syncProgressBar" style="width: 0%"></div>
                     </div>
                 </div>
-                
+
                 <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25">
                     <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 py-2">
                         <small class="text-white-50">同步日志</small>
                     </div>
-                    <div class="card-body p-2" style="height: 200px; overflow-y: auto; font-family: monospace; font-size: 0.85rem;" id="syncLogConsole">
+                    <div class="card-body p-2"
+                        style="height: 200px; overflow-y: auto; font-family: monospace; font-size: 0.85rem;"
+                        id="syncLogConsole">
                         <!-- Logs will appear here -->
                     </div>
                 </div>
             </div>
             <div class="modal-footer border-top border-secondary border-opacity-25">
-                <button type="button" class="btn btn-primary" id="closeSyncModalBtn" disabled data-bs-dismiss="modal">完成</button>
+                <button type="button" class="btn btn-primary" id="closeSyncModalBtn" disabled
+                    data-bs-dismiss="modal">完成</button>
             </div>
         </div>
     </div>
@@ -65,15 +69,37 @@
             <h1 class="h3 text-white mb-1">系统设置</h1>
             <p class="text-white-50 mb-0">管理 WooCommerce 站点连接和数据同步</p>
         </div>
-                        <div class="d-flex align-items-center me-3">
-            <div class="form-check form-switch">
-                <input class="form-check-input" type="checkbox" id="autoSyncToggle">
-                <label class="form-check-label text-white-50" for="autoSyncToggle">自动同步 (每15分钟)</label>
+        <div class="d-flex align-items-center gap-3">
+            <div class="d-flex align-items-center gap-2">
+                <div class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" id="autoSyncToggle">
+                    <label class="form-check-label text-white-50" for="autoSyncToggle">自动同步</label>
+                </div>
+                <select class="form-select form-select-sm bg-dark text-white border-secondary" id="syncIntervalSelect"
+                    style="width: auto;">
+                    <option value="300">每5分钟</option>
+                    <option value="900" selected>每15分钟</option>
+                    <option value="1800">每30分钟</option>
+                    <option value="3600">每1小时</option>
+                    <option value="7200">每2小时</option>
+                </select>
             </div>
         </div>
         <div class="d-flex gap-2">
+            <a href="/users" class="btn btn-outline-light">
+                <i class="bi bi-people me-1"></i> 用户管理
+            </a>
+            <button class="btn btn-outline-info" id="viewSyncLogsBtn">
+                <i class="bi bi-journal-text me-1"></i> 同步日志
+            </button>
+            <button class="btn btn-outline-warning" id="deepSyncBtn">
+                <i class="bi bi-cloud-download me-1"></i> 深度同步
+            </button>
+            <button class="btn btn-outline-secondary" id="importFromScriptBtn">
+                <i class="bi bi-download me-1"></i> 从脚本导入
+            </button>
             <button class="btn btn-outline-primary" id="syncAllBtn">
-                <i class="bi bi-arrow-repeat me-1"></i> 同步所有站点
+                <i class="bi bi-arrow-repeat me-1"></i> 快速同步
             </button>
             <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addSiteModal">
                 <i class="bi bi-plus-lg me-1"></i> 添加站点
@@ -123,9 +149,13 @@
                                     class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">已连接</span>
                             </td>
                             <td class="text-end pe-4">
-                                <button class="btn btn-sm btn-outline-primary me-2 sync-btn" data-site-id="{{ site.id }}"><i class="bi bi-arrow-repeat"></i> 同步</button>
-                                <button class="btn btn-sm btn-outline-info me-2 edit-btn" data-site-id="{{ site.id }}" data-url="{{ site.url }}" data-key="{{ site.consumer_key }}" data-secret="{{ site.consumer_secret }}"><i class="bi bi-pencil"></i></button>
-                                <button class="btn btn-sm btn-outline-danger delete-btn" data-site-id="{{ site.id }}"><i class="bi bi-trash"></i></button>
+                                <button class="btn btn-sm btn-outline-primary me-2 sync-btn"
+                                    data-site-id="{{ site.id }}"><i class="bi bi-arrow-repeat"></i> 同步</button>
+                                <button class="btn btn-sm btn-outline-info me-2 edit-btn" data-site-id="{{ site.id }}"
+                                    data-url="{{ site.url }}" data-key="{{ site.consumer_key }}"
+                                    data-secret="{{ site.consumer_secret }}"><i class="bi bi-pencil"></i></button>
+                                <button class="btn btn-sm btn-outline-danger delete-btn" data-site-id="{{ site.id }}"><i
+                                        class="bi bi-trash"></i></button>
                             </td>
                         </tr>
                         {% else %}
@@ -138,6 +168,101 @@
                         {% endfor %}
                     </tbody>
                 </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Cron Settings Card -->
+<div class="card data-card mb-4">
+    <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
+        <h5 class="card-title text-white mb-0"><i class="bi bi-clock-history me-2"></i>定时深度同步</h5>
+    </div>
+    <div class="card-body">
+        <div class="row align-items-center">
+            <div class="col-md-6">
+                <p class="text-white-50 mb-2">设置每天自动执行深度同步的时间，全量拉取所有订单状态更新。</p>
+                <div class="d-flex align-items-center gap-2" id="cronStatusDisplay">
+                    <span class="badge bg-secondary">加载中...</span>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="d-flex align-items-center gap-2 justify-content-end">
+                    <label class="text-white-50">每天</label>
+                    <select class="form-select form-select-sm bg-dark text-white border-secondary" id="cronHour"
+                        style="width: 80px;">
+                        <option value="0">00:00</option>
+                        <option value="1">01:00</option>
+                        <option value="2">02:00</option>
+                        <option value="3" selected>03:00</option>
+                        <option value="4">04:00</option>
+                        <option value="5">05:00</option>
+                        <option value="6">06:00</option>
+                    </select>
+                    <button class="btn btn-sm btn-success" id="setupCronBtn">
+                        <i class="bi bi-check-lg me-1"></i>启用
+                    </button>
+                    <button class="btn btn-sm btn-outline-danger" id="removeCronBtn">
+                        <i class="bi bi-x-lg me-1"></i>禁用
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Sync Logs Modal -->
+<div class="modal fade" id="syncLogsModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-journal-text me-2"></i>同步日志</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <!-- Summary Cards -->
+                <div class="row mb-4" id="syncSummaryCards">
+                    <!-- Cards will be populated by JavaScript -->
+                </div>
+
+                <!-- Logs Table -->
+                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25">
+                    <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 py-2">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <span class="text-white-50">最近同步记录</span>
+                            <select class="form-select form-select-sm bg-dark text-white border-secondary"
+                                id="logsFilterSite" style="width: 200px;">
+                                <option value="">所有站点</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                            <table class="table table-dark table-hover align-middle mb-0"
+                                style="--bs-table-bg: transparent;">
+                                <thead>
+                                    <tr>
+                                        <th>站点</th>
+                                        <th>时间</th>
+                                        <th>状态</th>
+                                        <th>新订单</th>
+                                        <th>更新订单</th>
+                                        <th>耗时</th>
+                                        <th>消息</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="syncLogsTableBody">
+                                    <tr>
+                                        <td colspan="7" class="text-center text-muted py-4">加载中...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">关闭</button>
             </div>
         </div>
     </div>
@@ -192,15 +317,18 @@
                     <input type="hidden" name="site_id" id="editSiteId">
                     <div class="mb-3">
                         <label class="form-label text-white-50">站点 URL</label>
-                        <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25" name="url" id="editSiteUrl" required>
+                        <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="url" id="editSiteUrl" required>
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">Consumer Key</label>
-                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25" name="consumer_key" id="editSiteKey" required>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="consumer_key" id="editSiteKey" required>
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">Consumer Secret</label>
-                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25" name="consumer_secret" id="editSiteSecret" required>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="consumer_secret" id="editSiteSecret" required>
                     </div>
                 </form>
             </div>
@@ -238,368 +366,647 @@
 
 {% block scripts %}
 <script>
-document.addEventListener('DOMContentLoaded', function() {
-    
-    // Auto Sync Toggle
-    const autoSyncToggle = document.getElementById('autoSyncToggle');
-    if (autoSyncToggle) {
-        // Fetch initial status
-        fetch('/api/settings/autosync')
-        .then(res => res.json())
-        .then(data => {
-            autoSyncToggle.checked = data.enabled;
-        });
-        
-        // Handle change
-        autoSyncToggle.addEventListener('change', function() {
-            const enabled = this.checked;
-            fetch('/api/settings/autosync', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ enabled: enabled })
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.success) {
-                    console.log('Auto sync set to:', data.enabled);
-                } else {
-                    alert('设置失败');
-                    this.checked = !enabled; // Revert
-                }
-            })
-            .catch(err => {
-                console.error('Error setting auto sync:', err);
-                alert('设置错误');
-                this.checked = !enabled; // Revert
+    document.addEventListener('DOMContentLoaded', function () {
+
+        // Auto Sync Toggle and Interval
+        const autoSyncToggle = document.getElementById('autoSyncToggle');
+        const syncIntervalSelect = document.getElementById('syncIntervalSelect');
+
+        if (autoSyncToggle && syncIntervalSelect) {
+            // Fetch initial status
+            fetch('/api/settings/autosync')
+                .then(res => res.json())
+                .then(data => {
+                    autoSyncToggle.checked = data.enabled;
+                    syncIntervalSelect.value = data.interval.toString();
+                });
+
+            // Handle toggle change
+            autoSyncToggle.addEventListener('change', function () {
+                const enabled = this.checked;
+                fetch('/api/settings/autosync', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: enabled })
+                })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (!data.success) {
+                            alert('设置失败');
+                            this.checked = !enabled;
+                        }
+                    })
+                    .catch(err => {
+                        alert('设置错误');
+                        this.checked = !enabled;
+                    });
             });
-        });
-    }
 
-    // Sync All Button
-    const syncAllBtn = document.getElementById('syncAllBtn');
-    if (syncAllBtn) {
-        syncAllBtn.addEventListener('click', function() {
-
-            const modalEl = document.getElementById('syncProgressModal');
-            const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
-            const progressBar = document.getElementById('syncProgressBar');
-            const statusText = document.getElementById('syncStatusText');
-            const logConsole = document.getElementById('syncLogConsole');
-            const closeBtn = document.getElementById('closeSyncModalBtn');
-            const timeText = document.getElementById('syncTimeText');
-            
-            // Reset UI
-            progressBar.style.width = '0%';
-            progressBar.classList.add('progress-bar-animated');
-            progressBar.classList.remove('bg-success', 'bg-danger');
-            progressBar.classList.add('bg-primary');
-            statusText.textContent = '正在启动全局同步任务...';
-            logConsole.innerHTML = '';
-            closeBtn.disabled = true;
-            const startTime = Date.now();
-            
-            modal.show();
-            
-            // Start Sync All
-            fetch('/api/sync/all', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
-            })
-            .then(response => response.json())
-            .then(result => {
-                if (result.success) {
-                    const syncId = result.sync_id;
-                    
-                    // Start Polling
-                    const syncPollInterval = setInterval(() => {
-                        // Update timer
-                        const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                        const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
-                        const secs = (elapsed % 60).toString().padStart(2, '0');
-                        timeText.textContent = `${mins}:${secs}`;
-                        
-                        fetch(`/api/sync/status/${syncId}`)
-                        .then(res => res.json())
-                        .then(status => {
-                            // Update Logs
-                            if (status.logs && status.logs.length > 0) {
-                                logConsole.innerHTML = status.logs.map(log => 
-                                    `<div class="text-white-50 mb-1">${log}</div>`
-                                ).join('');
-                                logConsole.scrollTop = logConsole.scrollHeight;
-                            }
-                            
-                            // Update Status
-                            statusText.textContent = status.message;
-                            
-                            if (status.status === 'running') {
-                                if (progressBar.style.width === '0%') progressBar.style.width = '100%';
-                            } else if (status.status === 'success') {
-                                clearInterval(syncPollInterval);
-                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                progressBar.classList.add('bg-success');
-                                progressBar.style.width = '100%';
-                                statusText.textContent = '所有站点同步完成！';
-                                statusText.classList.add('text-success');
-                                closeBtn.disabled = false;
-                                closeBtn.textContent = '完成并刷新';
-                                closeBtn.onclick = () => location.reload();
-                            } else if (status.status === 'error') {
-                                clearInterval(syncPollInterval);
-                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                progressBar.classList.add('bg-danger');
-                                progressBar.style.width = '100%';
-                                statusText.textContent = '同步出错';
-                                statusText.classList.add('text-danger');
-                                closeBtn.disabled = false;
-                            }
-                        });
-                    }, 1000);
-                } else {
-                    statusText.textContent = '启动失败: ' + result.message;
-                    progressBar.classList.remove('bg-primary');
-                    progressBar.classList.add('bg-danger');
-                    progressBar.style.width = '100%';
-                    closeBtn.disabled = false;
-                }
-            })
-            .catch(error => {
-                statusText.textContent = '请求错误: ' + error;
-                closeBtn.disabled = false;
+            // Handle interval change
+            syncIntervalSelect.addEventListener('change', function () {
+                const interval = parseInt(this.value);
+                fetch('/api/settings/autosync', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ interval: interval })
+                })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (!data.success) {
+                            alert('设置失败');
+                        }
+                    })
+                    .catch(err => {
+                        alert('设置错误');
+                    });
             });
-        });
-    }
+        }
 
-    // Confirm Delete Button
-    const confirmDeleteBtn = document.getElementById('confirmDeleteBtn');
-    if (confirmDeleteBtn) {
-        confirmDeleteBtn.addEventListener('click', function() {
-            const siteId = document.getElementById('deleteSiteId').value;
-            const modalEl = document.getElementById('deleteConfirmModal');
-            const modal = bootstrap.Modal.getInstance(modalEl);
-            
-            console.log('Confirmed delete for siteId:', siteId);
-            
-            // Disable button to prevent double submit
-            confirmDeleteBtn.disabled = true;
-            confirmDeleteBtn.textContent = '删除中...';
-            
-            fetch(`/api/sites/${siteId}`, {
-                method: 'DELETE'
-            })
-            .then(response => response.json())
-            .then(result => {
-                console.log('Delete result:', result);
-                if (result.success) {
-                    location.reload();
-                } else {
-                    alert('删除失败: ' + (result.error || '未知错误'));
-                    confirmDeleteBtn.disabled = false;
-                    confirmDeleteBtn.textContent = '确认删除';
-                    if (modal) modal.hide();
-                }
-            })
-            .catch(error => {
-                console.error('Delete request error:', error);
-                alert('请求错误: ' + error);
-                confirmDeleteBtn.disabled = false;
-                confirmDeleteBtn.textContent = '确认删除';
-                if (modal) modal.hide();
+        // Sync Logs Button
+        const viewSyncLogsBtn = document.getElementById('viewSyncLogsBtn');
+        const syncLogsModal = document.getElementById('syncLogsModal');
+
+        if (viewSyncLogsBtn && syncLogsModal) {
+            viewSyncLogsBtn.addEventListener('click', function () {
+                const modal = bootstrap.Modal.getOrCreateInstance(syncLogsModal);
+                modal.show();
+                loadSyncLogs();
             });
-        });
-    }
-    // Helper to safely get bootstrap modal
-    function getModal(id) {
-        const el = document.getElementById(id);
-        if (!el) return null;
-        return bootstrap.Modal.getOrCreateInstance(el);
-    }
 
-    // Add Site
-    const saveBtn = document.getElementById('saveSiteBtn');
-    if (saveBtn) {
-        saveBtn.addEventListener('click', function() {
-            const form = document.getElementById('addSiteForm');
-            if (!form.checkValidity()) {
-                form.reportValidity();
-                return;
+            // Filter by site
+            const logsFilterSite = document.getElementById('logsFilterSite');
+            if (logsFilterSite) {
+                logsFilterSite.addEventListener('change', function () {
+                    loadSyncLogs(this.value);
+                });
             }
-            
-            const formData = new FormData(form);
-            const data = Object.fromEntries(formData.entries());
-            
-            fetch('/api/sites', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            })
-            .then(response => response.json())
-            .then(result => {
-                if (result.success) {
-                    location.reload();
-                } else {
-                    alert('添加失败: ' + (result.error || '未知错误'));
-                }
-            })
-            .catch(error => alert('发生错误: ' + error));
-        });
-    }
-
-    // Update Site
-    const updateBtn = document.getElementById('updateSiteBtn');
-    if (updateBtn) {
-        updateBtn.addEventListener('click', function() {
-            const form = document.getElementById('editSiteForm');
-            if (!form.checkValidity()) {
-                form.reportValidity();
-                return;
-            }
-            
-            const formData = new FormData(form);
-            const data = Object.fromEntries(formData.entries());
-            const siteId = data.site_id;
-            
-            fetch(`/api/sites/${siteId}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            })
-            .then(response => response.json())
-            .then(result => {
-                if (result.success) {
-                    location.reload();
-                } else {
-                    alert('更新失败: ' + (result.error || '未知错误'));
-                }
-            })
-            .catch(error => alert('发生错误: ' + error));
-        });
-    }
-
-    // Global Event Delegation for Dynamic Buttons
-    document.body.addEventListener('click', function(e) {
-        // Edit Button
-        const editBtn = e.target.closest('.edit-btn');
-        if (editBtn) {
-            const siteId = editBtn.dataset.siteId;
-            const url = editBtn.dataset.url;
-            const key = editBtn.dataset.key;
-            const secret = editBtn.dataset.secret;
-            
-            document.getElementById('editSiteId').value = siteId;
-            document.getElementById('editSiteUrl').value = url;
-            document.getElementById('editSiteKey').value = key;
-            document.getElementById('editSiteSecret').value = secret;
-            
-            const modal = getModal('editSiteModal');
-            if (modal) modal.show();
         }
 
-                        // Delete Button
-        const deleteBtn = e.target.closest('.delete-btn');
-        if (deleteBtn) {
-            const siteId = deleteBtn.dataset.siteId;
-            console.log('Delete button clicked for site:', siteId);
-            
-            document.getElementById('deleteSiteId').value = siteId;
-            const modal = getModal('deleteConfirmModal');
-            if (modal) modal.show();
-        }
+        function loadSyncLogs(siteId = '') {
+            const tableBody = document.getElementById('syncLogsTableBody');
+            const summaryCards = document.getElementById('syncSummaryCards');
 
-        // Sync Button
-        const syncBtn = e.target.closest('.sync-btn');
-        if (syncBtn) {
-            const siteId = syncBtn.dataset.siteId;
-            const modal = getModal('syncProgressModal');
-            const progressBar = document.getElementById('syncProgressBar');
-            const statusText = document.getElementById('syncStatusText');
-            const logConsole = document.getElementById('syncLogConsole');
-            const closeBtn = document.getElementById('closeSyncModalBtn');
-            const timeText = document.getElementById('syncTimeText');
-            
-            if (!modal) return;
-
-            // Reset UI
-            progressBar.style.width = '0%';
-            progressBar.classList.add('progress-bar-animated');
-            progressBar.classList.remove('bg-success', 'bg-danger');
-            progressBar.classList.add('bg-primary');
-            statusText.textContent = '正在启动同步任务...';
-            logConsole.innerHTML = '';
-            closeBtn.disabled = true;
-            const startTime = Date.now();
-            
-            modal.show();
-            
-            // Start Sync
-            fetch('/api/sync', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ site_id: siteId })
-            })
-            .then(response => response.json())
-            .then(result => {
-                if (result.success) {
-                    // Start Polling
-                    const syncPollInterval = setInterval(() => {
-                        // Update timer
-                        const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                        const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
-                        const secs = (elapsed % 60).toString().padStart(2, '0');
-                        timeText.textContent = `${mins}:${secs}`;
-                        
-                        fetch(`/api/sync/status/${siteId}`)
-                        .then(res => res.json())
-                        .then(status => {
-                            // Update Logs
-                            if (status.logs && status.logs.length > 0) {
-                                logConsole.innerHTML = status.logs.map(log => 
-                                    `<div class="text-white-50 mb-1">${log}</div>`
-                                ).join('');
-                                logConsole.scrollTop = logConsole.scrollHeight;
-                            }
-                            
-                            // Update Status
-                            statusText.textContent = status.message;
-                            
-                            if (status.status === 'running') {
-                                if (progressBar.style.width === '0%') progressBar.style.width = '100%';
-                            } else if (status.status === 'success') {
-                                clearInterval(syncPollInterval);
-                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                progressBar.classList.add('bg-success');
-                                progressBar.style.width = '100%';
-                                statusText.textContent = '同步完成！';
-                                statusText.classList.add('text-success');
-                                closeBtn.disabled = false;
-                                closeBtn.textContent = '完成并刷新';
-                                closeBtn.onclick = () => location.reload();
-                            } else if (status.status === 'error') {
-                                clearInterval(syncPollInterval);
-                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                progressBar.classList.add('bg-danger');
-                                progressBar.style.width = '100%';
-                                statusText.textContent = '同步出错';
-                                statusText.classList.add('text-danger');
-                                closeBtn.disabled = false;
-                            }
+            // Load summary
+            fetch('/api/sync/summary')
+                .then(res => res.json())
+                .then(summary => {
+                    // Populate filter dropdown
+                    const filterSelect = document.getElementById('logsFilterSite');
+                    if (filterSelect && filterSelect.options.length <= 1) {
+                        summary.forEach(site => {
+                            const option = document.createElement('option');
+                            option.value = site.site_id;
+                            option.textContent = new URL(site.url).hostname;
+                            filterSelect.appendChild(option);
                         });
-                    }, 1000);
-                } else {
-                    statusText.textContent = '启动失败: ' + result.message;
-                    progressBar.classList.remove('bg-primary');
-                    progressBar.classList.add('bg-danger');
-                    progressBar.style.width = '100%';
-                    closeBtn.disabled = false;
+                    }
+
+                    // Build summary cards
+                    summaryCards.innerHTML = summary.map(site => {
+                        const hostname = new URL(site.url).hostname;
+                        const lastSync = site.last_sync || '从未同步';
+                        const stats = site.stats_7_days || {};
+                        const successRate = stats.total_syncs > 0 ?
+                            Math.round((stats.success_count / stats.total_syncs) * 100) : 0;
+                        const statusClass = successRate >= 80 ? 'success' : successRate >= 50 ? 'warning' : 'danger';
+
+                        return `
+                            <div class="col-md-4 mb-3">
+                                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25">
+                                    <div class="card-body">
+                                        <div class="d-flex justify-content-between align-items-start mb-2">
+                                            <h6 class="text-white mb-0">${hostname}</h6>
+                                            <span class="badge bg-${statusClass} bg-opacity-10 text-${statusClass}">${successRate}%</span>
+                                        </div>
+                                        <small class="text-white-50 d-block">上次同步: ${lastSync}</small>
+                                        <small class="text-white-50 d-block">7天内: ${stats.total_syncs || 0} 次同步</small>
+                                        <small class="text-white-50 d-block">新订单: ${stats.total_new_orders || 0} | 更新: ${stats.total_updated_orders || 0}</small>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                });
+
+            // Load logs
+            const url = siteId ? `/api/sync/logs?site_id=${siteId}` : '/api/sync/logs';
+            fetch(url)
+                .then(res => res.json())
+                .then(logs => {
+                    if (logs.length === 0) {
+                        tableBody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-4">暂无同步记录</td></tr>';
+                        return;
+                    }
+
+                    tableBody.innerHTML = logs.map(log => {
+                        const statusClass = log.status === 'success' ? 'success' : 'danger';
+                        const hostname = log.site_url ? new URL(log.site_url).hostname : '-';
+                        return `
+                            <tr>
+                                <td class="text-white-50">${hostname}</td>
+                                <td class="text-white-50">${log.sync_time}</td>
+                                <td><span class="badge bg-${statusClass} bg-opacity-10 text-${statusClass}">${log.status}</span></td>
+                                <td class="text-white">${log.new_orders || 0}</td>
+                                <td class="text-white">${log.updated_orders || 0}</td>
+                                <td class="text-white-50">${log.duration_seconds || 0}s</td>
+                                <td class="text-white-50 small" style="max-width: 200px; overflow: hidden; text-overflow: ellipsis;">${log.message || '-'}</td>
+                            </tr>
+                        `;
+                    }).join('');
+                })
+                .catch(err => {
+                    tableBody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">加载失败</td></tr>';
+                });
+        }
+
+        // Deep Sync Button
+        const deepSyncBtn = document.getElementById('deepSyncBtn');
+        if (deepSyncBtn) {
+            deepSyncBtn.addEventListener('click', function () {
+                if (!confirm('深度同步将从所有站点拉取全部订单数据，可能需要较长时间。\n\n确定要执行深度同步吗？')) {
+                    return;
                 }
-            })
-            .catch(error => {
-                statusText.textContent = '请求错误: ' + error;
-                closeBtn.disabled = false;
+
+                const modalEl = document.getElementById('syncProgressModal');
+                const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+                const progressBar = document.getElementById('syncProgressBar');
+                const statusText = document.getElementById('syncStatusText');
+                const logConsole = document.getElementById('syncLogConsole');
+                const closeBtn = document.getElementById('closeSyncModalBtn');
+                const timeText = document.getElementById('syncTimeText');
+
+                // Reset UI
+                progressBar.style.width = '100%';
+                progressBar.classList.add('progress-bar-animated', 'bg-warning');
+                progressBar.classList.remove('bg-success', 'bg-danger', 'bg-primary');
+                statusText.textContent = '正在启动深度同步...';
+                logConsole.innerHTML = '';
+                closeBtn.disabled = true;
+                const startTime = Date.now();
+
+                modal.show();
+
+                fetch('/api/sync/deep', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                })
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.success) {
+                            const DEEP_SYNC_ID = result.sync_id;
+
+                            const pollInterval = setInterval(() => {
+                                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                                const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
+                                const secs = (elapsed % 60).toString().padStart(2, '0');
+                                timeText.textContent = `${mins}:${secs}`;
+
+                                fetch(`/api/sync/status/${DEEP_SYNC_ID}`)
+                                    .then(res => res.json())
+                                    .then(status => {
+                                        statusText.textContent = status.message;
+
+                                        if (status.logs && status.logs.length > 0) {
+                                            logConsole.innerHTML = status.logs.map(log =>
+                                                `<div class="text-white-50 mb-1">${log}</div>`
+                                            ).join('');
+                                            logConsole.scrollTop = logConsole.scrollHeight;
+                                        }
+
+                                        if (status.status === 'success') {
+                                            clearInterval(pollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-warning');
+                                            progressBar.classList.add('bg-success');
+                                            closeBtn.disabled = false;
+                                            closeBtn.textContent = '完成并刷新';
+                                            closeBtn.onclick = () => location.reload();
+                                        } else if (status.status === 'error') {
+                                            clearInterval(pollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-warning');
+                                            progressBar.classList.add('bg-danger');
+                                            closeBtn.disabled = false;
+                                        }
+                                    });
+                            }, 2000);
+                        }
+                    });
             });
         }
+
+        // Cron Settings
+        function loadCronStatus() {
+            fetch('/api/cron/status')
+                .then(res => res.json())
+                .then(data => {
+                    const display = document.getElementById('cronStatusDisplay');
+                    if (data.enabled) {
+                        display.innerHTML = `<span class="badge bg-success">已启用</span><span class="text-white-50 ms-2">执行时间: ${data.schedule}</span>`;
+                    } else {
+                        display.innerHTML = `<span class="badge bg-secondary">未启用</span>`;
+                    }
+                });
+        }
+
+        loadCronStatus();
+
+        const setupCronBtn = document.getElementById('setupCronBtn');
+        const removeCronBtn = document.getElementById('removeCronBtn');
+        const cronHour = document.getElementById('cronHour');
+
+        if (setupCronBtn) {
+            setupCronBtn.addEventListener('click', function () {
+                const hour = parseInt(cronHour.value);
+                fetch('/api/cron/setup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ hour: hour, minute: 0 })
+                })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            alert(data.message);
+                            loadCronStatus();
+                        } else {
+                            alert('设置失败: ' + (data.error || '未知错误'));
+                        }
+                    });
+            });
+        }
+
+        if (removeCronBtn) {
+            removeCronBtn.addEventListener('click', function () {
+                fetch('/api/cron/remove', { method: 'DELETE' })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            alert(data.message);
+                            loadCronStatus();
+                        } else {
+                            alert('禁用失败: ' + (data.error || '未知错误'));
+                        }
+                    });
+            });
+        }
+
+        // Import from Script Button
+        const importBtn = document.getElementById('importFromScriptBtn');
+        if (importBtn) {
+            importBtn.addEventListener('click', function () {
+                if (!confirm('确定要从 1.wooorders_sqlite.py 脚本中导入站点配置吗？\n\n已存在的站点将会被跳过。')) {
+                    return;
+                }
+
+                importBtn.disabled = true;
+                importBtn.innerHTML = '<i class="bi bi-hourglass-split me-1"></i> 导入中...';
+
+                fetch('/api/sites/import-from-script', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                })
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.success) {
+                            alert(result.message);
+                            location.reload();
+                        } else {
+                            alert('导入失败: ' + (result.error || '未知错误'));
+                            importBtn.disabled = false;
+                            importBtn.innerHTML = '<i class="bi bi-download me-1"></i> 从脚本导入';
+                        }
+                    })
+                    .catch(error => {
+                        alert('请求错误: ' + error);
+                        importBtn.disabled = false;
+                        importBtn.innerHTML = '<i class="bi bi-download me-1"></i> 从脚本导入';
+                    });
+            });
+        }
+
+        // Sync All Button
+        const syncAllBtn = document.getElementById('syncAllBtn');
+        if (syncAllBtn) {
+            syncAllBtn.addEventListener('click', function () {
+
+                const modalEl = document.getElementById('syncProgressModal');
+                const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+                const progressBar = document.getElementById('syncProgressBar');
+                const statusText = document.getElementById('syncStatusText');
+                const logConsole = document.getElementById('syncLogConsole');
+                const closeBtn = document.getElementById('closeSyncModalBtn');
+                const timeText = document.getElementById('syncTimeText');
+
+                // Reset UI
+                progressBar.style.width = '0%';
+                progressBar.classList.add('progress-bar-animated');
+                progressBar.classList.remove('bg-success', 'bg-danger');
+                progressBar.classList.add('bg-primary');
+                statusText.textContent = '正在启动全局同步任务...';
+                logConsole.innerHTML = '';
+                closeBtn.disabled = true;
+                const startTime = Date.now();
+
+                modal.show();
+
+                // Start Sync All
+                fetch('/api/sync/all', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                })
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.success) {
+                            const syncId = result.sync_id;
+
+                            // Start Polling
+                            const syncPollInterval = setInterval(() => {
+                                // Update timer
+                                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                                const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
+                                const secs = (elapsed % 60).toString().padStart(2, '0');
+                                timeText.textContent = `${mins}:${secs}`;
+
+                                fetch(`/api/sync/status/${syncId}`)
+                                    .then(res => res.json())
+                                    .then(status => {
+                                        // Update Logs
+                                        if (status.logs && status.logs.length > 0) {
+                                            logConsole.innerHTML = status.logs.map(log =>
+                                                `<div class="text-white-50 mb-1">${log}</div>`
+                                            ).join('');
+                                            logConsole.scrollTop = logConsole.scrollHeight;
+                                        }
+
+                                        // Update Status
+                                        statusText.textContent = status.message;
+
+                                        if (status.status === 'running') {
+                                            if (progressBar.style.width === '0%') progressBar.style.width = '100%';
+                                        } else if (status.status === 'success') {
+                                            clearInterval(syncPollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                            progressBar.classList.add('bg-success');
+                                            progressBar.style.width = '100%';
+                                            statusText.textContent = '所有站点同步完成！';
+                                            statusText.classList.add('text-success');
+                                            closeBtn.disabled = false;
+                                            closeBtn.textContent = '完成并刷新';
+                                            closeBtn.onclick = () => location.reload();
+                                        } else if (status.status === 'error') {
+                                            clearInterval(syncPollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                            progressBar.classList.add('bg-danger');
+                                            progressBar.style.width = '100%';
+                                            statusText.textContent = '同步出错';
+                                            statusText.classList.add('text-danger');
+                                            closeBtn.disabled = false;
+                                        }
+                                    });
+                            }, 1000);
+                        } else {
+                            statusText.textContent = '启动失败: ' + result.message;
+                            progressBar.classList.remove('bg-primary');
+                            progressBar.classList.add('bg-danger');
+                            progressBar.style.width = '100%';
+                            closeBtn.disabled = false;
+                        }
+                    })
+                    .catch(error => {
+                        statusText.textContent = '请求错误: ' + error;
+                        closeBtn.disabled = false;
+                    });
+            });
+        }
+
+        // Confirm Delete Button
+        const confirmDeleteBtn = document.getElementById('confirmDeleteBtn');
+        if (confirmDeleteBtn) {
+            confirmDeleteBtn.addEventListener('click', function () {
+                const siteId = document.getElementById('deleteSiteId').value;
+                const modalEl = document.getElementById('deleteConfirmModal');
+                const modal = bootstrap.Modal.getInstance(modalEl);
+
+                console.log('Confirmed delete for siteId:', siteId);
+
+                // Disable button to prevent double submit
+                confirmDeleteBtn.disabled = true;
+                confirmDeleteBtn.textContent = '删除中...';
+
+                fetch(`/api/sites/${siteId}`, {
+                    method: 'DELETE'
+                })
+                    .then(response => response.json())
+                    .then(result => {
+                        console.log('Delete result:', result);
+                        if (result.success) {
+                            location.reload();
+                        } else {
+                            alert('删除失败: ' + (result.error || '未知错误'));
+                            confirmDeleteBtn.disabled = false;
+                            confirmDeleteBtn.textContent = '确认删除';
+                            if (modal) modal.hide();
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Delete request error:', error);
+                        alert('请求错误: ' + error);
+                        confirmDeleteBtn.disabled = false;
+                        confirmDeleteBtn.textContent = '确认删除';
+                        if (modal) modal.hide();
+                    });
+            });
+        }
+        // Helper to safely get bootstrap modal
+        function getModal(id) {
+            const el = document.getElementById(id);
+            if (!el) return null;
+            return bootstrap.Modal.getOrCreateInstance(el);
+        }
+
+        // Add Site
+        const saveBtn = document.getElementById('saveSiteBtn');
+        if (saveBtn) {
+            saveBtn.addEventListener('click', function () {
+                const form = document.getElementById('addSiteForm');
+                if (!form.checkValidity()) {
+                    form.reportValidity();
+                    return;
+                }
+
+                const formData = new FormData(form);
+                const data = Object.fromEntries(formData.entries());
+
+                fetch('/api/sites', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                })
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.success) {
+                            location.reload();
+                        } else {
+                            alert('添加失败: ' + (result.error || '未知错误'));
+                        }
+                    })
+                    .catch(error => alert('发生错误: ' + error));
+            });
+        }
+
+        // Update Site
+        const updateBtn = document.getElementById('updateSiteBtn');
+        if (updateBtn) {
+            updateBtn.addEventListener('click', function () {
+                const form = document.getElementById('editSiteForm');
+                if (!form.checkValidity()) {
+                    form.reportValidity();
+                    return;
+                }
+
+                const formData = new FormData(form);
+                const data = Object.fromEntries(formData.entries());
+                const siteId = data.site_id;
+
+                fetch(`/api/sites/${siteId}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                })
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.success) {
+                            location.reload();
+                        } else {
+                            alert('更新失败: ' + (result.error || '未知错误'));
+                        }
+                    })
+                    .catch(error => alert('发生错误: ' + error));
+            });
+        }
+
+        // Global Event Delegation for Dynamic Buttons
+        document.body.addEventListener('click', function (e) {
+            // Edit Button
+            const editBtn = e.target.closest('.edit-btn');
+            if (editBtn) {
+                const siteId = editBtn.dataset.siteId;
+                const url = editBtn.dataset.url;
+                const key = editBtn.dataset.key;
+                const secret = editBtn.dataset.secret;
+
+                document.getElementById('editSiteId').value = siteId;
+                document.getElementById('editSiteUrl').value = url;
+                document.getElementById('editSiteKey').value = key;
+                document.getElementById('editSiteSecret').value = secret;
+
+                const modal = getModal('editSiteModal');
+                if (modal) modal.show();
+            }
+
+            // Delete Button
+            const deleteBtn = e.target.closest('.delete-btn');
+            if (deleteBtn) {
+                const siteId = deleteBtn.dataset.siteId;
+                console.log('Delete button clicked for site:', siteId);
+
+                document.getElementById('deleteSiteId').value = siteId;
+                const modal = getModal('deleteConfirmModal');
+                if (modal) modal.show();
+            }
+
+            // Sync Button
+            const syncBtn = e.target.closest('.sync-btn');
+            if (syncBtn) {
+                const siteId = syncBtn.dataset.siteId;
+                const modal = getModal('syncProgressModal');
+                const progressBar = document.getElementById('syncProgressBar');
+                const statusText = document.getElementById('syncStatusText');
+                const logConsole = document.getElementById('syncLogConsole');
+                const closeBtn = document.getElementById('closeSyncModalBtn');
+                const timeText = document.getElementById('syncTimeText');
+
+                if (!modal) return;
+
+                // Reset UI
+                progressBar.style.width = '0%';
+                progressBar.classList.add('progress-bar-animated');
+                progressBar.classList.remove('bg-success', 'bg-danger');
+                progressBar.classList.add('bg-primary');
+                statusText.textContent = '正在启动同步任务...';
+                logConsole.innerHTML = '';
+                closeBtn.disabled = true;
+                const startTime = Date.now();
+
+                modal.show();
+
+                // Start Sync
+                fetch('/api/sync', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ site_id: siteId })
+                })
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.success) {
+                            // Start Polling
+                            const syncPollInterval = setInterval(() => {
+                                // Update timer
+                                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                                const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
+                                const secs = (elapsed % 60).toString().padStart(2, '0');
+                                timeText.textContent = `${mins}:${secs}`;
+
+                                fetch(`/api/sync/status/${siteId}`)
+                                    .then(res => res.json())
+                                    .then(status => {
+                                        // Update Logs
+                                        if (status.logs && status.logs.length > 0) {
+                                            logConsole.innerHTML = status.logs.map(log =>
+                                                `<div class="text-white-50 mb-1">${log}</div>`
+                                            ).join('');
+                                            logConsole.scrollTop = logConsole.scrollHeight;
+                                        }
+
+                                        // Update Status
+                                        statusText.textContent = status.message;
+
+                                        if (status.status === 'running') {
+                                            if (progressBar.style.width === '0%') progressBar.style.width = '100%';
+                                        } else if (status.status === 'success') {
+                                            clearInterval(syncPollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                            progressBar.classList.add('bg-success');
+                                            progressBar.style.width = '100%';
+                                            statusText.textContent = '同步完成！';
+                                            statusText.classList.add('text-success');
+                                            closeBtn.disabled = false;
+                                            closeBtn.textContent = '完成并刷新';
+                                            closeBtn.onclick = () => location.reload();
+                                        } else if (status.status === 'error') {
+                                            clearInterval(syncPollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                            progressBar.classList.add('bg-danger');
+                                            progressBar.style.width = '100%';
+                                            statusText.textContent = '同步出错';
+                                            statusText.classList.add('text-danger');
+                                            closeBtn.disabled = false;
+                                        }
+                                    });
+                            }, 1000);
+                        } else {
+                            statusText.textContent = '启动失败: ' + result.message;
+                            progressBar.classList.remove('bg-primary');
+                            progressBar.classList.add('bg-danger');
+                            progressBar.style.width = '100%';
+                            closeBtn.disabled = false;
+                        }
+                    })
+                    .catch(error => {
+                        statusText.textContent = '请求错误: ' + error;
+                        closeBtn.disabled = false;
+                    });
+            }
+        });
     });
-});
 </script>
 
 <!-- Delete Confirmation Modal -->
