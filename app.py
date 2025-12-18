@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 from functools import wraps
 
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
@@ -116,6 +116,101 @@ def build_source_filter_clause(allowed_sources, table_alias=''):
     prefix = f'{table_alias}.' if table_alias else ''
     placeholders = ', '.join(['?' for _ in allowed_sources])
     return f'AND {prefix}source IN ({placeholders})', allowed_sources
+
+
+def admin_required(f):
+    """Decorator to require admin role"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.is_admin():
+            # Return a beautiful access denied page
+            return render_template_string('''
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>访问受限 - WooCommerce 订单分析</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: #e0e0e0;
+        }
+        .container {
+            text-align: center;
+            padding: 60px 40px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 24px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            max-width: 480px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+        .icon {
+            width: 120px;
+            height: 120px;
+            margin: 0 auto 30px;
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(239, 68, 68, 0.1));
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 2px solid rgba(239, 68, 68, 0.3);
+        }
+        .icon i { font-size: 48px; color: #ef4444; }
+        h1 {
+            font-size: 28px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            background: linear-gradient(135deg, #f87171, #ef4444);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        p { color: #9ca3af; font-size: 16px; line-height: 1.6; margin-bottom: 30px; }
+        .user-info {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 12px 20px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .user-info span { color: #60a5fa; }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 14px 32px;
+            background: linear-gradient(135deg, #3b82f6, #2563eb);
+            color: white;
+            text-decoration: none;
+            border-radius: 12px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(59, 130, 246, 0.3); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon"><i class="bi bi-shield-lock"></i></div>
+        <h1>访问受限</h1>
+        <p>抱歉，您没有权限访问此页面。<br>此功能仅限管理员使用。</p>
+        <div class="user-info">当前登录: <span>{{ current_user.name or current_user.username }}</span></div>
+        <a href="/" class="btn"><i class="bi bi-house"></i> 返回首页</a>
+    </div>
+</body>
+</html>
+            '''), 403
+        return f(*args, **kwargs)
+    return decorated_function
 
 
 # ============== ROUTES ==============
@@ -1234,8 +1329,9 @@ with app.app_context():
 
 @app.route('/settings')
 @login_required
+@admin_required
 def settings():
-    """Settings page for site management"""
+    """Settings page for site management - Admin only"""
     conn = get_db_connection()
     sites = conn.execute('SELECT * FROM sites').fetchall()
     conn.close()
@@ -1896,16 +1992,6 @@ def remove_cron():
 
 
 # ============== USER MANAGEMENT API ==============
-
-def admin_required(f):
-    """Decorator to require admin role"""
-    from functools import wraps
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not current_user.is_authenticated or not current_user.is_admin():
-            return jsonify({'error': 'Admin access required'}), 403
-        return f(*args, **kwargs)
-    return decorated_function
 
 
 @app.route('/users')
