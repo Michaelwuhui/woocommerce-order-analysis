@@ -597,6 +597,8 @@
                                             progressBar.classList.add('bg-success');
                                             closeBtn.disabled = false;
                                             closeBtn.textContent = '完成并刷新';
+                                            // Broadcast sync completion to other tabs
+                                            localStorage.setItem('syncCompleted', Date.now().toString());
                                             closeBtn.onclick = () => location.reload();
                                         } else if (status.status === 'error') {
                                             clearInterval(pollInterval);
@@ -768,6 +770,8 @@
                                             statusText.classList.add('text-success');
                                             closeBtn.disabled = false;
                                             closeBtn.textContent = '完成并刷新';
+                                            // Broadcast sync completion to other tabs
+                                            localStorage.setItem('syncCompleted', Date.now().toString());
                                             closeBtn.onclick = () => location.reload();
                                         } else if (status.status === 'error') {
                                             clearInterval(syncPollInterval);
@@ -1000,6 +1004,8 @@
                                             statusText.classList.add('text-success');
                                             closeBtn.disabled = false;
                                             closeBtn.textContent = '完成并刷新';
+                                            // Broadcast sync completion to other tabs
+                                            localStorage.setItem('syncCompleted', Date.now().toString());
                                             closeBtn.onclick = () => location.reload();
                                         } else if (status.status === 'error') {
                                             clearInterval(syncPollInterval);

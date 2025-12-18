@@ -484,6 +484,75 @@
                 });
         }
     </script>
+    
+    <script>
+        // Auto-refresh listener for sync completion (cross-tab communication)
+        (function() {
+            // Only listen on pages that should auto-refresh (not settings page)
+            const currentPath = window.location.pathname;
+            const autoRefreshPages = ['/', '/orders', '/monthly', '/customers'];
+            
+            if (!autoRefreshPages.includes(currentPath)) {
+                return; // Don't add listener on settings page
+            }
+            
+            // Listen for storage events from other tabs
+            window.addEventListener('storage', function(e) {
+                if (e.key === 'syncCompleted' && e.newValue) {
+                    // Show toast notification before refresh
+                    showSyncToast('订单同步完成，正在刷新页面...');
+                    
+                    // Delay refresh slightly to show the toast
+                    setTimeout(function() {
+                        location.reload();
+                    }, 1500);
+                }
+            });
+            
+            // Also check on page focus (for same-tab scenarios)
+            let lastSyncCheck = localStorage.getItem('syncCompleted') || '0';
+            window.addEventListener('focus', function() {
+                const currentSync = localStorage.getItem('syncCompleted') || '0';
+                if (currentSync !== lastSyncCheck && currentSync !== '0') {
+                    lastSyncCheck = currentSync;
+                    showSyncToast('检测到新订单数据，正在刷新...');
+                    setTimeout(function() {
+                        location.reload();
+                    }, 1500);
+                }
+            });
+            
+            function showSyncToast(message) {
+                // Create toast container if not exists
+                let container = document.getElementById('syncToastContainer');
+                if (!container) {
+                    container = document.createElement('div');
+                    container.id = 'syncToastContainer';
+                    container.style.cssText = 'position: fixed; top: 80px; right: 20px; z-index: 9999;';
+                    document.body.appendChild(container);
+                }
+                
+                // Create toast element
+                const toast = document.createElement('div');
+                toast.className = 'toast show';
+                toast.style.cssText = 'background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; border: none; box-shadow: 0 10px 40px rgba(16, 185, 129, 0.4);';
+                toast.innerHTML = `
+                    <div class="toast-header" style="background: transparent; border: none; color: white;">
+                        <i class="bi bi-check-circle-fill me-2"></i>
+                        <strong class="me-auto">同步完成</strong>
+                        <small class="text-white-50">刚刚</small>
+                    </div>
+                    <div class="toast-body">
+                        ${message}
+                        <div class="mt-2">
+                            <div class="spinner-border spinner-border-sm text-white" role="status"></div>
+                        </div>
+                    </div>
+                `;
+                container.appendChild(toast);
+            }
+        })();
+    </script>
     {% block scripts %}{% endblock %}
 </body>
 
