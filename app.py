@@ -245,6 +245,10 @@ def dashboard():
         ''').fetchall()
     trend_data = [dict(row) for row in trend_data_raw]
     
+    # Get site managers mapping
+    sites = conn.execute('SELECT url, manager FROM sites').fetchall()
+    site_managers = {s['url']: s['manager'] or '' for s in sites}
+    
     conn.close()
     
     return render_template('dashboard.html',
@@ -256,7 +260,8 @@ def dashboard():
                          trend_type=trend_type,
                          quick_date=quick_date,
                          sources=sources,
-                         source_filter=source_filter)
+                         source_filter=source_filter,
+                         site_managers=site_managers)
 
 
 @app.route('/orders')
@@ -426,6 +431,11 @@ def orders():
     
     sources = conn.execute('SELECT DISTINCT source FROM orders').fetchall()
     statuses = conn.execute('SELECT DISTINCT status FROM orders').fetchall()
+    
+    # Get site managers mapping (url -> manager)
+    sites = conn.execute('SELECT url, manager FROM sites').fetchall()
+    site_managers = {s['url']: s['manager'] or '' for s in sites}
+    
     conn.close()
     
     return render_template('orders.html',
@@ -434,6 +444,7 @@ def orders():
                          statuses=statuses,
                          summary_stats=summary_stats,
                          totals=totals,
+                         site_managers=site_managers,
                          current_filters={
                              'source': source_filter,
                              'status': status_filter,
@@ -535,7 +546,13 @@ def monthly():
     else:
         rows.sort(key=lambda x: (x['month'], x['source']), reverse=True)
     
-    return render_template('monthly.html', monthly_stats=rows, sources=all_sources, source_filter=source_filter, sort_by=sort_by)
+    # Get site managers mapping
+    conn2 = get_db_connection()
+    sites = conn2.execute('SELECT url, manager FROM sites').fetchall()
+    site_managers = {s['url']: s['manager'] or '' for s in sites}
+    conn2.close()
+    
+    return render_template('monthly.html', monthly_stats=rows, sources=all_sources, source_filter=source_filter, sort_by=sort_by, site_managers=site_managers)
 
 
 @app.route('/customers')
@@ -666,7 +683,13 @@ def customers():
         'tier_counts': tier_counts
     }
     
-    return render_template('customers.html', customers=customers_list, stats=stats, sources=all_sources, source_filter=source_filter)
+    # Get site managers mapping
+    conn2 = get_db_connection()
+    sites = conn2.execute('SELECT url, manager FROM sites').fetchall()
+    site_managers = {s['url']: s['manager'] or '' for s in sites}
+    conn2.close()
+    
+    return render_template('customers.html', customers=customers_list, stats=stats, sources=all_sources, source_filter=source_filter, site_managers=site_managers)
 
 
 @app.route('/api/chart-data')
@@ -755,6 +778,10 @@ def get_order_details(order_id):
             'total_orders': customer_stats['count'] if customer_stats else 0,
             'total_spent': float(customer_stats['total'] or 0) if customer_stats else 0
         }
+    
+    # Get site manager for this order's source
+    site_row = conn.execute('SELECT manager FROM sites WHERE url = ?', (order_dict.get('source', ''),)).fetchone()
+    order_dict['site_manager'] = site_row['manager'] if site_row and site_row['manager'] else ''
     
     conn.close()
     
@@ -958,9 +985,15 @@ def init_sites_table():
             url TEXT NOT NULL,
             consumer_key TEXT NOT NULL,
             consumer_secret TEXT NOT NULL,
+            manager TEXT,
             last_sync TEXT
         )
     ''')
+    # Add manager column if not exists (for existing databases)
+    try:
+        conn.execute('ALTER TABLE sites ADD COLUMN manager TEXT')
+    except:
+        pass  # Column already exists
     conn.commit()
     conn.close()
 
@@ -1120,6 +1153,7 @@ def add_site():
     url = data.get('url')
     ck = data.get('consumer_key')
     cs = data.get('consumer_secret')
+    manager = data.get('manager', '')
     
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -1130,8 +1164,8 @@ def add_site():
         
     conn = get_db_connection()
     try:
-        conn.execute('INSERT INTO sites (url, consumer_key, consumer_secret) VALUES (?, ?, ?)',
-                     (url, ck, cs))
+        conn.execute('INSERT INTO sites (url, consumer_key, consumer_secret, manager) VALUES (?, ?, ?, ?)',
+                     (url, ck, cs, manager))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
@@ -1149,6 +1183,7 @@ def update_site(site_id):
     url = data.get('url')
     ck = data.get('consumer_key')
     cs = data.get('consumer_secret')
+    manager = data.get('manager', '')
     
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -1159,8 +1194,8 @@ def update_site(site_id):
         
     conn = get_db_connection()
     try:
-        conn.execute('UPDATE sites SET url = ?, consumer_key = ?, consumer_secret = ? WHERE id = ?',
-                     (url, ck, cs, site_id))
+        conn.execute('UPDATE sites SET url = ?, consumer_key = ?, consumer_secret = ?, manager = ? WHERE id = ?',
+                     (url, ck, cs, manager, site_id))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:

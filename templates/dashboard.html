@@ -137,7 +137,10 @@
                                 {% for source in source_data %}
                                 <tr>
                                     <td>
-                                        <span class="source-badge">{{ source.source.replace('https://www.', '')
+                                        {% set mgr = site_managers.get(source.source, '') %}{% if mgr %}<span
+                                            class="badge me-1" style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{
+                                            mgr }}</span>{% endif %}<span class="source-badge">{{
+                                            source.source.replace('https://www.', '')
                                             }}</span>
                                     </td>
                                     <td class="text-end">{{ "{:,}".format(source.count) }}</td>

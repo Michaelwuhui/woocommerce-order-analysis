@@ -261,7 +261,7 @@
                     html += '<p><strong>创建时间:</strong> ' + (order.date_created || '-').replace('T', ' ').substring(0, 16) + '</p>';
                     html += '<p><strong>付款时间:</strong> ' + (order.date_paid ? order.date_paid.replace('T', ' ').substring(0, 16) : '-') + '</p>';
                     html += '<p><strong>付款方式:</strong> ' + (order.payment_method_title || '-') + '</p>';
-                    html += '<p><strong>来源网站:</strong> <span style="color: #a5b4fc;">' + (order.source || '-').replace('https://www.', '') + '</span></p>';
+                    html += '<p><strong>来源网站:</strong> ' + (order.site_manager ? '<span style="background:rgba(23,162,184,0.3);color:#17a2b8;padding:2px 8px;border-radius:10px;font-size:12px;margin-right:6px;">' + order.site_manager + '</span>' : '') + '<span style="color: #a5b4fc;">' + (order.source || '-').replace('https://www.', '') + '</span></p>';
                     html += '</div></div></div>';
 
                     // Customer Info

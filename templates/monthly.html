@@ -68,7 +68,9 @@
                         {% for row in monthly_stats %}
                         <tr>
                             <td><strong>{{ row.month }}</strong></td>
-                            <td><span class="source-badge">{{ row.source.replace('https://www.', '') }}</span></td>
+                            <td>{% set mgr = site_managers.get(row.source, '') %}{% if mgr %}<span class="badge me-1"
+                                    style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{ mgr }}</span>{% endif
+                                %}<span class="source-badge">{{ row.source.replace('https://www.', '') }}</span></td>
                             <td class="text-end border-start">{{ "{:,}".format(row.total_orders) }}</td>
                             <td class="text-end">{{ "{:,}".format(row.total_products) }}</td>
                             <td class="text-end">{{ "{:,.2f}".format(row.total_amount) }}</td>

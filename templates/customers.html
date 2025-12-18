@@ -46,13 +46,14 @@
                         <span class="badge bg-success bg-opacity-25 text-white border border-success border-opacity-25">
                             <i class="bi bi-arrow-up-short"></i> {{ stats.new_customers_month }} 本月
                         </span>
-                        <span class="badge bg-secondary bg-opacity-25 text-white border border-secondary border-opacity-25">
+                        <span
+                            class="badge bg-secondary bg-opacity-25 text-white border border-secondary border-opacity-25">
                             {{ stats.new_customers_last_month }} 上月
                         </span>
                     </div>
                     <p class="mb-0 mt-2 text-white-50 small">
                         <span class="{{ 'text-success' if stats.growth_rate >= 0 else 'text-danger' }}">
-                            <i class="bi bi-graph-{{ 'up' if stats.growth_rate >= 0 else 'down' }}"></i> 
+                            <i class="bi bi-graph-{{ 'up' if stats.growth_rate >= 0 else 'down' }}"></i>
                             {{ '%+.1f'|format(stats.growth_rate) }}%
                         </span> 环比增长
                     </p>
@@ -165,7 +166,10 @@
                                     </div>
                                 </div>
                             </td>
-                            <td><span class="badge bg-dark border border-secondary">{{ c.source }}</span></td>
+                            <td>{% set mgr = site_managers.get(c.source, '') %}{% if mgr %}<span class="badge me-1"
+                                    style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{ mgr }}</span>{% endif
+                                %}<span class="badge bg-dark border border-secondary">{{
+                                    c.source.replace('https://www.', '').replace('https://', '') }}</span></td>
                             <td>
                                 <div class="btn-group">
                                     <a href="mailto:{{ c.email }}" class="btn btn-sm btn-outline-secondary"

@@ -117,7 +117,7 @@
                 <table class="table table-dark table-hover align-middle mb-0" style="--bs-table-bg: transparent;">
                     <thead>
                         <tr>
-                            <th class="ps-4">站点 URL</th>
+                            <th class="ps-4">站点</th>
                             <th>Consumer Key</th>
                             <th>上次同步时间</th>
                             <th>状态</th>
@@ -133,7 +133,14 @@
                                         style="width: 32px; height: 32px; font-size: 1rem;">
                                         <i class="bi bi-globe"></i>
                                     </div>
-                                    <span class="text-white">{{ site.url }}</span>
+                                    <div>
+                                        {% if site.manager and site.manager|trim %}
+                                        <span class="badge me-1"
+                                            style="background: rgba(23, 162, 184, 0.3); color: #17a2b8;">{{ site.manager
+                                            }}</span>
+                                        {% endif %}
+                                        <span class="text-white">{{ site.url.replace('https://www.', '') }}</span>
+                                    </div>
                                 </div>
                             </td>
                             <td class="text-white-50 font-monospace small">{{ site.consumer_key[:10] }}...</td>
@@ -153,7 +160,8 @@
                                     data-site-id="{{ site.id }}"><i class="bi bi-arrow-repeat"></i> 同步</button>
                                 <button class="btn btn-sm btn-outline-info me-2 edit-btn" data-site-id="{{ site.id }}"
                                     data-url="{{ site.url }}" data-key="{{ site.consumer_key }}"
-                                    data-secret="{{ site.consumer_secret }}"><i class="bi bi-pencil"></i></button>
+                                    data-secret="{{ site.consumer_secret }}" data-manager="{{ site.manager or '' }}"><i
+                                        class="bi bi-pencil"></i></button>
                                 <button class="btn btn-sm btn-outline-danger delete-btn" data-site-id="{{ site.id }}"><i
                                         class="bi bi-trash"></i></button>
                             </td>
@@ -279,6 +287,11 @@
             <div class="modal-body">
                 <form id="addSiteForm">
                     <div class="mb-3">
+                        <label class="form-label text-white-50">负责人</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="manager" placeholder="输入负责人姓名">
+                    </div>
+                    <div class="mb-3">
                         <label class="form-label text-white-50">站点 URL</label>
                         <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25"
                             name="url" placeholder="https://example.com" required>
@@ -315,6 +328,11 @@
             <div class="modal-body">
                 <form id="editSiteForm">
                     <input type="hidden" name="site_id" id="editSiteId">
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">负责人</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="manager" id="editSiteManager" placeholder="输入负责人姓名">
+                    </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">站点 URL</label>
                         <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25"
@@ -892,11 +910,13 @@
                 const url = editBtn.dataset.url;
                 const key = editBtn.dataset.key;
                 const secret = editBtn.dataset.secret;
+                const manager = editBtn.dataset.manager || '';
 
                 document.getElementById('editSiteId').value = siteId;
                 document.getElementById('editSiteUrl').value = url;
                 document.getElementById('editSiteKey').value = key;
                 document.getElementById('editSiteSecret').value = secret;
+                document.getElementById('editSiteManager').value = manager;
 
                 const modal = getModal('editSiteModal');
                 if (modal) modal.show();

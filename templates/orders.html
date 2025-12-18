@@ -118,7 +118,9 @@
                     <tbody>
                         {% for stat in summary_stats %}
                         <tr>
-                            <td><span class="source-badge">{{ stat.source.replace('https://www.', '') }}</span></td>
+                            <td>{% set mgr = site_managers.get(stat.source, '') %}{% if mgr %}<span class="badge me-1"
+                                    style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{ mgr }}</span>{% endif
+                                %}<span class="source-badge">{{ stat.source.replace('https://www.', '') }}</span></td>
                             <td class="text-end border-start">{{ "{:,}".format(stat.total_orders) }}</td>
                             <td class="text-end">{{ "{:,}".format(stat.total_products) }}</td>
                             <td class="text-end">{{ "{:,.2f}".format(stat.total_amount or 0) }}</td>
@@ -191,7 +193,9 @@
                             <td><a href="javascript:void(0)" onclick="showOrderDetail('{{ order.id }}')"
                                     class="text-info text-decoration-none"><strong>#{{ order.number }}</strong></a></td>
                             <td>{{ order.date_created|format_date }}</td>
-                            <td><span class="source-badge">{{ order.source.replace('https://www.', '') }}</span></td>
+                            <td>{% set mgr = site_managers.get(order.source, '') %}{% if mgr %}<span class="badge me-1"
+                                    style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{ mgr }}</span>{% endif
+                                %}<span class="source-badge">{{ order.source.replace('https://www.', '') }}</span></td>
                             <td><span class="status-badge status-{{ order.status }}">{{ order.status|status_label
                                     }}</span></td>
                             <td>
