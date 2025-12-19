@@ -73,6 +73,83 @@ def parse_json_field(value):
         return {}
 
 
+def extract_flavor_from_meta(item):
+    """
+    Extract flavor/variation attribute from WooCommerce line_item meta_data.
+    Looks for common variation attribute keys like 'flavour', 'flavor', 'pa_flavour', 'pa_flavor', etc.
+    Returns the display_value if found, otherwise empty string.
+    """
+    meta_data = item.get('meta_data', [])
+    if not isinstance(meta_data, list):
+        return ''
+    
+    # Common flavor-related keys in WooCommerce (also include Polish 'smak/smaki')
+    flavor_keys = ['pa_flavour', 'pa_flavor', 'flavour', 'flavor', 'pa_taste', 'taste', 'pa_variant', 'variant', 'pa_smak', 'smak', 'pa_smaki', 'smaki']
+    
+    for meta in meta_data:
+        if not isinstance(meta, dict):
+            continue
+        key = meta.get('key', '').lower()
+        if key in flavor_keys:
+            # Prefer display_value over value for human-readable format
+            return meta.get('display_value', '') or meta.get('value', '')
+    
+    return ''
+
+
+def extract_puffs_from_meta(item):
+    """
+    Extract puffs count from WooCommerce line_item meta_data.
+    Looks for 'puffs', 'pa_puffs', 'puff_count' keys.
+    Returns the numeric puffs value if found, otherwise None.
+    """
+    import re
+    
+    meta_data = item.get('meta_data', [])
+    if not isinstance(meta_data, list):
+        return None
+    
+    # Common puffs-related keys in WooCommerce (including Polish 'liczba-zaciagniec')
+    puffs_keys = ['pa_puffs', 'puffs', 'puff_count', 'pa_puff_count', 'pa_liczba-zaciagniec', 'liczba-zaciagniec']
+    
+    for meta in meta_data:
+        if not isinstance(meta, dict):
+            continue
+        key = meta.get('key', '').lower()
+        if key in puffs_keys:
+            value = meta.get('display_value', '') or meta.get('value', '')
+            # Extract numeric value from strings like "15000 puffs" or "15000"
+            if value:
+                match = re.search(r'(\d+)', str(value))
+                if match:
+                    return int(match.group(1))
+    
+    return None
+
+
+def get_full_product_name(item):
+    """
+    Get full product name including variation attributes (like flavor).
+    Combines the product name with any variation flavor found in meta_data.
+    Returns: (full_name, flavor_only, puffs_from_meta)
+    """
+    name = item.get('name', '')
+    flavor = extract_flavor_from_meta(item)
+    puffs = extract_puffs_from_meta(item)
+    
+    if flavor:
+        # If flavor is not already in the name, append it
+        if flavor.upper() not in name.upper():
+            full_name = f"{name} - {flavor}"
+        else:
+            full_name = name
+    else:
+        full_name = name
+        flavor = ''
+    
+    return full_name, flavor, puffs
+
+
 def get_user_allowed_sources(user_id, is_admin=False):
     """
     Get list of source URLs that a user has permission to access.
@@ -1070,7 +1147,9 @@ def get_customer_details(email):
         order_products = []
         order_qty = 0
         for item in (line_items or []):
-            product_name = item.get('name', 'Unknown')
+            # Get full product name including flavor from meta_data
+            full_name, flavor, meta_puffs = get_full_product_name(item)
+            product_name = full_name or item.get('name', 'Unknown')
             qty = item.get('quantity', 1)
             total = float(item.get('total', 0))
             order_products.append({
@@ -1320,12 +1399,169 @@ def init_users_table():
     conn.close()
 
 
+def init_product_tables():
+    """Initialize product analysis tables (brands, series, product_mappings)"""
+    conn = get_db_connection()
+    
+    # Brands table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS brands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            aliases TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Series table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS series (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            brand_id INTEGER,
+            name TEXT NOT NULL,
+            aliases TEXT,
+            UNIQUE(brand_id, name),
+            FOREIGN KEY (brand_id) REFERENCES brands(id)
+        )
+    ''')
+    
+    # Product mappings table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS product_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            raw_name TEXT NOT NULL,
+            brand_id INTEGER,
+            series_id INTEGER,
+            puff_count INTEGER,
+            flavor TEXT,
+            is_manual INTEGER DEFAULT 0,
+            source TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(raw_name, source),
+            FOREIGN KEY (brand_id) REFERENCES brands(id),
+            FOREIGN KEY (series_id) REFERENCES series(id)
+        )
+    ''')
+    
+    conn.commit()
+    
+    # Insert default brands if table is empty
+    existing = conn.execute('SELECT COUNT(*) FROM brands').fetchone()[0]
+    if existing == 0:
+        default_brands = [
+            ('IGET', '["iget", "I-GET"]'),
+            ('FUMO', '["Fumo"]'),
+            ('Crystal Blind', '["CRYSTAL BLIND", "Crystal-Blind"]'),
+            ('POD SALT', '["Pod Salt", "PODSALT"]'),
+            ('Waka', '["WAKA"]'),
+            ('UMIN', '["Umin"]'),
+            ('Isgo', '["ISGO", "Isgo bar"]'),
+            ('FIZZY', '["Fizzy", "FIZZY TWINS"]'),
+            ('FUMOT', '["Fumot"]'),
+            ('Esin', '["ESIN", "Esin Vape"]'),
+            ('XCOR', '["Xcor", "X-COR"]'),
+            ('ELF BAR', '["Elf Bar", "ELFBAR"]'),
+            ('Lost Mary', '["LOST MARY", "LostMary"]'),
+            ('Geek Bar', '["GEEK BAR", "GeekBar"]'),
+        ]
+        conn.executemany('INSERT OR IGNORE INTO brands (name, aliases) VALUES (?, ?)', default_brands)
+        conn.commit()
+    
+    conn.close()
+
+
+import re
+
+def parse_product_name(name, brands_cache=None):
+    """
+    Parse product name to extract brand, series, puff count, and flavor.
+    
+    Examples:
+    - "IGET ONE 12000 puffs - Mixed Berries" → brand: IGET, puffs: 12000, flavor: Mixed Berries
+    - "Crystal Blind 25000 Puffs" → brand: Crystal Blind, puffs: 25000
+    - "FUMO king 6000 puffs Disposable Vape 20mg" → brand: FUMO, series: king, puffs: 6000
+    """
+    if not name:
+        return {'brand': None, 'series': None, 'puffs': None, 'flavor': None, 'normalized': None}
+    
+    result = {'brand': None, 'series': None, 'puffs': None, 'flavor': None, 'normalized': None}
+    
+    # 1. Extract puff count
+    puff_match = re.search(r'(\d+)\s*puffs?', name, re.IGNORECASE)
+    if puff_match:
+        result['puffs'] = int(puff_match.group(1))
+    
+    # 2. Get brands from cache or database
+    if brands_cache is None:
+        conn = get_db_connection()
+        brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+        conn.close()
+        brands_cache = []
+        for row in brands_rows:
+            brand_name = row['name']
+            aliases = []
+            if row['aliases']:
+                try:
+                    aliases = json.loads(row['aliases'])
+                except:
+                    pass
+            brands_cache.append({
+                'id': row['id'],
+                'name': brand_name,
+                'aliases': aliases,
+                'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
+            })
+    
+    # 3. Match brand (longest match first)
+    name_upper = name.upper()
+    matched_brand = None
+    matched_len = 0
+    
+    for brand in brands_cache:
+        for pattern in brand['patterns']:
+            if pattern in name_upper and len(pattern) > matched_len:
+                matched_brand = brand
+                matched_len = len(pattern)
+    
+    if matched_brand:
+        result['brand'] = matched_brand['name']
+        result['brand_id'] = matched_brand['id']
+    
+    # 4. Extract flavor (usually after separator)
+    flavor = None
+    for sep in [' - ', ' – ', ' | ', ' / ']:
+        if sep in name:
+            parts = name.split(sep)
+            if len(parts) > 1:
+                flavor = parts[-1].strip()
+                # Don't treat product type/specs as flavor
+                if any(x in flavor.lower() for x in ['puff', 'disposable', 'vape', 'mg', 'ml']):
+                    flavor = None
+                break
+    
+    result['flavor'] = flavor
+    
+    # 5. Build normalized name
+    parts = []
+    if result['brand']:
+        parts.append(result['brand'])
+    if result['puffs']:
+        parts.append(f"{result['puffs']} Puffs")
+    if result['flavor']:
+        parts.append(result['flavor'])
+    
+    result['normalized'] = ' - '.join(parts) if parts else name
+    
+    return result
+
+
 # Initialize tables on startup
 with app.app_context():
     init_sites_table()
     init_sync_logs_table()
     init_settings_table()
     init_users_table()
+    init_product_tables()
 
 @app.route('/settings')
 @login_required
@@ -2155,6 +2391,683 @@ def update_user_permissions(user_id):
     conn.close()
     
     return jsonify({'success': True})
+
+
+# ============== PRODUCT ANALYSIS ==============
+
+@app.route('/products')
+@login_required
+def products():
+    """Product analysis page"""
+    from datetime import date, timedelta
+    conn = get_db_connection()
+    
+    # Get user's allowed sources for permission filtering
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    
+    # Get filter parameters
+    source_filter = request.args.get('source', '')
+    brand_filter = request.args.get('brand', '')
+    puff_filter = request.args.get('puffs', '')
+    quick_date = request.args.get('quick_date', 'this_month')
+    
+    # Validate source_filter against allowed sources
+    if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
+        source_filter = ''
+    
+    # Process quick date filter
+    today = date.today()
+    date_from = ''
+    date_to = today.isoformat()
+    
+    if quick_date == 'this_month':
+        date_from = today.replace(day=1).isoformat()
+    elif quick_date == 'last_month':
+        first_of_this_month = today.replace(day=1)
+        last_month_end = first_of_this_month - timedelta(days=1)
+        last_month_start = last_month_end.replace(day=1)
+        date_from = last_month_start.isoformat()
+        date_to = last_month_end.isoformat()
+    elif quick_date == 'last_quarter':
+        date_from = (today - timedelta(days=90)).isoformat()
+    elif quick_date == 'half_year':
+        date_from = (today - timedelta(days=180)).isoformat()
+    elif quick_date == 'one_year':
+        date_from = (today - timedelta(days=365)).isoformat()
+    elif quick_date == 'all':
+        date_from = ''
+        date_to = ''
+    
+    # Build filter conditions with permission check
+    conditions = ["status NOT IN ('failed', 'cancelled')"]
+    params = []
+    
+    # Add permission filter
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+    
+    if date_from and date_to:
+        conditions.append("date_created >= ? AND date_created <= ?")
+        params.extend([date_from, date_to + 'T23:59:59'])
+    elif date_from:
+        conditions.append("date_created >= ?")
+        params.append(date_from)
+    
+    if source_filter:
+        conditions.append("source = ?")
+        params.append(source_filter)
+    
+    where_clause = 'WHERE ' + ' AND '.join(conditions)
+    
+    # Get all orders with line items
+    orders = conn.execute(f'''
+        SELECT id, line_items, source, total, date_created
+        FROM orders {where_clause}
+    ''', params).fetchall()
+    
+    # Get brands list for parsing and filtering
+    brands = conn.execute('SELECT id, name, aliases FROM brands ORDER BY name').fetchall()
+    brands_list = [dict(b) for b in brands]
+    
+    # Build brands cache for parsing
+    brands_cache = []
+    for row in brands:
+        brand_name = row['name']
+        aliases = []
+        if row['aliases']:
+            try:
+                aliases = json.loads(row['aliases'])
+            except:
+                pass
+        brands_cache.append({
+            'id': row['id'],
+            'name': brand_name,
+            'aliases': aliases,
+            'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
+        })
+    
+    # Load manual product mappings
+    mappings_rows = conn.execute('''
+        SELECT pm.raw_name, pm.puff_count, pm.flavor, b.name as brand_name
+        FROM product_mappings pm
+        LEFT JOIN brands b ON pm.brand_id = b.id
+        WHERE pm.is_manual = 1
+    ''').fetchall()
+    manual_mappings = {}
+    for m in mappings_rows:
+        manual_mappings[m['raw_name']] = {
+            'brand': m['brand_name'],
+            'puffs': m['puff_count'],
+            'flavor': m['flavor']
+        }
+    
+    # Aggregate product data
+    product_stats = {}
+    brand_stats = {}
+    puff_stats = {}
+    
+    for order in orders:
+        items = parse_json_field(order['line_items'])
+        if not isinstance(items, list):
+            continue
+        
+        for item in items:
+            product_name = item.get('name', '')
+            quantity = item.get('quantity', 0)
+            total = float(item.get('total', 0))
+            
+            # Extract flavor from WooCommerce variation meta_data
+            meta_flavor = extract_flavor_from_meta(item)
+            
+            # Check for manual mapping first (using full name with flavor)
+            full_name, _, meta_puffs = get_full_product_name(item)
+            if full_name in manual_mappings:
+                mapping = manual_mappings[full_name]
+                brand = mapping.get('brand') or 'Unknown'
+                # Use meta_puffs if mapping doesn't have puffs
+                puffs = mapping.get('puffs') or meta_puffs
+                flavor = mapping.get('flavor') or meta_flavor or ''
+            elif product_name in manual_mappings:
+                mapping = manual_mappings[product_name]
+                brand = mapping.get('brand') or 'Unknown'
+                # Use meta_puffs if mapping doesn't have puffs
+                puffs = mapping.get('puffs') or meta_puffs
+                # Use meta_flavor if mapping doesn't have flavor
+                flavor = mapping.get('flavor') or meta_flavor or ''
+            else:
+                # Parse product name automatically
+                parsed = parse_product_name(product_name, brands_cache)
+                brand = parsed.get('brand') or 'Unknown'
+                # Prefer meta_puffs from WooCommerce variation data, then parsed puffs
+                puffs = meta_puffs or parsed.get('puffs')
+                # Prefer meta_flavor from WooCommerce variation data
+                flavor = meta_flavor or parsed.get('flavor') or ''
+            
+            # Apply brand filter
+            if brand_filter and brand != brand_filter:
+                continue
+            
+            # Apply puff filter
+            if puff_filter and puffs and str(puffs) != puff_filter:
+                continue
+            
+            # Product level stats (brand + puffs + flavor)
+            product_key = f"{brand}|{puffs or 'N/A'}|{flavor or 'No Flavor'}"
+            if product_key not in product_stats:
+                product_stats[product_key] = {
+                    'name': product_name,  # Store one sample name for mapping
+                    'brand': brand,
+                    'puffs': puffs,
+                    'flavor': flavor,
+                    'quantity': 0,
+                    'revenue': 0,
+                    'order_count': 0
+                }
+            product_stats[product_key]['quantity'] += quantity
+            product_stats[product_key]['revenue'] += total
+            product_stats[product_key]['order_count'] += 1
+            
+            # Brand level stats
+            if brand not in brand_stats:
+                brand_stats[brand] = {'quantity': 0, 'revenue': 0, 'order_count': 0}
+            brand_stats[brand]['quantity'] += quantity
+            brand_stats[brand]['revenue'] += total
+            brand_stats[brand]['order_count'] += 1
+            
+            # Puff level stats
+            puff_key = str(puffs) if puffs else 'Unknown'
+            if puff_key not in puff_stats:
+                puff_stats[puff_key] = {'quantity': 0, 'revenue': 0}
+            puff_stats[puff_key]['quantity'] += quantity
+            puff_stats[puff_key]['revenue'] += total
+    
+    # Sort products by quantity (top sellers)
+    top_products = sorted(product_stats.values(), key=lambda x: x['quantity'], reverse=True)[:50]
+    
+    # Sort brands by quantity
+    brand_ranking = sorted(
+        [{'name': k, **v} for k, v in brand_stats.items()],
+        key=lambda x: x['quantity'],
+        reverse=True
+    )
+    
+    # Sort puffs by quantity
+    puff_ranking = sorted(
+        [{'puffs': k, **v} for k, v in puff_stats.items()],
+        key=lambda x: x['quantity'],
+        reverse=True
+    )
+    
+    # Get available sources filtered by permissions
+    if allowed_sources is None:
+        sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
+    elif allowed_sources:
+        placeholders = ', '.join(['?' for _ in allowed_sources])
+        sources = conn.execute(f'SELECT DISTINCT source FROM orders WHERE source IN ({placeholders}) ORDER BY source', allowed_sources).fetchall()
+    else:
+        sources = []
+    
+    # Get available puff counts
+    puff_options = sorted([p for p in puff_stats.keys() if p != 'Unknown'], key=lambda x: int(x) if x.isdigit() else 0)
+    
+    # Get site managers mapping
+    sites = conn.execute('SELECT url, manager FROM sites').fetchall()
+    site_managers = {s['url']: s['manager'] or '' for s in sites}
+    
+    # Calculate totals
+    totals = {
+        'total_quantity': sum(p['quantity'] for p in product_stats.values()),
+        'total_revenue': sum(p['revenue'] for p in product_stats.values()),
+        'brand_count': len(brand_stats),
+        'product_count': len(product_stats)
+    }
+    
+    conn.close()
+    
+    return render_template('products.html',
+                          top_products=top_products,
+                          brand_ranking=brand_ranking,
+                          puff_ranking=puff_ranking,
+                          totals=totals,
+                          brands=brands_list,
+                          sources=sources,
+                          puff_options=puff_options,
+                          site_managers=site_managers,
+                          current_filters={
+                              'source': source_filter,
+                              'brand': brand_filter,
+                              'puffs': puff_filter,
+                              'quick_date': quick_date
+                          })
+
+
+@app.route('/api/brands')
+@login_required
+def get_brands():
+    """Get all brands"""
+    conn = get_db_connection()
+    brands = conn.execute('SELECT * FROM brands ORDER BY name').fetchall()
+    conn.close()
+    
+    result = []
+    for b in brands:
+        aliases = []
+        if b['aliases']:
+            try:
+                aliases = json.loads(b['aliases'])
+            except:
+                pass
+        result.append({
+            'id': b['id'],
+            'name': b['name'],
+            'aliases': aliases,
+            'created_at': b['created_at']
+        })
+    
+    return jsonify(result)
+
+
+@app.route('/api/brands', methods=['POST'])
+@login_required
+@admin_required
+def add_brand():
+    """Add a new brand"""
+    data = request.json
+    name = data.get('name', '').strip()
+    aliases = data.get('aliases', [])
+    
+    if not name:
+        return jsonify({'error': 'Brand name is required'}), 400
+    
+    conn = get_db_connection()
+    try:
+        conn.execute('INSERT INTO brands (name, aliases) VALUES (?, ?)',
+                    (name, json.dumps(aliases) if aliases else None))
+        conn.commit()
+        brand_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        conn.close()
+        return jsonify({'success': True, 'id': brand_id})
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({'error': 'Brand already exists'}), 400
+
+
+@app.route('/api/brands/<int:brand_id>', methods=['PUT'])
+@login_required
+@admin_required
+def update_brand(brand_id):
+    """Update a brand"""
+    data = request.json
+    name = data.get('name', '').strip()
+    aliases = data.get('aliases', [])
+    
+    if not name:
+        return jsonify({'error': 'Brand name is required'}), 400
+    
+    conn = get_db_connection()
+    conn.execute('UPDATE brands SET name = ?, aliases = ? WHERE id = ?',
+                (name, json.dumps(aliases) if aliases else None, brand_id))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True})
+
+
+@app.route('/api/brands/<int:brand_id>', methods=['DELETE'])
+@login_required
+@admin_required
+def delete_brand(brand_id):
+    """Delete a brand"""
+    conn = get_db_connection()
+    conn.execute('DELETE FROM brands WHERE id = ?', (brand_id,))
+    conn.execute('UPDATE product_mappings SET brand_id = NULL WHERE brand_id = ?', (brand_id,))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True})
+
+
+@app.route('/api/products/stats')
+@login_required
+def get_product_stats():
+    """Get product statistics API"""
+    from datetime import date, timedelta
+    
+    conn = get_db_connection()
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    
+    # Get parameters
+    source = request.args.get('source', '')
+    days = int(request.args.get('days', 30))
+    
+    # Build conditions
+    conditions = ["status NOT IN ('failed', 'cancelled')"]
+    params = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+    
+    if source:
+        conditions.append('source = ?')
+        params.append(source)
+    
+    date_from = (date.today() - timedelta(days=days)).isoformat()
+    conditions.append('date_created >= ?')
+    params.append(date_from)
+    
+    where_clause = 'WHERE ' + ' AND '.join(conditions)
+    
+    orders = conn.execute(f'''
+        SELECT line_items FROM orders {where_clause}
+    ''', params).fetchall()
+    
+    # Get brands cache
+    brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+    brands_cache = []
+    for row in brands_rows:
+        brand_name = row['name']
+        aliases = []
+        if row['aliases']:
+            try:
+                aliases = json.loads(row['aliases'])
+            except:
+                pass
+        brands_cache.append({
+            'id': row['id'],
+            'name': brand_name,
+            'aliases': aliases,
+            'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
+        })
+    
+    conn.close()
+    
+    # Aggregate
+    stats = {}
+    for order in orders:
+        items = parse_json_field(order['line_items'])
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            name = item.get('name', '')
+            qty = item.get('quantity', 0)
+            total = float(item.get('total', 0))
+            
+            # Extract flavor from meta_data
+            meta_flavor = extract_flavor_from_meta(item)
+            
+            parsed = parse_product_name(name, brands_cache)
+            # Use meta_flavor if available, otherwise use parsed flavor
+            flavor = meta_flavor or parsed.get('flavor') or ''
+            
+            # Create key with flavor for proper aggregation
+            base_key = parsed.get('normalized') or name
+            key = f"{base_key} - {flavor}" if flavor and flavor.upper() not in base_key.upper() else base_key
+            
+            if key not in stats:
+                stats[key] = {
+                    'name': key,
+                    'brand': parsed.get('brand'),
+                    'puffs': parsed.get('puffs'),
+                    'flavor': flavor,
+                    'quantity': 0,
+                    'revenue': 0
+                }
+            stats[key]['quantity'] += qty
+            stats[key]['revenue'] += total
+    
+    result = sorted(stats.values(), key=lambda x: x['quantity'], reverse=True)[:100]
+    return jsonify(result)
+
+
+@app.route('/api/products/unknown')
+@login_required
+def get_unknown_products():
+    """Get products that could not be mapped to any brand"""
+    from datetime import date, timedelta
+    
+    conn = get_db_connection()
+    
+    # Get parameters
+    days = int(request.args.get('days', 90))
+    limit = int(request.args.get('limit', 50))
+    
+    # Get orders from last N days
+    date_from = (date.today() - timedelta(days=days)).isoformat()
+    
+    orders = conn.execute('''
+        SELECT line_items, source FROM orders 
+        WHERE date_created >= ? AND status NOT IN ('failed', 'cancelled')
+    ''', (date_from,)).fetchall()
+    
+    # Get brands cache
+    brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+    brands_cache = []
+    for row in brands_rows:
+        brand_name = row['name']
+        aliases = []
+        if row['aliases']:
+            try:
+                aliases = json.loads(row['aliases'])
+            except:
+                pass
+        brands_cache.append({
+            'id': row['id'],
+            'name': brand_name,
+            'aliases': aliases,
+            'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
+        })
+    
+    conn.close()
+    
+    # Find unknown products
+    unknown_products = {}
+    
+    for order in orders:
+        items = parse_json_field(order['line_items'])
+        if not isinstance(items, list):
+            continue
+        
+        for item in items:
+            name = item.get('name', '')
+            if not name:
+                continue
+            
+            quantity = item.get('quantity', 0)
+            
+            # Get full name with flavor from meta_data
+            full_name, meta_flavor, meta_puffs = get_full_product_name(item)
+            
+            # Parse and check if brand is found
+            parsed = parse_product_name(name, brands_cache)
+            
+            if parsed.get('brand') is None:
+                # This product is unknown
+                # Use a simplified key (remove flavor for grouping)
+                key = name.split(' - ')[0].strip() if ' - ' in name else name
+                
+                if key not in unknown_products:
+                    unknown_products[key] = {
+                        'name': key,
+                        'sample_full_name': full_name,  # Include flavor in sample
+                        'puffs': parsed.get('puffs'),
+                        'quantity': 0,
+                        'sources': set()
+                    }
+                unknown_products[key]['quantity'] += quantity
+                unknown_products[key]['sources'].add(order['source'])
+    
+    # Convert sets to lists and sort by quantity
+    result = []
+    for key, product in unknown_products.items():
+        product['sources'] = list(product['sources'])
+        result.append(product)
+    
+    result = sorted(result, key=lambda x: x['quantity'], reverse=True)[:limit]
+    
+    return jsonify(result)
+
+
+@app.route('/api/products/mapping', methods=['GET', 'POST'])
+@login_required
+def product_mapping():
+    """Get or save product mapping"""
+    conn = get_db_connection()
+    
+    if request.method == 'GET':
+        # Get mapping for a specific product name
+        raw_name = request.args.get('name', '')
+        if not raw_name:
+            conn.close()
+            return jsonify({'error': 'Name is required'}), 400
+        
+        mapping = conn.execute('''
+            SELECT pm.*, b.name as brand_name 
+            FROM product_mappings pm
+            LEFT JOIN brands b ON pm.brand_id = b.id
+            WHERE pm.raw_name = ?
+        ''', (raw_name,)).fetchone()
+        
+        conn.close()
+        
+        if mapping:
+            return jsonify({
+                'id': mapping['id'],
+                'raw_name': mapping['raw_name'],
+                'brand_id': mapping['brand_id'],
+                'brand_name': mapping['brand_name'],
+                'puff_count': mapping['puff_count'],
+                'flavor': mapping['flavor'],
+                'is_manual': mapping['is_manual']
+            })
+        else:
+            return jsonify({'exists': False})
+    
+    else:  # POST - Save mapping
+        data = request.get_json()
+        raw_name = data.get('raw_name', '').strip()
+        
+        if not raw_name:
+            conn.close()
+            return jsonify({'success': False, 'error': 'Product name is required'})
+        
+        brand_id = data.get('brand_id')
+        puff_count = data.get('puff_count')
+        flavor = data.get('flavor')
+        
+        # Convert to proper types
+        if brand_id and str(brand_id).strip():
+            try:
+                brand_id = int(brand_id)
+            except ValueError:
+                brand_id = None
+        else:
+            brand_id = None
+            
+        if puff_count and str(puff_count).strip():
+            try:
+                puff_count = int(puff_count)
+            except ValueError:
+                puff_count = None
+        else:
+            puff_count = None
+            
+        if flavor:
+            flavor = str(flavor).strip()
+        else:
+            flavor = ''
+        
+        try:
+            # Check if mapping exists
+            existing = conn.execute(
+                'SELECT id FROM product_mappings WHERE raw_name = ?', 
+                (raw_name,)
+            ).fetchone()
+            
+            if existing:
+                # Update existing
+                conn.execute('''
+                    UPDATE product_mappings 
+                    SET brand_id = ?, puff_count = ?, flavor = ?, is_manual = 1
+                    WHERE raw_name = ?
+                ''', (brand_id, puff_count, flavor, raw_name))
+            else:
+                # Insert new
+                conn.execute('''
+                    INSERT INTO product_mappings (raw_name, brand_id, puff_count, flavor, is_manual)
+                    VALUES (?, ?, ?, ?, 1)
+                ''', (raw_name, brand_id, puff_count, flavor))
+            
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True})
+        except Exception as e:
+            conn.close()
+            return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/products/samples')
+@login_required
+def get_product_samples():
+    """Get sample orders containing a specific product"""
+    product_name = request.args.get('name', '')
+    if not product_name:
+        return jsonify({'error': 'Product name is required'}), 400
+    
+    conn = get_db_connection()
+    
+    # Search for orders containing this product in line_items
+    # We need to search JSON, so we'll filter in Python
+    orders = conn.execute('''
+        SELECT id, number, source, date_created, line_items 
+        FROM orders 
+        WHERE status NOT IN ('failed', 'cancelled')
+        ORDER BY date_created DESC
+        LIMIT 500
+    ''').fetchall()
+    
+    conn.close()
+    
+    # Find orders with matching product name
+    results = []
+    sources = set()
+    
+    for order in orders:
+        items = parse_json_field(order['line_items'])
+        if not isinstance(items, list):
+            continue
+        
+        for item in items:
+            if item.get('name', '') == product_name:
+                # Extract domain from source for display
+                source = order['source']
+                source_display = source.replace('https://www.', '').replace('https://', '').split('/')[0]
+                sources.add(source_display)
+                
+                results.append({
+                    'order_number': order['number'],
+                    'source': source_display,
+                    'date': order['date_created'][:10] if order['date_created'] else ''
+                })
+                break  # One match per order is enough
+        
+        if len(results) >= 10:
+            break
+    
+    return jsonify({
+        'sources': list(sources),
+        'orders': results,
+        'total_found': len(results)
+    })
 
 
 if __name__ == '__main__':

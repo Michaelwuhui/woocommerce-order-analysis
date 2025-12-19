@@ -1,0 +1,551 @@
+{% extends "base.html" %}
+
+{% block title %}产品分析 - WooCommerce 订单分析{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+    <!-- Quick Date Filters -->
+    <div class="quick-filters mb-4">
+        <div class="d-flex flex-wrap gap-3 align-items-center justify-content-between">
+            <div class="d-flex flex-wrap gap-2 align-items-center">
+                <span class="text-secondary me-2"><i class="bi bi-calendar-range me-1"></i>时间：</span>
+                <a href="{{ url_for('products', quick_date='this_month', source=current_filters.source, brand=current_filters.brand) }}"
+                    class="btn btn-quick {% if current_filters.quick_date == 'this_month' %}active{% endif %}">本月至今</a>
+                <a href="{{ url_for('products', quick_date='last_month', source=current_filters.source, brand=current_filters.brand) }}"
+                    class="btn btn-quick {% if current_filters.quick_date == 'last_month' %}active{% endif %}">上个月</a>
+                <a href="{{ url_for('products', quick_date='last_quarter', source=current_filters.source, brand=current_filters.brand) }}"
+                    class="btn btn-quick {% if current_filters.quick_date == 'last_quarter' %}active{% endif %}">近三个月</a>
+                <a href="{{ url_for('products', quick_date='half_year', source=current_filters.source, brand=current_filters.brand) }}"
+                    class="btn btn-quick {% if current_filters.quick_date == 'half_year' %}active{% endif %}">近半年</a>
+                <a href="{{ url_for('products', quick_date='one_year', source=current_filters.source, brand=current_filters.brand) }}"
+                    class="btn btn-quick {% if current_filters.quick_date == 'one_year' %}active{% endif %}">近一年</a>
+                <a href="{{ url_for('products', quick_date='all', source=current_filters.source, brand=current_filters.brand) }}"
+                    class="btn btn-outline-secondary btn-sm {% if current_filters.quick_date == 'all' %}active{% endif %}">全部</a>
+            </div>
+            <div class="d-flex align-items-center gap-3">
+                <div class="d-flex align-items-center gap-2">
+                    <span class="text-secondary"><i class="bi bi-globe me-1"></i>网站：</span>
+                    <select class="form-select form-select-sm" style="width: auto; min-width: 160px;"
+                        onchange="updateFilters('source', this.value)">
+                        <option value="">全部网站</option>
+                        {% for source in sources %}
+                        <option value="{{ source.source }}" {% if current_filters.source==source.source %}selected{%
+                            endif %}>
+                            {{ source.source.replace('https://www.', '') }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                    <span class="text-secondary"><i class="bi bi-tag me-1"></i>品牌：</span>
+                    <select class="form-select form-select-sm" style="width: auto; min-width: 140px;"
+                        onchange="updateFilters('brand', this.value)">
+                        <option value="">全部品牌</option>
+                        {% for brand in brands %}
+                        <option value="{{ brand.name }}" {% if current_filters.brand==brand.name %}selected{% endif %}>
+                            {{ brand.name }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Stats Cards -->
+    <div class="row g-4 mb-4">
+        <div class="col-xl-3 col-md-6">
+            <div class="stat-card stat-card-primary">
+                <div class="stat-icon">
+                    <i class="bi bi-box-seam"></i>
+                </div>
+                <div class="stat-content">
+                    <h3>{{ "{:,}".format(totals.total_quantity) }}</h3>
+                    <p>总销量 (件)</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <div class="stat-card stat-card-success">
+                <div class="stat-icon">
+                    <i class="bi bi-currency-dollar"></i>
+                </div>
+                <div class="stat-content">
+                    <h3>{{ "{:,.2f}".format(totals.total_revenue) }}</h3>
+                    <p>总销售额 (PLN)</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <div class="stat-card stat-card-info">
+                <div class="stat-icon">
+                    <i class="bi bi-tags"></i>
+                </div>
+                <div class="stat-content">
+                    <h3>{{ totals.brand_count }}</h3>
+                    <p>品牌数量</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <div class="stat-card stat-card-warning">
+                <div class="stat-icon">
+                    <i class="bi bi-grid-3x3-gap"></i>
+                </div>
+                <div class="stat-content">
+                    <h3>{{ totals.product_count }}</h3>
+                    <p>产品规格数</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4">
+        <!-- Brand Ranking -->
+        <div class="col-xl-4">
+            <div class="card data-card">
+                <div class="card-header">
+                    <h5><i class="bi bi-trophy me-2"></i>品牌销量排行</h5>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                        <table class="table table-dark table-hover mb-0">
+                            <thead style="position: sticky; top: 0; z-index: 1;">
+                                <tr>
+                                    <th>#</th>
+                                    <th>品牌</th>
+                                    <th class="text-end">销量</th>
+                                    <th class="text-end">销售额</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for brand in brand_ranking %}
+                                <tr>
+                                    <td>
+                                        {% if loop.index <= 3 %} <span
+                                            class="badge bg-{{ 'warning' if loop.index == 1 else 'secondary' if loop.index == 2 else 'danger' }}">
+                                            {{ loop.index }}
+                                            </span>
+                                            {% else %}
+                                            <span class="text-muted">{{ loop.index }}</span>
+                                            {% endif %}
+                                    </td>
+                                    <td>
+                                        <a href="{{ url_for('products', brand=brand.name, quick_date=current_filters.quick_date, source=current_filters.source) }}"
+                                            class="text-info text-decoration-none">{{ brand.name }}</a>
+                                    </td>
+                                    <td class="text-end"><strong>{{ "{:,}".format(brand.quantity) }}</strong></td>
+                                    <td class="text-end text-success">{{ "{:,.2f}".format(brand.revenue) }}</td>
+                                </tr>
+                                {% else %}
+                                <tr>
+                                    <td colspan="4" class="text-center text-muted py-4">暂无数据</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Puff Count Ranking -->
+        <div class="col-xl-4">
+            <div class="card data-card">
+                <div class="card-header">
+                    <h5><i class="bi bi-bar-chart me-2"></i>口数分布</h5>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                        <table class="table table-dark table-hover mb-0">
+                            <thead style="position: sticky; top: 0; z-index: 1;">
+                                <tr>
+                                    <th>口数</th>
+                                    <th class="text-end">销量</th>
+                                    <th class="text-end">销售额</th>
+                                    <th class="text-end">占比</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% set total_qty = totals.total_quantity if totals.total_quantity > 0 else 1 %}
+                                {% for puff in puff_ranking %}
+                                <tr>
+                                    <td>
+                                        {% if puff.puffs != 'Unknown' %}
+                                        <span class="badge"
+                                            style="background: rgba(6, 182, 212, 0.25); color: #22d3ee; border: 1px solid rgba(6, 182, 212, 0.4);">{{
+                                            puff.puffs }} Puffs</span>
+                                        {% else %}
+                                        <span class="text-muted">未知</span>
+                                        {% endif %}
+                                    </td>
+                                    <td class="text-end"><strong>{{ "{:,}".format(puff.quantity) }}</strong></td>
+                                    <td class="text-end text-success">{{ "{:,.2f}".format(puff.revenue) }}</td>
+                                    <td class="text-end">
+                                        <span class="text-warning">{{ "{:.1f}".format(puff.quantity / total_qty * 100)
+                                            }}%</span>
+                                    </td>
+                                </tr>
+                                {% else %}
+                                <tr>
+                                    <td colspan="4" class="text-center text-muted py-4">暂无数据</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Puff Distribution Chart Placeholder -->
+        <div class="col-xl-4">
+            <div class="card chart-card">
+                <div class="card-header">
+                    <h5><i class="bi bi-pie-chart me-2"></i>口数占比</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="puffChart" height="300"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Top Products -->
+    <div class="row mt-4">
+        <div class="col-12">
+            <div class="card data-card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5><i class="bi bi-star me-2"></i>热销产品排行 TOP 50</h5>
+                    <span class="badge bg-primary">{{ top_products|length }} 个产品</span>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-dark table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th style="width: 60px;">#</th>
+                                    <th>品牌</th>
+                                    <th class="text-center">口数</th>
+                                    <th>口味</th>
+                                    <th class="text-end">销量</th>
+                                    <th class="text-end">销售额</th>
+                                    <th class="text-end">订单数</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for product in top_products %}
+                                <tr style="cursor: pointer;"
+                                    onclick="openProductMapping('{{ product.name | e }}', '{{ product.brand | e }}', '{{ product.puffs | e }}', '{{ product.flavor | e }}')"
+                                    title="点击编辑产品映射">
+                                    <td>
+                                        {% if loop.index <= 3 %} <span
+                                            class="badge bg-{{ 'warning' if loop.index == 1 else 'secondary' if loop.index == 2 else 'danger' }}"
+                                            style="width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; font-size: 14px;">
+                                            {{ loop.index }}
+                                            </span>
+                                            {% elif loop.index <= 10 %} <span class="badge bg-primary bg-opacity-50"
+                                                style="width: 28px;">{{ loop.index }}</span>
+                                                {% else %}
+                                                <span class="text-muted">{{ loop.index }}</span>
+                                                {% endif %}
+                                    </td>
+                                    <td>
+                                        {% if product.brand and product.brand != 'Unknown' %}
+                                        <span class="badge"
+                                            style="background: rgba(99, 102, 241, 0.2); color: #a5b4fc;">{{
+                                            product.brand }}</span>
+                                        {% else %}
+                                        <span class="badge bg-warning bg-opacity-25 text-warning">
+                                            <i class="bi bi-exclamation-triangle me-1"></i>未知
+                                        </span>
+                                        {% endif %}
+                                    </td>
+                                    <td class="text-center">
+                                        {% if product.puffs %}
+                                        <span class="badge"
+                                            style="background: rgba(6, 182, 212, 0.25); color: #22d3ee; border: 1px solid rgba(6, 182, 212, 0.4);">{{
+                                            product.puffs }}</span>
+                                        {% else %}
+                                        <span class="badge bg-warning bg-opacity-25 text-warning">
+                                            <i class="bi bi-exclamation-triangle me-1"></i>缺失
+                                        </span>
+                                        {% endif %}
+                                    </td>
+                                    <td>{{ product.flavor or '-' }}</td>
+                                    <td class="text-end"><strong>{{ "{:,}".format(product.quantity) }}</strong></td>
+                                    <td class="text-end text-success">{{ "{:,.2f}".format(product.revenue) }}</td>
+                                    <td class="text-end text-muted">{{ "{:,}".format(product.order_count) }}</td>
+                                </tr>
+                                {% else %}
+                                <tr>
+                                    <td colspan="7" class="text-center py-5">
+                                        <i class="bi bi-inbox display-4 text-muted"></i>
+                                        <p class="text-muted mt-3">没有找到符合条件的产品数据</p>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Product Mapping Modal -->
+<div class="modal fade" id="productMappingModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-pencil-square me-2"></i>产品映射</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <!-- Original Data Section -->
+                <div class="card bg-black bg-opacity-50 border-info border-opacity-50 mb-3">
+                    <div class="card-header bg-info bg-opacity-10 py-2">
+                        <h6 class="mb-0 text-info"><i class="bi bi-database me-2"></i>原始数据 (来自订单)</h6>
+                    </div>
+                    <div class="card-body py-3">
+                        <p class="mb-1 text-white" style="word-break: break-all; font-size: 1.1rem;">
+                            <strong id="originalProductName"></strong>
+                        </p>
+                        <!-- Sources and Orders Info -->
+                        <div class="row mt-3">
+                            <div class="col-md-6">
+                                <small class="text-muted d-block mb-1">来源网站：</small>
+                                <div id="productSources"><span class="text-muted">加载中...</span></div>
+                            </div>
+                            <div class="col-md-6">
+                                <small class="text-muted d-block mb-1">相关订单号 (最近10个)：</small>
+                                <div id="productOrders" style="max-height: 80px; overflow-y: auto;"><span
+                                        class="text-muted">加载中...</span></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Auto-Parsed Result -->
+                <div class="card bg-black bg-opacity-25 border-secondary border-opacity-25 mb-4">
+                    <div class="card-header bg-secondary bg-opacity-10 py-2">
+                        <h6 class="mb-0 text-white-50"><i class="bi bi-cpu me-2"></i>系统自动解析结果</h6>
+                    </div>
+                    <div class="card-body py-2">
+                        <div class="row text-center">
+                            <div class="col-4">
+                                <small class="text-muted d-block">品牌</small>
+                                <span id="autoParsedBrand" class="text-white">-</span>
+                            </div>
+                            <div class="col-4">
+                                <small class="text-muted d-block">口数</small>
+                                <span id="autoParsedPuffs" class="text-white">-</span>
+                            </div>
+                            <div class="col-4">
+                                <small class="text-muted d-block">口味</small>
+                                <span id="autoParsedFlavor" class="text-white">-</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Manual Override Section -->
+                <div class="card bg-primary bg-opacity-10 border-primary border-opacity-25">
+                    <div class="card-header bg-primary bg-opacity-10 py-2">
+                        <h6 class="mb-0 text-primary"><i class="bi bi-pencil me-2"></i>手动修正 (可选)</h6>
+                    </div>
+                    <div class="card-body">
+                        <input type="hidden" id="mappingProductName">
+                        <div class="row g-3">
+                            <div class="col-md-4">
+                                <label class="form-label text-white-50 small">品牌</label>
+                                <select
+                                    class="form-select form-select-sm bg-black bg-opacity-25 text-white border-secondary"
+                                    id="mappingBrand">
+                                    <option value="">-- 不修改 --</option>
+                                    {% for brand in brands %}
+                                    <option value="{{ brand.id }}">{{ brand.name }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label text-white-50 small">口数 (Puffs)</label>
+                                <input type="number"
+                                    class="form-control form-control-sm bg-black bg-opacity-25 text-white border-secondary"
+                                    id="mappingPuffs" placeholder="如：45000">
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label text-white-50 small">口味</label>
+                                <input type="text"
+                                    class="form-control form-control-sm bg-black bg-opacity-25 text-white border-secondary"
+                                    id="mappingFlavor" placeholder="如：Strawberry Ice">
+                            </div>
+                        </div>
+                        <small class="text-muted d-block mt-2">只填写需要修正的字段，留空则使用系统自动解析结果</small>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="saveProductMappingBtn">
+                    <i class="bi bi-check-lg me-1"></i>保存映射
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+    function updateFilters(key, value) {
+        const url = new URL(window.location.href);
+        if (value) {
+            url.searchParams.set(key, value);
+        } else {
+            url.searchParams.delete(key);
+        }
+        window.location.href = url.toString();
+    }
+
+    // Puff Distribution Chart
+    var puffData = {{ puff_ranking | tojson | safe }};
+    var puffCtx = document.getElementById('puffChart').getContext('2d');
+
+    // Filter out unknown and take top 10
+    var chartData = puffData.filter(p => p.puffs !== 'Unknown').slice(0, 10);
+
+    var colors = [
+        '#6366f1', '#8b5cf6', '#a855f7', '#d946ef', '#ec4899',
+        '#f43f5e', '#f97316', '#eab308', '#22c55e', '#14b8a6'
+    ];
+
+    new Chart(puffCtx, {
+        type: 'doughnut',
+        data: {
+            labels: chartData.map(p => p.puffs + ' Puffs'),
+            datasets: [{
+                data: chartData.map(p => p.quantity),
+                backgroundColor: colors.slice(0, chartData.length),
+                borderWidth: 0,
+                spacing: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: {
+                        color: '#fff',
+                        padding: 10,
+                        boxWidth: 12,
+                        usePointStyle: true
+                    }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function (context) {
+                            var total = context.dataset.data.reduce((a, b) => a + b, 0);
+                            var percent = ((context.raw / total) * 100).toFixed(1);
+                            return context.raw.toLocaleString() + ' 件 (' + percent + '%)';
+                        }
+                    }
+                }
+            },
+            cutout: '60%'
+        }
+    });
+
+    // Product Mapping Functions
+    function openProductMapping(productName, currentBrand, currentPuffs, currentFlavor) {
+        // Populate original data section
+        document.getElementById('originalProductName').textContent = productName;
+        document.getElementById('mappingProductName').value = productName;
+
+        // Populate auto-parsed results section
+        document.getElementById('autoParsedBrand').textContent = currentBrand || '-';
+        document.getElementById('autoParsedPuffs').textContent = currentPuffs || '-';
+        document.getElementById('autoParsedFlavor').textContent = currentFlavor || '-';
+
+        // Add visual indicators for missing/unknown values
+        document.getElementById('autoParsedBrand').className =
+            (!currentBrand || currentBrand === 'Unknown') ? 'text-warning' : 'text-white';
+        document.getElementById('autoParsedPuffs').className =
+            !currentPuffs ? 'text-warning' : 'text-white';
+        document.getElementById('autoParsedFlavor').className =
+            !currentFlavor ? 'text-muted' : 'text-white';
+
+        // Clear manual override fields (user fills only what needs correction)
+        document.getElementById('mappingBrand').value = '';
+        document.getElementById('mappingPuffs').value = '';
+        document.getElementById('mappingFlavor').value = '';
+
+        // Load sources and orders info
+        document.getElementById('productSources').innerHTML = '<span class="text-muted">加载中...</span>';
+        document.getElementById('productOrders').innerHTML = '<span class="text-muted">加载中...</span>';
+
+        fetch('/api/products/samples?name=' + encodeURIComponent(productName))
+            .then(res => res.json())
+            .then(data => {
+                // Display sources
+                if (data.sources && data.sources.length > 0) {
+                    document.getElementById('productSources').innerHTML = data.sources.map(s =>
+                        '<span class="badge bg-success bg-opacity-25 text-success me-1">' + s + '</span>'
+                    ).join('');
+                } else {
+                    document.getElementById('productSources').innerHTML = '<span class="text-muted">未找到</span>';
+                }
+
+                // Display order numbers
+                if (data.orders && data.orders.length > 0) {
+                    document.getElementById('productOrders').innerHTML = data.orders.map(o =>
+                        '<span class="badge bg-secondary bg-opacity-50 me-1 mb-1" title="' + o.source + ' - ' + o.date + '">#' + o.order_number + '</span>'
+                    ).join('');
+                } else {
+                    document.getElementById('productOrders').innerHTML = '<span class="text-muted">未找到</span>';
+                }
+            })
+            .catch(err => {
+                document.getElementById('productSources').innerHTML = '<span class="text-danger">加载失败</span>';
+                document.getElementById('productOrders').innerHTML = '<span class="text-danger">加载失败</span>';
+            });
+
+        new bootstrap.Modal(document.getElementById('productMappingModal')).show();
+    }
+
+    document.getElementById('saveProductMappingBtn').addEventListener('click', function () {
+        const rawName = document.getElementById('mappingProductName').value;
+        const brandId = document.getElementById('mappingBrand').value;
+        const puffs = document.getElementById('mappingPuffs').value;
+        const flavor = document.getElementById('mappingFlavor').value;
+
+        fetch('/api/products/mapping', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                raw_name: rawName,
+                brand_id: brandId || null,
+                puff_count: puffs || null,
+                flavor: flavor || null
+            })
+        })
+            .then(res => res.json())
+            .then(result => {
+                if (result.success) {
+                    bootstrap.Modal.getInstance(document.getElementById('productMappingModal')).hide();
+                    alert('映射保存成功！刷新页面后生效。');
+                    location.reload();
+                } else {
+                    alert('保存失败: ' + (result.error || '未知错误'));
+                }
+            })
+            .catch(err => {
+                alert('请求失败: ' + err);
+            });
+    });
+</script>
+{% endblock %}

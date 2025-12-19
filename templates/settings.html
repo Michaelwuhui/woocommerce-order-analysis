@@ -219,6 +219,129 @@
     </div>
 </div>
 
+<!-- Brand Management Card -->
+<div class="card data-card mb-4">
+    <div
+        class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
+        <h5 class="card-title text-white mb-0"><i class="bi bi-tags me-2"></i>品牌管理</h5>
+        <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#addBrandModal">
+            <i class="bi bi-plus-lg me-1"></i>添加品牌
+        </button>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+            <table class="table table-dark table-hover align-middle mb-0" style="--bs-table-bg: transparent;">
+                <thead style="position: sticky; top: 0; z-index: 1; background: #1a1d21;">
+                    <tr>
+                        <th class="ps-4">品牌名称</th>
+                        <th>别名</th>
+                        <th>创建时间</th>
+                        <th class="text-end pe-4">操作</th>
+                    </tr>
+                </thead>
+                <tbody id="brandsTableBody">
+                    <tr>
+                        <td colspan="4" class="text-center text-muted py-4">加载中...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Unknown Products Card -->
+<div class="card data-card mb-4">
+    <div
+        class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
+        <h5 class="card-title text-white mb-0"><i class="bi bi-question-circle me-2"></i>未识别产品</h5>
+        <button class="btn btn-sm btn-outline-info" onclick="loadUnknownProducts()">
+            <i class="bi bi-arrow-repeat me-1"></i>刷新
+        </button>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive" style="max-height: 300px; overflow-y: auto;">
+            <table class="table table-dark table-hover align-middle mb-0" style="--bs-table-bg: transparent;">
+                <thead style="position: sticky; top: 0; z-index: 1; background: #1a1d21;">
+                    <tr>
+                        <th class="ps-4">产品名称</th>
+                        <th class="text-center">口数</th>
+                        <th class="text-end">销量</th>
+                        <th class="text-end pe-4">操作</th>
+                    </tr>
+                </thead>
+                <tbody id="unknownProductsTableBody">
+                    <tr>
+                        <td colspan="4" class="text-center text-muted py-4">点击刷新加载未识别产品...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="card-footer bg-transparent border-top border-secondary border-opacity-25 py-2">
+            <small class="text-muted">显示近90天内无法识别品牌的产品，按销量排序。点击"添加品牌"可快速配置。</small>
+        </div>
+    </div>
+</div>
+<div class="modal fade" id="addBrandModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-plus-circle me-2"></i>添加品牌</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label text-white-50">品牌名称 <span class="text-danger">*</span></label>
+                    <input type="text" class="form-control bg-black bg-opacity-25 text-white border-secondary"
+                        id="addBrandName" placeholder="如：IGET, XCOR">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">别名（每行一个）</label>
+                    <textarea class="form-control bg-black bg-opacity-25 text-white border-secondary"
+                        id="addBrandAliases" rows="3" placeholder="如：&#10;iget&#10;I-GET&#10;i get"></textarea>
+                    <small class="text-muted">别名用于识别不同写法的同一品牌</small>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="saveBrandBtn">
+                    <i class="bi bi-check-lg me-1"></i>保存
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Edit Brand Modal -->
+<div class="modal fade" id="editBrandModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-pencil me-2"></i>编辑品牌</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="editBrandId">
+                <div class="mb-3">
+                    <label class="form-label text-white-50">品牌名称 <span class="text-danger">*</span></label>
+                    <input type="text" class="form-control bg-black bg-opacity-25 text-white border-secondary"
+                        id="editBrandName">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">别名（每行一个）</label>
+                    <textarea class="form-control bg-black bg-opacity-25 text-white border-secondary"
+                        id="editBrandAliases" rows="3"></textarea>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="updateBrandBtn">
+                    <i class="bi bi-check-lg me-1"></i>保存修改
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Sync Logs Modal -->
 <div class="modal fade" id="syncLogsModal" tabindex="-1">
     <div class="modal-dialog modal-xl">
@@ -1055,5 +1178,234 @@
         </div>
     </div>
 </div>
+
+<!-- Brand Management JavaScript -->
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        // Load brands on page load
+        loadBrands();
+
+        // Save brand button
+        const saveBrandBtn = document.getElementById('saveBrandBtn');
+        if (saveBrandBtn) {
+            saveBrandBtn.addEventListener('click', function () {
+                saveBrand();
+            });
+        }
+
+        // Update brand button
+        const updateBrandBtn = document.getElementById('updateBrandBtn');
+        if (updateBrandBtn) {
+            updateBrandBtn.addEventListener('click', function () {
+                updateBrand();
+            });
+        }
+    });
+
+    function loadBrands() {
+        const tbody = document.getElementById('brandsTableBody');
+        if (!tbody) return;
+
+        fetch('/api/brands')
+            .then(res => res.json())
+            .then(brands => {
+                if (brands.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">暂无品牌数据</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = brands.map(brand => {
+                    const aliasesStr = JSON.stringify(brand.aliases || []);
+                    return `
+                <tr>
+                    <td class="ps-4">
+                        <span class="badge" style="background: rgba(99, 102, 241, 0.2); color: #a5b4fc; font-size: 0.9rem;">
+                            ${brand.name}
+                        </span>
+                    </td>
+                    <td>
+                        ${brand.aliases && brand.aliases.length > 0
+                            ? brand.aliases.map(a => '<span class="badge bg-secondary bg-opacity-50 me-1">' + a + '</span>').join('')
+                            : '<span class="text-muted">无</span>'}
+                    </td>
+                    <td class="text-white-50">${brand.created_at ? new Date(brand.created_at).toLocaleDateString('zh-CN') : '-'}</td>
+                    <td class="text-end pe-4">
+                        <button class="btn btn-sm btn-outline-info me-1" onclick="editBrand(${brand.id}, '${brand.name.replace(/'/g, "\\'")}', '${aliasesStr.replace(/'/g, "\\'")}')">
+                            <i class="bi bi-pencil"></i>
+                        </button>
+                        <button class="btn btn-sm btn-outline-danger" onclick="deleteBrand(${brand.id}, '${brand.name.replace(/'/g, "\\'")}')">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </td>
+                </tr>`;
+                }).join('');
+            })
+            .catch(err => {
+                console.error('Error loading brands:', err);
+                tbody.innerHTML = '<tr><td colspan="4" class="text-center text-danger py-4">加载失败</td></tr>';
+            });
+    }
+
+    function saveBrand() {
+        const name = document.getElementById('addBrandName').value.trim();
+        const aliasesText = document.getElementById('addBrandAliases').value.trim();
+
+        if (!name) {
+            alert('请输入品牌名称');
+            return;
+        }
+
+        const aliases = aliasesText ? aliasesText.split('\n').map(a => a.trim()).filter(a => a) : [];
+
+        fetch('/api/brands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, aliases })
+        })
+            .then(res => res.json())
+            .then(result => {
+                if (result.success) {
+                    bootstrap.Modal.getInstance(document.getElementById('addBrandModal')).hide();
+                    document.getElementById('addBrandName').value = '';
+                    document.getElementById('addBrandAliases').value = '';
+                    loadBrands();
+                } else {
+                    alert('保存失败: ' + (result.error || '未知错误'));
+                }
+            })
+            .catch(err => {
+                alert('请求失败: ' + err);
+            });
+    }
+
+    function editBrand(id, name, aliasesJson) {
+        document.getElementById('editBrandId').value = id;
+        document.getElementById('editBrandName').value = name;
+
+        let aliases = [];
+        try {
+            aliases = JSON.parse(aliasesJson);
+        } catch (e) { }
+
+        document.getElementById('editBrandAliases').value = aliases.join('\n');
+
+        new bootstrap.Modal(document.getElementById('editBrandModal')).show();
+    }
+
+    function updateBrand() {
+        const id = document.getElementById('editBrandId').value;
+        const name = document.getElementById('editBrandName').value.trim();
+        const aliasesText = document.getElementById('editBrandAliases').value.trim();
+
+        if (!name) {
+            alert('请输入品牌名称');
+            return;
+        }
+
+        const aliases = aliasesText ? aliasesText.split('\n').map(a => a.trim()).filter(a => a) : [];
+
+        fetch('/api/brands/' + id, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, aliases })
+        })
+            .then(res => res.json())
+            .then(result => {
+                if (result.success) {
+                    bootstrap.Modal.getInstance(document.getElementById('editBrandModal')).hide();
+                    loadBrands();
+                } else {
+                    alert('更新失败: ' + (result.error || '未知错误'));
+                }
+            })
+            .catch(err => {
+                alert('请求失败: ' + err);
+            });
+    }
+
+    function deleteBrand(id, name) {
+        if (!confirm('确定要删除品牌 "' + name + '" 吗？')) {
+            return;
+        }
+
+        fetch('/api/brands/' + id, {
+            method: 'DELETE'
+        })
+            .then(res => res.json())
+            .then(result => {
+                if (result.success) {
+                    loadBrands();
+                } else {
+                    alert('删除失败: ' + (result.error || '未知错误'));
+                }
+            })
+            .catch(err => {
+                alert('请求失败: ' + err);
+            });
+    }
+
+    // Unknown Products Functions
+    function loadUnknownProducts() {
+        const tbody = document.getElementById('unknownProductsTableBody');
+        if (!tbody) return;
+
+        tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4"><div class="spinner-border spinner-border-sm me-2"></div>加载中...</td></tr>';
+
+        fetch('/api/products/unknown?days=90&limit=50')
+            .then(res => res.json())
+            .then(products => {
+                if (products.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="text-center text-success py-4"><i class="bi bi-check-circle me-2"></i>所有产品都已识别！</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = products.map(product => {
+                    const escapedName = product.name.replace(/'/g, "\\'").replace(/"/g, "&quot;");
+                    return `
+                    <tr>
+                        <td class="ps-4">
+                            <span class="text-white">${product.name}</span>
+                            <br><small class="text-muted">${product.sample_full_name.substring(0, 60)}${product.sample_full_name.length > 60 ? '...' : ''}</small>
+                        </td>
+                        <td class="text-center">
+                            ${product.puffs ? '<span class="badge" style="background: rgba(6, 182, 212, 0.25); color: #22d3ee; border: 1px solid rgba(6, 182, 212, 0.4);">' + product.puffs + '</span>' : '<span class="text-muted">-</span>'}
+                        </td>
+                        <td class="text-end"><strong>${product.quantity}</strong></td>
+                        <td class="text-end pe-4">
+                            <button class="btn btn-sm btn-primary" onclick="addBrandFromUnknown('${escapedName}')">
+                                <i class="bi bi-plus-lg me-1"></i>添加品牌
+                            </button>
+                        </td>
+                    </tr>`;
+                }).join('');
+            })
+            .catch(err => {
+                console.error('Error loading unknown products:', err);
+                tbody.innerHTML = '<tr><td colspan="4" class="text-center text-danger py-4">加载失败</td></tr>';
+            });
+    }
+
+    function addBrandFromUnknown(productName) {
+        // Try to extract a brand name from the product name
+        // Usually the first 1-2 words before the puff count
+        let suggestedBrand = productName;
+
+        // Remove puff count and everything after
+        const puffMatch = productName.match(/(\d+)\s*puffs?/i);
+        if (puffMatch) {
+            suggestedBrand = productName.substring(0, productName.toLowerCase().indexOf(puffMatch[0])).trim();
+        }
+
+        // Clean up common suffixes
+        suggestedBrand = suggestedBrand.replace(/\s+(disposable|vape|pod|bar).*$/i, '').trim();
+
+        // Pre-fill the add brand form
+        document.getElementById('addBrandName').value = suggestedBrand;
+        document.getElementById('addBrandAliases').value = productName;
+
+        // Show the modal
+        new bootstrap.Modal(document.getElementById('addBrandModal')).show();
+    }
+</script>
 
 {% endblock %}
