@@ -71,8 +71,16 @@
                     <i class="bi bi-currency-dollar"></i>
                 </div>
                 <div class="stat-content">
-                    <h3>{{ "{:,.2f}".format(totals.total_revenue) }}</h3>
-                    <p>总销售额 (PLN)</p>
+                    {% if totals.total_revenue_by_currency %}
+                    <h3 style="font-size: 1rem;">
+                        {% for currency, amount in totals.total_revenue_by_currency.items() %}
+                        <span class="d-block">{{ "{:,.2f}".format(amount) }} {{ currency }}</span>
+                        {% endfor %}
+                    </h3>
+                    {% else %}
+                    <h3>0.00</h3>
+                    {% endif %}
+                    <p>总销售额</p>
                 </div>
             </div>
         </div>
@@ -135,7 +143,11 @@
                                             class="text-info text-decoration-none">{{ brand.name }}</a>
                                     </td>
                                     <td class="text-end"><strong>{{ "{:,}".format(brand.quantity) }}</strong></td>
-                                    <td class="text-end text-success">{{ "{:,.2f}".format(brand.revenue) }}</td>
+                                    <td class="text-end text-success">
+                                        {% for c, a in (brand.revenue_by_currency or {}).items() %}
+                                        <span class="d-block">{{ "{:,.0f}".format(a) }} {{ c }}</span>
+                                        {% endfor %}
+                                    </td>
                                 </tr>
                                 {% else %}
                                 <tr>
@@ -180,7 +192,11 @@
                                         {% endif %}
                                     </td>
                                     <td class="text-end"><strong>{{ "{:,}".format(puff.quantity) }}</strong></td>
-                                    <td class="text-end text-success">{{ "{:,.2f}".format(puff.revenue) }}</td>
+                                    <td class="text-end text-success">
+                                        {% for c, a in (puff.revenue_by_currency or {}).items() %}
+                                        <span class="d-block">{{ "{:,.0f}".format(a) }} {{ c }}</span>
+                                        {% endfor %}
+                                    </td>
                                     <td class="text-end">
                                         <span class="text-warning">{{ "{:.1f}".format(puff.quantity / total_qty * 100)
                                             }}%</span>
@@ -274,7 +290,11 @@
                                     </td>
                                     <td>{{ product.flavor or '-' }}</td>
                                     <td class="text-end"><strong>{{ "{:,}".format(product.quantity) }}</strong></td>
-                                    <td class="text-end text-success">{{ "{:,.2f}".format(product.revenue) }}</td>
+                                    <td class="text-end text-success">
+                                        {% for c, a in (product.revenue_by_currency or {}).items() %}
+                                        <span class="d-block">{{ "{:,.0f}".format(a) }} {{ c }}</span>
+                                        {% endfor %}
+                                    </td>
                                     <td class="text-end text-muted">{{ "{:,}".format(product.order_count) }}</td>
                                 </tr>
                                 {% else %}

@@ -407,29 +407,57 @@ def dashboard():
     # Total orders
     stats['total_orders'] = conn.execute(f'SELECT COUNT(*) FROM orders {date_condition}', params).fetchone()[0]
     
-    # Total revenue - add status filter
+    # Total revenue by currency - add status filter
     revenue_conditions = conditions.copy()
     revenue_conditions.append('status NOT IN ("failed", "cancelled")')
     revenue_where = 'WHERE ' + ' AND '.join(revenue_conditions)
-    result = conn.execute(f'SELECT SUM(total) FROM orders {revenue_where}', params).fetchone()[0]
-    stats['total_revenue'] = result or 0
     
-    # Orders by status
+    # Get revenue grouped by currency
+    revenue_by_currency_raw = conn.execute(f'''
+        SELECT currency, SUM(total) as revenue
+        FROM orders {revenue_where}
+        GROUP BY currency
+    ''', params).fetchall()
+    stats['total_revenue_by_currency'] = {row['currency']: row['revenue'] or 0 for row in revenue_by_currency_raw}
+    
+    # Also keep a simple total for backward compatibility
+    stats['total_revenue'] = sum(stats['total_revenue_by_currency'].values())
+    
+    # Orders by status with currency
     status_data_raw = conn.execute(f'''
-        SELECT status, COUNT(*) as count, SUM(total) as revenue
+        SELECT status, currency, COUNT(*) as count, SUM(total) as revenue
         FROM orders {date_condition}
-        GROUP BY status
+        GROUP BY status, currency
         ORDER BY count DESC
     ''', params).fetchall()
-    status_data = [dict(row) for row in status_data_raw]
+    # Group by status, with currency breakdown
+    status_dict = {}
+    for row in status_data_raw:
+        status = row['status']
+        if status not in status_dict:
+            status_dict[status] = {'status': status, 'count': 0, 'revenue_by_currency': {}}
+        status_dict[status]['count'] += row['count']
+        currency = row['currency'] or 'N/A'
+        if currency not in status_dict[status]['revenue_by_currency']:
+            status_dict[status]['revenue_by_currency'][currency] = 0
+        status_dict[status]['revenue_by_currency'][currency] += row['revenue'] or 0
+    status_data = sorted(status_dict.values(), key=lambda x: x['count'], reverse=True)
     
-    # Orders by source
+    # Orders by source with currency
     source_data_raw = conn.execute(f'''
-        SELECT source, COUNT(*) as count, SUM(total) as revenue
+        SELECT source, currency, COUNT(*) as count, SUM(total) as revenue
         FROM orders {date_condition}
-        GROUP BY source
+        GROUP BY source, currency
     ''', params).fetchall()
-    source_data = [dict(row) for row in source_data_raw]
+    # Group by source
+    source_dict = {}
+    for row in source_data_raw:
+        source = row['source']
+        if source not in source_dict:
+            source_dict[source] = {'source': source, 'count': 0, 'currency': row['currency'], 'revenue': 0}
+        source_dict[source]['count'] += row['count']
+        source_dict[source]['revenue'] += row['revenue'] or 0
+    source_data = list(source_dict.values())
     
     # Recent orders - apply permission filter, optionally source filter
     recent_conditions = ['1=1']
@@ -449,7 +477,7 @@ def dashboard():
     
     recent_where = 'WHERE ' + ' AND '.join(recent_conditions)
     recent_orders = conn.execute(f'''
-        SELECT id, number, status, total, date_created, source, line_items
+        SELECT id, number, status, total, currency, date_created, source, line_items
         FROM orders
         {recent_where}
         ORDER BY date_created DESC
@@ -584,9 +612,9 @@ def orders():
     
     where_clause = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
     
-    # Summary statistics by source
+    # Summary statistics by source (with currency)
     stats_query = f'''
-        SELECT source,
+        SELECT source, currency,
             COUNT(*) as total_orders,
             SUM(total) as total_amount,
             SUM(shipping_total) as total_shipping,
@@ -595,7 +623,7 @@ def orders():
             SUM(CASE WHEN status NOT IN ('failed','cancelled') THEN shipping_total ELSE 0 END) as success_shipping,
             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_orders,
             SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled_orders
-        FROM orders {where_clause} GROUP BY source
+        FROM orders {where_clause} GROUP BY source, currency
     '''
     summary_raw = conn.execute(stats_query, params).fetchall()
     summary_stats = [dict(row) for row in summary_raw]
@@ -771,7 +799,7 @@ def monthly():
     where_clause = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
     
     query = f'''
-        SELECT id, status, date_created, total, shipping_total, source, line_items
+        SELECT id, status, date_created, total, shipping_total, source, currency, line_items
         FROM orders
         {where_clause}
         ORDER BY date_created DESC
@@ -794,9 +822,12 @@ def monthly():
     df['product_qty'] = df['line_items'].apply(get_product_qty)
     df['month'] = pd.to_datetime(df['date_created']).dt.to_period('M')
     
-    # Group by month and source
+    # Group by month, source, and currency
     rows = []
     for (month, source), gdf in df.groupby(['month', 'source']):
+        # Get the currency for this source (should be the same for all orders from same source)
+        currency = gdf['currency'].iloc[0] if len(gdf) > 0 else 'N/A'
+        
         total_orders = len(gdf)
         total_products = gdf['product_qty'].sum()
         total_amount = gdf['total'].sum()
@@ -817,6 +848,7 @@ def monthly():
         rows.append({
             'month': str(month),
             'source': source,
+            'currency': currency,
             'total_orders': total_orders,
             'total_products': int(total_products),
             'total_amount': float(total_amount),
@@ -1113,7 +1145,7 @@ def get_customer_details(email):
     
     # Get all orders from this customer
     orders = conn.execute('''
-        SELECT id, number, status, total, shipping_total, date_created, source, line_items, billing
+        SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing
         FROM orders
         WHERE billing LIKE ?
         ORDER BY date_created DESC
@@ -1128,6 +1160,7 @@ def get_customer_details(email):
     order_list = []
     all_products = {}
     site_spending = {}
+    spending_by_currency = {}  # Track spending by currency
     total_spending = 0
     successful_orders = 0
     failed_orders = 0
@@ -1176,9 +1209,15 @@ def get_customer_details(email):
         
         # Status counting
         status = order['status']
+        currency = order['currency'] or 'N/A'
         if status in ['completed', 'processing']:
             successful_orders += 1
-            total_spending += float(order['total'] or 0)
+            order_total = float(order['total'] or 0)
+            total_spending += order_total
+            # Track by currency
+            if currency not in spending_by_currency:
+                spending_by_currency[currency] = 0
+            spending_by_currency[currency] += order_total
         elif status == 'failed':
             failed_orders += 1
         elif status == 'cancelled':
@@ -1193,6 +1232,7 @@ def get_customer_details(email):
             'number': order['number'],
             'status': status,
             'total': float(order['total'] or 0),
+            'currency': currency,
             'date_created': order['date_created'],
             'source': source.replace('https://www.', ''),
             'product_count': order_qty,
@@ -1239,6 +1279,7 @@ def get_customer_details(email):
         'failed_orders': failed_orders,
         'cancelled_orders': cancelled_orders,
         'total_spending': total_spending,
+        'spending_by_currency': spending_by_currency,  # New: currency breakdown
         'avg_order_value': total_spending / successful_orders if successful_orders > 0 else 0,
         'first_order_date': unique_dates[0] if unique_dates else None,
         'last_order_date': unique_dates[-1] if unique_dates else None,
@@ -1264,6 +1305,29 @@ STATUS_LABELS = {
     'failed': '失败'
 }
 
+# Currency symbols mapping
+CURRENCY_SYMBOLS = {
+    'PLN': 'zł',      # Polish Złoty
+    'AUD': 'A$',      # Australian Dollar
+    'AED': 'د.إ',     # UAE Dirham
+    'USD': '$',       # US Dollar
+    'EUR': '€',       # Euro
+    'GBP': '£',       # British Pound
+}
+
+
+def format_amount_with_currency(amount, currency):
+    """Format amount with currency code, e.g., '145.00 PLN'"""
+    try:
+        return f"{float(amount):,.2f} {currency}"
+    except:
+        return f"{amount} {currency}"
+
+
+def get_currency_symbol(currency):
+    """Get symbol for a currency code"""
+    return CURRENCY_SYMBOLS.get(currency, currency)
+
 
 @app.template_filter('status_label')
 def status_label_filter(status):
@@ -1271,9 +1335,13 @@ def status_label_filter(status):
 
 
 @app.template_filter('format_currency')
-def format_currency_filter(value):
+def format_currency_filter(value, currency=None):
+    """Format currency value, optionally with currency code"""
     try:
-        return f"{float(value):,.2f}"
+        formatted = f"{float(value):,.2f}"
+        if currency:
+            return f"{formatted} {currency}"
+        return formatted
     except:
         return value
 
@@ -2464,9 +2532,9 @@ def products():
     
     where_clause = 'WHERE ' + ' AND '.join(conditions)
     
-    # Get all orders with line items
+    # Get all orders with line items (including currency)
     orders = conn.execute(f'''
-        SELECT id, line_items, source, total, date_created
+        SELECT id, line_items, source, currency, total, date_created
         FROM orders {where_clause}
     ''', params).fetchall()
     
@@ -2565,26 +2633,34 @@ def products():
                     'puffs': puffs,
                     'flavor': flavor,
                     'quantity': 0,
-                    'revenue': 0,
+                    'revenue_by_currency': {},
                     'order_count': 0
                 }
             product_stats[product_key]['quantity'] += quantity
-            product_stats[product_key]['revenue'] += total
+            # Track revenue by currency
+            currency = order['currency'] or 'N/A'
+            if currency not in product_stats[product_key]['revenue_by_currency']:
+                product_stats[product_key]['revenue_by_currency'][currency] = 0
+            product_stats[product_key]['revenue_by_currency'][currency] += total
             product_stats[product_key]['order_count'] += 1
             
             # Brand level stats
             if brand not in brand_stats:
-                brand_stats[brand] = {'quantity': 0, 'revenue': 0, 'order_count': 0}
+                brand_stats[brand] = {'quantity': 0, 'revenue_by_currency': {}, 'order_count': 0}
             brand_stats[brand]['quantity'] += quantity
-            brand_stats[brand]['revenue'] += total
+            if currency not in brand_stats[brand]['revenue_by_currency']:
+                brand_stats[brand]['revenue_by_currency'][currency] = 0
+            brand_stats[brand]['revenue_by_currency'][currency] += total
             brand_stats[brand]['order_count'] += 1
             
             # Puff level stats
             puff_key = str(puffs) if puffs else 'Unknown'
             if puff_key not in puff_stats:
-                puff_stats[puff_key] = {'quantity': 0, 'revenue': 0}
+                puff_stats[puff_key] = {'quantity': 0, 'revenue_by_currency': {}}
             puff_stats[puff_key]['quantity'] += quantity
-            puff_stats[puff_key]['revenue'] += total
+            if currency not in puff_stats[puff_key]['revenue_by_currency']:
+                puff_stats[puff_key]['revenue_by_currency'][currency] = 0
+            puff_stats[puff_key]['revenue_by_currency'][currency] += total
     
     # Sort products by quantity (top sellers)
     top_products = sorted(product_stats.values(), key=lambda x: x['quantity'], reverse=True)[:50]
@@ -2619,10 +2695,17 @@ def products():
     sites = conn.execute('SELECT url, manager FROM sites').fetchall()
     site_managers = {s['url']: s['manager'] or '' for s in sites}
     
-    # Calculate totals
+    # Calculate totals with revenue by currency
+    total_revenue_by_currency = {}
+    for p in product_stats.values():
+        for currency, amount in p.get('revenue_by_currency', {}).items():
+            if currency not in total_revenue_by_currency:
+                total_revenue_by_currency[currency] = 0
+            total_revenue_by_currency[currency] += amount
+    
     totals = {
         'total_quantity': sum(p['quantity'] for p in product_stats.values()),
-        'total_revenue': sum(p['revenue'] for p in product_stats.values()),
+        'total_revenue_by_currency': total_revenue_by_currency,
         'brand_count': len(brand_stats),
         'product_count': len(product_stats)
     }

@@ -56,8 +56,16 @@
                     <i class="bi bi-currency-dollar"></i>
                 </div>
                 <div class="stat-content">
-                    <h3>{{ "{:,.2f}".format(stats.total_revenue) }}</h3>
-                    <p>总销售额 (PLN)</p>
+                    {% if stats.total_revenue_by_currency %}
+                    <h3 style="font-size: 1.1rem;">
+                        {% for currency, amount in stats.total_revenue_by_currency.items() %}
+                        <span class="d-block">{{ "{:,.2f}".format(amount) }} {{ currency }}</span>
+                        {% endfor %}
+                    </h3>
+                    {% else %}
+                    <h3>0.00</h3>
+                    {% endif %}
+                    <p>总销售额</p>
                 </div>
             </div>
         </div>
@@ -129,6 +137,7 @@
                             <thead>
                                 <tr>
                                     <th>网站</th>
+                                    <th class="text-center">货币</th>
                                     <th class="text-end">订单数</th>
                                     <th class="text-end">销售额</th>
                                 </tr>
@@ -143,8 +152,11 @@
                                             source.source.replace('https://www.', '')
                                             }}</span>
                                     </td>
+                                    <td class="text-center"><span class="badge bg-secondary">{{ source.currency or 'N/A'
+                                            }}</span></td>
                                     <td class="text-end">{{ "{:,}".format(source.count) }}</td>
-                                    <td class="text-end">{{ "{:,.2f}".format(source.revenue or 0) }}</td>
+                                    <td class="text-end">{{ "{:,.2f}".format(source.revenue or 0) }} {{ source.currency
+                                        or '' }}</td>
                                 </tr>
                                 {% endfor %}
                             </tbody>
@@ -183,7 +195,8 @@
                                     <td><span class="status-badge status-{{ order.status }}">{{
                                             order.status|status_label }}</span></td>
                                     <td class="text-end">{{ order.product_count }}</td>
-                                    <td class="text-end"><strong>{{ order.total|format_currency }}</strong></td>
+                                    <td class="text-end"><strong>{{ order.total|format_currency }} {{ order.currency or
+                                            '' }}</strong></td>
                                 </tr>
                                 {% endfor %}
                             </tbody>

@@ -407,7 +407,15 @@
                     html += '<div class="col-md-3">';
                     html += '<div class="info-card text-center"><div class="card-body">';
                     html += '<h6 class="text-muted mb-2">总消费</h6>';
-                    html += '<div class="h4 text-success mb-0">' + customer.total_spending.toFixed(2) + ' PLN</div>';
+                    if (customer.spending_by_currency && Object.keys(customer.spending_by_currency).length > 0) {
+                        var spendingHtml = '';
+                        for (var currency in customer.spending_by_currency) {
+                            spendingHtml += '<div class="h5 text-success mb-1">' + customer.spending_by_currency[currency].toFixed(2) + ' ' + currency + '</div>';
+                        }
+                        html += spendingHtml;
+                    } else {
+                        html += '<div class="h4 text-success mb-0">0.00</div>';
+                    }
                     html += '</div></div></div>';
 
                     html += '<div class="col-md-3">';
@@ -475,7 +483,7 @@
                         html += '<td>' + order.source + '</td>';
                         html += '<td><span style="color:' + (statusColors[order.status] || '#ccc') + '">' + (statusLabels[order.status] || order.status) + '</span></td>';
                         html += '<td>' + order.product_count + '</td>';
-                        html += '<td class="text-end">' + order.total.toFixed(2) + '</td>';
+                        html += '<td class="text-end">' + order.total.toFixed(2) + ' ' + (order.currency || '') + '</td>';
                         html += '<td><button class="btn btn-sm btn-outline-info" onclick="showOrderDetail(\'' + order.id + '\')">查看</button></td>';
                         html += '</tr>';
                     });
