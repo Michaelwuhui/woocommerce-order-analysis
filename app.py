@@ -647,7 +647,7 @@ def dashboard():
     
     recent_where = 'WHERE ' + ' AND '.join(recent_conditions)
     recent_orders = conn.execute(f'''
-        SELECT id, number, status, total, shipping_total, currency, date_created, source, line_items
+        SELECT id, number, status, total, shipping_total, currency, date_created, source, line_items, billing
         FROM orders
         {recent_where}
         ORDER BY date_created DESC
@@ -660,6 +660,12 @@ def dashboard():
         order_dict = dict(order)
         items = parse_json_field(order['line_items'])
         order_dict['product_count'] = sum(item.get('quantity', 0) for item in items) if isinstance(items, list) else 0
+        
+        # Parse customer info from billing
+        billing = parse_json_field(order['billing'])
+        order_dict['customer_name'] = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip() if billing else ''
+        order_dict['customer_email'] = billing.get('email', '') if billing else ''
+        
         processed_orders.append(order_dict)
     
     # Trend data based on filter - daily for single month, monthly for longer periods
@@ -722,6 +728,76 @@ def dashboard():
         order['net_total'] = float(order['total'] or 0) - float(order.get('shipping_total') or 0)
         order['net_total_cny'] = round(order['net_total'] * rate, 2) if rate else None
     
+    # Get customer attributes for the recent orders
+    customer_emails = list(set(o['customer_email'] for o in processed_orders if o.get('customer_email')))
+    customer_attributes = {}
+    
+    if customer_emails:
+        placeholders = ', '.join(['?' for _ in customer_emails])
+        
+        # Get manual quality settings
+        manual_settings = conn.execute(f'''
+            SELECT email, quality_tier FROM customer_settings 
+            WHERE email IN ({placeholders})
+        ''', customer_emails).fetchall()
+        
+        # Calculate attributes for each customer
+        for email in customer_emails:
+            if email not in customer_attributes:
+                customer_attributes[email] = {}
+            
+            # Check manual setting
+            manual_tier = 'auto'
+            for row in manual_settings:
+                if row['email'] == email:
+                    manual_tier = row['quality_tier']
+                    break
+            
+            # Get customer stats
+            stats_row = conn.execute('''
+                SELECT 
+                    COUNT(*) as total_orders,
+                    SUM(CASE WHEN status IN ('completed', 'processing') THEN 1 ELSE 0 END) as successful_orders,
+                    SUM(CASE WHEN status IN ('completed', 'processing') THEN total ELSE 0 END) as total_spending,
+                    MAX(date_created) as last_order_date,
+                    MIN(date_created) as first_order_date
+                FROM orders 
+                WHERE billing LIKE ?
+            ''', (f'%"{email}"%',)).fetchone()
+            
+            total_orders = stats_row['total_orders'] or 0
+            successful_orders = stats_row['successful_orders'] or 0
+            total_spending = stats_row['total_spending'] or 0
+            
+            customer_attributes[email]['order_count'] = total_orders
+            customer_attributes[email]['is_new'] = (total_orders <= 1)
+            
+            tier = manual_tier
+            if tier == 'auto':
+                avg_days_between = 0
+                if total_orders > 1 and stats_row['first_order_date'] and stats_row['last_order_date']:
+                    from datetime import datetime
+                    try:
+                        first_date = datetime.fromisoformat(stats_row['first_order_date'][:19])
+                        last_date = datetime.fromisoformat(stats_row['last_order_date'][:19])
+                        days_span = (last_date - first_date).days
+                        avg_days_between = days_span / (total_orders - 1)
+                    except:
+                        avg_days_between = 0
+                
+                tier = calculate_customer_tier(successful_orders, total_spending, avg_days_between)
+            
+            if tier == 'vip':
+                customer_attributes[email]['quality'] = {'label': 'VIP', 'class': 'text-warning', 'icon': 'star-fill'}
+            elif tier == 'good':
+                customer_attributes[email]['quality'] = {'label': '优质', 'class': 'text-success', 'icon': 'gem'}
+            elif tier == 'normal':
+                customer_attributes[email]['quality'] = {'label': '普通', 'class': 'text-primary', 'icon': 'person-check'}
+            elif tier == 'new':
+                customer_attributes[email]['quality'] = {'label': '新客', 'class': 'text-info', 'icon': 'stars'}
+            elif tier == 'bad':
+                customer_attributes[email]['quality'] = {'label': '劣质', 'class': 'text-danger', 'icon': 'x-circle'}
+
     conn.close()
     
     # Calculate overall CNY rate for dashboard
@@ -742,6 +818,7 @@ def dashboard():
                          manager_filter=manager_filter,
                          all_managers=all_managers,
                          site_managers=site_managers,
+                         customer_attributes=customer_attributes,
                          cny_rate=cny_rate)
 
 

@@ -233,6 +233,7 @@
                                 <tr>
                                     <th>订单号</th>
                                     <th>日期</th>
+                                    <th>客户</th>
                                     <th>状态</th>
                                     <th class="text-end">产品数</th>
                                     <th class="text-end">金额</th>
@@ -248,6 +249,30 @@
                                             class="text-info text-decoration-none"><strong>#{{ order.number
                                                 }}</strong></a></td>
                                     <td>{{ order.date_created|format_date }}</td>
+                                    <td>
+                                        <a href="javascript:void(0)"
+                                            onclick="showCustomerDetail('{{ order.customer_email }}')"
+                                            class="text-light text-decoration-none">{{ order.customer_name or '-' }}</a>
+
+                                        {% if customer_attributes and order.customer_email in customer_attributes %}
+                                        {% set attrs = customer_attributes[order.customer_email] %}
+                                        {% if attrs.quality %}
+                                        <span
+                                            class="badge {{ attrs.quality.class }} bg-opacity-10 border border-opacity-25 ms-1"
+                                            style="font-size: 0.7em; padding: 2px 6px;">
+                                            <i class="bi bi-{{ attrs.quality.icon }}"></i> {{ attrs.quality.label }}
+                                        </span>
+                                        {% endif %}
+
+                                        {% if attrs.order_count and attrs.order_count >= 1 %}
+                                        <span
+                                            class="badge text-secondary bg-opacity-10 border border-secondary border-opacity-25 ms-1"
+                                            style="font-size: 0.7em; padding: 2px 6px;">
+                                            <i class="bi bi-bag-check"></i> 第{{ attrs.order_count }}单
+                                        </span>
+                                        {% endif %}
+                                        {% endif %}
+                                    </td>
                                     <td><span class="status-badge status-{{ order.status }}">{{
                                             order.status|status_label }}</span></td>
                                     <td class="text-end">{{ order.product_count }}</td>
