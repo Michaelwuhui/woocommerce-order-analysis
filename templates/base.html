@@ -413,6 +413,9 @@
                             spendingHtml += '<div class="h5 text-success mb-1">' + customer.spending_by_currency[currency].toFixed(2) + ' ' + currency + '</div>';
                         }
                         html += spendingHtml;
+                        if (customer.spending_cny) {
+                            html += '<span class=\"badge bg-warning bg-opacity-25 text-warning\" style=\"font-size: 1rem;\">≈ ¥' + customer.spending_cny.toFixed(2) + '</span>';
+                        }
                     } else {
                         html += '<div class="h4 text-success mb-0">0.00</div>';
                     }

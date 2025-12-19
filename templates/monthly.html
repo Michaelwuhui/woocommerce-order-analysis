@@ -52,6 +52,8 @@
                             <th colspan="3" class="text-center border-start">总计</th>
                             <th colspan="4" class="text-center border-start">成功订单</th>
                             <th colspan="2" class="text-center border-start">失败/取消</th>
+                            <th rowspan="2" class="align-middle text-center">汇率</th>
+                            <th rowspan="2" class="align-middle text-end text-warning">¥净金额</th>
                         </tr>
                         <tr>
                             <th class="text-end border-start">订单数</th>
@@ -84,11 +86,15 @@
                             <td class="text-end text-success">{{ "{:,.2f}".format(row.success_net_amount) }} {{
                                 row.currency or '' }}</td>
                             <td class="text-end border-start text-danger">{{ row.failed_orders }}</td>
-                            <td class="text-end text-warning">{{ row.cancelled_orders }}</td>
+                            <td class="text-end text-danger">{{ row.cancelled_orders }}</td>
+                            <td class="text-center"><span class="badge bg-info bg-opacity-25 text-info">{{
+                                    "%.4f"|format(row.rate_to_cny) if row.rate_to_cny else '-' }}</span></td>
+                            <td class="text-end text-warning">{% if row.success_net_amount_cny %}¥{{
+                                "{:,.2f}".format(row.success_net_amount_cny) }}{% else %}-{% endif %}</td>
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="12" class="text-center py-5">
+                            <td colspan="14" class="text-center py-5">
                                 <i class="bi bi-inbox display-4 text-muted"></i>
                                 <p class="text-muted mt-3">暂无统计数据</p>
                             </td>

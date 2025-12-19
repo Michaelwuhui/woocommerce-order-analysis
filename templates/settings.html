@@ -219,6 +219,110 @@
     </div>
 </div>
 
+<!-- Exchange Rates Card -->
+<div class="card data-card mb-4">
+    <div
+        class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
+        <h5 class="card-title text-white mb-0"><i class="bi bi-currency-exchange me-2"></i>汇率设置 (转换为人民币)</h5>
+        <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#addExchangeRateModal">
+            <i class="bi bi-plus-lg me-1"></i>添加汇率
+        </button>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive" style="max-height: 300px; overflow-y: auto;">
+            <table class="table table-dark table-hover align-middle mb-0" style="--bs-table-bg: transparent;">
+                <thead style="position: sticky; top: 0; z-index: 1; background: #1a1d21;">
+                    <tr>
+                        <th class="ps-4">月份</th>
+                        <th>货币</th>
+                        <th>汇率 (→ CNY)</th>
+                        <th>示例</th>
+                        <th>更新时间</th>
+                        <th class="text-end pe-4">操作</th>
+                    </tr>
+                </thead>
+                <tbody id="exchangeRatesTableBody">
+                    {% for rate in exchange_rates %}
+                    <tr>
+                        <td class="ps-4"><span class="badge bg-info bg-opacity-25 text-info">{{ rate.year_month
+                                }}</span></td>
+                        <td><span class="badge bg-warning bg-opacity-25 text-warning">{{ rate.currency }}</span></td>
+                        <td class="text-white">{{ "%.4f"|format(rate.rate_to_cny) }}</td>
+                        <td class="text-muted small">1 {{ rate.currency }} = ¥{{ "%.2f"|format(rate.rate_to_cny) }}</td>
+                        <td class="text-muted small">{{ rate.updated_at[:16] if rate.updated_at else '-' }}</td>
+                        <td class="text-end pe-4">
+                            <button class="btn btn-sm btn-outline-danger delete-rate-btn" data-rate-id="{{ rate.id }}">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="6" class="text-center text-muted py-4">
+                            <i class="bi bi-currency-exchange display-6 d-block mb-2 opacity-50"></i>
+                            暂无汇率配置，请点击右上角添加
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        <div class="card-footer bg-transparent border-top border-secondary border-opacity-25 py-2">
+            <small class="text-muted">设置每月各货币对人民币的汇率。订单将按其所属月份使用对应汇率计算人民币金额。</small>
+        </div>
+    </div>
+</div>
+
+<!-- Add Exchange Rate Modal -->
+<div class="modal fade" id="addExchangeRateModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-plus-circle me-2"></i>添加汇率</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label text-white-50">月份 <span class="text-danger">*</span></label>
+                    <input type="month" class="form-control bg-black bg-opacity-25 text-white border-secondary"
+                        id="addRateYearMonth">
+                    <small class="text-muted">选择汇率适用的月份</small>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">货币代码 <span class="text-danger">*</span></label>
+                    <select class="form-select bg-black bg-opacity-25 text-white border-secondary" id="addRateCurrency">
+                        <option value="">选择货币</option>
+                        {% for currency in currencies %}
+                        <option value="{{ currency }}">{{ currency }}</option>
+                        {% endfor %}
+                        <option value="__custom__">自定义...</option>
+                    </select>
+                    <input type="text"
+                        class="form-control bg-black bg-opacity-25 text-white border-secondary mt-2 d-none"
+                        id="addRateCurrencyCustom" placeholder="输入货币代码，如 EUR, USD">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">汇率 (→ CNY) <span class="text-danger">*</span></label>
+                    <div class="input-group">
+                        <span class="input-group-text bg-black bg-opacity-25 text-white border-secondary">1 货币 =</span>
+                        <input type="number" step="0.0001"
+                            class="form-control bg-black bg-opacity-25 text-white border-secondary" id="addRateValue"
+                            placeholder="如 1.7823">
+                        <span class="input-group-text bg-black bg-opacity-25 text-white border-secondary">CNY</span>
+                    </div>
+                    <small class="text-muted">例如：1 PLN = 1.78 CNY，则填写 1.78</small>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="saveExchangeRateBtn">
+                    <i class="bi bi-check-lg me-1"></i>保存
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Brand Management Card -->
 <div class="card data-card mb-4">
     <div
@@ -1406,6 +1510,78 @@
         // Show the modal
         new bootstrap.Modal(document.getElementById('addBrandModal')).show();
     }
+
+    // Exchange Rate Management
+    const addRateCurrency = document.getElementById('addRateCurrency');
+    const addRateCurrencyCustom = document.getElementById('addRateCurrencyCustom');
+
+    if (addRateCurrency) {
+        addRateCurrency.addEventListener('change', function () {
+            if (this.value === '__custom__') {
+                addRateCurrencyCustom.classList.remove('d-none');
+            } else {
+                addRateCurrencyCustom.classList.add('d-none');
+            }
+        });
+    }
+
+    const saveExchangeRateBtn = document.getElementById('saveExchangeRateBtn');
+    if (saveExchangeRateBtn) {
+        saveExchangeRateBtn.addEventListener('click', function () {
+            const yearMonth = document.getElementById('addRateYearMonth').value;
+            let currency = document.getElementById('addRateCurrency').value;
+            const rateValue = document.getElementById('addRateValue').value;
+
+            if (currency === '__custom__') {
+                currency = document.getElementById('addRateCurrencyCustom').value.toUpperCase();
+            }
+
+            if (!yearMonth || !currency || !rateValue) {
+                alert('请填写所有字段');
+                return;
+            }
+
+            fetch('/api/exchange-rates', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    year_month: yearMonth,
+                    currency: currency,
+                    rate_to_cny: parseFloat(rateValue)
+                })
+            })
+                .then(res => res.json())
+                .then(result => {
+                    if (result.success) {
+                        alert('汇率保存成功');
+                        location.reload();
+                    } else {
+                        alert('保存失败: ' + (result.error || '未知错误'));
+                    }
+                })
+                .catch(err => {
+                    alert('请求失败: ' + err);
+                });
+        });
+    }
+
+    // Delete exchange rate
+    document.querySelectorAll('.delete-rate-btn').forEach(btn => {
+        btn.addEventListener('click', function () {
+            if (!confirm('确定要删除这个汇率吗？')) return;
+
+            const rateId = this.dataset.rateId;
+            fetch('/api/exchange-rates/' + rateId, { method: 'DELETE' })
+                .then(res => res.json())
+                .then(result => {
+                    if (result.success) {
+                        location.reload();
+                    } else {
+                        alert('删除失败: ' + (result.error || '未知错误'));
+                    }
+                });
+        });
+    });
 </script>
 
 {% endblock %}

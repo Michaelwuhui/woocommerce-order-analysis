@@ -39,7 +39,7 @@
 
     <!-- Stats Cards -->
     <div class="row g-4 mb-4">
-        <div class="col-xl-3 col-md-6">
+        <div class="col-xl col-md-6">
             <div class="stat-card stat-card-primary">
                 <div class="stat-icon">
                     <i class="bi bi-cart-check"></i>
@@ -50,7 +50,7 @@
                 </div>
             </div>
         </div>
-        <div class="col-xl-3 col-md-6">
+        <div class="col-xl col-md-6">
             <div class="stat-card stat-card-success">
                 <div class="stat-icon">
                     <i class="bi bi-currency-dollar"></i>
@@ -62,6 +62,10 @@
                         <span class="d-block">{{ "{:,.2f}".format(amount) }} {{ currency }}</span>
                         {% endfor %}
                     </h3>
+                    {% if stats.total_revenue_cny %}
+                    <span class="badge bg-warning bg-opacity-25 text-warning mt-1" style="font-size: 1rem;">≈ ¥{{
+                        "{:,.2f}".format(stats.total_revenue_cny) }}</span>
+                    {% endif %}
                     {% else %}
                     <h3>0.00</h3>
                     {% endif %}
@@ -69,7 +73,30 @@
                 </div>
             </div>
         </div>
-        <div class="col-xl-3 col-md-6">
+        <div class="col-xl col-md-6">
+            <div class="stat-card" style="background: linear-gradient(135deg, #059669 0%, #047857 100%);">
+                <div class="stat-icon">
+                    <i class="bi bi-cash-stack"></i>
+                </div>
+                <div class="stat-content">
+                    {% if stats.net_revenue_by_currency %}
+                    <h3 style="font-size: 1.1rem;">
+                        {% for currency, amount in stats.net_revenue_by_currency.items() %}
+                        <span class="d-block">{{ "{:,.2f}".format(amount) }} {{ currency }}</span>
+                        {% endfor %}
+                    </h3>
+                    {% if stats.net_revenue_cny %}
+                    <span class="badge bg-warning bg-opacity-25 text-warning mt-1" style="font-size: 1rem;">≈ ¥{{
+                        "{:,.2f}".format(stats.net_revenue_cny) }}</span>
+                    {% endif %}
+                    {% else %}
+                    <h3>0.00</h3>
+                    {% endif %}
+                    <p>净销售额 <small class="opacity-75">(扣除运费)</small></p>
+                </div>
+            </div>
+        </div>
+        <div class="col-xl col-md-6">
             <div class="stat-card stat-card-info">
                 <div class="stat-icon">
                     <i class="bi bi-shop"></i>
@@ -80,7 +107,7 @@
                 </div>
             </div>
         </div>
-        <div class="col-xl-3 col-md-6">
+        <div class="col-xl col-md-6">
             <div class="stat-card stat-card-warning">
                 <div class="stat-icon">
                     <i class="bi bi-graph-up"></i>
@@ -140,6 +167,9 @@
                                     <th class="text-center">货币</th>
                                     <th class="text-end">订单数</th>
                                     <th class="text-end">销售额</th>
+                                    <th class="text-end">净销售额</th>
+                                    <th class="text-center">汇率</th>
+                                    <th class="text-end">¥净额</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -157,6 +187,14 @@
                                     <td class="text-end">{{ "{:,}".format(source.count) }}</td>
                                     <td class="text-end">{{ "{:,.2f}".format(source.revenue or 0) }} {{ source.currency
                                         or '' }}</td>
+                                    <td class="text-end text-success">{{ "{:,.2f}".format(source.net_revenue or 0) }} {{
+                                        source.currency
+                                        or '' }}</td>
+                                    <td class="text-center"><span class="badge bg-info bg-opacity-25 text-info">{{
+                                            "%.4f"|format(source.rate_to_cny) if source.rate_to_cny else '-' }}</span>
+                                    </td>
+                                    <td class="text-end text-warning">{% if source.net_revenue_cny %}¥{{
+                                        "{:,.2f}".format(source.net_revenue_cny) }}{% else %}-{% endif %}</td>
                                 </tr>
                                 {% endfor %}
                             </tbody>
@@ -183,6 +221,9 @@
                                     <th>状态</th>
                                     <th class="text-end">产品数</th>
                                     <th class="text-end">金额</th>
+                                    <th class="text-end">净额</th>
+                                    <th class="text-center">汇率</th>
+                                    <th class="text-end">¥净额</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -197,6 +238,13 @@
                                     <td class="text-end">{{ order.product_count }}</td>
                                     <td class="text-end"><strong>{{ order.total|format_currency }} {{ order.currency or
                                             '' }}</strong></td>
+                                    <td class="text-end text-success">{{ "{:,.2f}".format(order.net_total or 0) }} {{
+                                        order.currency or '' }}</td>
+                                    <td class="text-center"><span class="badge bg-info bg-opacity-25 text-info small">{{
+                                            "%.4f"|format(order.rate_to_cny) if order.rate_to_cny else '-' }}</span>
+                                    </td>
+                                    <td class="text-end text-warning">{% if order.net_total_cny %}¥{{
+                                        "{:,.2f}".format(order.net_total_cny) }}{% else %}-{% endif %}</td>
                                 </tr>
                                 {% endfor %}
                             </tbody>
@@ -242,7 +290,21 @@
             maintainAspectRatio: false,
             interaction: { intersect: false, mode: 'index' },
             plugins: {
-                legend: { labels: { color: '#fff' } }
+                legend: { labels: { color: '#fff' } },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            var label = context.dataset.label || '';
+                            var value = context.parsed.y;
+                            if (label === '销售额') {
+                                var cnyRate = {% if stats.net_revenue %}{{ (stats.net_revenue_cny / stats.net_revenue)|round(4) }}{% else %}0{% endif %};
+                                var cnyValue = value * cnyRate;
+                                return label + ': ' + value.toLocaleString('zh-CN', {minimumFractionDigits: 2}) + ' (≈ ¥' + cnyValue.toLocaleString('zh-CN', {minimumFractionDigits: 2}) + ')';
+                            }
+                            return label + ': ' + value;
+                        }
+                    }
+                }
             },
             scales: {
                 x: {
@@ -250,7 +312,7 @@
                     ticks: {
                         color: '#aaa',
                         maxRotation: 0,
-                        callback: function (value, index) {
+                        callback: function(value, index) {
                             if (trendType === 'daily') {
                                 var label = this.getLabelForValue(value);
                                 var date = new Date(label);

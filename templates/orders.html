@@ -99,16 +99,12 @@
                     <thead>
                         <tr>
                             <th rowspan="2" class="align-middle">来源网站</th>
-                            <th colspan="3" class="text-center border-start">总计</th>
-                            <th colspan="4" class="text-center border-start text-success">成功订单</th>
-                            <th colspan="2" class="text-center border-start text-danger">失败/取消</th>
-                        </tr>
-                        <tr>
-                            <th rowspan="2" class="align-middle">来源网站</th>
                             <th rowspan="2" class="align-middle text-center">货币</th>
                             <th colspan="3" class="text-center border-start">总计</th>
                             <th colspan="4" class="text-center border-start text-success">成功订单</th>
                             <th colspan="2" class="text-center border-start text-danger">失败/取消</th>
+                            <th rowspan="2" class="align-middle text-center">汇率</th>
+                            <th rowspan="2" class="align-middle text-end text-warning">¥净金额</th>
                         </tr>
                         <tr>
                             <th class="text-end border-start">订单数</th>
@@ -141,7 +137,11 @@
                             <td class="text-end text-success">{{ "{:,.2f}".format(stat.success_net_amount or 0) }} {{
                                 stat.currency or '' }}</td>
                             <td class="text-end border-start text-danger">{{ stat.failed_orders }}</td>
-                            <td class="text-end text-warning">{{ stat.cancelled_orders }}</td>
+                            <td class="text-end text-danger">{{ stat.cancelled_orders }}</td>
+                            <td class="text-center"><span class="badge bg-info bg-opacity-25 text-info">{{
+                                    "%.4f"|format(stat.rate_to_cny) if stat.rate_to_cny else '-' }}</span></td>
+                            <td class="text-end text-warning">{% if stat.success_net_amount_cny %}¥{{
+                                "{:,.2f}".format(stat.success_net_amount_cny) }}{% else %}-{% endif %}</td>
                         </tr>
                         {% endfor %}
                         <!-- Totals Row -->
@@ -160,7 +160,10 @@
                             <td class="text-end text-success"><strong>-</strong></td>
                             <td class="text-end border-start text-danger"><strong>{{ totals.failed_orders }}</strong>
                             </td>
-                            <td class="text-end text-warning"><strong>{{ totals.cancelled_orders }}</strong></td>
+                            <td class="text-end text-danger"><strong>{{ totals.cancelled_orders }}</strong></td>
+                            <td class="text-center">-</td>
+                            <td class="text-end text-warning"><strong>¥{{ "{:,.2f}".format(totals.success_net_amount_cny
+                                    or 0) }}</strong></td>
                         </tr>
                     </tbody>
                 </table>
@@ -196,6 +199,9 @@
                             <th class="text-end">总数量</th>
                             <th class="text-end">运费</th>
                             <th class="text-end">订单金额</th>
+                            <th class="text-end">净额</th>
+                            <th class="text-center">汇率</th>
+                            <th class="text-end">¥净额</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -233,10 +239,17 @@
                                     "{:.2f}".format(order.shipping_total or 0) }}</span></td>
                             <td class="text-end align-middle"><strong>{{ order.total|format_currency }} {{
                                     order.currency or '' }}</strong></td>
+                            <td class="text-end align-middle text-success">{{ "{:,.2f}".format(order.net_total or 0) }}
+                                {{ order.currency or '' }}</td>
+                            <td class="text-center align-middle"><span
+                                    class="badge bg-info bg-opacity-25 text-info small">{{
+                                    "%.4f"|format(order.rate_to_cny) if order.rate_to_cny else '-' }}</span></td>
+                            <td class="text-end align-middle text-warning">{% if order.net_total_cny %}¥{{
+                                "{:,.2f}".format(order.net_total_cny) }}{% else %}-{% endif %}</td>
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="9" class="text-center py-5">
+                            <td colspan="12" class="text-center py-5">
                                 <i class="bi bi-inbox display-4 text-muted"></i>
                                 <p class="text-muted mt-3">没有找到符合条件的订单</p>
                             </td>

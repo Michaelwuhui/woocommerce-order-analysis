@@ -195,6 +195,82 @@ def build_source_filter_clause(allowed_sources, table_alias=''):
     return f'AND {prefix}source IN ({placeholders})', allowed_sources
 
 
+def get_cny_rate(currency, year_month):
+    """
+    Get CNY exchange rate for a currency in a specific month.
+    Falls back to the most recent rate if not found for the specific month.
+    Returns (rate, actual_year_month) or (None, None) if not found.
+    """
+    if not currency or currency == 'CNY':
+        return 1.0, year_month  # CNY to CNY is 1:1
+    
+    conn = get_db_connection()
+    
+    # Try exact month first
+    rate = conn.execute('''
+        SELECT rate_to_cny, year_month FROM exchange_rates
+        WHERE currency = ? AND year_month = ?
+    ''', (currency, year_month)).fetchone()
+    
+    if rate:
+        conn.close()
+        return rate['rate_to_cny'], rate['year_month']
+    
+    # Fall back to most recent rate before this month
+    rate = conn.execute('''
+        SELECT rate_to_cny, year_month FROM exchange_rates
+        WHERE currency = ? AND year_month <= ?
+        ORDER BY year_month DESC
+        LIMIT 1
+    ''', (currency, year_month)).fetchone()
+    
+    if rate:
+        conn.close()
+        return rate['rate_to_cny'], rate['year_month']
+    
+    # Fall back to any rate for this currency
+    rate = conn.execute('''
+        SELECT rate_to_cny, year_month FROM exchange_rates
+        WHERE currency = ?
+        ORDER BY year_month DESC
+        LIMIT 1
+    ''', (currency,)).fetchone()
+    
+    conn.close()
+    
+    if rate:
+        return rate['rate_to_cny'], rate['year_month']
+    
+    return None, None
+
+
+def convert_to_cny(amount, currency, year_month):
+    """
+    Convert an amount to CNY using the exchange rate for the given month.
+    Returns (cny_amount, rate, actual_month) or (None, None, None) if no rate found.
+    """
+    if amount is None:
+        return None, None, None
+    
+    rate, actual_month = get_cny_rate(currency, year_month)
+    if rate is None:
+        return None, None, None
+    
+    return round(amount * rate, 2), rate, actual_month
+
+
+def get_all_exchange_rates():
+    """Get all exchange rates from database."""
+    conn = get_db_connection()
+    rates = conn.execute('''
+        SELECT id, year_month, currency, rate_to_cny, updated_at
+        FROM exchange_rates
+        ORDER BY year_month DESC, currency
+    ''').fetchall()
+    conn.close()
+    return [dict(r) for r in rates]
+
+
 def admin_required(f):
     """Decorator to require admin role"""
     from functools import wraps
@@ -412,16 +488,18 @@ def dashboard():
     revenue_conditions.append('status NOT IN ("failed", "cancelled")')
     revenue_where = 'WHERE ' + ' AND '.join(revenue_conditions)
     
-    # Get revenue grouped by currency
+    # Get revenue grouped by currency (total and net = total - shipping)
     revenue_by_currency_raw = conn.execute(f'''
-        SELECT currency, SUM(total) as revenue
+        SELECT currency, SUM(total) as revenue, SUM(shipping_total) as shipping
         FROM orders {revenue_where}
         GROUP BY currency
     ''', params).fetchall()
     stats['total_revenue_by_currency'] = {row['currency']: row['revenue'] or 0 for row in revenue_by_currency_raw}
+    stats['net_revenue_by_currency'] = {row['currency']: (row['revenue'] or 0) - (row['shipping'] or 0) for row in revenue_by_currency_raw}
     
     # Also keep a simple total for backward compatibility
     stats['total_revenue'] = sum(stats['total_revenue_by_currency'].values())
+    stats['net_revenue'] = sum(stats['net_revenue_by_currency'].values())
     
     # Orders by status with currency
     status_data_raw = conn.execute(f'''
@@ -445,7 +523,7 @@ def dashboard():
     
     # Orders by source with currency
     source_data_raw = conn.execute(f'''
-        SELECT source, currency, COUNT(*) as count, SUM(total) as revenue
+        SELECT source, currency, COUNT(*) as count, SUM(total) as revenue, SUM(shipping_total) as shipping
         FROM orders {date_condition}
         GROUP BY source, currency
     ''', params).fetchall()
@@ -454,9 +532,13 @@ def dashboard():
     for row in source_data_raw:
         source = row['source']
         if source not in source_dict:
-            source_dict[source] = {'source': source, 'count': 0, 'currency': row['currency'], 'revenue': 0}
+            source_dict[source] = {'source': source, 'count': 0, 'currency': row['currency'], 'revenue': 0, 'shipping': 0}
         source_dict[source]['count'] += row['count']
         source_dict[source]['revenue'] += row['revenue'] or 0
+        source_dict[source]['shipping'] += row['shipping'] or 0
+    # Calculate net revenue
+    for source in source_dict.values():
+        source['net_revenue'] = source['revenue'] - source['shipping']
     source_data = list(source_dict.values())
     
     # Recent orders - apply permission filter, optionally source filter
@@ -477,7 +559,7 @@ def dashboard():
     
     recent_where = 'WHERE ' + ' AND '.join(recent_conditions)
     recent_orders = conn.execute(f'''
-        SELECT id, number, status, total, currency, date_created, source, line_items
+        SELECT id, number, status, total, shipping_total, currency, date_created, source, line_items
         FROM orders
         {recent_where}
         ORDER BY date_created DESC
@@ -520,6 +602,37 @@ def dashboard():
     # Get site managers mapping
     sites = conn.execute('SELECT url, manager FROM sites').fetchall()
     site_managers = {s['url']: s['manager'] or '' for s in sites}
+    
+    # Calculate CNY totals for revenue
+    total_cny = 0
+    net_cny = 0
+    for currency, amount in stats['total_revenue_by_currency'].items():
+        rate, _ = get_cny_rate(currency, date_to[:7] if date_to else (date_from[:7] if date_from else None))
+        if rate:
+            total_cny += amount * rate
+            net_cny += stats['net_revenue_by_currency'].get(currency, 0) * rate
+    stats['total_revenue_cny'] = round(total_cny, 2)
+    stats['net_revenue_cny'] = round(net_cny, 2)
+    
+    # Add CNY conversion to source_data
+    for source in source_data:
+        currency = source.get('currency', 'PLN')
+        # Get month from date filter or use current month
+        month = date_to[:7] if date_to else (date_from[:7] if date_from else None)
+        rate, _ = get_cny_rate(currency, month)
+        source['rate_to_cny'] = rate if rate else None
+        source['revenue_cny'] = round(source['revenue'] * rate, 2) if rate else None
+        source['net_revenue_cny'] = round(source['net_revenue'] * rate, 2) if rate else None
+    
+    # Add CNY conversion to recent_orders
+    for order in processed_orders:
+        currency = order.get('currency', 'PLN')
+        order_month = order['date_created'][:7] if order.get('date_created') else None
+        rate, _ = get_cny_rate(currency, order_month)
+        order['rate_to_cny'] = rate if rate else None
+        order['total_cny'] = round(float(order['total'] or 0) * rate, 2) if rate else None
+        order['net_total'] = float(order['total'] or 0) - float(order.get('shipping_total') or 0)
+        order['net_total_cny'] = round(order['net_total'] * rate, 2) if rate else None
     
     conn.close()
     
@@ -732,6 +845,35 @@ def orders():
     sites = conn.execute('SELECT url, manager FROM sites').fetchall()
     site_managers = {s['url']: s['manager'] or '' for s in sites}
     
+    # Add CNY conversion to summary_stats
+    totals_cny = 0
+    for stat in summary_stats:
+        currency = stat.get('currency', 'PLN')
+        # Use current_month for rate lookup
+        rate, _ = get_cny_rate(currency, current_month)
+        stat['rate_to_cny'] = rate
+        if rate:
+            stat['total_amount_cny'] = round((stat['total_amount'] or 0) * rate, 2)
+            stat['success_amount_cny'] = round((stat['success_amount'] or 0) * rate, 2)
+            stat['success_net_amount_cny'] = round((stat['success_net_amount'] or 0) * rate, 2)
+            totals_cny += stat['success_net_amount_cny']
+        else:
+            stat['total_amount_cny'] = None
+            stat['success_amount_cny'] = None
+            stat['success_net_amount_cny'] = None
+    
+    totals['success_net_amount_cny'] = round(totals_cny, 2)
+    
+    # Add CNY conversion to processed_orders
+    for order in processed_orders:
+        currency = order.get('currency', 'PLN')
+        order_month = order['date_created'][:7] if order.get('date_created') else current_month
+        rate, _ = get_cny_rate(currency, order_month)
+        order['rate_to_cny'] = rate
+        order['total_cny'] = round(float(order['total'] or 0) * rate, 2) if rate else None
+        order['net_total'] = float(order['total'] or 0) - float(order.get('shipping_total') or 0)
+        order['net_total_cny'] = round(order['net_total'] * rate, 2) if rate else None
+    
     conn.close()
     
     return render_template('orders.html',
@@ -874,6 +1016,14 @@ def monthly():
     sites = conn2.execute('SELECT url, manager FROM sites').fetchall()
     site_managers = {s['url']: s['manager'] or '' for s in sites}
     conn2.close()
+    
+    # Add CNY conversion to each row
+    for row in rows:
+        currency = row.get('currency', 'PLN')
+        month = row.get('month', '')
+        rate, _ = get_cny_rate(currency, month)
+        row['rate_to_cny'] = rate
+        row['success_net_amount_cny'] = round(row['success_net_amount'] * rate, 2) if rate else None
     
     return render_template('monthly.html', monthly_stats=rows, sources=all_sources, source_filter=source_filter, sort_by=sort_by, site_managers=site_managers)
 
@@ -1270,6 +1420,15 @@ def get_customer_details(email):
     else:
         customer_tier = {'level': '新客', 'color': '#6b7280', 'icon': 'person'}
     
+    # Calculate CNY total for customer spending
+    from datetime import datetime
+    current_month = datetime.now().strftime('%Y-%m')
+    spending_cny = 0
+    for currency, amount in spending_by_currency.items():
+        rate, _ = get_cny_rate(currency, current_month)
+        if rate:
+            spending_cny += amount * rate
+    
     result = {
         'email': email,
         'name': customer_name,
@@ -1280,6 +1439,7 @@ def get_customer_details(email):
         'cancelled_orders': cancelled_orders,
         'total_spending': total_spending,
         'spending_by_currency': spending_by_currency,  # New: currency breakdown
+        'spending_cny': round(spending_cny, 2),  # New: CNY total
         'avg_order_value': total_spending / successful_orders if successful_orders > 0 else 0,
         'first_order_date': unique_dates[0] if unique_dates else None,
         'last_order_date': unique_dates[-1] if unique_dates else None,
@@ -1298,7 +1458,7 @@ def get_customer_details(email):
 STATUS_LABELS = {
     'pending': '待处理',
     'processing': '处理中',
-    'on-hold': '暂停',
+    'on-hold': '已发货',
     'completed': '已完成',
     'cancelled': '已取消',
     'refunded': '已退款',
@@ -1638,8 +1798,82 @@ def settings():
     """Settings page for site management - Admin only"""
     conn = get_db_connection()
     sites = conn.execute('SELECT * FROM sites').fetchall()
+    
+    # Get exchange rates
+    exchange_rates = conn.execute('''
+        SELECT id, year_month, currency, rate_to_cny, updated_at
+        FROM exchange_rates
+        ORDER BY year_month DESC, currency
+    ''').fetchall()
+    
+    # Get distinct currencies from orders
+    currencies = conn.execute('SELECT DISTINCT currency FROM orders WHERE currency IS NOT NULL').fetchall()
+    currency_list = [c['currency'] for c in currencies if c['currency']]
+    
     conn.close()
-    return render_template('settings.html', sites=sites)
+    return render_template('settings.html', 
+                          sites=sites, 
+                          exchange_rates=exchange_rates,
+                          currencies=currency_list)
+
+
+@app.route('/api/exchange-rates', methods=['GET', 'POST'])
+@login_required
+@admin_required
+def exchange_rates_api():
+    """API for managing exchange rates"""
+    conn = get_db_connection()
+    
+    if request.method == 'GET':
+        rates = conn.execute('''
+            SELECT id, year_month, currency, rate_to_cny, updated_at
+            FROM exchange_rates
+            ORDER BY year_month DESC, currency
+        ''').fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rates])
+    
+    elif request.method == 'POST':
+        data = request.get_json()
+        year_month = data.get('year_month', '')
+        currency = data.get('currency', '').upper()
+        rate_to_cny = data.get('rate_to_cny')
+        
+        if not year_month or not currency or rate_to_cny is None:
+            conn.close()
+            return jsonify({'error': '请填写所有字段'}), 400
+        
+        try:
+            rate_to_cny = float(rate_to_cny)
+            if rate_to_cny <= 0:
+                raise ValueError("Rate must be positive")
+        except (ValueError, TypeError):
+            conn.close()
+            return jsonify({'error': '汇率必须是正数'}), 400
+        
+        try:
+            conn.execute('''
+                INSERT OR REPLACE INTO exchange_rates (year_month, currency, rate_to_cny, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+            ''', (year_month, currency, rate_to_cny))
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'message': '汇率保存成功'})
+        except Exception as e:
+            conn.close()
+            return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/exchange-rates/<int:rate_id>', methods=['DELETE'])
+@login_required
+@admin_required
+def delete_exchange_rate(rate_id):
+    """Delete an exchange rate"""
+    conn = get_db_connection()
+    conn.execute('DELETE FROM exchange_rates WHERE id = ?', (rate_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'message': '汇率已删除'})
 
 
 @app.route('/api/sites/import-from-script', methods=['POST'])
@@ -2532,9 +2766,9 @@ def products():
     
     where_clause = 'WHERE ' + ' AND '.join(conditions)
     
-    # Get all orders with line items (including currency)
+    # Get all orders with line items (including currency and shipping)
     orders = conn.execute(f'''
-        SELECT id, line_items, source, currency, total, date_created
+        SELECT id, line_items, source, currency, total, shipping_total, date_created
         FROM orders {where_clause}
     ''', params).fetchall()
     
@@ -2584,10 +2818,21 @@ def products():
         if not isinstance(items, list):
             continue
         
+        # Calculate order items sum for shipping pro-rating
+        order_items_sum = sum(float(i.get('total', 0)) for i in items)
+        order_shipping = float(order['shipping_total'] or 0)
+        
         for item in items:
             product_name = item.get('name', '')
             quantity = item.get('quantity', 0)
             total = float(item.get('total', 0))
+            
+            # Pro-rate shipping
+            item_shipping = 0
+            if order_items_sum > 0:
+                item_shipping = order_shipping * (total / order_items_sum)
+            
+            gross_total = total + item_shipping
             
             # Extract flavor from WooCommerce variation meta_data
             meta_flavor = extract_flavor_from_meta(item)
@@ -2634,6 +2879,7 @@ def products():
                     'flavor': flavor,
                     'quantity': 0,
                     'revenue_by_currency': {},
+                    'gross_revenue_by_currency': {},
                     'order_count': 0
                 }
             product_stats[product_key]['quantity'] += quantity
@@ -2641,26 +2887,32 @@ def products():
             currency = order['currency'] or 'N/A'
             if currency not in product_stats[product_key]['revenue_by_currency']:
                 product_stats[product_key]['revenue_by_currency'][currency] = 0
+                product_stats[product_key]['gross_revenue_by_currency'][currency] = 0
             product_stats[product_key]['revenue_by_currency'][currency] += total
+            product_stats[product_key]['gross_revenue_by_currency'][currency] += gross_total
             product_stats[product_key]['order_count'] += 1
             
             # Brand level stats
             if brand not in brand_stats:
-                brand_stats[brand] = {'quantity': 0, 'revenue_by_currency': {}, 'order_count': 0}
+                brand_stats[brand] = {'quantity': 0, 'revenue_by_currency': {}, 'gross_revenue_by_currency': {}, 'order_count': 0}
             brand_stats[brand]['quantity'] += quantity
             if currency not in brand_stats[brand]['revenue_by_currency']:
                 brand_stats[brand]['revenue_by_currency'][currency] = 0
+                brand_stats[brand]['gross_revenue_by_currency'][currency] = 0
             brand_stats[brand]['revenue_by_currency'][currency] += total
+            brand_stats[brand]['gross_revenue_by_currency'][currency] += gross_total
             brand_stats[brand]['order_count'] += 1
             
             # Puff level stats
             puff_key = str(puffs) if puffs else 'Unknown'
             if puff_key not in puff_stats:
-                puff_stats[puff_key] = {'quantity': 0, 'revenue_by_currency': {}}
+                puff_stats[puff_key] = {'quantity': 0, 'revenue_by_currency': {}, 'gross_revenue_by_currency': {}}
             puff_stats[puff_key]['quantity'] += quantity
             if currency not in puff_stats[puff_key]['revenue_by_currency']:
                 puff_stats[puff_key]['revenue_by_currency'][currency] = 0
+                puff_stats[puff_key]['gross_revenue_by_currency'][currency] = 0
             puff_stats[puff_key]['revenue_by_currency'][currency] += total
+            puff_stats[puff_key]['gross_revenue_by_currency'][currency] += gross_total
     
     # Sort products by quantity (top sellers)
     top_products = sorted(product_stats.values(), key=lambda x: x['quantity'], reverse=True)[:50]
@@ -2697,15 +2949,40 @@ def products():
     
     # Calculate totals with revenue by currency
     total_revenue_by_currency = {}
+    total_gross_revenue_by_currency = {}
     for p in product_stats.values():
         for currency, amount in p.get('revenue_by_currency', {}).items():
             if currency not in total_revenue_by_currency:
                 total_revenue_by_currency[currency] = 0
             total_revenue_by_currency[currency] += amount
+            
+        for currency, amount in p.get('gross_revenue_by_currency', {}).items():
+            if currency not in total_gross_revenue_by_currency:
+                total_gross_revenue_by_currency[currency] = 0
+            total_gross_revenue_by_currency[currency] += amount
+    
+    # Calculate CNY total for products
+    total_revenue_cny = 0
+    total_gross_revenue_cny = 0
+    from datetime import datetime
+    current_month = datetime.now().strftime('%Y-%m')
+    
+    for currency, amount in total_revenue_by_currency.items():
+        rate, _ = get_cny_rate(currency, current_month)
+        if rate:
+            total_revenue_cny += amount * rate
+            
+    for currency, amount in total_gross_revenue_by_currency.items():
+        rate, _ = get_cny_rate(currency, current_month)
+        if rate:
+            total_gross_revenue_cny += amount * rate
     
     totals = {
         'total_quantity': sum(p['quantity'] for p in product_stats.values()),
         'total_revenue_by_currency': total_revenue_by_currency,
+        'total_gross_revenue_by_currency': total_gross_revenue_by_currency,
+        'total_revenue_cny': round(total_revenue_cny, 2),
+        'total_gross_revenue_cny': round(total_gross_revenue_cny, 2),
         'brand_count': len(brand_stats),
         'product_count': len(product_stats)
     }
