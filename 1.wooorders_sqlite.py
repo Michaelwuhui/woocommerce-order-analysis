@@ -251,6 +251,106 @@ def get_order_ids_from_db(site_url):
         if connection:
             connection.close()
 
+
+def fetch_all_remote_order_ids(wcapi, site_url):
+    """从WooCommerce API获取所有订单ID列表"""
+    all_ids = set()
+    page = 1
+    per_page = 100  # 使用较大的分页以减少请求次数
+    max_retries = 3
+    retry_count = 0
+    
+    print(f"正在获取 {site_url} 的所有远程订单ID...")
+    
+    while True:
+        try:
+            time.sleep(random.uniform(0.5, 1))
+            
+            # 只获取订单ID，减少数据传输
+            response = wcapi.get("orders", params={
+                "per_page": per_page,
+                "page": page,
+                "_fields": "id"  # 只返回ID字段
+            })
+            
+            if response.status_code != 200:
+                if retry_count < max_retries:
+                    retry_count += 1
+                    time.sleep(2)
+                    continue
+                else:
+                    print(f"获取远程订单ID失败: HTTP {response.status_code}")
+                    break
+            
+            data = response.json()
+            if not data:
+                break
+            
+            for order in data:
+                all_ids.add(str(order['id']))
+            
+            print(f"已获取 {len(all_ids)} 个远程订单ID (页 {page})")
+            
+            page += 1
+            retry_count = 0
+            
+        except Exception as e:
+            print(f"获取远程订单ID时出错: {e}")
+            if retry_count < max_retries:
+                retry_count += 1
+                time.sleep(2)
+                continue
+            else:
+                break
+    
+    print(f"共获取 {len(all_ids)} 个远程订单ID")
+    return all_ids
+
+
+def delete_orphaned_orders(site_url, remote_ids):
+    """删除本地数据库中已在WooCommerce中被删除的订单"""
+    local_ids = get_order_ids_from_db(site_url)
+    
+    if not local_ids:
+        print(f"站点 {site_url} 本地无订单，跳过删除检查")
+        return 0
+    
+    if not remote_ids:
+        print(f"未获取到远程订单ID，跳过删除以避免误删")
+        return 0
+    
+    # 找出本地存在但远程不存在的订单
+    local_set = set(local_ids)
+    orphaned_ids = local_set - remote_ids
+    
+    if not orphaned_ids:
+        print(f"站点 {site_url} 没有需要删除的孤立订单")
+        return 0
+    
+    print(f"发现 {len(orphaned_ids)} 个孤立订单需要删除")
+    
+    connection = create_database_connection()
+    if not connection:
+        return 0
+    
+    try:
+        cursor = connection.cursor()
+        # 批量删除孤立订单
+        placeholders = ','.join(['?' for _ in orphaned_ids])
+        delete_query = f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})"
+        params = [site_url] + list(orphaned_ids)
+        cursor.execute(delete_query, params)
+        connection.commit()
+        deleted_count = cursor.rowcount
+        print(f"已删除 {deleted_count} 个孤立订单: {list(orphaned_ids)[:10]}{'...' if len(orphaned_ids) > 10 else ''}")
+        return deleted_count
+    except Exception as e:
+        print(f"删除孤立订单时出错: {e}")
+        return 0
+    finally:
+        if connection:
+            connection.close()
+
 def save_orders_to_db(orders_data):
     """将订单数据保存到SQLite数据库"""
     if not orders_data:
@@ -461,15 +561,27 @@ def fetch_orders_modified_after(wcapi, site_url, modified_after=None):
                 break
     return orders
 
-def main(incremental=True, sync_status=True, start_date=None):
-    """主函数"""
+def main(incremental=True, sync_status=True, start_date=None, clean_deleted=False):
+    """主函数
+    
+    Args:
+        incremental: 是否增量同步
+        sync_status: 是否同步状态更新
+        start_date: 起始日期
+        clean_deleted: 是否清理已删除的订单
+    """
     print("开始 WooCommerce 订单同步程序（SQLite版本）...")
+    
+    if clean_deleted:
+        print("注意: 已启用删除同步，将清理本地数据库中已被远程删除的订单")
     
     # 创建订单表
     create_orders_table()
     
     # 获取站点配置（优先从数据库，否则使用硬编码）
     sites = get_sites()
+    
+    total_deleted = 0
     
     for site in sites:
         print(f"\n处理站点: {site['url']}")
@@ -499,15 +611,26 @@ def main(incremental=True, sync_status=True, start_date=None):
         if updated_orders:
             print(f"站点 {site['url']} 获取到 {len(updated_orders)} 个修改更新的订单")
         
+        # 清理已删除的订单
+        if clean_deleted:
+            print(f"\n开始检查站点 {site['url']} 的已删除订单...")
+            remote_ids = fetch_all_remote_order_ids(wcapi, site['url'])
+            deleted_count = delete_orphaned_orders(site['url'], remote_ids)
+            total_deleted += deleted_count
+        
         print(f"站点 {site['url']} 处理完成，等待处理下一个站点...")
         time.sleep(random.uniform(5, 10))
     
     print("\n所有站点处理完成！")
+    if clean_deleted:
+        print(f"共清理 {total_deleted} 个已删除的订单")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="WooCommerce订单同步工具")
     parser.add_argument("--start", type=str, help="YYYY-MM-DD 起始日期")
+    parser.add_argument("--clean", action="store_true", help="清理已在WooCommerce中删除的订单")
     args = parser.parse_args()
+    
     start_iso = None
     if args.start:
         try:
@@ -515,4 +638,5 @@ if __name__ == "__main__":
             start_iso = dt.strftime("%Y-%m-%dT00:00:00")
         except Exception:
             start_iso = None
-    main(incremental=True, sync_status=False, start_date=start_iso)
+    
+    main(incremental=True, sync_status=False, start_date=start_iso, clean_deleted=args.clean)

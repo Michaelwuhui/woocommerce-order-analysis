@@ -2561,6 +2561,237 @@ def sync_data():
     
     return jsonify({'success': True, 'message': 'Synchronization started'})
 
+
+@app.route('/api/sync/deep/<int:site_id>', methods=['POST'])
+@login_required
+def deep_sync_site(site_id):
+    """Trigger deep sync for a single site using 1.wooorders_sqlite.py"""
+    import subprocess
+    import threading
+    
+    # Use unique ID for deep sync status (site_id + 100000)
+    status_id = site_id + 100000
+    
+    SYNC_STATUS[status_id] = {
+        'status': 'running',
+        'message': '正在启动单站点深度同步...',
+        'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Deep sync started for site {site_id}"]
+    }
+    
+    def run_deep_sync(app_context, site_id, status_id):
+        with app_context:
+            try:
+                conn = get_db_connection()
+                site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
+                conn.close()
+                
+                if not site:
+                    SYNC_STATUS[status_id]['status'] = 'error'
+                    SYNC_STATUS[status_id]['message'] = 'Site not found'
+                    return
+                
+                site_url = site['url']
+                SYNC_STATUS[status_id]['message'] = f'正在深度同步 {site_url}...'
+                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Processing {site_url}")
+                
+                # Import sync functions directly
+                from woocommerce import API
+                import time
+                import random
+                
+                # Create WooCommerce API client
+                wcapi = API(
+                    url=site_url,
+                    consumer_key=site['consumer_key'],
+                    consumer_secret=site['consumer_secret'],
+                    version="wc/v3",
+                    timeout=30
+                )
+                
+                # Fetch all orders (full resync)
+                orders = []
+                page = 1
+                per_page = 50
+                
+                SYNC_STATUS[status_id]['message'] = f'正在获取所有订单...'
+                
+                while True:
+                    try:
+                        time.sleep(random.uniform(0.5, 1))
+                        response = wcapi.get("orders", params={
+                            "per_page": per_page,
+                            "page": page,
+                            "expand": "line_items,shipping_lines,tax_lines,fee_lines,coupon_lines,refunds"
+                        })
+                        
+                        if response.status_code != 200:
+                            SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] HTTP {response.status_code}")
+                            break
+                        
+                        data = response.json()
+                        if not data:
+                            break
+                        
+                        for order in data:
+                            order['source'] = site_url
+                        
+                        # Save orders using sync_utils
+                        import sync_utils
+                        sync_utils.save_orders_to_db(data)
+                        orders.extend(data)
+                        
+                        SYNC_STATUS[status_id]['message'] = f'已获取 {len(orders)} 个订单 (页 {page})'
+                        SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Page {page}: {len(data)} orders")
+                        
+                        page += 1
+                        
+                    except Exception as e:
+                        SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
+                        break
+                
+                # Update last sync time
+                conn = get_db_connection()
+                conn.execute('UPDATE sites SET last_sync = ? WHERE id = ?', 
+                             (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), site_id))
+                conn.commit()
+                conn.close()
+                
+                SYNC_STATUS[status_id]['status'] = 'success'
+                SYNC_STATUS[status_id]['message'] = f'深度同步完成，共 {len(orders)} 个订单'
+                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Completed: {len(orders)} total orders")
+                
+            except Exception as e:
+                SYNC_STATUS[status_id]['status'] = 'error'
+                SYNC_STATUS[status_id]['message'] = str(e)
+                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+    
+    thread = threading.Thread(target=run_deep_sync, args=(app.app_context(), site_id, status_id))
+    thread.start()
+    
+    return jsonify({'success': True, 'sync_id': status_id, 'message': 'Deep sync started'})
+
+
+@app.route('/api/sync/clean/<int:site_id>', methods=['POST'])
+@login_required
+def clean_sync_site(site_id):
+    """Clean deleted orders for a single site"""
+    import threading
+    
+    # Use unique ID for clean sync status (site_id + 200000)
+    status_id = site_id + 200000
+    
+    SYNC_STATUS[status_id] = {
+        'status': 'running',
+        'message': '正在启动清理同步...',
+        'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Clean sync started for site {site_id}"]
+    }
+    
+    def run_clean_sync(app_context, site_id, status_id):
+        with app_context:
+            try:
+                conn = get_db_connection()
+                site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
+                conn.close()
+                
+                if not site:
+                    SYNC_STATUS[status_id]['status'] = 'error'
+                    SYNC_STATUS[status_id]['message'] = 'Site not found'
+                    return
+                
+                site_url = site['url']
+                SYNC_STATUS[status_id]['message'] = f'正在获取远程订单ID...'
+                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching remote order IDs for {site_url}")
+                
+                from woocommerce import API
+                import time
+                import random
+                
+                wcapi = API(
+                    url=site_url,
+                    consumer_key=site['consumer_key'],
+                    consumer_secret=site['consumer_secret'],
+                    version="wc/v3",
+                    timeout=30
+                )
+                
+                # Fetch all remote order IDs
+                remote_ids = set()
+                page = 1
+                per_page = 100
+                
+                while True:
+                    try:
+                        time.sleep(random.uniform(0.5, 1))
+                        response = wcapi.get("orders", params={
+                            "per_page": per_page,
+                            "page": page,
+                            "_fields": "id"
+                        })
+                        
+                        if response.status_code != 200:
+                            break
+                        
+                        data = response.json()
+                        if not data:
+                            break
+                        
+                        for order in data:
+                            remote_ids.add(str(order['id']))
+                        
+                        SYNC_STATUS[status_id]['message'] = f'已获取 {len(remote_ids)} 个远程订单ID (页 {page})'
+                        page += 1
+                        
+                    except Exception as e:
+                        SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
+                        break
+                
+                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(remote_ids)} remote orders")
+                
+                if not remote_ids:
+                    SYNC_STATUS[status_id]['status'] = 'error'
+                    SYNC_STATUS[status_id]['message'] = '未获取到远程订单ID，跳过删除以避免误删'
+                    return
+                
+                # Get local order IDs
+                conn = get_db_connection()
+                local_orders = conn.execute('SELECT id FROM orders WHERE source = ?', (site_url,)).fetchall()
+                conn.close()
+                
+                local_ids = set(str(o['id']) for o in local_orders)
+                orphaned_ids = local_ids - remote_ids
+                
+                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Local: {len(local_ids)}, Orphaned: {len(orphaned_ids)}")
+                
+                if not orphaned_ids:
+                    SYNC_STATUS[status_id]['status'] = 'success'
+                    SYNC_STATUS[status_id]['message'] = '没有需要清理的订单'
+                    return
+                
+                # Delete orphaned orders
+                SYNC_STATUS[status_id]['message'] = f'正在清理 {len(orphaned_ids)} 个已删除订单...'
+                
+                conn = get_db_connection()
+                placeholders = ','.join(['?' for _ in orphaned_ids])
+                conn.execute(f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})", 
+                             [site_url] + list(orphaned_ids))
+                conn.commit()
+                conn.close()
+                
+                SYNC_STATUS[status_id]['status'] = 'success'
+                SYNC_STATUS[status_id]['message'] = f'清理完成，删除了 {len(orphaned_ids)} 个订单'
+                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Deleted {len(orphaned_ids)} orphaned orders")
+                
+            except Exception as e:
+                SYNC_STATUS[status_id]['status'] = 'error'
+                SYNC_STATUS[status_id]['message'] = str(e)
+                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+    
+    thread = threading.Thread(target=run_clean_sync, args=(app.app_context(), site_id, status_id))
+    thread.start()
+    
+    return jsonify({'success': True, 'sync_id': status_id, 'message': 'Clean sync started'})
+
+
 @app.route('/api/sync/all', methods=['POST'])
 @login_required
 def sync_all_data():
@@ -2875,6 +3106,122 @@ def trigger_deep_sync():
     return jsonify({'success': True, 'sync_id': DEEP_SYNC_ID, 'message': 'Deep sync started'})
 
 
+@app.route('/api/sync/clean/all', methods=['POST'])
+@login_required
+def clean_all_sites():
+    """Clean deleted orders from all sites"""
+    import threading
+    
+    CLEAN_ALL_ID = 999999
+    
+    SYNC_STATUS[CLEAN_ALL_ID] = {
+        'status': 'running',
+        'message': '正在启动全站点清理同步...',
+        'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Clean all sites started"]
+    }
+    
+    def run_clean_all(app_context):
+        with app_context:
+            try:
+                from woocommerce import API
+                import time
+                import random
+                
+                conn = get_db_connection()
+                sites = conn.execute('SELECT * FROM sites').fetchall()
+                conn.close()
+                
+                total_deleted = 0
+                
+                for i, site in enumerate(sites):
+                    site_url = site['url']
+                    SYNC_STATUS[CLEAN_ALL_ID]['message'] = f'正在处理 {site_url} ({i+1}/{len(sites)})...'
+                    SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Processing {site_url}")
+                    
+                    try:
+                        wcapi = API(
+                            url=site_url,
+                            consumer_key=site['consumer_key'],
+                            consumer_secret=site['consumer_secret'],
+                            version="wc/v3",
+                            timeout=30
+                        )
+                        
+                        # Fetch all remote order IDs
+                        remote_ids = set()
+                        page = 1
+                        per_page = 100
+                        
+                        while True:
+                            try:
+                                time.sleep(random.uniform(0.5, 1))
+                                response = wcapi.get("orders", params={
+                                    "per_page": per_page,
+                                    "page": page,
+                                    "_fields": "id"
+                                })
+                                
+                                if response.status_code != 200:
+                                    break
+                                
+                                data = response.json()
+                                if not data:
+                                    break
+                                
+                                for order in data:
+                                    remote_ids.add(str(order['id']))
+                                
+                                page += 1
+                                
+                            except Exception as e:
+                                SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error fetching: {str(e)[:50]}")
+                                break
+                        
+                        SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(remote_ids)} remote orders")
+                        
+                        if not remote_ids:
+                            SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping {site_url} - no remote orders")
+                            continue
+                        
+                        # Get local order IDs
+                        conn = get_db_connection()
+                        local_orders = conn.execute('SELECT id FROM orders WHERE source = ?', (site_url,)).fetchall()
+                        conn.close()
+                        
+                        local_ids = set(str(o['id']) for o in local_orders)
+                        orphaned_ids = local_ids - remote_ids
+                        
+                        if orphaned_ids:
+                            conn = get_db_connection()
+                            placeholders = ','.join(['?' for _ in orphaned_ids])
+                            conn.execute(f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})", 
+                                         [site_url] + list(orphaned_ids))
+                            conn.commit()
+                            conn.close()
+                            
+                            total_deleted += len(orphaned_ids)
+                            SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Deleted {len(orphaned_ids)} orphaned orders from {site_url}")
+                        else:
+                            SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] No orphaned orders in {site_url}")
+                            
+                    except Exception as e:
+                        SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)[:100]}")
+                
+                SYNC_STATUS[CLEAN_ALL_ID]['status'] = 'success'
+                SYNC_STATUS[CLEAN_ALL_ID]['message'] = f'清理完成，共删除 {total_deleted} 个订单'
+                SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Completed: {total_deleted} total deleted")
+                
+            except Exception as e:
+                SYNC_STATUS[CLEAN_ALL_ID]['status'] = 'error'
+                SYNC_STATUS[CLEAN_ALL_ID]['message'] = str(e)
+                SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+    
+    thread = threading.Thread(target=run_clean_all, args=(app.app_context(),))
+    thread.start()
+    
+    return jsonify({'success': True, 'sync_id': CLEAN_ALL_ID, 'message': 'Clean all started'})
+
+
 @app.route('/api/cron/status')
 @login_required
 def get_cron_status():
@@ -2967,6 +3314,106 @@ def remove_cron():
         process.communicate(input=new_crontab)
         
         return jsonify({'success': True, 'message': 'Cron job removed'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cron/clean/status')
+@login_required
+def get_clean_cron_status():
+    """Get status of clean sync cron job"""
+    import subprocess
+    
+    try:
+        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        if result.returncode != 0:
+            return jsonify({'enabled': False})
+        
+        crontab = result.stdout
+        # Look for clean sync job (python 1.wooorders_sqlite.py --clean or curl clean/all)
+        for line in crontab.split('\n'):
+            if '--clean' in line or 'sync/clean/all' in line:
+                # Parse cron schedule
+                parts = line.split()
+                if len(parts) >= 5:
+                    minute = parts[0]
+                    hour = parts[1]
+                    day_of_week = parts[4]
+                    days = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+                    day_name = days[int(day_of_week)] if day_of_week.isdigit() and 0 <= int(day_of_week) <= 6 else day_of_week
+                    return jsonify({
+                        'enabled': True,
+                        'schedule': f'{day_name} {hour}:{minute.zfill(2)}',
+                        'hour': int(hour) if hour.isdigit() else 4,
+                        'day': int(day_of_week) if day_of_week.isdigit() else 0
+                    })
+        
+        return jsonify({'enabled': False})
+    except Exception as e:
+        return jsonify({'enabled': False, 'error': str(e)})
+
+
+@app.route('/api/cron/clean/setup', methods=['POST'])
+@login_required
+def setup_clean_cron():
+    """Setup cron job for clean sync"""
+    import subprocess
+    
+    data = request.json
+    hour = int(data.get('hour', 4))  # Default 4 AM
+    day = int(data.get('day', 0))    # Default Sunday
+    minute = int(data.get('minute', 0))
+    
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= day <= 6):
+        return jsonify({'error': 'Invalid time or day'}), 400
+    
+    try:
+        # Get existing crontab
+        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        existing_crontab = result.stdout if result.returncode == 0 else ''
+        
+        # Remove existing clean sync job if any
+        lines = [line for line in existing_crontab.split('\n') 
+                 if '--clean' not in line and 'sync/clean/all' not in line and line.strip()]
+        
+        # Add new job (runs weekly on specified day)
+        new_job = f"{minute} {hour} * * {day} cd /www/wwwroot/woo-analysis && /www/wwwroot/woo-analysis/venv/bin/python 1.wooorders_sqlite.py --clean >> /www/wwwroot/woo-analysis/clean_sync.log 2>&1"
+        lines.append(new_job)
+        
+        # Write new crontab
+        new_crontab = '\n'.join(lines) + '\n'
+        process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+        process.communicate(input=new_crontab)
+        
+        days = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+        if process.returncode == 0:
+            return jsonify({'success': True, 'message': f'Clean sync cron set for {days[day]} {hour:02d}:{minute:02d}'})
+        else:
+            return jsonify({'error': 'Failed to set crontab'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cron/clean/remove', methods=['DELETE'])
+@login_required
+def remove_clean_cron():
+    """Remove cron job for clean sync"""
+    import subprocess
+    
+    try:
+        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        existing_crontab = result.stdout if result.returncode == 0 else ''
+        
+        # Remove clean sync job
+        lines = [line for line in existing_crontab.split('\n') 
+                 if '--clean' not in line and 'sync/clean/all' not in line and line.strip()]
+        
+        new_crontab = '\n'.join(lines) + '\n' if lines else ''
+        process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+        process.communicate(input=new_crontab)
+        
+        return jsonify({'success': True, 'message': 'Clean sync cron job removed'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

@@ -110,8 +110,11 @@
                         <button class="btn btn-sm btn-outline-info" id="viewSyncLogsBtn">
                             <i class="bi bi-journal-text me-1"></i> 同步日志
                         </button>
-                        <button class="btn btn-sm btn-outline-warning" id="deepSyncBtn">
+                        <button class="btn btn-sm btn-outline-info" id="deepSyncBtn">
                             <i class="bi bi-cloud-download me-1"></i> 深度同步
+                        </button>
+                        <button class="btn btn-sm btn-outline-warning" id="cleanAllBtn">
+                            <i class="bi bi-trash2 me-1"></i> 清理同步
                         </button>
                         <button class="btn btn-sm btn-outline-secondary" id="importFromScriptBtn">
                             <i class="bi bi-download me-1"></i> 从脚本导入
@@ -175,12 +178,20 @@
                                     class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">已连接</span>
                             </td>
                             <td class="text-end pe-4">
-                                <button class="btn btn-sm btn-outline-primary me-2 sync-btn"
-                                    data-site-id="{{ site.id }}"><i class="bi bi-arrow-repeat"></i> 同步</button>
-                                <button class="btn btn-sm btn-outline-info me-2 edit-btn" data-site-id="{{ site.id }}"
-                                    data-url="{{ site.url }}" data-key="{{ site.consumer_key }}"
-                                    data-secret="{{ site.consumer_secret }}" data-manager="{{ site.manager or '' }}"><i
-                                        class="bi bi-pencil"></i></button>
+                                <div class="btn-group me-2">
+                                    <button class="btn btn-sm btn-outline-primary sync-btn" data-site-id="{{ site.id }}"
+                                        title="快速同步 - 增量获取新订单"><i class="bi bi-arrow-repeat"></i></button>
+                                    <button class="btn btn-sm btn-outline-info deep-sync-btn"
+                                        data-site-id="{{ site.id }}" title="深度同步 - 重新获取所有订单"><i
+                                            class="bi bi-cloud-download"></i></button>
+                                    <button class="btn btn-sm btn-outline-warning clean-sync-btn"
+                                        data-site-id="{{ site.id }}" title="清理同步 - 删除已在远程删除的订单"><i
+                                            class="bi bi-trash2"></i></button>
+                                </div>
+                                <button class="btn btn-sm btn-outline-secondary me-2 edit-btn"
+                                    data-site-id="{{ site.id }}" data-url="{{ site.url }}"
+                                    data-key="{{ site.consumer_key }}" data-secret="{{ site.consumer_secret }}"
+                                    data-manager="{{ site.manager or '' }}"><i class="bi bi-pencil"></i></button>
                                 <button class="btn btn-sm btn-outline-danger delete-btn" data-site-id="{{ site.id }}"><i
                                         class="bi bi-trash"></i></button>
                             </td>
@@ -230,6 +241,54 @@
                         <i class="bi bi-check-lg me-1"></i>启用
                     </button>
                     <button class="btn btn-sm btn-outline-danger" id="removeCronBtn">
+                        <i class="bi bi-x-lg me-1"></i>禁用
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Clean Sync Cron Settings Card -->
+<div class="card data-card mb-4">
+    <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
+        <h5 class="card-title text-white mb-0"><i class="bi bi-clock-history me-2"></i>定时清理同步</h5>
+    </div>
+    <div class="card-body">
+        <div class="row align-items-center">
+            <div class="col-md-6">
+                <p class="text-white-50 mb-2">设置每周自动执行清理同步的时间，删除已在WooCommerce中被删除的订单。</p>
+                <div class="d-flex align-items-center gap-2" id="cleanCronStatusDisplay">
+                    <span class="badge bg-secondary">加载中...</span>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="d-flex align-items-center gap-2 justify-content-end">
+                    <label class="text-white-50">每周</label>
+                    <select class="form-select form-select-sm bg-dark text-white border-secondary" id="cleanCronDay"
+                        style="width: 80px;">
+                        <option value="0">周日</option>
+                        <option value="1">周一</option>
+                        <option value="2">周二</option>
+                        <option value="3">周三</option>
+                        <option value="4">周四</option>
+                        <option value="5">周五</option>
+                        <option value="6">周六</option>
+                    </select>
+                    <select class="form-select form-select-sm bg-dark text-white border-secondary" id="cleanCronHour"
+                        style="width: 80px;">
+                        <option value="0">00:00</option>
+                        <option value="1">01:00</option>
+                        <option value="2">02:00</option>
+                        <option value="3">03:00</option>
+                        <option value="4" selected>04:00</option>
+                        <option value="5">05:00</option>
+                        <option value="6">06:00</option>
+                    </select>
+                    <button class="btn btn-sm btn-success" id="setupCleanCronBtn">
+                        <i class="bi bi-check-lg me-1"></i>启用
+                    </button>
+                    <button class="btn btn-sm btn-outline-danger" id="removeCleanCronBtn">
                         <i class="bi bi-x-lg me-1"></i>禁用
                     </button>
                 </div>
@@ -892,6 +951,81 @@
             });
         }
 
+        // Clean All Sites Button
+        const cleanAllBtn = document.getElementById('cleanAllBtn');
+        if (cleanAllBtn) {
+            cleanAllBtn.addEventListener('click', function () {
+                if (!confirm('清理同步将检查所有站点，删除已在WooCommerce中删除的订单。\n\n确定要执行全站点清理同步吗？')) {
+                    return;
+                }
+
+                const modalEl = document.getElementById('syncProgressModal');
+                const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+                const progressBar = document.getElementById('syncProgressBar');
+                const statusText = document.getElementById('syncStatusText');
+                const logConsole = document.getElementById('syncLogConsole');
+                const closeBtn = document.getElementById('closeSyncModalBtn');
+                const timeText = document.getElementById('syncTimeText');
+
+                // Reset UI
+                progressBar.style.width = '100%';
+                progressBar.classList.add('progress-bar-animated', 'bg-danger');
+                progressBar.classList.remove('bg-success', 'bg-warning', 'bg-primary');
+                statusText.textContent = '正在启动全站点清理同步...';
+                logConsole.innerHTML = '';
+                closeBtn.disabled = true;
+                const startTime = Date.now();
+
+                modal.show();
+
+                fetch('/api/sync/clean/all', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                })
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.success) {
+                            const CLEAN_SYNC_ID = result.sync_id;
+
+                            const pollInterval = setInterval(() => {
+                                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                                const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
+                                const secs = (elapsed % 60).toString().padStart(2, '0');
+                                timeText.textContent = `${mins}:${secs}`;
+
+                                fetch(`/api/sync/status/${CLEAN_SYNC_ID}`)
+                                    .then(res => res.json())
+                                    .then(status => {
+                                        statusText.textContent = status.message;
+
+                                        if (status.logs && status.logs.length > 0) {
+                                            logConsole.innerHTML = status.logs.map(log =>
+                                                `<div class="text-white-50 mb-1">${log}</div>`
+                                            ).join('');
+                                            logConsole.scrollTop = logConsole.scrollHeight;
+                                        }
+
+                                        if (status.status === 'success') {
+                                            clearInterval(pollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-danger');
+                                            progressBar.classList.add('bg-success');
+                                            closeBtn.disabled = false;
+                                            closeBtn.textContent = '完成并刷新';
+                                            localStorage.setItem('syncCompleted', Date.now().toString());
+                                            closeBtn.onclick = () => location.reload();
+                                        } else if (status.status === 'error') {
+                                            clearInterval(pollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-danger');
+                                            progressBar.classList.add('bg-danger');
+                                            closeBtn.disabled = false;
+                                        }
+                                    });
+                            }, 2000);
+                        }
+                    });
+            });
+        }
+
         // Cron Settings
         function loadCronStatus() {
             fetch('/api/cron/status')
@@ -940,6 +1074,70 @@
                         if (data.success) {
                             alert(data.message);
                             loadCronStatus();
+                        } else {
+                            alert('禁用失败: ' + (data.error || '未知错误'));
+                        }
+                    });
+            });
+        }
+
+        // Clean Sync Cron Settings
+        function loadCleanCronStatus() {
+            fetch('/api/cron/clean/status')
+                .then(res => res.json())
+                .then(data => {
+                    const display = document.getElementById('cleanCronStatusDisplay');
+                    if (data.enabled) {
+                        display.innerHTML = `<span class="badge bg-success">已启用</span><span class="text-white-50 ms-2">执行时间: ${data.schedule}</span>`;
+                        // Set the dropdown values
+                        if (document.getElementById('cleanCronDay') && data.day !== undefined) {
+                            document.getElementById('cleanCronDay').value = data.day;
+                        }
+                        if (document.getElementById('cleanCronHour') && data.hour !== undefined) {
+                            document.getElementById('cleanCronHour').value = data.hour;
+                        }
+                    } else {
+                        display.innerHTML = `<span class="badge bg-secondary">未启用</span>`;
+                    }
+                });
+        }
+
+        loadCleanCronStatus();
+
+        const setupCleanCronBtn = document.getElementById('setupCleanCronBtn');
+        const removeCleanCronBtn = document.getElementById('removeCleanCronBtn');
+        const cleanCronDay = document.getElementById('cleanCronDay');
+        const cleanCronHour = document.getElementById('cleanCronHour');
+
+        if (setupCleanCronBtn) {
+            setupCleanCronBtn.addEventListener('click', function () {
+                const day = parseInt(cleanCronDay.value);
+                const hour = parseInt(cleanCronHour.value);
+                fetch('/api/cron/clean/setup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ day: day, hour: hour, minute: 0 })
+                })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            alert(data.message);
+                            loadCleanCronStatus();
+                        } else {
+                            alert('设置失败: ' + (data.error || '未知错误'));
+                        }
+                    });
+            });
+        }
+
+        if (removeCleanCronBtn) {
+            removeCleanCronBtn.addEventListener('click', function () {
+                fetch('/api/cron/clean/remove', { method: 'DELETE' })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            alert(data.message);
+                            loadCleanCronStatus();
                         } else {
                             alert('禁用失败: ' + (data.error || '未知错误'));
                         }
@@ -1300,6 +1498,188 @@
                         } else {
                             statusText.textContent = '启动失败: ' + result.message;
                             progressBar.classList.remove('bg-primary');
+                            progressBar.classList.add('bg-danger');
+                            progressBar.style.width = '100%';
+                            closeBtn.disabled = false;
+                        }
+                    })
+                    .catch(error => {
+                        statusText.textContent = '请求错误: ' + error;
+                        closeBtn.disabled = false;
+                    });
+            }
+
+            // Deep Sync Button (single site)
+            const deepSyncBtn = e.target.closest('.deep-sync-btn');
+            if (deepSyncBtn) {
+                const siteId = deepSyncBtn.dataset.siteId;
+
+                if (!confirm('深度同步将重新获取该站点的所有订单数据，可能需要较长时间。\n\n确定要执行深度同步吗？')) {
+                    return;
+                }
+
+                const modal = getModal('syncProgressModal');
+                const progressBar = document.getElementById('syncProgressBar');
+                const statusText = document.getElementById('syncStatusText');
+                const logConsole = document.getElementById('syncLogConsole');
+                const closeBtn = document.getElementById('closeSyncModalBtn');
+                const timeText = document.getElementById('syncTimeText');
+
+                if (!modal) return;
+
+                // Reset UI
+                progressBar.style.width = '0%';
+                progressBar.classList.add('progress-bar-animated');
+                progressBar.classList.remove('bg-success', 'bg-danger', 'bg-warning');
+                progressBar.classList.add('bg-info');
+                statusText.textContent = '正在启动深度同步...';
+                logConsole.innerHTML = '';
+                closeBtn.disabled = true;
+                const startTime = Date.now();
+
+                modal.show();
+
+                fetch(`/api/sync/deep/${siteId}`, { method: 'POST' })
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.success) {
+                            const syncId = result.sync_id;
+                            progressBar.style.width = '50%';
+
+                            const deepPollInterval = setInterval(() => {
+                                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                                const mins = Math.floor(elapsed / 60);
+                                const secs = elapsed % 60;
+                                timeText.textContent = `已用时: ${mins}分${secs}秒`;
+
+                                fetch(`/api/sync/status/${syncId}`)
+                                    .then(r => r.json())
+                                    .then(status => {
+                                        statusText.textContent = status.message || '深度同步中...';
+
+                                        if (status.logs && status.logs.length > 0) {
+                                            logConsole.innerHTML = status.logs.slice(-20).map(log =>
+                                                `<div class="text-white-50 small">${log}</div>`
+                                            ).join('');
+                                            logConsole.scrollTop = logConsole.scrollHeight;
+                                        }
+
+                                        if (status.status === 'success') {
+                                            clearInterval(deepPollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-info');
+                                            progressBar.classList.add('bg-success');
+                                            progressBar.style.width = '100%';
+                                            statusText.textContent = '深度同步完成！';
+                                            statusText.classList.add('text-success');
+                                            closeBtn.disabled = false;
+                                            closeBtn.textContent = '完成并刷新';
+                                            localStorage.setItem('syncCompleted', Date.now().toString());
+                                            closeBtn.onclick = () => location.reload();
+                                        } else if (status.status === 'error') {
+                                            clearInterval(deepPollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-info');
+                                            progressBar.classList.add('bg-danger');
+                                            progressBar.style.width = '100%';
+                                            statusText.textContent = '深度同步出错';
+                                            statusText.classList.add('text-danger');
+                                            closeBtn.disabled = false;
+                                        }
+                                    });
+                            }, 1000);
+                        } else {
+                            statusText.textContent = '启动失败: ' + result.message;
+                            progressBar.classList.remove('bg-info');
+                            progressBar.classList.add('bg-danger');
+                            progressBar.style.width = '100%';
+                            closeBtn.disabled = false;
+                        }
+                    })
+                    .catch(error => {
+                        statusText.textContent = '请求错误: ' + error;
+                        closeBtn.disabled = false;
+                    });
+            }
+
+            // Clean Sync Button (delete orphaned orders)
+            const cleanSyncBtn = e.target.closest('.clean-sync-btn');
+            if (cleanSyncBtn) {
+                const siteId = cleanSyncBtn.dataset.siteId;
+
+                if (!confirm('清理同步将删除本地数据库中已在WooCommerce远程删除的订单。\n\n确定要执行清理同步吗？')) {
+                    return;
+                }
+
+                const modal = getModal('syncProgressModal');
+                const progressBar = document.getElementById('syncProgressBar');
+                const statusText = document.getElementById('syncStatusText');
+                const logConsole = document.getElementById('syncLogConsole');
+                const closeBtn = document.getElementById('closeSyncModalBtn');
+                const timeText = document.getElementById('syncTimeText');
+
+                if (!modal) return;
+
+                // Reset UI
+                progressBar.style.width = '0%';
+                progressBar.classList.add('progress-bar-animated');
+                progressBar.classList.remove('bg-success', 'bg-danger', 'bg-info');
+                progressBar.classList.add('bg-warning');
+                statusText.textContent = '正在启动清理同步...';
+                logConsole.innerHTML = '';
+                closeBtn.disabled = true;
+                const startTime = Date.now();
+
+                modal.show();
+
+                fetch(`/api/sync/clean/${siteId}`, { method: 'POST' })
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.success) {
+                            const syncId = result.sync_id;
+                            progressBar.style.width = '50%';
+
+                            const cleanPollInterval = setInterval(() => {
+                                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                                const mins = Math.floor(elapsed / 60);
+                                const secs = elapsed % 60;
+                                timeText.textContent = `已用时: ${mins}分${secs}秒`;
+
+                                fetch(`/api/sync/status/${syncId}`)
+                                    .then(r => r.json())
+                                    .then(status => {
+                                        statusText.textContent = status.message || '清理同步中...';
+
+                                        if (status.logs && status.logs.length > 0) {
+                                            logConsole.innerHTML = status.logs.slice(-20).map(log =>
+                                                `<div class="text-white-50 small">${log}</div>`
+                                            ).join('');
+                                            logConsole.scrollTop = logConsole.scrollHeight;
+                                        }
+
+                                        if (status.status === 'success') {
+                                            clearInterval(cleanPollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-warning');
+                                            progressBar.classList.add('bg-success');
+                                            progressBar.style.width = '100%';
+                                            statusText.textContent = '清理同步完成！';
+                                            statusText.classList.add('text-success');
+                                            closeBtn.disabled = false;
+                                            closeBtn.textContent = '完成并刷新';
+                                            localStorage.setItem('syncCompleted', Date.now().toString());
+                                            closeBtn.onclick = () => location.reload();
+                                        } else if (status.status === 'error') {
+                                            clearInterval(cleanPollInterval);
+                                            progressBar.classList.remove('progress-bar-animated', 'bg-warning');
+                                            progressBar.classList.add('bg-danger');
+                                            progressBar.style.width = '100%';
+                                            statusText.textContent = '清理同步出错';
+                                            statusText.classList.add('text-danger');
+                                            closeBtn.disabled = false;
+                                        }
+                                    });
+                            }, 1000);
+                        } else {
+                            statusText.textContent = '启动失败: ' + result.message;
+                            progressBar.classList.remove('bg-warning');
                             progressBar.classList.add('bg-danger');
                             progressBar.style.width = '100%';
                             closeBtn.disabled = false;
