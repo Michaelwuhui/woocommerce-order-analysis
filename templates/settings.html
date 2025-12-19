@@ -64,46 +64,64 @@
 </div>
 
 <div class="container-fluid py-4">
-    <div class="d-flex justify-content-between align-items-center mb-4">
-        <div>
-            <h1 class="h3 text-white mb-1">系统设置</h1>
-            <p class="text-white-50 mb-0">管理 WooCommerce 站点连接和数据同步</p>
-        </div>
-        <div class="d-flex align-items-center gap-3">
-            <div class="d-flex align-items-center gap-2">
-                <div class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" id="autoSyncToggle">
-                    <label class="form-check-label text-white-50" for="autoSyncToggle">自动同步</label>
-                </div>
-                <select class="form-select form-select-sm bg-dark text-white border-secondary" id="syncIntervalSelect"
-                    style="width: auto;">
-                    <option value="300">每5分钟</option>
-                    <option value="900" selected>每15分钟</option>
-                    <option value="1800">每30分钟</option>
-                    <option value="3600">每1小时</option>
-                    <option value="7200">每2小时</option>
-                </select>
+    <div class="mb-4">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <div>
+                <h1 class="h3 text-white mb-1">系统设置</h1>
+                <p class="text-white-50 mb-0">管理 WooCommerce 站点连接和数据同步</p>
+            </div>
+            <div class="d-flex gap-2">
+                <a href="/users" class="btn btn-outline-light">
+                    <i class="bi bi-people me-1"></i> 用户管理
+                </a>
+                <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addSiteModal">
+                    <i class="bi bi-plus-lg me-1"></i> 添加站点
+                </button>
             </div>
         </div>
-        <div class="d-flex gap-2">
-            <a href="/users" class="btn btn-outline-light">
-                <i class="bi bi-people me-1"></i> 用户管理
-            </a>
-            <button class="btn btn-outline-info" id="viewSyncLogsBtn">
-                <i class="bi bi-journal-text me-1"></i> 同步日志
-            </button>
-            <button class="btn btn-outline-warning" id="deepSyncBtn">
-                <i class="bi bi-cloud-download me-1"></i> 深度同步
-            </button>
-            <button class="btn btn-outline-secondary" id="importFromScriptBtn">
-                <i class="bi bi-download me-1"></i> 从脚本导入
-            </button>
-            <button class="btn btn-outline-primary" id="syncAllBtn">
-                <i class="bi bi-arrow-repeat me-1"></i> 快速同步
-            </button>
-            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addSiteModal">
-                <i class="bi bi-plus-lg me-1"></i> 添加站点
-            </button>
+
+        <!-- Toolbar -->
+        <div class="card bg-dark border-secondary border-opacity-25 mb-4">
+            <div class="card-body py-2 px-3">
+                <div class="d-flex justify-content-between align-items-center flex-wrap gap-3">
+                    <div class="d-flex align-items-center gap-3">
+                        <div class="d-flex align-items-center gap-2 border-end border-secondary border-opacity-25 pe-3">
+                            <div class="form-check form-switch mb-0">
+                                <input class="form-check-input" type="checkbox" id="sourceDisplayToggle">
+                                <label class="form-check-label text-white-50" for="sourceDisplayToggle">仅显示负责人</label>
+                            </div>
+                        </div>
+                        <div class="d-flex align-items-center gap-2">
+                            <div class="form-check form-switch mb-0">
+                                <input class="form-check-input" type="checkbox" id="autoSyncToggle">
+                                <label class="form-check-label text-white-50" for="autoSyncToggle">自动同步</label>
+                            </div>
+                            <select class="form-select form-select-sm bg-dark text-white border-secondary"
+                                id="syncIntervalSelect" style="width: auto;">
+                                <option value="300">每5分钟</option>
+                                <option value="900" selected>每15分钟</option>
+                                <option value="1800">每30分钟</option>
+                                <option value="3600">每1小时</option>
+                                <option value="7200">每2小时</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-sm btn-outline-info" id="viewSyncLogsBtn">
+                            <i class="bi bi-journal-text me-1"></i> 同步日志
+                        </button>
+                        <button class="btn btn-sm btn-outline-warning" id="deepSyncBtn">
+                            <i class="bi bi-cloud-download me-1"></i> 深度同步
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary" id="importFromScriptBtn">
+                            <i class="bi bi-download me-1"></i> 从脚本导入
+                        </button>
+                        <button class="btn btn-sm btn-outline-primary" id="syncAllBtn">
+                            <i class="bi bi-arrow-repeat me-1"></i> 快速同步
+                        </button>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -136,7 +154,8 @@
                                     <div>
                                         {% if site.manager and site.manager|trim %}
                                         <span class="badge me-1"
-                                            style="background: rgba(23, 162, 184, 0.3); color: #17a2b8;">{{ site.manager
+                                            style="background: rgba(23, 162, 184, 0.3); color: #17a2b8;">{{
+                                            site.manager
                                             }}</span>
                                         {% endif %}
                                         <span class="text-white">{{ site.url.replace('https://www.', '') }}</span>
@@ -246,9 +265,11 @@
                     <tr>
                         <td class="ps-4"><span class="badge bg-info bg-opacity-25 text-info">{{ rate.year_month
                                 }}</span></td>
-                        <td><span class="badge bg-warning bg-opacity-25 text-warning">{{ rate.currency }}</span></td>
+                        <td><span class="badge bg-warning bg-opacity-25 text-warning">{{ rate.currency }}</span>
+                        </td>
                         <td class="text-white">{{ "%.4f"|format(rate.rate_to_cny) }}</td>
-                        <td class="text-muted small">1 {{ rate.currency }} = ¥{{ "%.2f"|format(rate.rate_to_cny) }}</td>
+                        <td class="text-muted small">1 {{ rate.currency }} = ¥{{ "%.2f"|format(rate.rate_to_cny) }}
+                        </td>
                         <td class="text-muted small">{{ rate.updated_at[:16] if rate.updated_at else '-' }}</td>
                         <td class="text-end pe-4">
                             <button class="btn btn-sm btn-outline-danger delete-rate-btn" data-rate-id="{{ rate.id }}">
@@ -304,7 +325,8 @@
                 <div class="mb-3">
                     <label class="form-label text-white-50">汇率 (→ CNY) <span class="text-danger">*</span></label>
                     <div class="input-group">
-                        <span class="input-group-text bg-black bg-opacity-25 text-white border-secondary">1 货币 =</span>
+                        <span class="input-group-text bg-black bg-opacity-25 text-white border-secondary">1 货币
+                            =</span>
                         <input type="number" step="0.0001"
                             class="form-control bg-black bg-opacity-25 text-white border-secondary" id="addRateValue"
                             placeholder="如 1.7823">
@@ -616,23 +638,53 @@
         // Auto Sync Toggle and Interval
         const autoSyncToggle = document.getElementById('autoSyncToggle');
         const syncIntervalSelect = document.getElementById('syncIntervalSelect');
+        const sourceDisplayToggle = document.getElementById('sourceDisplayToggle');
 
         if (autoSyncToggle && syncIntervalSelect) {
             // Fetch initial status
-            fetch('/api/settings/autosync')
+            fetch('/api/settings')
                 .then(res => res.json())
                 .then(data => {
-                    autoSyncToggle.checked = data.enabled;
-                    syncIntervalSelect.value = data.interval.toString();
+                    if (data.autosync_enabled) autoSyncToggle.checked = data.autosync_enabled === 'true';
+                    if (data.autosync_interval) syncIntervalSelect.value = data.autosync_interval;
+                    if (sourceDisplayToggle && data.source_display_mode) {
+                        sourceDisplayToggle.checked = data.source_display_mode === 'manager_only';
+                    }
                 });
+
+            // Handle source display toggle
+            if (sourceDisplayToggle) {
+                sourceDisplayToggle.addEventListener('change', function () {
+                    const mode = this.checked ? 'manager_only' : 'full';
+                    fetch('/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ source_display_mode: mode })
+                    })
+                        .then(res => res.json())
+                        .then(data => {
+                            if (!data.success) {
+                                alert('设置失败');
+                                this.checked = !this.checked;
+                            } else {
+                                // Reload to apply changes
+                                location.reload();
+                            }
+                        })
+                        .catch(err => {
+                            alert('设置错误');
+                            this.checked = !this.checked;
+                        });
+                });
+            }
 
             // Handle toggle change
             autoSyncToggle.addEventListener('change', function () {
                 const enabled = this.checked;
-                fetch('/api/settings/autosync', {
+                fetch('/api/settings', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ enabled: enabled })
+                    body: JSON.stringify({ autosync_enabled: enabled })
                 })
                     .then(res => res.json())
                     .then(data => {
@@ -650,10 +702,10 @@
             // Handle interval change
             syncIntervalSelect.addEventListener('change', function () {
                 const interval = parseInt(this.value);
-                fetch('/api/settings/autosync', {
+                fetch('/api/settings', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ interval: interval })
+                    body: JSON.stringify({ autosync_interval: interval })
                 })
                     .then(res => res.json())
                     .then(data => {

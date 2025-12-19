@@ -63,6 +63,14 @@ def get_db_connection():
     return conn
 
 
+def get_all_managers():
+    """Get list of all unique site managers"""
+    conn = get_db_connection()
+    managers = conn.execute('SELECT DISTINCT manager FROM sites WHERE manager IS NOT NULL AND manager != "" ORDER BY manager').fetchall()
+    conn.close()
+    return [m['manager'] for m in managers]
+
+
 def parse_json_field(value):
     """Safely parse JSON field"""
     if not value:
@@ -415,19 +423,47 @@ def dashboard():
     # Get filters
     quick_date = request.args.get('quick_date', 'this_month')
     source_filter = request.args.get('source', '')
+    manager_filter = request.args.get('manager', '')
+    
+    # Get all managers
+    all_managers = get_all_managers()
     
     # Validate source_filter against allowed sources
     if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
         source_filter = ''  # Reset invalid filter
     
-    # Get available sources for dropdown (filtered by permissions)
-    if allowed_sources is None:
-        sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
-    elif allowed_sources:
-        placeholders = ', '.join(['?' for _ in allowed_sources])
-        sources = conn.execute(f'SELECT DISTINCT source FROM orders WHERE source IN ({placeholders}) ORDER BY source', allowed_sources).fetchall()
-    else:
-        sources = []
+    # Get available sources (filtered by permissions and manager)
+    conn = get_db_connection()
+    
+    # Base source query
+    source_query = 'SELECT DISTINCT source FROM orders'
+    source_params = []
+    source_conditions = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(allowed_sources)
+        else:
+            source_conditions.append('1=0')
+            
+    if manager_filter:
+        # Get sites managed by this manager
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(manager_urls)
+        else:
+            source_conditions.append('1=0')
+            
+    if source_conditions:
+        source_query += ' WHERE ' + ' AND '.join(source_conditions)
+        
+    source_query += ' ORDER BY source'
+    sources = conn.execute(source_query, source_params).fetchall()
     
     # Process quick date filter
     today = date.today()
@@ -464,6 +500,20 @@ def dashboard():
             params.extend(allowed_sources)
         else:
             conditions.append('1=0')  # No access
+            
+    # Add manager filter
+    if manager_filter:
+        # Re-use manager_urls from above or fetch if not done
+        if 'manager_urls' not in locals():
+            manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+            manager_urls = [s['url'] for s in manager_sites]
+        
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(manager_urls)
+        else:
+            conditions.append('1=0')
     
     if date_from and date_to:
         conditions.append(f"date_created >= ? AND date_created <= ?")
@@ -646,6 +696,8 @@ def dashboard():
                          quick_date=quick_date,
                          sources=sources,
                          source_filter=source_filter,
+                         manager_filter=manager_filter,
+                         all_managers=all_managers,
                          site_managers=site_managers)
 
 
@@ -666,8 +718,12 @@ def orders():
     date_to = request.args.get('date_to', '')
     search = request.args.get('search', '')
     quick_date = request.args.get('quick_date', '')
+    manager_filter = request.args.get('manager', '')
     page = int(request.args.get('page', 1))
     per_page = 20
+    
+    # Get all managers
+    all_managers = get_all_managers()
     
     # Validate source_filter against allowed sources
     if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
@@ -706,6 +762,18 @@ def orders():
             params.extend(allowed_sources)
         else:
             conditions.append('1=0')  # No access
+            
+    # Add manager filter
+    if manager_filter:
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(manager_urls)
+        else:
+            conditions.append('1=0')
     
     if source_filter:
         conditions.append('source = ?')
@@ -831,14 +899,38 @@ def orders():
         od['customer_email'] = billing.get('email', '')
         processed_orders.append(od)
     
-    # Get available sources filtered by permissions
-    if allowed_sources is None:
-        sources = conn.execute('SELECT DISTINCT source FROM orders').fetchall()
-    elif allowed_sources:
-        placeholders = ', '.join(['?' for _ in allowed_sources])
-        sources = conn.execute(f'SELECT DISTINCT source FROM orders WHERE source IN ({placeholders})', allowed_sources).fetchall()
-    else:
-        sources = []
+    # Get available sources (filtered by permissions and manager)
+    conn = get_db_connection()
+    
+    # Base source query
+    source_query = 'SELECT DISTINCT source FROM orders'
+    source_params = []
+    source_conditions = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(allowed_sources)
+        else:
+            source_conditions.append('1=0')
+            
+    if manager_filter:
+        # Get sites managed by this manager
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(manager_urls)
+        else:
+            source_conditions.append('1=0')
+            
+    if source_conditions:
+        source_query += ' WHERE ' + ' AND '.join(source_conditions)
+        
+    source_query += ' ORDER BY source'
+    sources = conn.execute(source_query, source_params).fetchall()
     statuses = conn.execute('SELECT DISTINCT status FROM orders').fetchall()
     
     # Get site managers mapping (url -> manager)
@@ -883,13 +975,15 @@ def orders():
                          summary_stats=summary_stats,
                          totals=totals,
                          site_managers=site_managers,
+                         all_managers=all_managers,
                          current_filters={
                              'source': source_filter,
                              'status': status_filter,
                              'date_from': date_from,
                              'date_to': date_to,
                              'search': search,
-                             'quick_date': quick_date
+                             'quick_date': quick_date,
+                             'manager': manager_filter
                          },
                          available_months=available_months,
                          current_month=current_month,
@@ -908,19 +1002,47 @@ def monthly():
     
     # Get source filter
     source_filter = request.args.get('source', '')
+    manager_filter = request.args.get('manager', '')
+    
+    # Get all managers
+    all_managers = get_all_managers()
     
     # Validate source_filter against allowed sources
     if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
         source_filter = ''
     
-    # Get all sources for dropdown (filtered by permissions)
-    if allowed_sources is None:
-        all_sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
-    elif allowed_sources:
-        placeholders = ', '.join(['?' for _ in allowed_sources])
-        all_sources = conn.execute(f'SELECT DISTINCT source FROM orders WHERE source IN ({placeholders}) ORDER BY source', allowed_sources).fetchall()
-    else:
-        all_sources = []
+    # Get available sources (filtered by permissions and manager)
+    conn = get_db_connection()
+    
+    # Base source query
+    source_query = 'SELECT DISTINCT source FROM orders'
+    source_params = []
+    source_conditions = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(allowed_sources)
+        else:
+            source_conditions.append('1=0')
+            
+    if manager_filter:
+        # Get sites managed by this manager
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(manager_urls)
+        else:
+            source_conditions.append('1=0')
+            
+    if source_conditions:
+        source_query += ' WHERE ' + ' AND '.join(source_conditions)
+        
+    source_query += ' ORDER BY source'
+    all_sources = conn.execute(source_query, source_params).fetchall()
     
     # Build query with permission filter and optional source filter
     conditions = []
@@ -931,6 +1053,20 @@ def monthly():
             placeholders = ', '.join(['?' for _ in allowed_sources])
             conditions.append(f'source IN ({placeholders})')
             params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+            
+    # Add manager filter
+    if manager_filter:
+        # Re-use manager_urls from above or fetch if not done
+        if 'manager_urls' not in locals():
+            manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+            manager_urls = [s['url'] for s in manager_sites]
+        
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(manager_urls)
         else:
             conditions.append('1=0')
     
@@ -1025,7 +1161,7 @@ def monthly():
         row['rate_to_cny'] = rate
         row['success_net_amount_cny'] = round(row['success_net_amount'] * rate, 2) if rate else None
     
-    return render_template('monthly.html', monthly_stats=rows, sources=all_sources, source_filter=source_filter, sort_by=sort_by, site_managers=site_managers)
+    return render_template('monthly.html', monthly_stats=rows, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, all_managers=all_managers, sort_by=sort_by, site_managers=site_managers)
 
 
 @app.route('/customers')
@@ -1038,19 +1174,47 @@ def customers():
     
     # Get source filter
     source_filter = request.args.get('source', '')
+    manager_filter = request.args.get('manager', '')
+    
+    # Get all managers
+    all_managers = get_all_managers()
     
     # Validate source_filter against allowed sources
     if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
         source_filter = ''
     
-    # Get all sources for dropdown (filtered by permissions)
-    if allowed_sources is None:
-        all_sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
-    elif allowed_sources:
-        placeholders = ', '.join(['?' for _ in allowed_sources])
-        all_sources = conn.execute(f'SELECT DISTINCT source FROM orders WHERE source IN ({placeholders}) ORDER BY source', allowed_sources).fetchall()
-    else:
-        all_sources = []
+    # Get available sources (filtered by permissions and manager)
+    conn = get_db_connection()
+    
+    # Base source query
+    source_query = 'SELECT DISTINCT source FROM orders'
+    source_params = []
+    source_conditions = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(allowed_sources)
+        else:
+            source_conditions.append('1=0')
+            
+    if manager_filter:
+        # Get sites managed by this manager
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(manager_urls)
+        else:
+            source_conditions.append('1=0')
+            
+    if source_conditions:
+        source_query += ' WHERE ' + ' AND '.join(source_conditions)
+        
+    source_query += ' ORDER BY source'
+    all_sources = conn.execute(source_query, source_params).fetchall()
     
     # Build query with permission filter and optional source filter
     base_condition = "json_extract(billing, '$.email') IS NOT NULL AND json_extract(billing, '$.email') != ''"
@@ -1062,6 +1226,20 @@ def customers():
             placeholders = ', '.join(['?' for _ in allowed_sources])
             conditions.append(f'source IN ({placeholders})')
             params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+            
+    # Add manager filter
+    if manager_filter:
+        # Re-use manager_urls from above or fetch if not done
+        if 'manager_urls' not in locals():
+            manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+            manager_urls = [s['url'] for s in manager_sites]
+        
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(manager_urls)
         else:
             conditions.append('1=0')
     
@@ -1185,7 +1363,7 @@ def customers():
     site_managers = {s['url']: s['manager'] or '' for s in sites}
     conn2.close()
     
-    return render_template('customers.html', customers=customers_list, stats=stats, sources=all_sources, source_filter=source_filter, site_managers=site_managers)
+    return render_template('customers.html', customers=customers_list, stats=stats, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, all_managers=all_managers, site_managers=site_managers)
 
 
 @app.route('/api/chart-data')
@@ -1578,8 +1756,20 @@ def init_settings_table():
     conn.execute('''
         INSERT OR IGNORE INTO settings (key, value) VALUES ('autosync_interval', '900')
     ''')
+    conn.execute('''
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('source_display_mode', 'full')
+    ''')
     conn.commit()
     conn.close()
+
+
+@app.context_processor
+def inject_settings():
+    """Inject global settings into all templates"""
+    conn = get_db_connection()
+    mode = conn.execute("SELECT value FROM settings WHERE key = 'source_display_mode'").fetchone()
+    conn.close()
+    return dict(source_display_mode=mode['value'] if mode else 'full')
 
 
 def save_sync_log(site_id, site_url, status, message, new_orders=0, updated_orders=0, duration_seconds=0):
@@ -2712,6 +2902,10 @@ def products():
     brand_filter = request.args.get('brand', '')
     puff_filter = request.args.get('puffs', '')
     quick_date = request.args.get('quick_date', 'this_month')
+    manager_filter = request.args.get('manager', '')
+    
+    # Get all managers
+    all_managers = get_all_managers()
     
     # Validate source_filter against allowed sources
     if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
@@ -2750,6 +2944,20 @@ def products():
             placeholders = ', '.join(['?' for _ in allowed_sources])
             conditions.append(f'source IN ({placeholders})')
             params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+            
+    # Add manager filter
+    if manager_filter:
+        # Re-use manager_urls from above or fetch if not done
+        if 'manager_urls' not in locals():
+            manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+            manager_urls = [s['url'] for s in manager_sites]
+        
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(manager_urls)
         else:
             conditions.append('1=0')
     
@@ -2931,14 +3139,38 @@ def products():
         reverse=True
     )
     
-    # Get available sources filtered by permissions
-    if allowed_sources is None:
-        sources = conn.execute('SELECT DISTINCT source FROM orders ORDER BY source').fetchall()
-    elif allowed_sources:
-        placeholders = ', '.join(['?' for _ in allowed_sources])
-        sources = conn.execute(f'SELECT DISTINCT source FROM orders WHERE source IN ({placeholders}) ORDER BY source', allowed_sources).fetchall()
-    else:
-        sources = []
+    # Get available sources (filtered by permissions and manager)
+    conn = get_db_connection()
+    
+    # Base source query
+    source_query = 'SELECT DISTINCT source FROM orders'
+    source_params = []
+    source_conditions = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(allowed_sources)
+        else:
+            source_conditions.append('1=0')
+            
+    if manager_filter:
+        # Get sites managed by this manager
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(manager_urls)
+        else:
+            source_conditions.append('1=0')
+            
+    if source_conditions:
+        source_query += ' WHERE ' + ' AND '.join(source_conditions)
+        
+    source_query += ' ORDER BY source'
+    sources = conn.execute(source_query, source_params).fetchall()
     
     # Get available puff counts
     puff_options = sorted([p for p in puff_stats.keys() if p != 'Unknown'], key=lambda x: int(x) if x.isdigit() else 0)
@@ -3002,8 +3234,10 @@ def products():
                               'source': source_filter,
                               'brand': brand_filter,
                               'puffs': puff_filter,
-                              'quick_date': quick_date
-                          })
+                              'quick_date': quick_date,
+                              'manager': manager_filter
+                          },
+                          all_managers=all_managers)
 
 
 @app.route('/api/brands')
@@ -3399,7 +3633,7 @@ def get_product_samples():
     
     # Find orders with matching product name
     results = []
-    sources = set()
+    sources_map = {}
     
     for order in orders:
         items = parse_json_field(order['line_items'])
@@ -3411,11 +3645,17 @@ def get_product_samples():
                 # Extract domain from source for display
                 source = order['source']
                 source_display = source.replace('https://www.', '').replace('https://', '').split('/')[0]
-                sources.add(source_display)
+                
+                # Get manager
+                manager = conn.execute('SELECT manager FROM sites WHERE url = ?', (source,)).fetchone()
+                manager_name = manager['manager'] if manager else ''
+                
+                sources_map[source_display] = manager_name
                 
                 results.append({
                     'order_number': order['number'],
                     'source': source_display,
+                    'manager': manager_name,
                     'date': order['date_created'][:10] if order['date_created'] else ''
                 })
                 break  # One match per order is enough
@@ -3423,11 +3663,40 @@ def get_product_samples():
         if len(results) >= 10:
             break
     
+    sources_list = [{'site': k, 'manager': v} for k, v in sources_map.items()]
+    
     return jsonify({
-        'sources': list(sources),
+        'sources': sources_list,
         'orders': results,
         'total_found': len(results)
     })
+
+
+
+@app.route('/api/settings', methods=['GET', 'POST'])
+@login_required
+def settings_api():
+    """API endpoint for general settings"""
+    conn = get_db_connection()
+    
+    if request.method == 'GET':
+        settings = conn.execute("SELECT key, value FROM settings").fetchall()
+        conn.close()
+        return jsonify({row['key']: row['value'] for row in settings})
+        
+    elif request.method == 'POST':
+        data = request.json
+        try:
+            for key, value in data.items():
+                # Allow specific keys only for security
+                if key in ['source_display_mode', 'autosync_enabled', 'autosync_interval']:
+                    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True})
+        except Exception as e:
+            conn.close()
+            return jsonify({'success': False, 'error': str(e)}), 500
 
 
 if __name__ == '__main__':

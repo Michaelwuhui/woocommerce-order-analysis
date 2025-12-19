@@ -25,6 +25,18 @@
                 </div>
             </div>
             <div class="d-flex align-items-center gap-2">
+                <span class="text-secondary"><i class="bi bi-person-badge me-1"></i>负责人：</span>
+                <select id="managerFilter" class="form-select form-select-sm" style="width: auto; min-width: 120px;"
+                    onchange="window.location.href='{{ url_for('monthly', sort=sort_by) }}&manager=' + this.value">
+                    <option value="">全部负责人</option>
+                    {% for manager in all_managers %}
+                    <option value="{{ manager }}" {% if manager_filter==manager %}selected{% endif %}>
+                        {{ manager }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="d-flex align-items-center gap-2">
                 <span class="text-secondary"><i class="bi bi-globe me-1"></i>网站：</span>
                 <select id="sourceFilter" class="form-select form-select-sm" style="width: auto; min-width: 180px;"
                     onchange="window.location.href='{{ url_for('monthly', sort=sort_by) }}&source=' + this.value">
@@ -73,7 +85,8 @@
                             <td><strong>{{ row.month }}</strong></td>
                             <td>{% set mgr = site_managers.get(row.source, '') %}{% if mgr %}<span class="badge me-1"
                                     style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{ mgr }}</span>{% endif
-                                %}<span class="source-badge">{{ row.source.replace('https://www.', '') }}</span></td>
+                                %}{% if source_display_mode != 'manager_only' %}<span class="source-badge">{{
+                                    row.source.replace('https://www.', '') }}</span>{% endif %}</td>
                             <td class="text-center"><span class="badge bg-secondary">{{ row.currency or 'N/A' }}</span>
                             </td>
                             <td class="text-end border-start">{{ "{:,}".format(row.total_orders) }}</td>

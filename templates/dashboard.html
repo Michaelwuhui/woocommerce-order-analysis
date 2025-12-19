@@ -22,17 +22,31 @@
                 <a href="{{ url_for('dashboard', quick_date='all', source=source_filter) }}"
                     class="btn btn-outline-secondary btn-sm {% if quick_date == 'all' %}active{% endif %}">全部</a>
             </div>
-            <div class="d-flex align-items-center gap-2">
-                <span class="text-secondary"><i class="bi bi-globe me-1"></i>网站：</span>
-                <select id="sourceFilter" class="form-select form-select-sm" style="width: auto; min-width: 180px;"
-                    onchange="window.location.href='{{ url_for('dashboard', quick_date=quick_date) }}&source=' + this.value">
-                    <option value="">全部网站</option>
-                    {% for source in sources %}
-                    <option value="{{ source.source }}" {% if source_filter==source.source %}selected{% endif %}>
-                        {{ source.source.replace('https://www.', '') }}
-                    </option>
-                    {% endfor %}
-                </select>
+            <div class="d-flex align-items-center gap-3">
+                <div class="d-flex align-items-center gap-2">
+                    <span class="text-secondary"><i class="bi bi-person-badge me-1"></i>负责人：</span>
+                    <select id="managerFilter" class="form-select form-select-sm" style="width: auto; min-width: 120px;"
+                        onchange="window.location.href='{{ url_for('dashboard', quick_date=quick_date) }}&manager=' + this.value">
+                        <option value="">全部负责人</option>
+                        {% for manager in all_managers %}
+                        <option value="{{ manager }}" {% if manager_filter==manager %}selected{% endif %}>
+                            {{ manager }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                    <span class="text-secondary"><i class="bi bi-globe me-1"></i>网站：</span>
+                    <select id="sourceFilter" class="form-select form-select-sm" style="width: auto; min-width: 180px;"
+                        onchange="window.location.href='{{ url_for('dashboard', quick_date=quick_date) }}&source=' + this.value">
+                        <option value="">全部网站</option>
+                        {% for source in sources %}
+                        <option value="{{ source.source }}" {% if source_filter==source.source %}selected{% endif %}>
+                            {{ source.source.replace('https://www.', '') }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
             </div>
         </div>
     </div>
@@ -178,9 +192,10 @@
                                     <td>
                                         {% set mgr = site_managers.get(source.source, '') %}{% if mgr %}<span
                                             class="badge me-1" style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{
-                                            mgr }}</span>{% endif %}<span class="source-badge">{{
+                                            mgr }}</span>{% endif %}{% if source_display_mode != 'manager_only' %}<span
+                                            class="source-badge">{{
                                             source.source.replace('https://www.', '')
-                                            }}</span>
+                                            }}</span>{% endif %}
                                     </td>
                                     <td class="text-center"><span class="badge bg-secondary">{{ source.currency or 'N/A'
                                             }}</span></td>
@@ -293,51 +308,51 @@
                 legend: { labels: { color: '#fff' } },
                 tooltip: {
                     callbacks: {
-                        label: function(context) {
+                        label: function (context) {
                             var label = context.dataset.label || '';
                             var value = context.parsed.y;
                             if (label === '销售额') {
-                                var cnyRate = {% if stats.net_revenue %}{{ (stats.net_revenue_cny / stats.net_revenue)|round(4) }}{% else %}0{% endif %};
-                                var cnyValue = value * cnyRate;
-                                return label + ': ' + value.toLocaleString('zh-CN', {minimumFractionDigits: 2}) + ' (≈ ¥' + cnyValue.toLocaleString('zh-CN', {minimumFractionDigits: 2}) + ')';
-                            }
+                                var cnyRate = {% if stats.net_revenue %} { { (stats.net_revenue_cny / stats.net_revenue) | round(4) } } {% else %}0{% endif %};
+                var cnyValue = value * cnyRate;
+                return label + ': ' + value.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ' (≈ ¥' + cnyValue.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ')';
+            }
                             return label + ': ' + value;
-                        }
-                    }
+        }
+    }
                 }
             },
-            scales: {
-                x: {
-                    grid: { color: 'rgba(255,255,255,0.1)' },
-                    ticks: {
-                        color: '#aaa',
-                        maxRotation: 0,
-                        callback: function(value, index) {
-                            if (trendType === 'daily') {
-                                var label = this.getLabelForValue(value);
-                                var date = new Date(label);
-                                var day = label.split('-')[2];
-                                var weekdays = ['日', '一', '二', '三', '四', '五', '六'];
-                                var weekday = weekdays[date.getDay()];
-                                return [day, weekday];
-                            }
-                            return this.getLabelForValue(value);
-                        }
+        scales: {
+        x: {
+            grid: { color: 'rgba(255,255,255,0.1)' },
+            ticks: {
+                color: '#aaa',
+                maxRotation: 0,
+                callback: function (value, index) {
+                    if (trendType === 'daily') {
+                        var label = this.getLabelForValue(value);
+                        var date = new Date(label);
+                        var day = label.split('-')[2];
+                        var weekdays = ['日', '一', '二', '三', '四', '五', '六'];
+                        var weekday = weekdays[date.getDay()];
+                        return [day, weekday];
                     }
-                },
-                y: {
-                    position: 'left',
-                    grid: { color: 'rgba(255,255,255,0.1)' },
-                    ticks: { color: '#aaa' },
-                    title: { display: true, text: '订单数', color: '#aaa' }
-                },
-                y1: {
-                    position: 'right',
-                    grid: { drawOnChartArea: false },
-                    ticks: { color: '#aaa' },
-                    title: { display: true, text: '销售额', color: '#aaa' }
+                    return this.getLabelForValue(value);
                 }
             }
+        },
+        y: {
+            position: 'left',
+            grid: { color: 'rgba(255,255,255,0.1)' },
+            ticks: { color: '#aaa' },
+            title: { display: true, text: '订单数', color: '#aaa' }
+        },
+        y1: {
+            position: 'right',
+            grid: { drawOnChartArea: false },
+            ticks: { color: '#aaa' },
+            title: { display: true, text: '销售额', color: '#aaa' }
+        }
+    }
         }
     });
 
