@@ -400,10 +400,11 @@
                     // Overview Cards
                     html += '<div class="col-md-3">';
                     html += '<div class="info-card text-center"><div class="card-body">';
-                    html += '<h6 class="text-muted mb-2">客户等级</h6>';
+                    html += '<h6 class="text-white-50 mb-2">客户等级</h6>';
 
                     // Quality Selector
                     var currentVal = customer.customer_tier.manual ? customer.customer_tier.value : 'auto';
+                    {% if current_user.can_edit() %}
                     html += '<div class="dropdown">';
                     html += '<button class="btn btn-sm dropdown-toggle w-100" type="button" data-bs-toggle="dropdown" aria-expanded="false" style="color: ' + customer.customer_tier.color + '; border-color: ' + customer.customer_tier.color + ';">';
                     html += '<i class="bi bi-' + customer.customer_tier.icon + ' me-1"></i>' + customer.customer_tier.level;
@@ -417,12 +418,17 @@
                     html += '<li><a class="dropdown-item text-secondary" href="#" onclick="updateCustomerQuality(\'' + customer.email + '\', \'new\'); return false;"><i class="bi bi-person me-2"></i>新客</a></li>';
                     html += '<li><a class="dropdown-item text-danger" href="#" onclick="updateCustomerQuality(\'' + customer.email + '\', \'bad\'); return false;"><i class="bi bi-x-circle me-2"></i>劣质</a></li>';
                     html += '</ul></div>';
+                    {% else %}
+                    html += '<span class="badge" style="color: ' + customer.customer_tier.color + '; border: 1px solid ' + customer.customer_tier.color + '; background: transparent;">';
+                    html += '<i class="bi bi-' + customer.customer_tier.icon + ' me-1"></i>' + customer.customer_tier.level;
+                    html += '</span>';
+                    {% endif %}
 
                     html += '</div></div></div>';
 
                     html += '<div class="col-md-3">';
                     html += '<div class="info-card text-center"><div class="card-body">';
-                    html += '<h6 class="text-muted mb-2">总消费</h6>';
+                    html += '<h6 class="text-white-50 mb-2">总消费</h6>';
                     if (customer.spending_by_currency && Object.keys(customer.spending_by_currency).length > 0) {
                         var spendingHtml = '';
                         for (var currency in customer.spending_by_currency) {
@@ -439,13 +445,13 @@
 
                     html += '<div class="col-md-3">';
                     html += '<div class="info-card text-center"><div class="card-body">';
-                    html += '<h6 class="text-muted mb-2">订单数</h6>';
-                    html += '<div class="h4 text-info mb-0">' + customer.successful_orders + ' <span class="fs-6 text-muted">/ ' + customer.total_orders + '</span></div>';
+                    html += '<h6 class="text-white-50 mb-2">订单数</h6>';
+                    html += '<div class="h4 text-info mb-0">' + customer.successful_orders + ' <span class="fs-6 text-white-50">/ ' + customer.total_orders + '</span></div>';
                     html += '</div></div></div>';
 
                     html += '<div class="col-md-3">';
                     html += '<div class="info-card text-center"><div class="card-body">';
-                    html += '<h6 class="text-muted mb-2">客单价</h6>';
+                    html += '<h6 class="text-white-50 mb-2">客单价</h6>';
                     html += '<div class="h4 text-warning mb-0">' + customer.avg_order_value.toFixed(2) + ' PLN</div>';
                     html += '</div></div></div>';
 

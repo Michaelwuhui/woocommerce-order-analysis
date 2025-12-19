@@ -44,6 +44,14 @@ class User(UserMixin):
     
     def is_admin(self):
         return self.role == 'admin'
+    
+    def is_viewer(self):
+        """Viewer can see all data but cannot modify"""
+        return self.role == 'viewer'
+    
+    def can_edit(self):
+        """Check if user can edit/modify data (not a viewer)"""
+        return self.role in ('admin', 'user')
 
 
 @login_manager.user_loader
@@ -183,14 +191,14 @@ def get_full_product_name(item):
     return full_name, flavor, puffs
 
 
-def get_user_allowed_sources(user_id, is_admin=False):
+def get_user_allowed_sources(user_id, is_admin=False, is_viewer=False):
     """
     Get list of source URLs that a user has permission to access.
-    Admin users can access all sources.
+    Admin and Viewer users can access all sources.
     Returns None if user has no restrictions (can see all), or a list of allowed URLs.
     """
-    if is_admin:
-        return None  # No restrictions for admin
+    if is_admin or is_viewer:
+        return None  # No restrictions for admin or viewer
     
     conn = get_db_connection()
     
@@ -399,6 +407,17 @@ def admin_required(f):
     return decorated_function
 
 
+def editor_required(f):
+    """Decorator to require edit permission (admin or user, not viewer)"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.can_edit():
+            return jsonify({'error': '只读用户无法修改数据', 'readonly': True}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
 # ============== ROUTES ==============
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -442,7 +461,7 @@ def dashboard():
     conn = get_db_connection()
     
     # Get user's allowed sources for permission filtering
-    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
     source_clause, source_params = build_source_filter_clause(allowed_sources)
     
     # Get filters
@@ -830,7 +849,7 @@ def orders():
     conn = get_db_connection()
     
     # Get user's allowed sources for permission filtering
-    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
     
     # Get filter parameters
     source_filter = request.args.get('source', '')
@@ -1197,7 +1216,7 @@ def monthly():
     conn = get_db_connection()
     
     # Get user's allowed sources for permission filtering
-    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
     
     # Get source filter
     source_filter = request.args.get('source', '')
@@ -1369,7 +1388,7 @@ def customers():
     conn = get_db_connection()
     
     # Get user's allowed sources for permission filtering
-    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
     
     # Get source filter
     source_filter = request.args.get('source', '')
@@ -1858,6 +1877,7 @@ def get_customer_details(email):
 
 @app.route('/api/customer/quality', methods=['POST'])
 @login_required
+@editor_required
 def update_customer_quality():
     """Update customer quality tier manually"""
     data = request.json
@@ -3481,7 +3501,7 @@ def update_user(user_id):
     role = data.get('role', 'user')
     password = data.get('password', '')
     
-    if role not in ['admin', 'user']:
+    if role not in ['admin', 'user', 'viewer']:
         role = 'user'
     
     conn = get_db_connection()
@@ -3594,7 +3614,7 @@ def products():
     conn = get_db_connection()
     
     # Get user's allowed sources for permission filtering
-    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
     
     # Get filter parameters
     source_filter = request.args.get('source', '')
@@ -4032,7 +4052,7 @@ def get_product_stats():
     from datetime import date, timedelta
     
     conn = get_db_connection()
-    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin())
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
     
     # Get parameters
     source = request.args.get('source', '')

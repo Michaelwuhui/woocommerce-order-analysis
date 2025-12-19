@@ -103,6 +103,7 @@
                         <label class="form-label text-white-50">角色</label>
                         <select class="form-select bg-dark text-white border-secondary" id="addRole">
                             <option value="user">普通用户</option>
+                            <option value="viewer">只读用户</option>
                             <option value="admin">管理员</option>
                         </select>
                     </div>
@@ -145,6 +146,7 @@
                         <label class="form-label text-white-50">角色</label>
                         <select class="form-select bg-dark text-white border-secondary" id="editRole">
                             <option value="user">普通用户</option>
+                            <option value="viewer">只读用户</option>
                             <option value="admin">管理员</option>
                         </select>
                     </div>
@@ -199,7 +201,7 @@
                         <td class="ps-4 text-white">${u.username}</td>
                         <td class="text-white-50">${u.name || '-'}</td>
                         <td>
-                            <span class="badge ${u.role === 'admin' ? 'bg-warning' : 'bg-secondary'}">${u.role === 'admin' ? '管理员' : '普通用户'}</span>
+                            <span class="badge ${u.role === 'admin' ? 'bg-warning' : (u.role === 'viewer' ? 'bg-info' : 'bg-secondary')}">${u.role === 'admin' ? '管理员' : (u.role === 'viewer' ? '只读用户' : '普通用户')}</span>
                         </td>
                         <td class="text-white-50">${u.created_at || '-'}</td>
                         <td class="text-end pe-4">
