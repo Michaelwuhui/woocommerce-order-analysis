@@ -135,6 +135,31 @@ def extract_puffs_from_meta(item):
     return None
 
 
+def calculate_customer_tier(successful_orders, total_spending, avg_days_between):
+    """Calculate customer tier based on orders, spending, and frequency"""
+    quality_score = 0
+    quality_score += min(successful_orders * 10, 30)  # Max 30 for orders
+    quality_score += min(total_spending / 100, 40)    # Max 40 for spending
+    
+    # Frequency bonus
+    if avg_days_between > 0:
+        if avg_days_between < 60:
+            quality_score += 30
+        elif avg_days_between < 120:
+            quality_score += 15
+    
+    quality_score = min(quality_score, 100)
+    
+    if quality_score >= 80:
+        return 'vip'
+    elif quality_score >= 60:
+        return 'good'
+    elif quality_score >= 40:
+        return 'normal'
+    else:
+        return 'new'
+
+
 def get_full_product_name(item):
     """
     Get full product name including variation attributes (like flavor).
@@ -537,6 +562,9 @@ def dashboard():
     revenue_conditions = conditions.copy()
     revenue_conditions.append('status NOT IN ("failed", "cancelled")')
     revenue_where = 'WHERE ' + ' AND '.join(revenue_conditions)
+    
+    # Valid orders count (for AOV calculation)
+    stats['valid_orders'] = conn.execute(f'SELECT COUNT(*) FROM orders {revenue_where}', params).fetchone()[0]
     
     # Get revenue grouped by currency (total and net = total - shipping)
     revenue_by_currency_raw = conn.execute(f'''
@@ -982,6 +1010,83 @@ def orders():
         order['net_total'] = float(order['total'] or 0) - float(order.get('shipping_total') or 0)
         order['net_total_cny'] = round(order['net_total'] * rate, 2) if rate else None
     
+    # Get customer attributes for the displayed orders
+    customer_emails = list(set(o['customer_email'] for o in processed_orders if o.get('customer_email')))
+    customer_attributes = {}
+    
+    if customer_emails:
+        placeholders = ', '.join(['?' for _ in customer_emails])
+        
+        # 1. Get manual quality settings
+        manual_settings = conn.execute(f'''
+            SELECT email, quality_tier FROM customer_settings 
+            WHERE email IN ({placeholders})
+        ''', customer_emails).fetchall()
+        
+        # 2. Calculate attributes for each customer
+        for email in customer_emails:
+            if email not in customer_attributes:
+                customer_attributes[email] = {}
+            
+            # Check manual setting
+            manual_tier = 'auto'
+            for row in manual_settings:
+                if row['email'] == email:
+                    manual_tier = row['quality_tier']
+                    break
+            
+            # Get customer stats (order count and total spending)
+            # Note: This is a bit expensive inside a loop, but for 20 items it's acceptable.
+            # Optimized query to get count and total in one go
+            stats = conn.execute('''
+                SELECT 
+                    COUNT(*) as total_orders,
+                    SUM(CASE WHEN status IN ('completed', 'processing') THEN 1 ELSE 0 END) as successful_orders,
+                    SUM(CASE WHEN status IN ('completed', 'processing') THEN total ELSE 0 END) as total_spending,
+                    MAX(date_created) as last_order_date,
+                    MIN(date_created) as first_order_date
+                FROM orders 
+                WHERE billing LIKE ?
+            ''', (f'%"{email}"%',)).fetchone()
+            
+            total_orders = stats['total_orders'] or 0
+            successful_orders = stats['successful_orders'] or 0
+            total_spending = stats['total_spending'] or 0
+            
+            # Store order count for display
+            customer_attributes[email]['order_count'] = total_orders
+            customer_attributes[email]['is_new'] = (total_orders <= 1)
+            
+            # Determine Tier
+            tier = manual_tier
+            
+            if tier == 'auto':
+                # Calculate auto tier using shared logic
+                avg_days_between = 0
+                if total_orders > 1 and stats['first_order_date'] and stats['last_order_date']:
+                    from datetime import datetime
+                    try:
+                        first_date = datetime.fromisoformat(stats['first_order_date'][:19])
+                        last_date = datetime.fromisoformat(stats['last_order_date'][:19])
+                        days_span = (last_date - first_date).days
+                        avg_days_between = days_span / (total_orders - 1)
+                    except:
+                        avg_days_between = 0
+                
+                tier = calculate_customer_tier(successful_orders, total_spending, avg_days_between)
+            
+            # Set attributes based on tier
+            if tier == 'vip':
+                customer_attributes[email]['quality'] = {'label': 'VIP', 'class': 'text-warning', 'icon': 'star-fill'}
+            elif tier == 'good':
+                customer_attributes[email]['quality'] = {'label': '优质', 'class': 'text-success', 'icon': 'gem'}
+            elif tier == 'normal':
+                customer_attributes[email]['quality'] = {'label': '普通', 'class': 'text-primary', 'icon': 'person-check'}
+            elif tier == 'new':
+                customer_attributes[email]['quality'] = {'label': '新客', 'class': 'text-info', 'icon': 'stars'}
+            elif tier == 'bad':
+                customer_attributes[email]['quality'] = {'label': '劣质', 'class': 'text-danger', 'icon': 'x-circle'}
+
     conn.close()
     
     return render_template('orders.html',
@@ -991,6 +1096,7 @@ def orders():
                          summary_stats=summary_stats,
                          totals=totals,
                          site_managers=site_managers,
+                         customer_attributes=customer_attributes,
                          all_managers=all_managers,
                          current_filters={
                              'source': source_filter,
@@ -1604,15 +1710,40 @@ def get_customer_details(email):
     quality_score += 30 if avg_days_between > 0 and avg_days_between < 60 else (15 if avg_days_between < 120 else 0)  # Frequency bonus
     quality_score = min(quality_score, 100)
     
+    # Check for manual override
+    conn = get_db_connection()
+    manual_setting = conn.execute('SELECT quality_tier FROM customer_settings WHERE email = ?', (email,)).fetchone()
+    conn.close()
+    manual_tier = manual_setting['quality_tier'] if manual_setting else 'auto'
+    
     # Determine customer tier
-    if quality_score >= 80:
-        customer_tier = {'level': 'VIP', 'color': '#f59e0b', 'icon': 'star-fill'}
-    elif quality_score >= 60:
-        customer_tier = {'level': '优质', 'color': '#10b981', 'icon': 'gem'}
-    elif quality_score >= 40:
-        customer_tier = {'level': '普通', 'color': '#3b82f6', 'icon': 'person-check'}
-    else:
-        customer_tier = {'level': '新客', 'color': '#6b7280', 'icon': 'person'}
+    if manual_tier != 'auto':
+        if manual_tier == 'vip':
+            customer_tier = {'level': 'VIP', 'color': '#f59e0b', 'icon': 'star-fill', 'manual': True}
+        elif manual_tier == 'good':
+            customer_tier = {'level': '优质', 'color': '#10b981', 'icon': 'gem', 'manual': True}
+        elif manual_tier == 'normal':
+            customer_tier = {'level': '普通', 'color': '#3b82f6', 'icon': 'person-check', 'manual': True}
+        elif manual_tier == 'new':
+            customer_tier = {'level': '新客', 'color': '#0dcaf0', 'icon': 'stars', 'manual': True}
+        elif manual_tier == 'bad':
+            customer_tier = {'level': '劣质', 'color': '#ef4444', 'icon': 'x-circle', 'manual': True}
+        else:
+            # Fallback to auto if unknown
+            manual_tier = 'auto'
+            
+    if manual_tier == 'auto':
+        tier = calculate_customer_tier(successful_orders, total_spending, avg_days_between)
+        if tier == 'vip':
+            customer_tier = {'level': 'VIP', 'color': '#f59e0b', 'icon': 'star-fill', 'manual': False}
+        elif tier == 'good':
+            customer_tier = {'level': '优质', 'color': '#10b981', 'icon': 'gem', 'manual': False}
+        elif tier == 'normal':
+            customer_tier = {'level': '普通', 'color': '#3b82f6', 'icon': 'person-check', 'manual': False}
+        else:
+            customer_tier = {'level': '新客', 'color': '#0dcaf0', 'icon': 'stars', 'manual': False}
+            
+    customer_tier['value'] = manual_tier
     
     # Calculate CNY total for customer spending
     from datetime import datetime
@@ -1646,6 +1777,34 @@ def get_customer_details(email):
     }
     
     return jsonify(result)
+
+
+@app.route('/api/customer/quality', methods=['POST'])
+@login_required
+def update_customer_quality():
+    """Update customer quality tier manually"""
+    data = request.json
+    email = data.get('email')
+    quality = data.get('quality')
+    
+    if not email or not quality:
+        return jsonify({'success': False, 'error': 'Missing required fields'}), 400
+        
+    conn = get_db_connection()
+    try:
+        conn.execute('''
+            INSERT INTO customer_settings (email, quality_tier, updated_at) 
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(email) DO UPDATE SET 
+                quality_tier = excluded.quality_tier,
+                updated_at = excluded.updated_at
+        ''', (email, quality))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        conn.close()
 
 
 # Status translation

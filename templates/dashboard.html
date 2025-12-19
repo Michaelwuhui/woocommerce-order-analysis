@@ -127,9 +127,9 @@
                     <i class="bi bi-graph-up"></i>
                 </div>
                 <div class="stat-content">
-                    <h3>{{ "{:,.2f}".format(stats.total_revenue / stats.total_orders if stats.total_orders > 0 else 0)
-                        }}</h3>
-                    <p>平均订单金额</p>
+                    <h3>¥{{ "{:,.2f}".format(stats.total_revenue_cny / stats.valid_orders if stats.valid_orders > 0 else
+                        0) }}</h3>
+                    <p>平均订单金额 (CNY)</p>
                 </div>
             </div>
         </div>
