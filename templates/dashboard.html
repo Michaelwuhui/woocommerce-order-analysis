@@ -274,11 +274,25 @@
 
 {% block scripts %}
 <script>
-    // Trend Chart
-    var trendData = {{ trend_data | tojson | safe }};
+    document.addEventListener('DOMContentLoaded', function () {
+        try {
+            // Global variables
+            var trendData = {{ trend_data | tojson | safe
+        }};
     var trendType = '{{ trend_type }}';
-    var trendCtx = document.getElementById('trendChart').getContext('2d');
+    var statusData = {{ status_data | tojson | safe }};
+    // Use backend calculated rate, default to 0 if missing
+    var cnyRate = {{ cny_rate if cny_rate is defined else 0 }};
 
+    // Check if Chart is loaded
+    if (typeof Chart === 'undefined') {
+        console.error('Chart.js not loaded');
+        document.getElementById('trendChart').parentNode.innerHTML = '<div class="alert alert-danger">图表组件加载失败，请检查网络连接</div>';
+        return;
+    }
+
+    // Trend Chart
+    var trendCtx = document.getElementById('trendChart').getContext('2d');
     new Chart(trendCtx, {
         type: 'bar',
         data: {
@@ -312,52 +326,56 @@
                             var label = context.dataset.label || '';
                             var value = context.parsed.y;
                             if (label === '销售额') {
-                                var cnyRate = {% if stats.net_revenue %} { { (stats.net_revenue_cny / stats.net_revenue) | round(4) } } {% else %}0{% endif %};
-                var cnyValue = value * cnyRate;
-                return label + ': ' + value.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ' (≈ ¥' + cnyValue.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ')';
-            }
+                                var cnyValue = value * cnyRate;
+                                return label + ': ' + value.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ' (≈ ¥' + cnyValue.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ')';
+                            }
                             return label + ': ' + value;
-        }
-    }
+                        }
+                    }
                 }
             },
-        scales: {
-        x: {
-            grid: { color: 'rgba(255,255,255,0.1)' },
-            ticks: {
-                color: '#aaa',
-                maxRotation: 0,
-                callback: function (value, index) {
-                    if (trendType === 'daily') {
-                        var label = this.getLabelForValue(value);
-                        var date = new Date(label);
-                        var day = label.split('-')[2];
-                        var weekdays = ['日', '一', '二', '三', '四', '五', '六'];
-                        var weekday = weekdays[date.getDay()];
-                        return [day, weekday];
+            scales: {
+                x: {
+                    grid: { color: 'rgba(255,255,255,0.1)' },
+                    ticks: {
+                        color: '#aaa',
+                        maxRotation: 0,
+                        callback: function (value, index) {
+                            if (trendType === 'daily') {
+                                var label = this.getLabelForValue(value);
+                                // Simple date parsing
+                                var parts = label.split('-');
+                                if (parts.length === 3) {
+                                    var date = new Date(label);
+                                    var day = parts[2];
+                                    var weekdays = ['日', '一', '二', '三', '四', '五', '六'];
+                                    var weekday = weekdays[date.getDay()];
+                                    if (weekday) {
+                                        return [day, weekday];
+                                    }
+                                }
+                            }
+                            return this.getLabelForValue(value);
+                        }
                     }
-                    return this.getLabelForValue(value);
+                },
+                y: {
+                    position: 'left',
+                    grid: { color: 'rgba(255,255,255,0.1)' },
+                    ticks: { color: '#aaa' },
+                    title: { display: true, text: '订单数', color: '#aaa' }
+                },
+                y1: {
+                    position: 'right',
+                    grid: { drawOnChartArea: false },
+                    ticks: { color: '#aaa' },
+                    title: { display: true, text: '销售额', color: '#aaa' }
                 }
             }
-        },
-        y: {
-            position: 'left',
-            grid: { color: 'rgba(255,255,255,0.1)' },
-            ticks: { color: '#aaa' },
-            title: { display: true, text: '订单数', color: '#aaa' }
-        },
-        y1: {
-            position: 'right',
-            grid: { drawOnChartArea: false },
-            ticks: { color: '#aaa' },
-            title: { display: true, text: '销售额', color: '#aaa' }
-        }
-    }
         }
     });
 
-    // Status Chart with percentages
-    var statusData = {{ status_data | tojson | safe }};
+    // Status Chart
     var statusCtx = document.getElementById('statusChart').getContext('2d');
     var total = statusData.reduce(function (sum, d) { return sum + d.count; }, 0);
 
@@ -375,7 +393,7 @@
         type: 'doughnut',
         data: {
             labels: statusData.map(function (d) {
-                var percent = ((d.count / total) * 100).toFixed(1);
+                var percent = total > 0 ? ((d.count / total) * 100).toFixed(1) : 0;
                 return d.status + ' (' + percent + '%)';
             }),
             datasets: [{
@@ -405,7 +423,7 @@
                     callbacks: {
                         label: function (context) {
                             var value = context.raw;
-                            var percent = ((value / total) * 100).toFixed(1);
+                            var percent = total > 0 ? ((value / total) * 100).toFixed(1) : 0;
                             return value + ' 订单 (' + percent + '%)';
                         }
                     }
@@ -413,6 +431,14 @@
             },
             cutout: '65%'
         }
+    });
+        } catch (e) {
+        console.error('Chart initialization error:', e);
+        var errorDiv = document.createElement('div');
+        errorDiv.className = 'alert alert-danger';
+        errorDiv.textContent = '图表加载错误: ' + e.message;
+        document.querySelector('.chart-card .card-body').prepend(errorDiv);
+    }
     });
 </script>
 

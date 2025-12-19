@@ -606,6 +606,16 @@ def dashboard():
     if source_filter:
         recent_conditions.append('source = ?')
         recent_params.append(source_filter)
+
+    if manager_filter:
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            recent_conditions.append(f'source IN ({placeholders})')
+            recent_params.extend(manager_urls)
+        else:
+            recent_conditions.append('1=0')
     
     recent_where = 'WHERE ' + ' AND '.join(recent_conditions)
     recent_orders = conn.execute(f'''
@@ -686,6 +696,11 @@ def dashboard():
     
     conn.close()
     
+    # Calculate overall CNY rate for dashboard
+    cny_rate = 0
+    if stats.get('net_revenue'):
+        cny_rate = round(stats.get('net_revenue_cny', 0) / stats['net_revenue'], 4)
+        
     return render_template('dashboard.html',
                          stats=stats,
                          status_data=status_data,
@@ -698,7 +713,8 @@ def dashboard():
                          source_filter=source_filter,
                          manager_filter=manager_filter,
                          all_managers=all_managers,
-                         site_managers=site_managers)
+                         site_managers=site_managers,
+                         cny_rate=cny_rate)
 
 
 @app.route('/orders')
