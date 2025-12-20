@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}WooCommerce 订单分析{% endblock %}</title>
+    <title>{% block title %}苍赋管理系统{% endblock %}</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" rel="stylesheet">
@@ -592,6 +592,8 @@
             }
         })();
 
+        var customerQualityChanged = false;
+
         function updateCustomerQuality(email, quality) {
             fetch('/api/customer/quality', {
                 method: 'POST',
@@ -606,6 +608,7 @@
                 .then(function (response) { return response.json(); })
                 .then(function (data) {
                     if (data.success) {
+                        customerQualityChanged = true;
                         // Reload customer details
                         showCustomerDetail(email);
                     } else {
@@ -616,6 +619,14 @@
                     alert('请求失败: ' + err.message);
                 });
         }
+
+        // Refresh page when customer modal is closed if quality was changed
+        document.getElementById('customerDetailModal').addEventListener('hidden.bs.modal', function () {
+            if (customerQualityChanged) {
+                customerQualityChanged = false;
+                location.reload();
+            }
+        });
     </script>
     {% block scripts %}{% endblock %}
 </body>

@@ -619,23 +619,47 @@ def dashboard():
     status_data = sorted(status_dict.values(), key=lambda x: x['count'], reverse=True)
     
     # Orders by source with currency
+    # Query 1: All orders for total count and total revenue (销售额)
     source_data_raw = conn.execute(f'''
-        SELECT source, currency, COUNT(*) as count, SUM(total) as revenue, SUM(shipping_total) as shipping
+        SELECT source, currency, COUNT(*) as count, SUM(total) as revenue
         FROM orders {date_condition}
         GROUP BY source, currency
     ''', params).fetchall()
-    # Group by source
+    
+    # Query 2: Only successful orders for net revenue (净销售额)
+    source_success_conditions = conditions.copy()
+    source_success_conditions.append('status NOT IN ("failed", "cancelled")')
+    source_success_where = 'WHERE ' + ' AND '.join(source_success_conditions)
+    
+    source_success_raw = conn.execute(f'''
+        SELECT source, currency, SUM(total) as success_revenue, SUM(shipping_total) as success_shipping
+        FROM orders {source_success_where}
+        GROUP BY source, currency
+    ''', params).fetchall()
+    
+    # Build success data lookup
+    success_lookup = {}
+    for row in source_success_raw:
+        key = (row['source'], row['currency'])
+        success_lookup[key] = {
+            'success_revenue': row['success_revenue'] or 0,
+            'success_shipping': row['success_shipping'] or 0
+        }
+    
+    # Group by source - combine all orders data with success-only data
     source_dict = {}
     for row in source_data_raw:
         source = row['source']
+        currency = row['currency']
         if source not in source_dict:
-            source_dict[source] = {'source': source, 'count': 0, 'currency': row['currency'], 'revenue': 0, 'shipping': 0}
+            source_dict[source] = {'source': source, 'count': 0, 'currency': currency, 'revenue': 0, 'net_revenue': 0}
         source_dict[source]['count'] += row['count']
         source_dict[source]['revenue'] += row['revenue'] or 0
-        source_dict[source]['shipping'] += row['shipping'] or 0
-    # Calculate net revenue
-    for source in source_dict.values():
-        source['net_revenue'] = source['revenue'] - source['shipping']
+        
+        # Get success data for net revenue calculation
+        success_data = success_lookup.get((source, currency), {'success_revenue': 0, 'success_shipping': 0})
+        source_dict[source]['net_revenue'] += success_data['success_revenue'] - success_data['success_shipping']
+    
     source_data = list(source_dict.values())
     
     # Recent orders - apply permission filter, optionally source filter
