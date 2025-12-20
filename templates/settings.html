@@ -85,12 +85,6 @@
             <div class="card-body py-2 px-3">
                 <div class="d-flex justify-content-between align-items-center flex-wrap gap-3">
                     <div class="d-flex align-items-center gap-3">
-                        <div class="d-flex align-items-center gap-2 border-end border-secondary border-opacity-25 pe-3">
-                            <div class="form-check form-switch mb-0">
-                                <input class="form-check-input" type="checkbox" id="sourceDisplayToggle">
-                                <label class="form-check-label text-white-50" for="sourceDisplayToggle">仅显示负责人</label>
-                            </div>
-                        </div>
                         <div class="d-flex align-items-center gap-2">
                             <div class="form-check form-switch mb-0">
                                 <input class="form-check-input" type="checkbox" id="autoSyncToggle">
@@ -697,7 +691,6 @@
         // Auto Sync Toggle and Interval
         const autoSyncToggle = document.getElementById('autoSyncToggle');
         const syncIntervalSelect = document.getElementById('syncIntervalSelect');
-        const sourceDisplayToggle = document.getElementById('sourceDisplayToggle');
 
         if (autoSyncToggle && syncIntervalSelect) {
             // Fetch initial status
@@ -706,36 +699,7 @@
                 .then(data => {
                     if (data.autosync_enabled) autoSyncToggle.checked = data.autosync_enabled === 'true';
                     if (data.autosync_interval) syncIntervalSelect.value = data.autosync_interval;
-                    if (sourceDisplayToggle && data.source_display_mode) {
-                        sourceDisplayToggle.checked = data.source_display_mode === 'manager_only';
-                    }
                 });
-
-            // Handle source display toggle
-            if (sourceDisplayToggle) {
-                sourceDisplayToggle.addEventListener('change', function () {
-                    const mode = this.checked ? 'manager_only' : 'full';
-                    fetch('/api/settings', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ source_display_mode: mode })
-                    })
-                        .then(res => res.json())
-                        .then(data => {
-                            if (!data.success) {
-                                alert('设置失败');
-                                this.checked = !this.checked;
-                            } else {
-                                // Reload to apply changes
-                                location.reload();
-                            }
-                        })
-                        .catch(err => {
-                            alert('设置错误');
-                            this.checked = !this.checked;
-                        });
-                });
-            }
 
             // Handle toggle change
             autoSyncToggle.addEventListener('change', function () {

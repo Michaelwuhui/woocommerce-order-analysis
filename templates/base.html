@@ -154,6 +154,14 @@
                     </li>
                 </ul>
                 <ul class="navbar-nav">
+                    <!-- Display Mode Toggle -->
+                    <li class="nav-item d-flex align-items-center me-3">
+                        <div class="form-check form-switch mb-0">
+                            <input class="form-check-input" type="checkbox" id="navDisplayModeToggle" {% if
+                                source_display_mode=='manager_only' %}checked{% endif %}>
+                            <label class="form-check-label text-white-50 small" for="navDisplayModeToggle">仅负责人</label>
+                        </div>
+                    </li>
                     <li class="nav-item dropdown">
                         <a class="nav-link dropdown-toggle" href="#" data-bs-toggle="dropdown">
                             <i class="bi bi-person-circle me-1"></i>{{ current_user.name }}
@@ -522,6 +530,34 @@
                     document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-danger">加载失败: ' + err.message + '</div>';
                 });
         }
+
+        // Navigation bar display mode toggle handler
+        (function () {
+            var toggle = document.getElementById('navDisplayModeToggle');
+            if (toggle) {
+                toggle.addEventListener('change', function () {
+                    var mode = this.checked ? 'manager_only' : 'full';
+                    fetch('/api/user/preferences', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ source_display_mode: mode })
+                    })
+                        .then(function (res) { return res.json(); })
+                        .then(function (data) {
+                            if (data.success) {
+                                location.reload();
+                            } else {
+                                alert('设置失败');
+                                toggle.checked = !toggle.checked;
+                            }
+                        })
+                        .catch(function (err) {
+                            alert('设置错误');
+                            toggle.checked = !toggle.checked;
+                        });
+                });
+            }
+        })();
     </script>
 
     <script>

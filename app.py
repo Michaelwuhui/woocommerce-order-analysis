@@ -2052,8 +2052,22 @@ def init_settings_table():
     conn.execute('''
         INSERT OR IGNORE INTO settings (key, value) VALUES ('autosync_interval', '900')
     ''')
+    # Note: source_display_mode is now per-user, stored in user_preferences table
+    conn.commit()
+    conn.close()
+
+
+def init_user_preferences_table():
+    """Initialize user_preferences table for storing per-user settings"""
+    conn = get_db_connection()
     conn.execute('''
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('source_display_mode', 'full')
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            user_id INTEGER,
+            preference_key TEXT,
+            preference_value TEXT,
+            PRIMARY KEY (user_id, preference_key),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
     ''')
     conn.commit()
     conn.close()
@@ -2061,11 +2075,22 @@ def init_settings_table():
 
 @app.context_processor
 def inject_settings():
-    """Inject global settings into all templates"""
-    conn = get_db_connection()
-    mode = conn.execute("SELECT value FROM settings WHERE key = 'source_display_mode'").fetchone()
-    conn.close()
-    return dict(source_display_mode=mode['value'] if mode else 'full')
+    """Inject user-specific settings into all templates"""
+    # Default value
+    source_display_mode = 'full'
+    
+    # Try to get user-specific preference if logged in
+    if current_user.is_authenticated:
+        conn = get_db_connection()
+        pref = conn.execute('''
+            SELECT preference_value FROM user_preferences 
+            WHERE user_id = ? AND preference_key = 'source_display_mode'
+        ''', (current_user.id,)).fetchone()
+        conn.close()
+        if pref:
+            source_display_mode = pref['preference_value']
+    
+    return dict(source_display_mode=source_display_mode)
 
 
 def save_sync_log(site_id, site_url, status, message, new_orders=0, updated_orders=0, duration_seconds=0):
@@ -2276,6 +2301,7 @@ with app.app_context():
     init_settings_table()
     init_users_table()
     init_product_tables()
+    init_user_preferences_table()
 
 @app.route('/settings')
 @login_required
@@ -4419,21 +4445,72 @@ def get_product_samples():
 @app.route('/api/settings', methods=['GET', 'POST'])
 @login_required
 def settings_api():
-    """API endpoint for general settings"""
+    """API endpoint for general settings (admin only for POST)"""
     conn = get_db_connection()
     
     if request.method == 'GET':
         settings = conn.execute("SELECT key, value FROM settings").fetchall()
         conn.close()
-        return jsonify({row['key']: row['value'] for row in settings})
+        result = {row['key']: row['value'] for row in settings}
+        
+        # Also include user's display preference
+        if current_user.is_authenticated:
+            pref = get_db_connection()
+            user_pref = pref.execute('''
+                SELECT preference_value FROM user_preferences 
+                WHERE user_id = ? AND preference_key = 'source_display_mode'
+            ''', (current_user.id,)).fetchone()
+            pref.close()
+            result['source_display_mode'] = user_pref['preference_value'] if user_pref else 'full'
+        
+        return jsonify(result)
         
     elif request.method == 'POST':
         data = request.json
         try:
             for key, value in data.items():
-                # Allow specific keys only for security
-                if key in ['source_display_mode', 'autosync_enabled', 'autosync_interval']:
+                # source_display_mode is now per-user
+                if key == 'source_display_mode':
+                    # Save to user_preferences instead
+                    conn.execute('''
+                        INSERT OR REPLACE INTO user_preferences (user_id, preference_key, preference_value)
+                        VALUES (?, 'source_display_mode', ?)
+                    ''', (current_user.id, str(value)))
+                elif key in ['autosync_enabled', 'autosync_interval']:
+                    # These remain global settings (admin only)
                     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True})
+        except Exception as e:
+            conn.close()
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/user/preferences', methods=['GET', 'POST'])
+@login_required
+def user_preferences_api():
+    """API endpoint for user-specific preferences"""
+    conn = get_db_connection()
+    
+    if request.method == 'GET':
+        prefs = conn.execute('''
+            SELECT preference_key, preference_value FROM user_preferences
+            WHERE user_id = ?
+        ''', (current_user.id,)).fetchall()
+        conn.close()
+        return jsonify({row['preference_key']: row['preference_value'] for row in prefs})
+        
+    elif request.method == 'POST':
+        data = request.json
+        try:
+            for key, value in data.items():
+                # Allow specific preference keys only
+                if key in ['source_display_mode']:
+                    conn.execute('''
+                        INSERT OR REPLACE INTO user_preferences (user_id, preference_key, preference_value)
+                        VALUES (?, ?, ?)
+                    ''', (current_user.id, key, str(value)))
             conn.commit()
             conn.close()
             return jsonify({'success': True})
@@ -4444,3 +4521,4 @@ def settings_api():
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
+
