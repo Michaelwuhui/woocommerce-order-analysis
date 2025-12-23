@@ -199,7 +199,10 @@
     <!-- Orders Table -->
     <div class="card data-card">
         <div class="card-body p-0">
-            <div class="table-responsive">
+            <div class="scroll-hint d-lg-none">
+                <i class="bi bi-arrow-left-right me-2"></i>左右滑动查看更多
+            </div>
+            <div class="table-responsive orders-table-container">
                 <table class="table table-dark table-hover mb-0">
                     <thead>
                         <tr>
@@ -208,7 +211,7 @@
                             <th>来源</th>
                             <th>状态</th>
                             <th>客户</th>
-                            <th style="min-width: 350px;">产品明细</th>
+                            <th>产品明细</th>
                             <th class="text-end">总数量</th>
                             <th class="text-end">运费</th>
                             <th class="text-end">订单金额</th>
@@ -311,9 +314,57 @@
 </div>
 
 <style>
+    /* Scroll hint for smaller screens */
+    .scroll-hint {
+        background: linear-gradient(90deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.15) 100%);
+        color: #a0aec0;
+        padding: 8px 16px;
+        font-size: 0.8rem;
+        text-align: center;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        animation: pulse-hint 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse-hint {
+
+        0%,
+        100% {
+            opacity: 0.7;
+        }
+
+        50% {
+            opacity: 1;
+        }
+    }
+
+    /* Improved table container with visible scrollbar */
+    .orders-table-container {
+        scrollbar-width: thin;
+        scrollbar-color: rgba(102, 126, 234, 0.5) rgba(0, 0, 0, 0.2);
+    }
+
+    .orders-table-container::-webkit-scrollbar {
+        height: 10px;
+    }
+
+    .orders-table-container::-webkit-scrollbar-track {
+        background: rgba(0, 0, 0, 0.2);
+        border-radius: 5px;
+    }
+
+    .orders-table-container::-webkit-scrollbar-thumb {
+        background: linear-gradient(90deg, #667eea, #764ba2);
+        border-radius: 5px;
+    }
+
+    .orders-table-container::-webkit-scrollbar-thumb:hover {
+        background: linear-gradient(90deg, #5a67d8, #6b42a1);
+    }
+
     /* Product cell styling */
     .product-cell {
         padding: 8px 16px !important;
+        min-width: 280px;
     }
 
     .product-item {
@@ -378,6 +429,52 @@
         border-color: transparent;
         color: white;
         box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+    }
+
+    /* Responsive optimizations */
+    @media (max-width: 1600px) {
+        .product-cell {
+            min-width: 250px;
+        }
+
+        .product-name {
+            font-size: 0.8rem;
+        }
+
+        .table-dark th,
+        .table-dark td {
+            padding: 12px 10px;
+            font-size: 0.85rem;
+        }
+    }
+
+    @media (max-width: 1400px) {
+        .product-cell {
+            min-width: 220px;
+        }
+
+        .product-total {
+            min-width: 70px;
+            font-size: 0.8rem;
+        }
+
+        /* Hide shipping column on smaller screens */
+        .orders-table-container table th:nth-child(8),
+        .orders-table-container table td:nth-child(8) {
+            display: none;
+        }
+    }
+
+    @media (max-width: 1200px) {
+        .product-cell {
+            min-width: 200px;
+        }
+
+        /* Hide exchange rate column */
+        .orders-table-container table th:nth-child(10),
+        .orders-table-container table td:nth-child(10) {
+            display: none;
+        }
     }
 </style>
 
