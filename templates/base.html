@@ -381,6 +381,15 @@
         }
 
         function showCustomerDetail(email) {
+            // Check if email is valid
+            if (!email || email.trim() === '') {
+                var modal = new bootstrap.Modal(document.getElementById('customerDetailModal'));
+                document.getElementById('modalCustomerName').textContent = '';
+                document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-warning"><i class="bi bi-exclamation-triangle me-2"></i>该订单没有客户邮箱信息</div>';
+                modal.show();
+                return;
+            }
+
             // Close order modal if open
             var orderModalEl = document.getElementById('orderDetailModal');
             var orderModal = bootstrap.Modal.getInstance(orderModalEl);

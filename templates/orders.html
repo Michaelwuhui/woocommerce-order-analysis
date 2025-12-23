@@ -232,31 +232,31 @@
                                     order.source.replace('https://www.', '') }}</span>{% endif %}</td>
                             <td><span class="status-badge status-{{ order.status }}">{{ order.status|status_label
                                     }}</span></td>
-                            <td>
-                                <div>
-                                    <a href="javascript:void(0)"
-                                        onclick="showCustomerDetail('{{ order.customer_email }}')"
-                                        class="text-light text-decoration-none">{{ order.customer_name or '-' }}</a>
-
-                                    {% if customer_attributes and order.customer_email in customer_attributes %}
-                                    {% set attrs = customer_attributes[order.customer_email] %}
+                            <td class="customer-cell">
+                                {% if customer_attributes and order.customer_email in customer_attributes %}
+                                {% set attrs = customer_attributes[order.customer_email] %}
+                                <div class="customer-badges">
                                     {% if attrs.quality %}
-                                    <span
-                                        class="badge {{ attrs.quality.class }} bg-opacity-10 border border-opacity-25 ms-1"
-                                        style="font-size: 0.7em; padding: 2px 6px;">
+                                    <span class="badge {{ attrs.quality.class }} bg-opacity-10 border border-opacity-25"
+                                        style="font-size: 0.65em; padding: 2px 5px;">
                                         <i class="bi bi-{{ attrs.quality.icon }}"></i> {{ attrs.quality.label }}
                                     </span>
                                     {% endif %}
                                     {% if attrs.order_count and attrs.order_count >= 1 %}
                                     <span
-                                        class="badge text-secondary bg-opacity-10 border border-secondary border-opacity-25 ms-1"
-                                        style="font-size: 0.7em; padding: 2px 6px;">
+                                        class="badge text-secondary bg-opacity-10 border border-secondary border-opacity-25"
+                                        style="font-size: 0.65em; padding: 2px 5px;">
                                         <i class="bi bi-bag-check"></i> 第{{ attrs.order_count }}单
                                     </span>
                                     {% endif %}
-                                    {% endif %}
                                 </div>
-                                <small class="text-muted">{{ order.customer_email }}</small>
+                                {% endif %}
+                                <div class="customer-name">
+                                    <a href="javascript:void(0)"
+                                        onclick="showCustomerDetail('{{ order.customer_email }}')"
+                                        class="text-light text-decoration-none">{{ order.customer_name or '-' }}</a>
+                                </div>
+                                <div class="customer-email text-muted">{{ order.customer_email }}</div>
                             </td>
                             <td class="product-cell">
                                 {% for product in order.products %}
@@ -383,6 +383,10 @@
         flex: 1;
         color: #c8d4e3;
         font-size: 0.875rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
     }
 
     .product-qty {
@@ -402,6 +406,50 @@
         font-size: 0.85rem;
         min-width: 80px;
         text-align: right;
+    }
+
+    /* Customer cell styling */
+    .customer-cell {
+        padding: 8px 12px !important;
+        width: 180px;
+        min-width: 120px;
+        max-width: 180px;
+    }
+
+    .customer-badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-bottom: 4px;
+    }
+
+    .customer-badges .badge {
+        white-space: nowrap;
+    }
+
+    .customer-name {
+        font-size: 0.875rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        width: 100%;
+        display: block;
+    }
+
+    .customer-name a {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .customer-email {
+        font-size: 0.75rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        width: 100%;
+        display: block;
     }
 
     /* Month button styling */
