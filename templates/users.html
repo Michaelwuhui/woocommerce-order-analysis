@@ -183,9 +183,51 @@
     </div>
 </div>
 
+<!-- Delete Confirmation Modal -->
+<div class="modal fade" id="deleteUserModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">确认删除</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-white mb-0">确定要删除这个用户吗？此操作不可撤销。</p>
+                <input type="hidden" id="deleteUserId">
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-danger" id="confirmDeleteBtn">删除</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script>
     document.addEventListener('DOMContentLoaded', function () {
         loadUsers();
+
+        // Use event delegation on tbody for all button clicks - this is more robust
+        const tbody = document.getElementById('usersTableBody');
+        tbody.addEventListener('click', function (e) {
+            // Find the button that was clicked (could be the icon inside)
+            const btn = e.target.closest('button');
+            if (!btn) return;
+
+            const userId = parseInt(btn.dataset.userId);
+            if (!userId) return;
+
+            if (btn.classList.contains('btn-permissions')) {
+                openPermissions(userId);
+            } else if (btn.classList.contains('btn-edit')) {
+                const user = window._usersData && window._usersData[userId];
+                if (user) {
+                    openEditUser(user.id, user.username, user.name || '', user.role);
+                }
+            } else if (btn.classList.contains('btn-delete')) {
+                deleteUser(userId);
+            }
+        });
 
         function loadUsers() {
             fetch('/api/users')
@@ -196,22 +238,34 @@
                         tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-muted">暂无用户</td></tr>';
                         return;
                     }
+                    // Store users data for event handlers
+                    window._usersData = {};
+                    users.forEach(u => { window._usersData[u.id] = u; });
+
+                    // Helper function to escape special characters for display
+                    const escapeHtml = (str) => {
+                        if (!str) return '';
+                        return str.replace(/&/g, '&amp;')
+                            .replace(/</g, '&lt;')
+                            .replace(/>/g, '&gt;');
+                    };
+
                     tbody.innerHTML = users.map(u => `
                     <tr>
-                        <td class="ps-4 text-white">${u.username}</td>
-                        <td class="text-white-50">${u.name || '-'}</td>
+                        <td class="ps-4 text-white">${escapeHtml(u.username)}</td>
+                        <td class="text-white-50">${escapeHtml(u.name) || '-'}</td>
                         <td>
                             <span class="badge ${u.role === 'admin' ? 'bg-warning' : (u.role === 'viewer' ? 'bg-info' : 'bg-secondary')}">${u.role === 'admin' ? '管理员' : (u.role === 'viewer' ? '只读用户' : '普通用户')}</span>
                         </td>
                         <td class="text-white-50">${u.created_at || '-'}</td>
                         <td class="text-end pe-4">
-                            <button class="btn btn-sm btn-outline-info me-1" onclick="openPermissions(${u.id})" title="权限设置">
+                            <button class="btn btn-sm btn-outline-info me-1 btn-permissions" data-user-id="${u.id}" title="权限设置">
                                 <i class="bi bi-shield-lock"></i>
                             </button>
-                            <button class="btn btn-sm btn-outline-primary me-1" onclick="openEditUser(${u.id}, '${u.username}', '${u.name || ''}', '${u.role}')" title="编辑">
+                            <button class="btn btn-sm btn-outline-primary me-1 btn-edit" data-user-id="${u.id}" title="编辑">
                                 <i class="bi bi-pencil"></i>
                             </button>
-                            <button class="btn btn-sm btn-outline-danger" onclick="deleteUser(${u.id})" title="删除">
+                            <button class="btn btn-sm btn-outline-danger btn-delete" data-user-id="${u.id}" title="删除">
                                 <i class="bi bi-trash"></i>
                             </button>
                         </td>
@@ -278,19 +332,36 @@
                 });
         });
 
-        // Delete User
+
+        // Delete User - show modal instead of confirm() since browser blocks it
         window.deleteUser = function (id) {
-            if (!confirm('确定要删除这个用户吗？')) return;
+            document.getElementById('deleteUserId').value = id;
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('deleteUserModal')).show();
+        };
+
+        // Handle actual delete when confirm button is clicked
+        document.getElementById('confirmDeleteBtn').addEventListener('click', function () {
+            const id = document.getElementById('deleteUserId').value;
             fetch(`/api/users/${id}`, { method: 'DELETE' })
                 .then(res => res.json())
                 .then(data => {
+                    bootstrap.Modal.getInstance(document.getElementById('deleteUserModal')).hide();
                     if (data.success) {
                         loadUsers();
                     } else {
-                        alert('删除失败: ' + (data.error || '未知错误'));
+                        // Use modal or toast instead of alert if also blocked
+                        console.error('删除失败:', data.error);
+                        document.body.insertAdjacentHTML('beforeend', `
+                            <div class="toast-container position-fixed top-0 end-0 p-3">
+                                <div class="toast show bg-danger text-white" role="alert">
+                                    <div class="toast-body">删除失败: ${data.error || '未知错误'}</div>
+                                </div>
+                            </div>
+                        `);
+                        setTimeout(() => document.querySelector('.toast-container')?.remove(), 3000);
                     }
                 });
-        };
+        });
 
         // Permissions
         window.openPermissions = function (userId) {
