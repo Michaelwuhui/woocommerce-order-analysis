@@ -215,7 +215,7 @@
             if (!btn) return;
 
             const userId = parseInt(btn.dataset.userId);
-            if (!userId) return;
+            if (isNaN(userId)) return;
 
             if (btn.classList.contains('btn-permissions')) {
                 openPermissions(userId);
