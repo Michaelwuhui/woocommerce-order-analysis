@@ -547,7 +547,14 @@
         document.getElementById('productSources').innerHTML = '<span class="text-muted">加载中...</span>';
         document.getElementById('productOrders').innerHTML = '<span class="text-muted">加载中...</span>';
 
-        fetch('/api/products/samples?name=' + encodeURIComponent(productName))
+        // Build query params for searching by brand+puffs+flavor combination
+        const params = new URLSearchParams();
+        params.set('name', productName);
+        if (currentBrand && currentBrand !== 'Unknown') params.set('brand', currentBrand);
+        if (currentPuffs) params.set('puffs', currentPuffs);
+        if (currentFlavor) params.set('flavor', currentFlavor);
+
+        fetch('/api/products/samples?' + params.toString())
             .then(res => res.json())
             .then(data => {
                 // Display sources

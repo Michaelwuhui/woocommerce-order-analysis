@@ -4381,28 +4381,69 @@ def product_mapping():
 @app.route('/api/products/samples')
 @login_required
 def get_product_samples():
-    """Get sample orders containing a specific product"""
+    """Get sample orders containing a specific product (supports brand+puffs+flavor matching)"""
     product_name = request.args.get('name', '')
+    brand_filter = request.args.get('brand', '')
+    puffs_filter = request.args.get('puffs', '')
+    flavor_filter = request.args.get('flavor', '')
+    
     if not product_name:
         return jsonify({'error': 'Product name is required'}), 400
     
     conn = get_db_connection()
     
-    # Search for orders containing this product in line_items
-    # We need to search JSON, so we'll filter in Python
+    # Get all site managers first (before closing connection)
+    sites = conn.execute('SELECT url, manager FROM sites').fetchall()
+    site_managers = {s['url']: s['manager'] or '' for s in sites}
+    
+    # Get brands cache for parsing
+    brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+    brands_cache = []
+    for row in brands_rows:
+        brand_name = row['name']
+        aliases = []
+        if row['aliases']:
+            try:
+                aliases = json.loads(row['aliases'])
+            except:
+                pass
+        brands_cache.append({
+            'id': row['id'],
+            'name': brand_name,
+            'aliases': aliases,
+            'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
+        })
+    
+    # Load manual product mappings
+    mappings_rows = conn.execute('''
+        SELECT pm.raw_name, pm.puff_count, pm.flavor, b.name as brand_name
+        FROM product_mappings pm
+        LEFT JOIN brands b ON pm.brand_id = b.id
+        WHERE pm.is_manual = 1
+    ''').fetchall()
+    manual_mappings = {}
+    for m in mappings_rows:
+        manual_mappings[m['raw_name']] = {
+            'brand': m['brand_name'],
+            'puffs': m['puff_count'],
+            'flavor': m['flavor']
+        }
+    
+    # Search for orders - increase limit to find more sources
     orders = conn.execute('''
         SELECT id, number, source, date_created, line_items 
         FROM orders 
         WHERE status NOT IN ('failed', 'cancelled')
         ORDER BY date_created DESC
-        LIMIT 500
+        LIMIT 2000
     ''').fetchall()
     
     conn.close()
     
-    # Find orders with matching product name
+    # Find orders with matching product (by brand+puffs+flavor or exact name)
     results = []
     sources_map = {}
+    use_combination_match = brand_filter or puffs_filter or flavor_filter
     
     for order in orders:
         items = parse_json_field(order['line_items'])
@@ -4410,27 +4451,67 @@ def get_product_samples():
             continue
         
         for item in items:
-            if item.get('name', '') == product_name:
+            item_name = item.get('name', '')
+            if not item_name:
+                continue
+            
+            matched = False
+            
+            if use_combination_match:
+                # Match by brand+puffs+flavor combination
+                # First, parse the product to get its brand/puffs/flavor
+                meta_flavor = extract_flavor_from_meta(item)
+                full_name, _, meta_puffs = get_full_product_name(item)
+                
+                # Check manual mapping first
+                if full_name in manual_mappings:
+                    mapping = manual_mappings[full_name]
+                    item_brand = mapping.get('brand') or 'Unknown'
+                    item_puffs = str(mapping.get('puffs') or meta_puffs or '')
+                    item_flavor = mapping.get('flavor') or meta_flavor or ''
+                elif item_name in manual_mappings:
+                    mapping = manual_mappings[item_name]
+                    item_brand = mapping.get('brand') or 'Unknown'
+                    item_puffs = str(mapping.get('puffs') or meta_puffs or '')
+                    item_flavor = mapping.get('flavor') or meta_flavor or ''
+                else:
+                    # Parse automatically
+                    parsed = parse_product_name(item_name, brands_cache)
+                    item_brand = parsed.get('brand') or 'Unknown'
+                    item_puffs = str(meta_puffs or parsed.get('puffs') or '')
+                    item_flavor = meta_flavor or parsed.get('flavor') or ''
+                
+                # Check if matches the filter criteria
+                brand_match = not brand_filter or item_brand.upper() == brand_filter.upper()
+                puffs_match = not puffs_filter or item_puffs == puffs_filter
+                # For flavor, use case-insensitive contains match
+                flavor_match = not flavor_filter or (item_flavor and flavor_filter.upper() in item_flavor.upper())
+                
+                matched = brand_match and puffs_match and flavor_match
+            else:
+                # Fallback to exact name match
+                matched = item_name == product_name
+            
+            if matched:
                 # Extract domain from source for display
                 source = order['source']
                 source_display = source.replace('https://www.', '').replace('https://', '').split('/')[0]
                 
-                # Get manager
-                manager = conn.execute('SELECT manager FROM sites WHERE url = ?', (source,)).fetchone()
-                manager_name = manager['manager'] if manager else ''
+                # Get manager from pre-loaded site_managers
+                manager_name = site_managers.get(source, '')
                 
+                # Always collect all sources
                 sources_map[source_display] = manager_name
                 
-                results.append({
-                    'order_number': order['number'],
-                    'source': source_display,
-                    'manager': manager_name,
-                    'date': order['date_created'][:10] if order['date_created'] else ''
-                })
+                # Only add to results if under limit
+                if len(results) < 10:
+                    results.append({
+                        'order_number': order['number'],
+                        'source': source_display,
+                        'manager': manager_name,
+                        'date': order['date_created'][:10] if order['date_created'] else ''
+                    })
                 break  # One match per order is enough
-        
-        if len(results) >= 10:
-            break
     
     sources_list = [{'site': k, 'manager': v} for k, v in sources_map.items()]
     
