@@ -43,7 +43,7 @@
                         {% for source in sources %}
                         <option value="{{ source.source }}" {% if current_filters.source==source.source %}selected{%
                             endif %}>
-                            {{ source.source.replace('https://www.', '') }}
+                            {{ source.source.replace('https://www.', '').replace('https://', '') }}
                         </option>
                         {% endfor %}
                     </select>

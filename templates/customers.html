@@ -32,7 +32,7 @@
                     <option value="">全部网站</option>
                     {% for source in sources %}
                     <option value="{{ source.source }}" {% if source_filter==source.source %}selected{% endif %}>
-                        {{ source.source.replace('https://www.', '') }}
+                        {{ source.source.replace('https://www.', '').replace('https://', '') }}
                     </option>
                     {% endfor %}
                 </select>

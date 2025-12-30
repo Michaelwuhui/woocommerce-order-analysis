@@ -42,7 +42,7 @@
                         <option value="">全部网站</option>
                         {% for source in sources %}
                         <option value="{{ source.source }}" {% if source_filter==source.source %}selected{% endif %}>
-                            {{ source.source.replace('https://www.', '') }}
+                            {{ source.source.replace('https://www.', '').replace('https://', '') }}
                         </option>
                         {% endfor %}
                     </select>
@@ -143,7 +143,7 @@
                     <h5><i class="bi bi-bar-chart-line me-2"></i>
                         {% if trend_type == 'daily' %}日销售趋势{% else %}月度销售趋势{% endif %}
                         {% if source_filter %}<small class="text-muted ms-2">({{ source_filter.replace('https://www.',
-                            '') }})</small>{% endif %}
+                            '').replace('https://', '') }})</small>{% endif %}
                     </h5>
                 </div>
                 <div class="card-body">
@@ -194,7 +194,7 @@
                                             class="badge me-1" style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{
                                             mgr }}</span>{% endif %}{% if source_display_mode != 'manager_only' %}<span
                                             class="source-badge">{{
-                                            source.source.replace('https://www.', '')
+                                            source.source.replace('https://www.', '').replace('https://', '')
                                             }}</span>{% endif %}
                                     </td>
                                     <td class="text-center"><span class="badge bg-secondary">{{ source.currency or 'N/A'

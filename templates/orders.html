@@ -58,7 +58,7 @@
                         {% for source in sources %}
                         <option value="{{ source.source }}" {% if current_filters.source==source.source %}selected{%
                             endif %}>
-                            {{ source.source.replace('https://www.', '') }}
+                            {{ source.source.replace('https://www.', '').replace('https://', '') }}
                         </option>
                         {% endfor %}
                     </select>
@@ -136,7 +136,8 @@
                             <td>{% set mgr = site_managers.get(stat.source, '') %}{% if mgr %}<span class="badge me-1"
                                     style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{ mgr }}</span>{% endif
                                 %}{% if source_display_mode != 'manager_only' %}<span class="source-badge">{{
-                                    stat.source.replace('https://www.', '') }}</span>{% endif %}</td>
+                                    stat.source.replace('https://www.', '').replace('https://', '') }}</span>{% endif %}
+                            </td>
                             <td class="text-center"><span class="badge bg-secondary">{{ stat.currency or 'N/A' }}</span>
                             </td>
                             <td class="text-end border-start">{{ "{:,}".format(stat.total_orders) }}</td>
@@ -229,7 +230,8 @@
                             <td>{% set mgr = site_managers.get(order.source, '') %}{% if mgr %}<span class="badge me-1"
                                     style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{ mgr }}</span>{% endif
                                 %}{% if source_display_mode != 'manager_only' %}<span class="source-badge">{{
-                                    order.source.replace('https://www.', '') }}</span>{% endif %}</td>
+                                    order.source.replace('https://www.', '').replace('https://', '') }}</span>{% endif
+                                %}</td>
                             <td><span class="status-badge status-{{ order.status }}">{{ order.status|status_label
                                     }}</span></td>
                             <td class="customer-cell">

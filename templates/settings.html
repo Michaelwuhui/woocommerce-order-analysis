@@ -155,7 +155,8 @@
                                             site.manager
                                             }}</span>
                                         {% endif %}
-                                        <span class="text-white">{{ site.url.replace('https://www.', '') }}</span>
+                                        <span class="text-white">{{ site.url.replace('https://www.',
+                                            '').replace('https://', '') }}</span>
                                     </div>
                                 </div>
                             </td>
