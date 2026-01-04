@@ -2768,7 +2768,8 @@ def clean_sync_site(site_id):
                     SYNC_STATUS[status_id]['message'] = 'Site not found'
                     return
                 
-                site_url = site['url']
+                # Strip whitespace to handle potential database issues
+                site_url = site['url'].strip()
                 SYNC_STATUS[status_id]['message'] = f'正在获取远程订单ID...'
                 SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching remote order IDs for {site_url}")
                 
@@ -2799,6 +2800,7 @@ def clean_sync_site(site_id):
                         })
                         
                         if response.status_code != 200:
+                            SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] HTTP Error {response.status_code} on page {page}")
                             break
                         
                         data = response.json()
@@ -2822,7 +2824,7 @@ def clean_sync_site(site_id):
                     SYNC_STATUS[status_id]['message'] = '未获取到远程订单ID，跳过删除以避免误删'
                     return
                 
-                # Get local order IDs
+                # Get local order IDs - use trimmed URL and handle exact match
                 conn = get_db_connection()
                 local_orders = conn.execute('SELECT id FROM orders WHERE source = ?', (site_url,)).fetchall()
                 conn.close()
@@ -2830,7 +2832,7 @@ def clean_sync_site(site_id):
                 local_ids = set(str(o['id']) for o in local_orders)
                 orphaned_ids = local_ids - remote_ids
                 
-                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Local: {len(local_ids)}, Orphaned: {len(orphaned_ids)}")
+                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Local (source='{site_url}'): {len(local_ids)}, Orphaned: {len(orphaned_ids)}")
                 
                 if not orphaned_ids:
                     SYNC_STATUS[status_id]['status'] = 'success'
@@ -2840,16 +2842,24 @@ def clean_sync_site(site_id):
                 # Delete orphaned orders
                 SYNC_STATUS[status_id]['message'] = f'正在清理 {len(orphaned_ids)} 个已删除订单...'
                 
-                conn = get_db_connection()
-                placeholders = ','.join(['?' for _ in orphaned_ids])
-                conn.execute(f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})", 
-                             [site_url] + list(orphaned_ids))
-                conn.commit()
-                conn.close()
-                
-                SYNC_STATUS[status_id]['status'] = 'success'
-                SYNC_STATUS[status_id]['message'] = f'清理完成，删除了 {len(orphaned_ids)} 个订单'
-                SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Deleted {len(orphaned_ids)} orphaned orders")
+                try:
+                    conn = get_db_connection()
+                    placeholders = ','.join(['?' for _ in orphaned_ids])
+                    # Execute delete
+                    conn.execute(f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})", 
+                                 [site_url] + list(orphaned_ids))
+                    conn.commit()
+                    deleted_count = conn.total_changes
+                    conn.close()
+                    
+                    SYNC_STATUS[status_id]['status'] = 'success'
+                    SYNC_STATUS[status_id]['message'] = f'清理完成，删除了 {deleted_count} 个订单'
+                    SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Successfully deleted {deleted_count} orphaned orders")
+                    
+                except Exception as e:
+                    SYNC_STATUS[status_id]['status'] = 'error'
+                    SYNC_STATUS[status_id]['message'] = f'删除失败: {str(e)}'
+                    SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] DB Error: {str(e)}")
                 
             except Exception as e:
                 SYNC_STATUS[status_id]['status'] = 'error'
