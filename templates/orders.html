@@ -310,6 +310,10 @@
                 {{ month }}
             </a>
             {% endfor %}
+            <a href="?month=all&source={{ current_filters.source }}&status={{ current_filters.status }}&date_from={{ current_filters.date_from }}&date_to={{ current_filters.date_to }}&search={{ current_filters.search }}&quick_date={{ current_filters.quick_date }}&manager={{ current_filters.manager }}"
+                class="btn btn-month btn-month-all {% if current_month == 'all' %}active{% endif %}">
+                <i class="bi bi-collection me-1"></i>全部
+            </a>
         </div>
     </div>
     {% endif %}
@@ -479,6 +483,21 @@
         border-color: transparent;
         color: white;
         box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+    }
+
+    .btn-month-all {
+        border-color: rgba(236, 72, 153, 0.4);
+        background: rgba(236, 72, 153, 0.1);
+    }
+
+    .btn-month-all:hover {
+        border-color: #ec4899;
+        background: rgba(236, 72, 153, 0.2);
+    }
+
+    .btn-month-all.active {
+        background: linear-gradient(135deg, #ec4899, #f97316);
+        box-shadow: 0 4px 15px rgba(236, 72, 153, 0.4);
     }
 
     /* Responsive optimizations */

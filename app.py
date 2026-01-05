@@ -1026,8 +1026,12 @@ def orders():
     if not current_month and available_months:
         current_month = available_months[0]  # Default to most recent month
     
-    # Get orders for the selected month
-    if current_month:
+    # Get orders for the selected month (or all if month='all')
+    if current_month == 'all':
+        # Show all orders matching the filters (no month filter)
+        orders_query = f'SELECT * FROM orders {where_clause} ORDER BY date_created DESC'
+        orders_data = conn.execute(orders_query, params).fetchall()
+    elif current_month:
         month_conditions = conditions.copy() if conditions else []
         month_params = params.copy()
         month_conditions.append("strftime('%Y-%m', date_created) = ?")
