@@ -847,6 +847,11 @@ def dashboard():
     cny_rate = 0
     if stats.get('net_revenue'):
         cny_rate = round(stats.get('net_revenue_cny', 0) / stats['net_revenue'], 4)
+    
+    # Get sites with API errors
+    conn = get_db_connection()
+    api_error_sites = conn.execute("SELECT url FROM sites WHERE api_status = 'error'").fetchall()
+    conn.close()
         
     return render_template('dashboard.html',
                          stats=stats,
@@ -862,7 +867,8 @@ def dashboard():
                          all_managers=all_managers,
                          site_managers=site_managers,
                          customer_attributes=customer_attributes,
-                         cny_rate=cny_rate)
+                         cny_rate=cny_rate,
+                         api_error_sites=api_error_sites)
 
 
 @app.route('/orders')
@@ -1688,15 +1694,32 @@ def get_order_details(order_id):
     # Calculate customer total spending
     if order_dict['billing'] and order_dict['billing'].get('email'):
         email = order_dict['billing']['email']
+        # 统计已完成订单（历史消费）
         customer_stats = conn.execute('''
             SELECT COUNT(*) as count, SUM(total) as total
             FROM orders 
             WHERE billing LIKE ? AND status IN ('completed', 'processing')
         ''', (f'%"{email}"%',)).fetchone()
         
+        # 按状态分类统计所有订单
+        status_stats = conn.execute('''
+            SELECT status, COUNT(*) as count, SUM(total) as total
+            FROM orders 
+            WHERE billing LIKE ?
+            GROUP BY status
+        ''', (f'%"{email}"%',)).fetchall()
+        
+        status_breakdown = {}
+        for row in status_stats:
+            status_breakdown[row['status']] = {
+                'count': row['count'],
+                'total': float(row['total'] or 0)
+            }
+        
         order_dict['customer_stats'] = {
             'total_orders': customer_stats['count'] if customer_stats else 0,
-            'total_spent': float(customer_stats['total'] or 0) if customer_stats else 0
+            'total_spent': float(customer_stats['total'] or 0) if customer_stats else 0,
+            'status_breakdown': status_breakdown
         }
     
     # Get site manager for this order's source
@@ -2008,12 +2031,24 @@ def init_sites_table():
             consumer_key TEXT NOT NULL,
             consumer_secret TEXT NOT NULL,
             manager TEXT,
-            last_sync TEXT
+            last_sync TEXT,
+            api_status TEXT DEFAULT 'unknown',
+            last_api_error TEXT
         )
     ''')
     # Add manager column if not exists (for existing databases)
     try:
         conn.execute('ALTER TABLE sites ADD COLUMN manager TEXT')
+    except:
+        pass  # Column already exists
+    # Add api_status column if not exists
+    try:
+        conn.execute("ALTER TABLE sites ADD COLUMN api_status TEXT DEFAULT 'unknown'")
+    except:
+        pass  # Column already exists
+    # Add last_api_error column if not exists
+    try:
+        conn.execute('ALTER TABLE sites ADD COLUMN last_api_error TEXT')
     except:
         pass  # Column already exists
     conn.commit()
@@ -2698,6 +2733,28 @@ def deep_sync_site(site_id):
                             "expand": "line_items,shipping_lines,tax_lines,fee_lines,coupon_lines,refunds"
                         })
                         
+                        if response.status_code in (401, 403):
+                            # API authentication/authorization error
+                            error_msg = f"API认证失败 (HTTP {response.status_code})"
+                            try:
+                                error_data = response.json()
+                                if 'message' in error_data:
+                                    error_msg = f"{error_msg}: {error_data['message']}"
+                            except:
+                                pass
+                            
+                            SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ {error_msg}")
+                            SYNC_STATUS[status_id]['status'] = 'error'
+                            SYNC_STATUS[status_id]['message'] = error_msg
+                            
+                            # Update site API status in database
+                            conn = get_db_connection()
+                            conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
+                                         ('error', error_msg, site_id))
+                            conn.commit()
+                            conn.close()
+                            return
+                        
                         if response.status_code != 200:
                             SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] HTTP {response.status_code}")
                             break
@@ -2723,10 +2780,10 @@ def deep_sync_site(site_id):
                         SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
                         break
                 
-                # Update last sync time
+                # Update last sync time and API status (success)
                 conn = get_db_connection()
-                conn.execute('UPDATE sites SET last_sync = ? WHERE id = ?', 
-                             (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), site_id))
+                conn.execute('UPDATE sites SET last_sync = ?, api_status = ?, last_api_error = NULL WHERE id = ?', 
+                             (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'ok', site_id))
                 conn.commit()
                 conn.close()
                 
@@ -2744,6 +2801,145 @@ def deep_sync_site(site_id):
     
     return jsonify({'success': True, 'sync_id': status_id, 'message': 'Deep sync started'})
 
+
+@app.route('/api/site/<int:site_id>/check', methods=['POST'])
+@login_required
+def check_site_api(site_id):
+    """Check API connectivity for a site"""
+    from woocommerce import API
+    
+    conn = get_db_connection()
+    site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
+    
+    if not site:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Site not found'}), 404
+    
+    try:
+        wcapi = API(
+            url=site['url'],
+            consumer_key=site['consumer_key'],
+            consumer_secret=site['consumer_secret'],
+            version="wc/v3",
+            timeout=15
+        )
+        
+        # Try to fetch just 1 order to test connection
+        response = wcapi.get("orders", params={"per_page": 1})
+        
+        if response.status_code == 200:
+            # API is working
+            conn.execute('UPDATE sites SET api_status = ?, last_api_error = NULL WHERE id = ?', 
+                         ('ok', site_id))
+            conn.commit()
+            conn.close()
+            return jsonify({
+                'success': True, 
+                'status': 'ok',
+                'message': 'API连接正常'
+            })
+        elif response.status_code in (401, 403):
+            # Authentication error
+            error_msg = f"API认证失败 (HTTP {response.status_code})"
+            try:
+                error_data = response.json()
+                if 'message' in error_data:
+                    error_msg = f"{error_msg}: {error_data['message']}"
+            except:
+                pass
+            
+            conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
+                         ('error', error_msg, site_id))
+            conn.commit()
+            conn.close()
+            return jsonify({
+                'success': True, 
+                'status': 'error',
+                'message': error_msg
+            })
+        else:
+            # Other error
+            error_msg = f"HTTP {response.status_code}"
+            conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
+                         ('error', error_msg, site_id))
+            conn.commit()
+            conn.close()
+            return jsonify({
+                'success': True, 
+                'status': 'error',
+                'message': error_msg
+            })
+            
+    except Exception as e:
+        error_msg = f"连接失败: {str(e)}"
+        conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
+                     ('error', error_msg, site_id))
+        conn.commit()
+        conn.close()
+        return jsonify({
+            'success': True, 
+            'status': 'error',
+            'message': error_msg
+        })
+
+@app.route('/api/sites/check-all', methods=['POST'])
+@login_required
+def check_all_sites_api():
+    """Check API connectivity for all sites"""
+    from woocommerce import API
+    
+    conn = get_db_connection()
+    sites = conn.execute('SELECT * FROM sites').fetchall()
+    
+    results = []
+    
+    for site in sites:
+        site_id = site['id']
+        site_url = site['url']
+        
+        try:
+            wcapi = API(
+                url=site_url,
+                consumer_key=site['consumer_key'],
+                consumer_secret=site['consumer_secret'],
+                version="wc/v3",
+                timeout=15
+            )
+            
+            response = wcapi.get("orders", params={"per_page": 1})
+            
+            if response.status_code == 200:
+                conn.execute('UPDATE sites SET api_status = ?, last_api_error = NULL WHERE id = ?', 
+                             ('ok', site_id))
+                results.append({'site_id': site_id, 'url': site_url, 'status': 'ok'})
+            elif response.status_code in (401, 403):
+                error_msg = f"API认证失败 (HTTP {response.status_code})"
+                try:
+                    error_data = response.json()
+                    if 'message' in error_data:
+                        error_msg = f"{error_msg}: {error_data['message']}"
+                except:
+                    pass
+                
+                conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
+                             ('error', error_msg, site_id))
+                results.append({'site_id': site_id, 'url': site_url, 'status': 'error', 'message': error_msg})
+            else:
+                error_msg = f"HTTP {response.status_code}"
+                conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
+                             ('error', error_msg, site_id))
+                results.append({'site_id': site_id, 'url': site_url, 'status': 'error', 'message': error_msg})
+                
+        except Exception as e:
+            error_msg = f"连接失败: {str(e)}"
+            conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
+                         ('error', error_msg, site_id))
+            results.append({'site_id': site_id, 'url': site_url, 'status': 'error', 'message': error_msg})
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'results': results})
 
 @app.route('/api/sync/clean/<int:site_id>', methods=['POST'])
 @login_required
@@ -2823,9 +3019,34 @@ def clean_sync_site(site_id):
                 
                 SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(remote_ids)} remote orders")
                 
+                # Always clean checkout-draft orders first (they are not returned by API)
+                conn = get_db_connection()
+                draft_orders = conn.execute("SELECT id FROM orders WHERE source = ? AND status = 'checkout-draft'", (site_url,)).fetchall()
+                draft_ids = set(str(o['id']) for o in draft_orders)
+                conn.close()
+                
+                draft_deleted = 0
+                if draft_ids:
+                    SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(draft_ids)} checkout-draft orders to clean")
+                    try:
+                        conn = get_db_connection()
+                        placeholders = ','.join(['?' for _ in draft_ids])
+                        conn.execute(f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})", 
+                                     [site_url] + list(draft_ids))
+                        conn.commit()
+                        draft_deleted = conn.total_changes
+                        conn.close()
+                        SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Deleted {draft_deleted} checkout-draft orders")
+                    except Exception as e:
+                        SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error deleting drafts: {str(e)}")
+                
                 if not remote_ids:
-                    SYNC_STATUS[status_id]['status'] = 'error'
-                    SYNC_STATUS[status_id]['message'] = '未获取到远程订单ID，跳过删除以避免误删'
+                    if draft_deleted > 0:
+                        SYNC_STATUS[status_id]['status'] = 'success'
+                        SYNC_STATUS[status_id]['message'] = f'清理完成，删除了 {draft_deleted} 个草稿订单'
+                    else:
+                        SYNC_STATUS[status_id]['status'] = 'error'
+                        SYNC_STATUS[status_id]['message'] = '未获取到远程订单ID，跳过删除以避免误删'
                     return
                 
                 # Get local order IDs - use trimmed URL and handle exact match

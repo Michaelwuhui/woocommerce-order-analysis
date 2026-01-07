@@ -266,7 +266,8 @@
                                     <span class="product-name">{{ product.name[:50] }}{% if product.name|length > 50
                                         %}...{% endif %}</span>
                                     <span class="product-qty">×{{ product.quantity }}</span>
-                                    <span class="product-total">{{ "{:.2f}".format(product.total) }} PLN</span>
+                                    <span class="product-total">{{ "{:.2f}".format(product.total) }} {{ order.currency
+                                        or '' }}</span>
                                 </div>
                                 {% else %}
                                 <span class="text-muted">-</span>

@@ -100,6 +100,12 @@ def save_orders_to_db(orders_data):
         )
         """
         
+        # Filter out checkout-draft orders - they should not be synced
+        orders_data = [o for o in orders_data if o.get('status') != 'checkout-draft']
+        
+        if not orders_data:
+            return
+        
         processed_orders = []
         for order in orders_data:
             processed_order = []

@@ -4,6 +4,26 @@
 
 {% block content %}
 <div class="container-fluid py-4">
+    {% if api_error_sites and api_error_sites|length > 0 %}
+    <div class="alert alert-danger alert-dismissible fade show mb-4" role="alert"
+        style="background: linear-gradient(135deg, rgba(220, 53, 69, 0.15) 0%, rgba(139, 0, 0, 0.1) 100%); border: 1px solid rgba(220, 53, 69, 0.3); border-radius: 12px;">
+        <div class="d-flex align-items-center">
+            <i class="bi bi-exclamation-triangle-fill text-danger fs-4 me-3"></i>
+            <div>
+                <strong class="text-danger">API 连接异常</strong>
+                <p class="mb-0 text-white-50 small">
+                    以下站点 API 连接失败，无法同步订单数据：
+                    {% for site in api_error_sites %}
+                    <span class="badge bg-danger bg-opacity-25 text-danger ms-1">{{ site.url.replace('https://www.',
+                        '').replace('https://', '') }}</span>
+                    {% endfor %}
+                    <a href="{{ url_for('settings') }}" class="text-info ms-2">前往设置</a>
+                </p>
+            </div>
+        </div>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="alert"></button>
+    </div>
+    {% endif %}
     <!-- Filters -->
     <div class="quick-filters mb-4">
         <div class="d-flex flex-wrap gap-3 align-items-center justify-content-between">

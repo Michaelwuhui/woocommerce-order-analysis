@@ -101,6 +101,9 @@
                         </div>
                     </div>
                     <div class="d-flex gap-2">
+                        <button class="btn btn-sm btn-outline-secondary" id="checkAllApisBtn" title="检测所有站点API连接">
+                            <i class="bi bi-broadcast me-1"></i> 检测全部
+                        </button>
                         <button class="btn btn-sm btn-outline-info" id="viewSyncLogsBtn">
                             <i class="bi bi-journal-text me-1"></i> 同步日志
                         </button>
@@ -109,9 +112,6 @@
                         </button>
                         <button class="btn btn-sm btn-outline-warning" id="cleanAllBtn">
                             <i class="bi bi-trash2 me-1"></i> 清理同步
-                        </button>
-                        <button class="btn btn-sm btn-outline-secondary" id="importFromScriptBtn">
-                            <i class="bi bi-download me-1"></i> 从脚本导入
                         </button>
                         <button class="btn btn-sm btn-outline-primary" id="syncAllBtn">
                             <i class="bi bi-arrow-repeat me-1"></i> 快速同步
@@ -169,10 +169,29 @@
                                 {% endif %}
                             </td>
                             <td>
+                                {% if site.api_status == 'error' %}
                                 <span
-                                    class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">已连接</span>
+                                    class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25"
+                                    title="{{ site.last_api_error or 'API连接异常' }}" style="cursor: help;">
+                                    <i class="bi bi-exclamation-triangle-fill me-1"></i>API异常
+                                </span>
+                                {% elif site.api_status == 'ok' %}
+                                <span
+                                    class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">
+                                    <i class="bi bi-check-circle-fill me-1"></i>已连接
+                                </span>
+                                {% else %}
+                                <span
+                                    class="badge bg-secondary bg-opacity-10 text-secondary border border-secondary border-opacity-25">
+                                    <i class="bi bi-question-circle me-1"></i>未知
+                                </span>
+                                {% endif %}
                             </td>
                             <td class="text-end pe-4">
+                                <button class="btn btn-sm btn-outline-secondary me-1 check-api-btn"
+                                    data-site-id="{{ site.id }}" title="检测API连接">
+                                    <i class="bi bi-broadcast"></i>
+                                </button>
                                 <div class="btn-group me-2">
                                     <button class="btn btn-sm btn-outline-primary sync-btn" data-site-id="{{ site.id }}"
                                         title="快速同步 - 增量获取新订单"><i class="bi bi-arrow-repeat"></i></button>
@@ -825,6 +844,44 @@
             });
         }
 
+        // Check All APIs Button
+        const checkAllApisBtn = document.getElementById('checkAllApisBtn');
+        if (checkAllApisBtn) {
+            checkAllApisBtn.addEventListener('click', function () {
+                const btn = this;
+                const originalHtml = btn.innerHTML;
+
+                btn.disabled = true;
+                btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> 检测中...';
+
+                fetch('/api/sites/check-all', { method: 'POST' })
+                    .then(res => res.json())
+                    .then(data => {
+                        btn.disabled = false;
+                        btn.innerHTML = originalHtml;
+
+                        if (data.success) {
+                            const okCount = data.results.filter(r => r.status === 'ok').length;
+                            const errorCount = data.results.filter(r => r.status === 'error').length;
+
+                            if (errorCount > 0) {
+                                alert(`检测完成！\n✅ 正常: ${okCount} 个\n❌ 异常: ${errorCount} 个`);
+                            } else {
+                                alert(`检测完成！所有 ${okCount} 个站点连接正常 ✅`);
+                            }
+                            location.reload();
+                        } else {
+                            alert('检测失败: ' + (data.error || '未知错误'));
+                        }
+                    })
+                    .catch(err => {
+                        btn.disabled = false;
+                        btn.innerHTML = originalHtml;
+                        alert('检测失败: ' + err.message);
+                    });
+            });
+        }
+
         // Sync Logs Button
         const viewSyncLogsBtn = document.getElementById('viewSyncLogsBtn');
         const syncLogsModal = document.getElementById('syncLogsModal');
@@ -1467,6 +1524,40 @@
                 document.getElementById('deleteSiteId').value = siteId;
                 const modal = getModal('deleteConfirmModal');
                 if (modal) modal.show();
+            }
+
+            // Check API Button
+            const checkApiBtn = e.target.closest('.check-api-btn');
+            if (checkApiBtn) {
+                const siteId = checkApiBtn.dataset.siteId;
+                const originalHtml = checkApiBtn.innerHTML;
+
+                // Show loading state
+                checkApiBtn.disabled = true;
+                checkApiBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+
+                fetch(`/api/site/${siteId}/check`, { method: 'POST' })
+                    .then(res => res.json())
+                    .then(data => {
+                        checkApiBtn.disabled = false;
+                        checkApiBtn.innerHTML = originalHtml;
+
+                        if (data.status === 'ok') {
+                            // Show success briefly then reload
+                            checkApiBtn.classList.remove('btn-outline-secondary');
+                            checkApiBtn.classList.add('btn-success');
+                            setTimeout(() => location.reload(), 1000);
+                        } else {
+                            // Show error message
+                            alert('API连接异常: ' + data.message);
+                            location.reload();
+                        }
+                    })
+                    .catch(err => {
+                        checkApiBtn.disabled = false;
+                        checkApiBtn.innerHTML = originalHtml;
+                        alert('检测失败: ' + err.message);
+                    });
             }
 
             // Sync Button

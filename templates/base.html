@@ -286,7 +286,28 @@
                     html += '<p><strong>邮箱:</strong> <a href="mailto:' + (billing.email || '') + '" style="color: #60a5fa;">' + (billing.email || '-') + '</a></p>';
                     html += '<p><strong>电话:</strong> ' + (billing.phone || '-') + '</p>';
                     if (order.customer_stats) {
-                        html += '<p><strong>历史消费:</strong> <span class="text-success fw-bold">' + order.customer_stats.total_spent.toFixed(2) + ' PLN</span> <span class="text-muted small">(' + order.customer_stats.total_orders + ' 单)</span></p>';
+                        html += '<p><strong>历史消费:</strong> <span class="text-success fw-bold">' + order.customer_stats.total_spent.toFixed(2) + ' ' + (order.currency || '') + '</span> <span class="badge bg-info bg-opacity-25 text-info ms-1">共 ' + order.customer_stats.total_orders + ' 单</span></p>';
+
+                        // 显示按状态分类的订单统计
+                        if (order.customer_stats.status_breakdown && Object.keys(order.customer_stats.status_breakdown).length > 0) {
+                            var statusLabels = {
+                                'pending': '待处理', 'processing': '处理中', 'on-hold': '暂停', 'shipped': '已发货',
+                                'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败'
+                            };
+                            var statusColors = {
+                                'pending': '#f59e0b', 'processing': '#3b82f6', 'on-hold': '#6b7280', 'shipped': '#8b5cf6',
+                                'completed': '#10b981', 'cancelled': '#ef4444', 'refunded': '#f97316', 'failed': '#dc2626'
+                            };
+                            html += '<p class="mb-1"><strong>订单状态分布:</strong></p>';
+                            html += '<div style="display: flex; flex-wrap: wrap; gap: 6px;">';
+                            for (var status in order.customer_stats.status_breakdown) {
+                                var stat = order.customer_stats.status_breakdown[status];
+                                var label = statusLabels[status] || status;
+                                var color = statusColors[status] || '#6b7280';
+                                html += '<span style="background: ' + color + '22; color: ' + color + '; padding: 3px 8px; border-radius: 6px; font-size: 12px; border: 1px solid ' + color + '44;">' + label + ': ' + stat.count + '单 ' + stat.total.toFixed(2) + '</span>';
+                            }
+                            html += '</div>';
+                        }
                     }
                     if (billing.company) html += '<p><strong>公司:</strong> ' + billing.company + '</p>';
                     html += '</div></div></div>';
@@ -332,7 +353,7 @@
                     if (shippingLines.length > 0) {
                         shippingLines.forEach(function (sl) {
                             html += '<p><strong>' + (sl.method_title || '-') + '</strong></p>';
-                            html += '<p style="color: #60a5fa; font-size: 18px; font-weight: 600;">' + parseFloat(sl.total || 0).toFixed(2) + ' PLN</p>';
+                            html += '<p style="color: #60a5fa; font-size: 18px; font-weight: 600;">' + parseFloat(sl.total || 0).toFixed(2) + ' ' + (order.currency || '') + '</p>';
                         });
                     } else {
                         html += '<p>-</p>';
@@ -343,11 +364,11 @@
                     html += '<div class="col-md-6">';
                     html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-calculator me-2"></i>订单金额</h6></div>';
                     html += '<div class="card-body">';
-                    html += '<p><strong>商品小计:</strong> <span style="color: #e2e8f0;">' + (parseFloat(order.total) - parseFloat(order.shipping_total || 0)).toFixed(2) + ' PLN</span></p>';
-                    html += '<p><strong>运费:</strong> <span style="color: #e2e8f0;">' + parseFloat(order.shipping_total || 0).toFixed(2) + ' PLN</span></p>';
-                    if (order.discount_total > 0) html += '<p><strong>折扣:</strong> <span style="color: #f87171;">-' + parseFloat(order.discount_total).toFixed(2) + ' PLN</span></p>';
+                    html += '<p><strong>商品小计:</strong> <span style="color: #e2e8f0;">' + (parseFloat(order.total) - parseFloat(order.shipping_total || 0)).toFixed(2) + ' ' + (order.currency || '') + '</span></p>';
+                    html += '<p><strong>运费:</strong> <span style="color: #e2e8f0;">' + parseFloat(order.shipping_total || 0).toFixed(2) + ' ' + (order.currency || '') + '</span></p>';
+                    if (order.discount_total > 0) html += '<p><strong>折扣:</strong> <span style="color: #f87171;">-' + parseFloat(order.discount_total).toFixed(2) + ' ' + (order.currency || '') + '</span></p>';
                     html += '<hr style="border-color: rgba(71, 85, 105, 0.3);">';
-                    html += '<p class="mb-0"><strong>总计:</strong> <span class="total-amount">' + parseFloat(order.total).toFixed(2) + ' PLN</span></p>';
+                    html += '<p class="mb-0"><strong>总计:</strong> <span class="total-amount">' + parseFloat(order.total).toFixed(2) + ' ' + (order.currency || '') + '</span></p>';
                     html += '</div></div></div>';
 
                     // Customer Note
@@ -469,7 +490,7 @@
                     html += '<div class="col-md-3">';
                     html += '<div class="info-card text-center"><div class="card-body">';
                     html += '<h6 class="text-white-50 mb-2">客单价</h6>';
-                    html += '<div class="h4 text-warning mb-0">' + customer.avg_order_value.toFixed(2) + ' PLN</div>';
+                    html += '<div class="h4 text-warning mb-0">' + customer.avg_order_value.toFixed(2) + '</div>';
                     html += '</div></div></div>';
 
                     // Detailed Info
