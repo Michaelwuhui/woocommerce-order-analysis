@@ -81,7 +81,34 @@
                         </tr>
                     </thead>
                     <tbody>
+                        {% set current_month = namespace(value=None) %}
                         {% for row in monthly_stats %}
+                        {% if (sort_by == 'month' or not sort_by) and row.month != current_month.value %}
+                        {% set current_month.value = row.month %}
+                        <tr class="table-active border-bottom border-secondary"
+                            style="--bs-table-bg-type: rgba(255,255,255,0.05);">
+                            <td colspan="3" class="align-middle ps-3">
+                                <span class="badge bg-primary bg-opacity-50 text-light fs-6">{{ row.month }} 月度汇总</span>
+                            </td>
+                            <td class="text-end fw-bold align-middle text-light border-start">{{
+                                "{:,}".format(monthly_aggregates[row.month].total_orders) }}</td>
+                            <td class="text-end fw-bold align-middle text-light">{{
+                                "{:,}".format(monthly_aggregates[row.month].total_products) }}</td>
+                            <td class="text-end"></td>
+                            <td class="text-end text-success fw-bold align-middle border-start">{{
+                                "{:,}".format(monthly_aggregates[row.month].success_orders) }}</td>
+                            <td class="text-end text-info fw-bold align-middle">{{
+                                "{:,}".format(monthly_aggregates[row.month].success_products) }}</td>
+                            <td colspan="2"></td>
+                            <td class="text-end text-danger fw-bold align-middle border-start">{{
+                                "{:,}".format(monthly_aggregates[row.month].failed_orders) }}</td>
+                            <td class="text-end text-danger fw-bold align-middle">{{
+                                "{:,}".format(monthly_aggregates[row.month].cancelled_orders) }}</td>
+                            <td colspan="1"></td>
+                            <td class="text-end text-warning fw-bold align-middle fs-6">¥{{
+                                "{:,.2f}".format(monthly_aggregates[row.month].success_net_amount_cny) }}</td>
+                        </tr>
+                        {% endif %}
                         <tr>
                             <td><strong>{{ row.month }}</strong></td>
                             <td>{% set mgr = site_managers.get(row.source, '') %}{% if mgr %}<span class="badge me-1"

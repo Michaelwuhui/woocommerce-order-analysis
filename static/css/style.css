@@ -116,6 +116,10 @@ body {
     background: var(--gradient-warning);
 }
 
+.stat-card-danger::before {
+    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+}
+
 .stat-card:hover {
     transform: translateY(-4px);
     box-shadow: var(--shadow-lg);
@@ -149,6 +153,11 @@ body {
 .stat-card-warning .stat-icon {
     background: rgba(240, 147, 251, 0.2);
     color: #f093fb;
+}
+
+.stat-card-danger .stat-icon {
+    background: rgba(220, 53, 69, 0.2);
+    color: #dc3545;
 }
 
 .stat-content h3 {
@@ -318,7 +327,7 @@ body {
 }
 
 /* Alt input (visible input) styling */
-input.flatpickr-input + input,
+input.flatpickr-input+input,
 .filter-card input[readonly] {
     color: rgba(160, 174, 192, 0.9) !important;
     background: rgba(0, 0, 0, 0.3) !important;
@@ -541,6 +550,12 @@ input.flatpickr-input + input,
 .totals-row td {
     padding: 14px 16px;
 }
+
 /* Improved text visibility in dark tables */
-.table-dark .text-muted { color: #9fafc4 !important; }
-.table-dark small.text-muted { color: #b0c4de !important; }
+.table-dark .text-muted {
+    color: #9fafc4 !important;
+}
+
+.table-dark small.text-muted {
+    color: #b0c4de !important;
+}

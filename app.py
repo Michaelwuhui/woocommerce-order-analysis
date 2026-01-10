@@ -577,6 +577,9 @@ def dashboard():
     # Total orders
     stats['total_orders'] = conn.execute(f'SELECT COUNT(*) FROM orders {date_condition}', params).fetchone()[0]
     
+    # Cancelled/failed orders count
+    stats['cancelled_orders'] = conn.execute(f"SELECT COUNT(*) FROM orders {date_condition} AND status IN ('cancelled', 'failed')", params).fetchone()[0]
+    
     # Total revenue by currency - add status filter
     revenue_conditions = conditions.copy()
     revenue_conditions.append('status NOT IN ("failed", "cancelled")')
@@ -1413,7 +1416,397 @@ def monthly():
         row['rate_to_cny'] = rate
         row['success_net_amount_cny'] = round(row['success_net_amount'] * rate, 2) if rate else None
     
-    return render_template('monthly.html', monthly_stats=rows, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, all_managers=all_managers, sort_by=sort_by, site_managers=site_managers)
+    # Calculate monthly aggregates
+    monthly_aggregates = {}
+    for row in rows:
+        m = row['month']
+        if m not in monthly_aggregates:
+            monthly_aggregates[m] = {'success_net_amount_cny': 0, 'success_orders': 0, 'success_products': 0, 'failed_orders': 0, 'cancelled_orders': 0, 'total_orders': 0, 'total_products': 0}
+        monthly_aggregates[m]['success_net_amount_cny'] += (row.get('success_net_amount_cny') or 0)
+        monthly_aggregates[m]['success_orders'] += row['success_orders']
+        monthly_aggregates[m]['success_products'] += row['success_products']
+        monthly_aggregates[m]['failed_orders'] += row['failed_orders']
+        monthly_aggregates[m]['cancelled_orders'] += row['cancelled_orders']
+        monthly_aggregates[m]['total_orders'] += row['total_orders']
+        monthly_aggregates[m]['total_products'] += row['total_products']
+        
+    return render_template('monthly.html', monthly_stats=rows, monthly_aggregates=monthly_aggregates, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, all_managers=all_managers, sort_by=sort_by, site_managers=site_managers)
+
+
+@app.route('/cancelled-analysis')
+@login_required
+def cancelled_analysis():
+    """Cancelled/Failed Order Analysis Page"""
+    conn = get_db_connection()
+    
+    # Get user's allowed sources for permission filtering
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    
+    # Get filters
+    source_filter = request.args.get('source', '')
+    manager_filter = request.args.get('manager', '')
+    quick_date = request.args.get('quick_date', 'this_month')
+    month_filter = request.args.get('month', '')
+    
+    # Calculate date range based on quick_date or month
+    from datetime import timedelta
+    today = datetime.now().date()
+    date_from = ''
+    date_to = today.isoformat()
+    
+    # If month filter is specified, it overrides quick_date
+    if month_filter:
+        # Month filter takes priority - set quick_date to empty to show no button is active
+        quick_date = ''
+        date_from = month_filter + '-01'
+        # Calculate last day of month
+        import calendar
+        year, month = int(month_filter[:4]), int(month_filter[5:7])
+        last_day = calendar.monthrange(year, month)[1]
+        date_to = f"{month_filter}-{last_day:02d}"
+    elif quick_date == 'this_month':
+        date_from = today.replace(day=1).isoformat()
+    elif quick_date == 'last_month':
+        last_month_end = today.replace(day=1) - timedelta(days=1)
+        date_from = last_month_end.replace(day=1).isoformat()
+        date_to = last_month_end.isoformat()
+    elif quick_date == 'last_quarter':
+        date_from = (today - timedelta(days=90)).isoformat()
+    elif quick_date == 'half_year':
+        date_from = (today - timedelta(days=180)).isoformat()
+    elif quick_date == 'one_year':
+        date_from = (today - timedelta(days=365)).isoformat()
+    elif quick_date == 'all':
+        date_from = ''
+        date_to = ''
+    
+    # Get all managers
+    all_managers = get_all_managers()
+    
+    # Validate source_filter against allowed sources
+    if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
+        source_filter = ''
+    
+    # Get available sources
+    source_query = 'SELECT DISTINCT source FROM orders'
+    source_params = []
+    source_conditions = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(allowed_sources)
+        else:
+            source_conditions.append('1=0')
+            
+    if manager_filter:
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(manager_urls)
+        else:
+            source_conditions.append('1=0')
+            
+    if source_conditions:
+        source_query += ' WHERE ' + ' AND '.join(source_conditions)
+        
+    source_query += ' ORDER BY source'
+    all_sources = conn.execute(source_query, source_params).fetchall()
+    
+    # Build query conditions for cancelled/failed orders
+    conditions = ["status IN ('cancelled', 'failed')"]
+    params = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+    
+    manager_urls = []
+    if manager_filter:
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(manager_urls)
+        else:
+            conditions.append('1=0')
+    
+    if source_filter:
+        conditions.append('source = ?')
+        params.append(source_filter)
+    
+    # Add date range filter
+    if date_from:
+        conditions.append('date_created >= ?')
+        params.append(date_from)
+    if date_to:
+        conditions.append('date_created <= ?')
+        params.append(date_to + 'T23:59:59')
+    
+    where_clause = 'WHERE ' + ' AND '.join(conditions)
+    
+    # Query cancelled/failed orders with date information
+    query = f'''
+        SELECT id, number, status, total, shipping_total, currency, date_created, date_modified, source, line_items, billing
+        FROM orders
+        {where_clause}
+        ORDER BY date_created DESC
+    '''
+    
+    orders_data = conn.execute(query, params).fetchall()
+    
+    # Get available months
+    months_query = '''
+        SELECT DISTINCT strftime('%Y-%m', date_created) as month 
+        FROM orders 
+        WHERE status IN ('cancelled', 'failed')
+        ORDER BY month DESC
+    '''
+    available_months = [row['month'] for row in conn.execute(months_query).fetchall()]
+    
+    # Get site managers mapping
+    sites = conn.execute('SELECT url, manager FROM sites').fetchall()
+    site_managers = {s['url']: s['manager'] or '' for s in sites}
+    
+    # Calculate statistics
+    from datetime import datetime as dt
+    
+    # By timing
+    timing_stats = {
+        'within_1_day': {'count': 0, 'amount': 0},
+        '1_to_7_days': {'count': 0, 'amount': 0},
+        'over_7_days': {'count': 0, 'amount': 0}
+    }
+    
+    # By status
+    status_stats = {'cancelled': {'count': 0, 'amount': 0}, 'failed': {'count': 0, 'amount': 0}}
+    
+    # By source
+    source_stats = {}
+    
+    # By customer type
+    customer_type_stats = {'new': {'count': 0, 'amount': 0}, 'repeat': {'count': 0, 'amount': 0}}
+    
+    # Get customer order counts for customer type classification
+    customer_emails = set()
+    orders_list = []
+    
+    for order in orders_data:
+        billing = parse_json_field(order['billing'])
+        email = billing.get('email', '') if billing else ''
+        if email:
+            customer_emails.add(email)
+    
+    # Get order counts for all customers
+    customer_order_counts = {}
+    if customer_emails:
+        for email in customer_emails:
+            count = conn.execute('''
+                SELECT COUNT(*) as cnt FROM orders WHERE billing LIKE ?
+            ''', (f'%"{email}"%',)).fetchone()
+            customer_order_counts[email] = count['cnt'] if count else 0
+    
+    for order in orders_data:
+        od = dict(order)
+        status = order['status']
+        total = float(order['total'] or 0)
+        source = order['source']
+        
+        # Parse dates
+        date_created = order['date_created']
+        date_modified = order['date_modified']
+        
+        days_to_cancel = 0
+        if date_created and date_modified:
+            try:
+                created = dt.fromisoformat(date_created[:19])
+                modified = dt.fromisoformat(date_modified[:19])
+                days_to_cancel = (modified - created).days
+            except:
+                days_to_cancel = 0
+        
+        od['days_to_cancel'] = days_to_cancel
+        
+        # Timing classification
+        if days_to_cancel <= 1:
+            timing_stats['within_1_day']['count'] += 1
+            timing_stats['within_1_day']['amount'] += total
+            od['timing_category'] = '1天内'
+        elif days_to_cancel <= 7:
+            timing_stats['1_to_7_days']['count'] += 1
+            timing_stats['1_to_7_days']['amount'] += total
+            od['timing_category'] = '1-7天'
+        else:
+            timing_stats['over_7_days']['count'] += 1
+            timing_stats['over_7_days']['amount'] += total
+            od['timing_category'] = '7天+'
+        
+        # Status stats
+        if status in status_stats:
+            status_stats[status]['count'] += 1
+            status_stats[status]['amount'] += total
+        
+        # Source stats
+        if source not in source_stats:
+            source_stats[source] = {'count': 0, 'amount': 0, 'cancelled': 0, 'failed': 0}
+        source_stats[source]['count'] += 1
+        source_stats[source]['amount'] += total
+        if status == 'cancelled':
+            source_stats[source]['cancelled'] += 1
+        else:
+            source_stats[source]['failed'] += 1
+        
+        # Customer type classification
+        billing = parse_json_field(order['billing'])
+        email = billing.get('email', '') if billing else ''
+        od['customer_name'] = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip() if billing else ''
+        od['customer_email'] = email
+        
+        if email:
+            order_count = customer_order_counts.get(email, 0)
+            if order_count <= 1:
+                customer_type_stats['new']['count'] += 1
+                customer_type_stats['new']['amount'] += total
+                od['customer_type'] = '新客'
+            else:
+                customer_type_stats['repeat']['count'] += 1
+                customer_type_stats['repeat']['amount'] += total
+                od['customer_type'] = '老客'
+        else:
+            od['customer_type'] = '未知'
+        
+        # Parse line items for product count
+        items = parse_json_field(order['line_items'])
+        od['product_count'] = sum(i.get('quantity', 0) for i in items) if isinstance(items, list) else 0
+        
+        # Calculate net amount and CNY conversion
+        shipping = float(order['shipping_total'] or 0)
+        od['shipping_total'] = shipping
+        od['net_total'] = total - shipping
+        
+        # Get CNY rate
+        order_month = order['date_created'][:7] if order['date_created'] else None
+        currency = order['currency']
+        rate, _ = get_cny_rate(currency, order_month)
+        od['rate_to_cny'] = rate
+        od['total_cny'] = round(total * rate, 2) if rate else None
+        od['net_total_cny'] = round(od['net_total'] * rate, 2) if rate else None
+        
+        orders_list.append(od)
+    
+    # Get total orders for cancellation rate
+    total_query_conditions = []
+    total_params = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            total_query_conditions.append(f'source IN ({placeholders})')
+            total_params.extend(allowed_sources)
+            
+    if manager_filter and manager_urls:
+        placeholders = ', '.join(['?' for _ in manager_urls])
+        total_query_conditions.append(f'source IN ({placeholders})')
+        total_params.extend(manager_urls)
+    
+    if source_filter:
+        total_query_conditions.append('source = ?')
+        total_params.append(source_filter)
+    
+    if date_from:
+        total_query_conditions.append('date_created >= ?')
+        total_params.append(date_from)
+    if date_to:
+        total_query_conditions.append('date_created <= ?')
+        total_params.append(date_to + 'T23:59:59')
+    
+    total_where = 'WHERE ' + ' AND '.join(total_query_conditions) if total_query_conditions else ''
+    total_orders_count = conn.execute(f'SELECT COUNT(*) FROM orders {total_where}', total_params).fetchone()[0]
+    
+    # Calculate totals
+    total_cancelled = len(orders_list)
+    total_amount = sum(float(o['total'] or 0) for o in orders_list)
+    cancellation_rate = (total_cancelled / total_orders_count * 100) if total_orders_count > 0 else 0
+    
+    # Group amounts by currency
+    currency_amounts = {}
+    for o in orders_list:
+        currency = o.get('currency', 'USD')
+        amount = float(o.get('total') or 0)
+        if currency not in currency_amounts:
+            currency_amounts[currency] = 0
+        currency_amounts[currency] += amount
+    
+    # Calculate total CNY amount
+    total_cny = 0
+    currency_stats = []
+    for currency, amount in sorted(currency_amounts.items(), key=lambda x: x[1], reverse=True):
+        rate, _ = get_cny_rate(currency, None)  # Use current rate
+        cny_amount = round(amount * rate, 2) if rate else 0
+        total_cny += cny_amount
+        currency_stats.append({
+            'currency': currency,
+            'amount': round(amount, 2),
+            'cny_amount': cny_amount,
+            'rate': rate
+        })
+    
+    # Convert source_stats to list for template
+    source_stats_list = []
+    for source, stats in source_stats.items():
+        source_stats_list.append({
+            'source': source,
+            'manager': site_managers.get(source, ''),
+            'count': stats['count'],
+            'amount': stats['amount'],
+            'cancelled': stats['cancelled'],
+            'failed': stats['failed']
+        })
+    source_stats_list.sort(key=lambda x: x['count'], reverse=True)
+    
+    # Get source display mode for user
+    source_display_mode = 'full'
+    if current_user.is_authenticated:
+        user_pref = conn.execute('''
+            SELECT preference_value FROM user_preferences 
+            WHERE user_id = ? AND preference_key = 'source_display_mode'
+        ''', (current_user.id,)).fetchone()
+        if user_pref:
+            source_display_mode = user_pref['preference_value']
+    
+    conn.close()
+    
+    return render_template('cancelled.html',
+        orders=orders_list,
+        total_cancelled=total_cancelled,
+        total_amount=total_amount,
+        total_orders=total_orders_count,
+        cancellation_rate=round(cancellation_rate, 2),
+        timing_stats=timing_stats,
+        status_stats=status_stats,
+        source_stats=source_stats_list,
+        customer_type_stats=customer_type_stats,
+        sources=all_sources,
+        source_filter=source_filter,
+        manager_filter=manager_filter,
+        all_managers=all_managers,
+        site_managers=site_managers,
+        quick_date=quick_date,
+        available_months=available_months,
+        current_month=month_filter,
+        source_display_mode=source_display_mode,
+        currency_stats=currency_stats,
+        total_cny=total_cny
+    )
 
 
 @app.route('/customers')

@@ -74,7 +74,7 @@
     <!-- Stats Cards -->
     <div class="row g-4 mb-4">
         <div class="col-xl col-md-6">
-            <div class="stat-card stat-card-primary">
+            <div class="stat-card h-100 stat-card-primary">
                 <div class="stat-icon">
                     <i class="bi bi-cart-check"></i>
                 </div>
@@ -84,54 +84,27 @@
                 </div>
             </div>
         </div>
-        <div class="col-xl col-md-6">
-            <div class="stat-card stat-card-success">
+        <div class="col-xl-3 col-md-6">
+            <div class="stat-card h-100 stat-card-success">
                 <div class="stat-icon">
                     <i class="bi bi-currency-dollar"></i>
                 </div>
-                <div class="stat-content">
-                    {% if stats.total_revenue_by_currency %}
-                    <h3 style="font-size: 1.1rem;">
-                        {% for currency, amount in stats.total_revenue_by_currency.items() %}
-                        <span class="d-block">{{ "{:,.2f}".format(amount) }} {{ currency }}</span>
-                        {% endfor %}
-                    </h3>
-                    {% if stats.total_revenue_cny %}
-                    <span class="badge bg-warning bg-opacity-25 text-warning mt-1" style="font-size: 1rem;">≈ ¥{{
-                        "{:,.2f}".format(stats.total_revenue_cny) }}</span>
+                <div class="stat-content text-end">
+                    {% set currencies = stats.total_revenue_by_currency.items() | list %}
+                    {% for currency, amount in currencies[:2] %}
+                    <div>{{ "{:,.2f}".format(amount) }} {{ currency }}</div>
+                    {% endfor %}
+                    {% if currencies|length > 2 %}
+                    <small>+{{ currencies|length - 2 }} 种货币...</small>
                     {% endif %}
-                    {% else %}
-                    <h3>0.00</h3>
-                    {% endif %}
-                    <p>总销售额</p>
+                    <div class="mt-2"><span class="badge bg-warning text-dark">≈ ¥{{
+                            "{:,.2f}".format(stats.total_revenue_cny) }}</span></div>
+                    <p class="mb-0 mt-1">净销售额 (已除运费)</p>
                 </div>
             </div>
         </div>
         <div class="col-xl col-md-6">
-            <div class="stat-card" style="background: linear-gradient(135deg, #059669 0%, #047857 100%);">
-                <div class="stat-icon">
-                    <i class="bi bi-cash-stack"></i>
-                </div>
-                <div class="stat-content">
-                    {% if stats.net_revenue_by_currency %}
-                    <h3 style="font-size: 1.1rem;">
-                        {% for currency, amount in stats.net_revenue_by_currency.items() %}
-                        <span class="d-block">{{ "{:,.2f}".format(amount) }} {{ currency }}</span>
-                        {% endfor %}
-                    </h3>
-                    {% if stats.net_revenue_cny %}
-                    <span class="badge bg-warning bg-opacity-25 text-warning mt-1" style="font-size: 1rem;">≈ ¥{{
-                        "{:,.2f}".format(stats.net_revenue_cny) }}</span>
-                    {% endif %}
-                    {% else %}
-                    <h3>0.00</h3>
-                    {% endif %}
-                    <p>净销售额 <small class="opacity-75">(扣除运费)</small></p>
-                </div>
-            </div>
-        </div>
-        <div class="col-xl col-md-6">
-            <div class="stat-card stat-card-info">
+            <div class="stat-card h-100 stat-card-info">
                 <div class="stat-icon">
                     <i class="bi bi-shop"></i>
                 </div>
@@ -142,16 +115,30 @@
             </div>
         </div>
         <div class="col-xl col-md-6">
-            <div class="stat-card stat-card-warning">
+            <div class="stat-card h-100 stat-card-warning">
                 <div class="stat-icon">
-                    <i class="bi bi-graph-up"></i>
+                    <i class="bi bi-graph-up-arrow"></i>
                 </div>
                 <div class="stat-content">
-                    <h3>¥{{ "{:,.2f}".format(stats.total_revenue_cny / stats.valid_orders if stats.valid_orders > 0 else
+                    <h3>¥{{ "{:,.2f}".format(stats.total_revenue_cny / stats.valid_orders if stats.valid_orders > 0
+                        else
                         0) }}</h3>
                     <p>平均订单金额 (CNY)</p>
                 </div>
             </div>
+        </div>
+        <div class="col-xl col-md-6">
+            <a href="{{ url_for('cancelled_analysis') }}" class="text-decoration-none">
+                <div class="stat-card h-100 stat-card-danger">
+                    <div class="stat-icon">
+                        <i class="bi bi-x-circle"></i>
+                    </div>
+                    <div class="stat-content">
+                        <h3>{{ stats.cancelled_orders }}</h3>
+                        <p>取消/失败订单 <i class="bi bi-arrow-right-short"></i></p>
+                    </div>
+                </div>
+            </a>
         </div>
     </div>
 
@@ -162,7 +149,8 @@
                 <div class="card-header">
                     <h5><i class="bi bi-bar-chart-line me-2"></i>
                         {% if trend_type == 'daily' %}日销售趋势{% else %}月度销售趋势{% endif %}
-                        {% if source_filter %}<small class="text-muted ms-2">({{ source_filter.replace('https://www.',
+                        {% if source_filter %}<small class="text-muted ms-2">({{
+                            source_filter.replace('https://www.',
                             '').replace('https://', '') }})</small>{% endif %}
                     </h5>
                 </div>
@@ -212,21 +200,25 @@
                                     <td>
                                         {% set mgr = site_managers.get(source.source, '') %}{% if mgr %}<span
                                             class="badge me-1" style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{
-                                            mgr }}</span>{% endif %}{% if source_display_mode != 'manager_only' %}<span
-                                            class="source-badge">{{
+                                            mgr }}</span>{% endif %}{% if source_display_mode != 'manager_only'
+                                        %}<span class="source-badge">{{
                                             source.source.replace('https://www.', '').replace('https://', '')
                                             }}</span>{% endif %}
                                     </td>
-                                    <td class="text-center"><span class="badge bg-secondary">{{ source.currency or 'N/A'
+                                    <td class="text-center"><span class="badge bg-secondary">{{ source.currency or
+                                            'N/A'
                                             }}</span></td>
                                     <td class="text-end">{{ "{:,}".format(source.count) }}</td>
-                                    <td class="text-end">{{ "{:,.2f}".format(source.revenue or 0) }} {{ source.currency
+                                    <td class="text-end">{{ "{:,.2f}".format(source.revenue or 0) }} {{
+                                        source.currency
                                         or '' }}</td>
-                                    <td class="text-end text-success">{{ "{:,.2f}".format(source.net_revenue or 0) }} {{
+                                    <td class="text-end text-success">{{ "{:,.2f}".format(source.net_revenue or 0)
+                                        }} {{
                                         source.currency
                                         or '' }}</td>
                                     <td class="text-center"><span class="badge bg-info bg-opacity-25 text-info">{{
-                                            "%.4f"|format(source.rate_to_cny) if source.rate_to_cny else '-' }}</span>
+                                            "%.4f"|format(source.rate_to_cny) if source.rate_to_cny else '-'
+                                            }}</span>
                                     </td>
                                     <td class="text-end text-warning">{% if source.net_revenue_cny %}¥{{
                                         "{:,.2f}".format(source.net_revenue_cny) }}{% else %}-{% endif %}</td>
@@ -272,7 +264,8 @@
                                     <td>
                                         <a href="javascript:void(0)"
                                             onclick="showCustomerDetail('{{ order.customer_email }}')"
-                                            class="text-light text-decoration-none">{{ order.customer_name or '-' }}</a>
+                                            class="text-light text-decoration-none">{{ order.customer_name or '-'
+                                            }}</a>
 
                                         {% if customer_attributes and order.customer_email in customer_attributes %}
                                         {% set attrs = customer_attributes[order.customer_email] %}
@@ -296,9 +289,11 @@
                                     <td><span class="status-badge status-{{ order.status }}">{{
                                             order.status|status_label }}</span></td>
                                     <td class="text-end">{{ order.product_count }}</td>
-                                    <td class="text-end"><strong>{{ order.total|format_currency }} {{ order.currency or
+                                    <td class="text-end"><strong>{{ order.total|format_currency }} {{ order.currency
+                                            or
                                             '' }}</strong></td>
-                                    <td class="text-end text-success">{{ "{:,.2f}".format(order.net_total or 0) }} {{
+                                    <td class="text-end text-success">{{ "{:,.2f}".format(order.net_total or 0) }}
+                                        {{
                                         order.currency or '' }}</td>
                                     <td class="text-center"><span class="badge bg-info bg-opacity-25 text-info small">{{
                                             "%.4f"|format(order.rate_to_cny) if order.rate_to_cny else '-' }}</span>
