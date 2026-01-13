@@ -512,7 +512,7 @@
                 if (data.success) {
                     bootstrap.Modal.getInstance(document.getElementById('shipModal')).hide();
                     loadOrders();
-                    showToast('发货成功', 'success');
+                    showToast(data.message, 'success');
                 } else {
                     alert('发货失败: ' + (data.error || '未知错误'));
                 }
@@ -737,7 +737,7 @@
             });
     }
 
-    function showToast(message, type = 'info') {
+    function showToast(message, type = 'info', duration = 3000) {
         const toast = document.createElement('div');
         toast.className = `toast align-items-center text-white bg-${type} border-0 show position-fixed top-0 end-0 m-3`;
         toast.style.zIndex = 9999;
@@ -748,7 +748,7 @@
         </div>
     `;
         document.body.appendChild(toast);
-        setTimeout(() => toast.remove(), 3000);
+        setTimeout(() => toast.remove(), duration);
     }
 </script>
 

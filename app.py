@@ -2153,10 +2153,33 @@ def get_order_details(order_id):
             'status_breakdown': status_breakdown
         }
     
-    # Get site manager for this order's source
-    site_row = conn.execute('SELECT manager FROM sites WHERE url = ?', (order_dict.get('source', ''),)).fetchone()
+    # Get site credentials for API calls
+    site_row = conn.execute('SELECT manager, url, consumer_key, consumer_secret FROM sites WHERE url = ?', (order_dict.get('source', ''),)).fetchone()
     order_dict['site_manager'] = site_row['manager'] if site_row and site_row['manager'] else ''
     
+    # Fetch Order Notes from WooCommerce API
+    order_dict['order_notes'] = []
+    if site_row and site_row['consumer_key'] and site_row['consumer_secret']:
+        try:
+            import requests as req
+            api_url = f"{site_row['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+            response = req.get(
+                api_url,
+                auth=(site_row['consumer_key'], site_row['consumer_secret']),
+                timeout=5
+            )
+            if response.status_code == 200:
+                order_dict['order_notes'] = response.json()
+            else:
+                print(f"Warning: Failed to fetch notes for order {order['number']}: {response.status_code} {response.text}")
+        except Exception as e:
+            print(f"Error fetching notes for order {order['number']}: {e}")
+
+    # Get local shipping log if exists (for manually shipped orders not yet synced)
+    shipping_log = conn.execute('SELECT tracking_number, carrier_slug, shipped_at FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
+    if shipping_log:
+        order_dict['shipping_log'] = dict(shipping_log)
+
     conn.close()
     
     return jsonify(order_dict)
@@ -5632,30 +5655,11 @@ def ship_order():
     # Check if already has tracking log - update instead of insert
     existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
     
+    # Note: The free version of "Orders Tracking for WooCommerce" plugin does not support REST API
+    # We will still send customer notifications via order notes, which works reliably
+    
+    # Send customer notification via order note
     try:
-        # 1. Call Orders Tracking API to add tracking number
-        tracking_url_api = f"{site['url']}/wp-json/woo-orders-tracking/v1/tracking/set"
-        tracking_payload = {
-            'order_id': order['number'],
-            'tracking_data': [{
-                'tracking_number': tracking_number,
-                'carrier_slug': carrier_slug
-            }],
-            'send_email': False # We will send our own reliable email via Note
-        }
-        
-        tracking_resp = req.post(
-            tracking_url_api,
-            json=tracking_payload,
-            auth=(site['consumer_key'], site['consumer_secret']),
-            timeout=30
-        )
-        
-        # Log warning if tracking API fails, but don't stop shipment (it might be a plugin issue)
-        if tracking_resp.status_code not in [200, 201]:
-             print(f"Warning: Tracking API failed: {tracking_resp.text}")
-
-        # 2. Send Reliable Email via Customer Note
         if send_email:
             note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
             
@@ -5712,6 +5716,92 @@ def ship_order():
     except Exception as e:
         conn.close()
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/shipping/debug/<int:order_id>', methods=['POST'])
+@login_required
+@shipper_required
+def debug_tracking_sync(order_id):
+    """Debug endpoint to manually resync tracking number to WordPress"""
+    import requests as req
+    
+    conn = get_db_connection()
+    
+    # Get order and tracking info
+    order = conn.execute('''
+        SELECT o.*, sl.tracking_number, sl.carrier_slug
+        FROM orders o
+        LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        WHERE o.id = ?
+    ''', (order_id,)).fetchone()
+    
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    
+    if not order['tracking_number']:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单没有运单号记录'}), 400
+    
+    # Get site credentials
+    site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    conn.close()
+    
+    if not site:
+        return jsonify({'success': False, 'error': '站点配置不存在'}), 404
+    
+    # Prepare the tracking API request
+    tracking_url_api = f"{site['url']}/wp-json/woo-orders-tracking/v1/tracking/set"
+    tracking_payload = {
+        'order_id': order['number'],
+        'tracking_data': [{
+            'tracking_number': order['tracking_number'],
+            'carrier_slug': order['carrier_slug']
+        }],
+        'send_email': False
+    }
+    
+    debug_info = {
+        'order_id': order['id'],
+        'order_number': order['number'],
+        'tracking_number': order['tracking_number'],
+        'carrier_slug': order['carrier_slug'],
+        'api_endpoint': tracking_url_api,
+        'payload': tracking_payload
+    }
+    
+    # Attempt to sync
+    try:
+        tracking_resp = req.post(
+            tracking_url_api,
+            json=tracking_payload,
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=30
+        )
+        
+        debug_info['response_status'] = tracking_resp.status_code
+        debug_info['response_body'] = tracking_resp.text
+        
+        if tracking_resp.status_code in [200, 201]:
+            return jsonify({
+                'success': True,
+                'message': f'运单号 {order["tracking_number"]} 已成功同步到WordPress',
+                'debug_info': debug_info
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'同步失败: API返回状态 {tracking_resp.status_code}',
+                'debug_info': debug_info
+            }), 400
+            
+    except Exception as e:
+        debug_info['exception'] = str(e)
+        return jsonify({
+            'success': False,
+            'error': f'同步异常: {str(e)}',
+            'debug_info': debug_info
+        }), 500
 
 
 @app.route('/api/shipping/complete/<int:order_id>', methods=['POST'])
@@ -6111,7 +6201,10 @@ def process_shipped_order(order, conn, carriers, ast_provider_mapping):
                                                 pass
                             except:
                                 pass
-                            if tracking_number: break
+                        elif isinstance(meta, dict) and meta.get('key') == 'tracking_number':
+                            tracking_number = str(meta.get('value', '')).strip()
+                        
+                        if tracking_number: break
                 if tracking_number: break
 
     # If still no tracking, try shipping_lines meta_data 'tracking_number'

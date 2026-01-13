@@ -432,6 +432,33 @@
                         html += '<div class="card-body"><p style="color: #fbbf24; font-style: italic;">' + order.customer_note + '</p></div></div></div>';
                     }
 
+                    // Order Notes Timeline
+                    if (order.order_notes && order.order_notes.length > 0) {
+                        html += '<div class="col-12">';
+                        html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-clock-history me-2"></i>订单动态</h6></div>';
+                        html += '<div class="card-body" style="max-height: 300px; overflow-y: auto;">';
+                        html += '<div class="timeline">';
+
+                        order.order_notes.forEach(function (note) {
+                            var isSystem = note.note.includes('Order status changed') || note.note.includes('订单状态');
+                            var bgClass = isSystem ? 'bg-secondary bg-opacity-10' : 'bg-info bg-opacity-10';
+                            var borderClass = isSystem ? 'border-secondary' : 'border-info';
+                            var textClass = isSystem ? 'text-secondary' : 'text-info';
+
+                            html += '<div class="d-flex mb-3">';
+                            html += '<div class="d-flex flex-column align-items-center me-3" style="min-width: 60px;">';
+                            html += '<small style="color: #94a3b8; font-size: 10px;">' + note.date_created.substring(0, 10) + '</small>';
+                            html += '<small style="color: #94a3b8; font-size: 10px;">' + note.date_created.substring(11, 16) + '</small>';
+                            html += '</div>';
+                            html += '<div class="p-2 rounded w-100 ' + bgClass + ' border-start border-3 ' + borderClass + '" style="font-size: 13px;">';
+                            html += '<div class="mb-1" style="color: #e2e8f0;">' + note.note + '</div>';
+                            html += '<div class="small" style="color: #94a3b8;">by ' + (note.author || 'System') + '</div>';
+                            html += '</div></div>';
+                        });
+
+                        html += '</div></div></div></div>';
+                    }
+
                     // --- TRACKING INFORMATION LOGIC ---
                     var allTracking = [];
 
@@ -507,7 +534,26 @@
                         });
                     }
 
-                    // Helper to add custom tracking with deduplication and carrier detection
+                    // 4. Local Shipping Log (for manually shipped orders not yet synced)
+                    if (order.shipping_log && order.shipping_log.tracking_number) {
+                        var tn = order.shipping_log.tracking_number;
+                        var carrier = detectCarrier(tn);
+                        var url = '';
+
+                        if (order.shipping_log.carrier_slug) {
+                            if (order.shipping_log.carrier_slug === 'inpost') {
+                                url = 'https://inpost.pl/sledzenie-przesylek?number=' + tn;
+                                carrier.name = 'InPost';
+                            } else if (order.shipping_log.carrier_slug === 'dpd') {
+                                url = 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + tn;
+                                carrier.name = 'DPD';
+                            }
+                        }
+
+                        if (!url) url = carrier.url;
+
+                        addCustomTracking(tn, 'Shipping Log');
+                    }
                     function addCustomTracking(tn, sourceName) {
                         tn = String(tn).trim();
                         if (!tn) return;
