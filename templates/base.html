@@ -152,6 +152,14 @@
                             <i class="bi bi-exclamation-triangle me-1"></i>问题分析
                         </a>
                     </li>
+                    {% if current_user.is_admin() or current_user.can_ship() %}
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint == 'shipping' else '' }}"
+                            href="{{ url_for('shipping') }}">
+                            <i class="bi bi-truck me-1"></i>发货管理
+                        </a>
+                    </li>
+                    {% endif %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint == 'settings' else '' }}"
                             href="{{ url_for('settings') }}">
@@ -293,14 +301,12 @@
                     html += '<p><strong>电话:</strong> ' + (billing.phone || '-') + '</p>';
                     if (order.customer_stats) {
                         html += '<p><strong>历史消费:</strong> <span class="text-success fw-bold">' + order.customer_stats.total_spent.toFixed(2) + ' ' + (order.currency || '') + '</span> <span class="badge bg-info bg-opacity-25 text-info ms-1">共 ' + order.customer_stats.total_orders + ' 单</span></p>';
-
-                        // 显示按状态分类的订单统计
                         if (order.customer_stats.status_breakdown && Object.keys(order.customer_stats.status_breakdown).length > 0) {
-                            var statusLabels = {
+                            var statusLabelsMap = {
                                 'pending': '待处理', 'processing': '处理中', 'on-hold': '暂停', 'shipped': '已发货',
                                 'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败'
                             };
-                            var statusColors = {
+                            var statusColorsMap = {
                                 'pending': '#f59e0b', 'processing': '#3b82f6', 'on-hold': '#6b7280', 'shipped': '#8b5cf6',
                                 'completed': '#10b981', 'cancelled': '#ef4444', 'refunded': '#f97316', 'failed': '#dc2626'
                             };
@@ -308,9 +314,7 @@
                             html += '<div style="display: flex; flex-wrap: wrap; gap: 6px;">';
                             for (var status in order.customer_stats.status_breakdown) {
                                 var stat = order.customer_stats.status_breakdown[status];
-                                var label = statusLabels[status] || status;
-                                var color = statusColors[status] || '#6b7280';
-                                html += '<span style="background: ' + color + '22; color: ' + color + '; padding: 3px 8px; border-radius: 6px; font-size: 12px; border: 1px solid ' + color + '44;">' + label + ': ' + stat.count + '单 ' + stat.total.toFixed(2) + '</span>';
+                                html += '<span style="background: ' + (statusColorsMap[status] || '#6b7280') + '22; color: ' + (statusColorsMap[status] || '#6b7280') + '; padding: 3px 8px; border-radius: 6px; font-size: 12px; border: 1px solid ' + (statusColorsMap[status] || '#6b7280') + '44;">' + (statusLabelsMap[status] || status) + ': ' + stat.count + '单 ' + stat.total.toFixed(2) + '</span>';
                             }
                             html += '</div>';
                         }
@@ -322,21 +326,65 @@
                     html += '<div class="col-md-6">';
                     html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-geo-alt me-2"></i>账单地址</h6></div>';
                     html += '<div class="card-body">';
+                    // Add Name, Email, Phone
+                    html += '<p><strong>姓名:</strong> ' + (billing.first_name || '') + ' ' + (billing.last_name || '') + '</p>';
+                    html += '<p><strong>邮箱:</strong> <a href="mailto:' + (billing.email || '') + '" style="color: #60a5fa;">' + (billing.email || '-') + '</a></p>';
+                    html += '<p><strong>电话:</strong> ' + (billing.phone || '-') + '</p>';
+                    html += '<hr style="border-color: rgba(255,255,255,0.1);">';
+                    // Address
                     html += '<p>' + (billing.address_1 || '-') + '</p>';
                     if (billing.address_2) html += '<p>' + billing.address_2 + '</p>';
                     html += '<p>' + (billing.postcode || '') + ' ' + (billing.city || '') + '</p>';
                     html += '<p>' + (billing.country || '') + '</p>';
+
+                    // Check for custom billing fields
+                    var customerInPost = '';
+                    var customerSocial = '';
+                    if (metaData && Array.isArray(metaData)) {
+                        metaData.forEach(function (meta) {
+                            if (meta.key === '_billing_inpost') customerInPost = meta.value;
+                            if (meta.key === '_billing_social') customerSocial = meta.value;
+                        });
+                    }
+                    if (customerInPost) html += '<p class="text-primary mt-2 mb-1"><strong><i class="bi bi-box-seam me-1"></i>InPost:</strong> ' + customerInPost + '</p>';
+                    if (customerSocial) html += '<p class="text-success mb-0"><strong><i class="bi bi-whatsapp me-1"></i>Social:</strong> ' + customerSocial + '</p>';
+
+                    // Check for DPD Address
+                    var dpdAddress = { street: '', house: '', zip: '', city: '' };
+                    if (metaData && Array.isArray(metaData)) {
+                        metaData.forEach(function (meta) {
+                            if (meta.key === '_billing_adres_dpd') dpdAddress.street = meta.value;
+                            if (meta.key === '_billing_numer_domu') dpdAddress.house = meta.value;
+                            if (meta.key === '_billing_kod_pocztowy') dpdAddress.zip = meta.value;
+                            if (meta.key === '_billing_miejscowosc') dpdAddress.city = meta.value;
+                        });
+                    }
+
+                    // Display DPD Address if found
+                    if (dpdAddress.street || dpdAddress.city) {
+                        html += '<div class="mt-2 pt-2 border-top border-secondary border-opacity-25">';
+                        html += '<h6 class="text-info small mb-1"><i class="bi bi-truck me-1"></i>DPD 配送地址</h6>';
+                        html += '<p class="mb-0">' + (dpdAddress.street || '') + ' ' + (dpdAddress.house || '') + '</p>';
+                        html += '<p class="mb-0">' + (dpdAddress.zip || '') + ' ' + (dpdAddress.city || '') + '</p>';
+                        html += '</div>';
+                    }
+
                     html += '</div></div></div>';
 
                     // Shipping Address
                     html += '<div class="col-md-6">';
                     html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-truck me-2"></i>配送地址</h6></div>';
                     html += '<div class="card-body">';
-                    html += '<p><strong>收件人:</strong> ' + (shipping.first_name || '') + ' ' + (shipping.last_name || '') + '</p>';
-                    html += '<p>' + (shipping.address_1 || '-') + '</p>';
-                    if (shipping.address_2) html += '<p>' + shipping.address_2 + '</p>';
-                    html += '<p>' + (shipping.postcode || '') + ' ' + (shipping.city || '') + '</p>';
-                    html += '<p>' + (shipping.country || '') + '</p>';
+
+                    if (shipping && shipping.address_1) {
+                        html += '<p><strong>收件人:</strong> ' + (shipping.first_name || '') + ' ' + (shipping.last_name || '') + '</p>';
+                        html += '<p>' + shipping.address_1 + '</p>';
+                        if (shipping.address_2) html += '<p>' + shipping.address_2 + '</p>';
+                        html += '<p>' + (shipping.postcode || '') + ' ' + (shipping.city || '') + '</p>';
+                        html += '<p>' + (shipping.country || '') + '</p>';
+                    } else {
+                        html += '<p class="text-muted mb-0">没有设置配送地址</p>';
+                    }
                     html += '</div></div></div>';
 
                     // Line Items
@@ -384,16 +432,122 @@
                         html += '<div class="card-body"><p style="color: #fbbf24; font-style: italic;">' + order.customer_note + '</p></div></div></div>';
                     }
 
-                    // Meta Data (tracking info etc)
-                    var trackingInfo = metaData.filter(function (m) {
-                        return m.key && (m.key.indexOf('tracking') !== -1 || m.key.indexOf('shipment') !== -1 || m.key.indexOf('_wc_shipment') !== -1);
+                    // --- TRACKING INFORMATION LOGIC ---
+                    var allTracking = [];
+
+                    // 1. VillaTheme Plugin (in line_items)
+                    lineItems.forEach(function (item) {
+                        if (item.meta_data && Array.isArray(item.meta_data)) {
+                            item.meta_data.forEach(function (meta) {
+                                if (meta.key === '_vi_wot_order_item_tracking_data') {
+                                    try {
+                                        var trackData = typeof meta.value === 'string' ? JSON.parse(meta.value) : meta.value;
+                                        if (Array.isArray(trackData)) {
+                                            trackData.forEach(function (td) {
+                                                allTracking.push({
+                                                    tracking_number: td.tracking_number,
+                                                    carrier_name: td.carrier_name || td.carrier_slug,
+                                                    carrier_url: td.carrier_url ? td.carrier_url.replace('{tracking_number}', td.tracking_number) : '',
+                                                    time: td.time,
+                                                    source: item.name
+                                                });
+                                            });
+                                        }
+                                    } catch (e) { }
+                                } else if (meta.key === 'tracking_number' && meta.value) {
+                                    addCustomTracking(meta.value, item.name);
+                                }
+                            });
+                        }
                     });
-                    if (trackingInfo.length > 0) {
+
+                    // 2. Shipping Lines
+                    shippingLines.forEach(function (item) {
+                        if (item.meta_data && Array.isArray(item.meta_data)) {
+                            item.meta_data.forEach(function (meta) {
+                                if (meta.key === 'tracking_number' && meta.value) {
+                                    addCustomTracking(meta.value, 'Shipping: ' + (item.method_title || 'Method'));
+                                }
+                            });
+                        }
+                    });
+
+                    // 3. Order Meta (Advanced Shipment Tracking Pro & Custom)
+                    if (metaData) {
+                        metaData.forEach(function (meta) {
+                            // Advanced Shipment Tracking Pro
+                            if (meta.key === '_wc_shipment_tracking_items' && Array.isArray(meta.value)) {
+                                meta.value.forEach(function (item) {
+                                    if (item.tracking_number) {
+                                        var carrierInfo = detectCarrier(item.tracking_number);
+                                        var url = '';
+                                        // Use plugin provided URL if available, otherwise heuristic
+                                        if (item.tracking_provider && item.tracking_provider.indexOf('inpost') !== -1) {
+                                            url = 'https://inpost.pl/sledzenie-przesylek?number=' + item.tracking_number;
+                                        } else if (item.tracking_provider && item.tracking_provider.indexOf('dpd') !== -1) {
+                                            url = 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + item.tracking_number;
+                                        } else {
+                                            url = carrierInfo.url;
+                                        }
+
+                                        allTracking.push({
+                                            tracking_number: item.tracking_number,
+                                            carrier_name: (item.tracking_provider || carrierInfo.name).replace(/-/g, ' ').replace(/\b\w/g, function (l) { return l.toUpperCase(); }),
+                                            carrier_url: url,
+                                            time: item.date_shipped,
+                                            source: 'Order Info'
+                                        });
+                                    }
+                                });
+                            }
+                            // Custom _tracking_number
+                            if (meta.key === '_tracking_number' && meta.value) {
+                                addCustomTracking(meta.value, 'Order Main Tracking');
+                            }
+                        });
+                    }
+
+                    // Helper to add custom tracking with deduplication and carrier detection
+                    function addCustomTracking(tn, sourceName) {
+                        tn = String(tn).trim();
+                        if (!tn) return;
+                        // Avoid duplicates
+                        if (allTracking.some(function (t) { return t.tracking_number === tn; })) return;
+
+                        var carrier = detectCarrier(tn);
+                        allTracking.push({
+                            tracking_number: tn,
+                            carrier_name: carrier.name,
+                            carrier_url: carrier.url,
+                            time: null,
+                            source: sourceName
+                        });
+                    }
+
+                    function detectCarrier(tn) {
+                        if (tn.length === 24 && /^\d+$/.test(tn)) return { name: 'InPost', url: 'https://inpost.pl/sledzenie-przesylek?number=' + tn };
+                        if ((tn.length >= 10 && tn.length <= 14 && /^[a-zA-Z0-9]+$/.test(tn)) || tn.endsWith('U')) return { name: 'DPD', url: 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + tn };
+                        return { name: 'Custom', url: '' };
+                    }
+
+                    if (allTracking.length > 0) {
                         html += '<div class="col-12">';
                         html += '<div class="info-card" style="border-color: rgba(16, 185, 129, 0.3);"><div class="card-header" style="background: linear-gradient(90deg, rgba(16, 185, 129, 0.15) 0%, transparent 100%);"><h6 style="color: #34d399;"><i class="bi bi-geo-alt-fill me-2"></i>运单追踪</h6></div>';
                         html += '<div class="card-body">';
-                        trackingInfo.forEach(function (t) {
-                            html += '<p><strong>' + t.key.replace('_', ' ') + ':</strong> ' + (typeof t.value === 'object' ? JSON.stringify(t.value) : t.value) + '</p>';
+                        allTracking.forEach(function (t) {
+                            html += '<div class="mb-2 p-2 rounded" style="background: rgba(16, 185, 129, 0.1);">';
+                            html += '<div><strong>运单号:</strong> <span class="text-info">' + t.tracking_number + '</span></div>';
+                            html += '<div><strong>物流商:</strong> ' + t.carrier_name + '</div>';
+                            if (t.time) {
+                                var d = new Date(parseInt(t.time) * 1000);
+                                if (!isNaN(d.getTime())) {
+                                    html += '<div><strong>发货日期:</strong> ' + d.toLocaleDateString('zh-CN') + '</div>';
+                                }
+                            }
+                            if (t.carrier_url) {
+                                html += '<div class="mt-1"><a href="' + t.carrier_url + '" target="_blank" class="btn btn-sm btn-outline-success"><i class="bi bi-box-arrow-up-right me-1"></i>查询物流</a></div>';
+                            }
+                            html += '</div>';
                         });
                         html += '</div></div></div>';
                     }
@@ -403,6 +557,7 @@
                     document.getElementById('orderDetailContent').innerHTML = html;
                 })
                 .catch(function (err) {
+                    console.error(err);
                     document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger">加载失败: ' + err.message + '</div>';
                 });
         }

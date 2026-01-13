@@ -150,6 +150,15 @@
                             <option value="admin">管理员</option>
                         </select>
                     </div>
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="editCanShip">
+                            <label class="form-check-label text-white-50" for="editCanShip">
+                                <i class="bi bi-truck me-1"></i>发货权限
+                            </label>
+                        </div>
+                        <small class="text-muted">允许该用户访问发货管理功能</small>
+                    </div>
                 </div>
                 <div class="modal-footer border-top border-secondary border-opacity-25">
                     <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
@@ -222,7 +231,7 @@
             } else if (btn.classList.contains('btn-edit')) {
                 const user = window._usersData && window._usersData[userId];
                 if (user) {
-                    openEditUser(user.id, user.username, user.name || '', user.role);
+                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0);
                 }
             } else if (btn.classList.contains('btn-delete')) {
                 deleteUser(userId);
@@ -300,11 +309,12 @@
         });
 
         // Edit User
-        window.openEditUser = function (id, username, name, role) {
+        window.openEditUser = function (id, username, name, role, can_ship) {
             document.getElementById('editUserId').value = id;
             document.getElementById('editUsername').value = username;
             document.getElementById('editName').value = name;
             document.getElementById('editRole').value = role;
+            document.getElementById('editCanShip').checked = can_ship == 1;
             document.getElementById('editPassword').value = '';
             bootstrap.Modal.getOrCreateInstance(document.getElementById('editUserModal')).show();
         };
@@ -318,7 +328,8 @@
                 body: JSON.stringify({
                     name: document.getElementById('editName').value,
                     role: document.getElementById('editRole').value,
-                    password: document.getElementById('editPassword').value
+                    password: document.getElementById('editPassword').value,
+                    can_ship: document.getElementById('editCanShip').checked ? 1 : 0
                 })
             })
                 .then(res => res.json())

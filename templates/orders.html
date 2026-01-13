@@ -259,6 +259,12 @@
                                         class="text-light text-decoration-none">{{ order.customer_name or '-' }}</a>
                                 </div>
                                 <div class="customer-email text-muted">{{ order.customer_email }}</div>
+                                {% if order.dpd_address %}
+                                <div class="small text-info mt-1 text-truncate" style="max-width: 180px;"
+                                    title="{{ order.dpd_address }}">
+                                    <i class="bi bi-truck me-1"></i>{{ order.dpd_address }}
+                                </div>
+                                {% endif %}
                             </td>
                             <td class="product-cell">
                                 {% for product in order.products %}

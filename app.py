@@ -52,6 +52,17 @@ class User(UserMixin):
     def can_edit(self):
         """Check if user can edit/modify data (not a viewer)"""
         return self.role in ('admin', 'user')
+    
+    def can_ship(self):
+        """Check if user has shipping permission"""
+        if self.role == 'admin':
+            return True
+        # Check database for can_ship flag
+        from flask import current_app
+        conn = get_db_connection()
+        user = conn.execute('SELECT can_ship FROM users WHERE id = ?', (self.id,)).fetchone()
+        conn.close()
+        return user and user['can_ship'] == 1
 
 
 @login_manager.user_loader
@@ -414,6 +425,19 @@ def editor_required(f):
     def decorated_function(*args, **kwargs):
         if not current_user.is_authenticated or not current_user.can_edit():
             return jsonify({'error': '只读用户无法修改数据', 'readonly': True}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def shipper_required(f):
+    """Decorator to require shipping permission"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login'))
+        if not current_user.can_ship():
+            return jsonify({'error': '无发货权限', 'permission': 'shipping'}), 403
         return f(*args, **kwargs)
     return decorated_function
 
@@ -1074,6 +1098,20 @@ def orders():
         billing = parse_json_field(order['billing'])
         od['customer_name'] = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip()
         od['customer_email'] = billing.get('email', '')
+        
+        # Extract DPD address for list display
+        meta_data = parse_json_field(order['meta_data'])
+        custom_fields = extract_custom_billing_fields(meta_data)
+        
+        dpd_address = ''
+        if custom_fields.get('dpd_street') or custom_fields.get('dpd_city'):
+             parts = [
+                f"{custom_fields.get('dpd_street', '')} {custom_fields.get('dpd_house', '')}".strip(),
+                custom_fields.get('dpd_zip', ''),
+                custom_fields.get('dpd_city', '')
+             ]
+             dpd_address = ', '.join(filter(None, parts))
+        od['dpd_address'] = dpd_address
         processed_orders.append(od)
     
     # Get available sources (filtered by permissions and manager)
@@ -2157,6 +2195,9 @@ def get_customer_details(email):
     cancelled_orders = 0
     dates = []
     
+    # Initialize customer details
+    customer_phone = ''
+    
     for order in orders:
         order_dict = dict(order)
         billing = parse_json_field(order['billing'])
@@ -2164,7 +2205,10 @@ def get_customer_details(email):
         
         # Get customer name
         customer_name = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip()
-        customer_phone = billing.get('phone', '')
+        
+        # Only set if we haven't found a phone yet (processing from newest to oldest)
+        if not customer_phone:
+             customer_phone = billing.get('phone') or ''
         
         # Calculate order products
         order_products = []
@@ -2570,6 +2614,58 @@ def init_users_table():
     conn.close()
 
 
+def init_shipping_tables():
+    """Initialize shipping-related tables"""
+    conn = get_db_connection()
+    
+    # Add can_ship column to users table if not exists
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_ship INTEGER DEFAULT 0')
+        conn.commit()
+    except:
+        pass  # Column already exists
+    
+    # Shipping logs table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS shipping_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            woo_order_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            tracking_number TEXT NOT NULL,
+            carrier_slug TEXT,
+            shipped_by INTEGER,
+            shipped_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT,
+            status TEXT DEFAULT 'shipped'
+        )
+    ''')
+    
+    # Shipping carriers table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS shipping_carriers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            tracking_url TEXT,
+            is_active INTEGER DEFAULT 1
+        )
+    ''')
+    conn.commit()
+    
+    # Insert default carriers if table is empty
+    existing = conn.execute('SELECT COUNT(*) FROM shipping_carriers').fetchone()[0]
+    if existing == 0:
+        default_carriers = [
+            ('inpost', 'InPost', 'https://inpost.pl/sledzenie-przesylek?number={tracking}'),
+            ('dpd', 'DPD', 'https://www.dpd.com.pl/tracking?q={tracking}'),
+        ]
+        conn.executemany('INSERT INTO shipping_carriers (slug, name, tracking_url) VALUES (?, ?, ?)', default_carriers)
+        conn.commit()
+    
+    conn.close()
+
+
 def init_product_tables():
     """Initialize product analysis tables (brands, series, product_mappings)"""
     conn = get_db_connection()
@@ -2732,6 +2828,7 @@ with app.app_context():
     init_sync_logs_table()
     init_settings_table()
     init_users_table()
+    init_shipping_tables()
     init_product_tables()
     init_user_preferences_table()
 
@@ -4133,7 +4230,7 @@ def users_page():
 def get_users():
     """Get all users"""
     conn = get_db_connection()
-    users = conn.execute('SELECT id, username, name, role, created_at FROM users').fetchall()
+    users = conn.execute('SELECT id, username, name, role, can_ship, created_at FROM users').fetchall()
     conn.close()
     return jsonify([dict(row) for row in users])
 
@@ -4178,6 +4275,7 @@ def update_user(user_id):
     name = data.get('name', '').strip()
     role = data.get('role', 'user')
     password = data.get('password', '')
+    can_ship = data.get('can_ship', 0)
     
     if role not in ['admin', 'user', 'viewer']:
         role = 'user'
@@ -4185,11 +4283,11 @@ def update_user(user_id):
     conn = get_db_connection()
     try:
         if password:
-            conn.execute('UPDATE users SET name = ?, role = ?, password_hash = ? WHERE id = ?',
-                        (name, role, generate_password_hash(password), user_id))
+            conn.execute('UPDATE users SET name = ?, role = ?, can_ship = ?, password_hash = ? WHERE id = ?',
+                        (name, role, can_ship, generate_password_hash(password), user_id))
         else:
-            conn.execute('UPDATE users SET name = ?, role = ? WHERE id = ?',
-                        (name, role, user_id))
+            conn.execute('UPDATE users SET name = ?, role = ?, can_ship = ? WHERE id = ?',
+                        (name, role, can_ship, user_id))
         conn.commit()
         return jsonify({'success': True})
     finally:
@@ -5226,6 +5324,881 @@ def user_preferences_api():
         except Exception as e:
             conn.close()
             return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============== SHIPPING MANAGEMENT ==============
+
+@app.route('/shipping')
+@login_required
+@shipper_required
+def shipping():
+    """Shipping management page"""
+    conn = get_db_connection()
+    
+    # Get carriers
+    carriers = conn.execute('SELECT * FROM shipping_carriers WHERE is_active = 1').fetchall()
+    
+    # Get all managers for filter
+    managers = get_all_managers()
+    
+    # Get sites for filter
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    if allowed_sources is None:
+        sites = conn.execute('SELECT id, url, manager FROM sites').fetchall()
+    else:
+        placeholders = ','.join(['?' for _ in allowed_sources])
+        sites = conn.execute(f'SELECT id, url, manager FROM sites WHERE url IN ({placeholders})', allowed_sources).fetchall()
+    
+    conn.close()
+    return render_template('shipping.html', carriers=carriers, managers=managers, sites=sites)
+
+
+def extract_custom_billing_fields(meta_data):
+    """Extract custom billing fields from meta_data"""
+    custom_fields = {
+        'customer_inpost_id': '',
+        'customer_social': '',
+        'dpd_street': '',
+        'dpd_house': '',
+        'dpd_zip': '',
+        'dpd_city': ''
+    }
+    
+    if not meta_data:
+        return custom_fields
+        
+    for meta in meta_data:
+        if isinstance(meta, dict):
+            key = meta.get('key')
+            value = meta.get('value')
+            
+            if key == '_billing_inpost':
+                custom_fields['customer_inpost_id'] = value
+            elif key == '_billing_social':
+                custom_fields['customer_social'] = value
+            elif key == '_billing_adres_dpd':
+                custom_fields['dpd_street'] = value
+            elif key == '_billing_numer_domu':
+                custom_fields['dpd_house'] = value
+            elif key == '_billing_kod_pocztowy':
+                custom_fields['dpd_zip'] = value
+            elif key == '_billing_miejscowosc':
+                custom_fields['dpd_city'] = value
+                
+    return custom_fields
+
+
+@app.route('/api/shipping/pending')
+@login_required
+@shipper_required
+def get_pending_orders():
+    """Get orders pending shipment (status=processing)"""
+    conn = get_db_connection()
+    
+    # Get filter parameters
+    source_filter = request.args.get('source', '')
+    manager_filter = request.args.get('manager', '')
+    
+    # Build query
+    query = '''
+        SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, 
+               o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_total, o.shipping_lines,
+               s.manager
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        WHERE o.status IN ('processing', 'offline')
+    '''
+    params = []
+    
+    # Apply source filter
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    if allowed_sources is not None:
+        placeholders = ','.join(['?' for _ in allowed_sources])
+        query += f' AND o.source IN ({placeholders})'
+        params.extend(allowed_sources)
+    
+    if source_filter:
+        query += ' AND o.source = ?'
+        params.append(source_filter)
+    
+    if manager_filter:
+        query += ' AND s.manager = ?'
+        params.append(manager_filter)
+    
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    search = request.args.get('search')
+    
+    if start_date:
+        query += ' AND o.date_created >= ?'
+        params.append(start_date + ' 00:00:00')
+    
+    if end_date:
+        query += ' AND o.date_created <= ?'
+        params.append(end_date + ' 23:59:59')
+    
+    if search:
+        search_term = f'%{search}%'
+        query += ' AND (o.number LIKE ? OR o.billing LIKE ? OR o.shipping LIKE ?)'
+        params.extend([search_term, search_term, search_term])
+    
+    query += ' ORDER BY o.date_created DESC'
+    
+    orders = conn.execute(query, params).fetchall()
+    conn.close()
+    
+    result = []
+    for order in orders:
+        billing = parse_json_field(order['billing'])
+        shipping_info = parse_json_field(order['shipping'])
+        line_items = parse_json_field(order['line_items'])
+        shipping_lines = parse_json_field(order['shipping_lines'])
+        shipping_method = shipping_lines[0].get('method_title', 'Unknown') if shipping_lines and len(shipping_lines) > 0 else ''
+        
+        # Get shipping address (prefer shipping, fallback to billing)
+        addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
+        meta_data = parse_json_field(order['meta_data'])
+        custom_fields = extract_custom_billing_fields(meta_data)
+        
+        # Calculate customer address (Standard)
+        std_parts = [
+            addr.get('address_1', ''),
+            addr.get('address_2', ''),
+            addr.get('postcode', ''),
+            addr.get('city', ''),
+            addr.get('country', '')
+        ]
+        customer_address = ', '.join(filter(None, std_parts))
+        
+        # DPD Fallback: If standard address is empty but DPD fields exist
+        if not addr.get('address_1') and (custom_fields.get('dpd_street') or custom_fields.get('dpd_city')):
+            dpd_parts = [
+                f"{custom_fields.get('dpd_street', '')} {custom_fields.get('dpd_house', '')}".strip(),
+                custom_fields.get('dpd_zip', ''),
+                custom_fields.get('dpd_city', '')
+            ]
+            customer_address = ', '.join(filter(None, dpd_parts))
+
+        result.append({
+            'id': order['id'],
+            'number': order['number'],
+            'total': float(order['total'] or 0),
+            'currency': order['currency'],
+            'date_created': order['date_created'],
+            'source': order['source'].replace('https://www.', '').replace('https://', ''),
+            'manager': order['manager'] or '',
+            'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
+            'customer_email': billing.get('email', ''),
+            'customer_phone': addr.get('phone') or billing.get('phone', ''),
+            'customer_address': customer_address,
+            'customer_inpost_id': custom_fields['customer_inpost_id'],
+            'customer_social': custom_fields['customer_social'],
+            'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (line_items or [])],
+            'shipping_total': float(order['shipping_total'] or 0),
+            'shipping_method': shipping_method,
+            'product_count': sum(item.get('quantity', 1) for item in (line_items or []))
+        })
+    
+    return jsonify(result)
+
+
+@app.route('/api/shipping/shipped')
+@login_required
+@shipper_required
+def get_shipped_orders():
+    """Get shipped orders (status=on-hold) with tracking info"""
+    conn = get_db_connection()
+    
+    # Get filter parameters
+    source_filter = request.args.get('source', '')
+    
+    query = '''
+        SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, o.date_modified,
+               o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_lines, o.shipping_total,
+               s.manager,
+               sl.tracking_number, sl.carrier_slug, sl.shipped_at
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        WHERE o.status = 'on-hold'
+    '''
+    params = []
+    
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    if allowed_sources is not None:
+        placeholders = ','.join(['?' for _ in allowed_sources])
+        query += f' AND o.source IN ({placeholders})'
+        params.extend(allowed_sources)
+    
+    if source_filter:
+        query += ' AND o.source = ?'
+        params.append(source_filter)
+
+    manager_filter = request.args.get('manager', '')
+    if manager_filter:
+        query += ' AND s.manager = ?'
+        params.append(manager_filter)
+        
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    search = request.args.get('search')
+    
+    if start_date:
+        query += ' AND o.date_created >= ?'
+        params.append(start_date + ' 00:00:00')
+    
+    if end_date:
+        query += ' AND o.date_created <= ?'
+        params.append(end_date + ' 23:59:59')
+    
+    if search:
+        search_term = f'%{search}%'
+        # For shipped orders, also search tracking number
+        query += ' AND (o.number LIKE ? OR o.billing LIKE ? OR o.shipping LIKE ? OR sl.tracking_number LIKE ?)'
+        params.extend([search_term, search_term, search_term, search_term])
+    
+    query += ' ORDER BY sl.shipped_at DESC, o.date_modified DESC, o.date_created DESC'
+    
+    orders = conn.execute(query, params).fetchall()
+    
+    # Get carriers for tracking URL
+    carriers = {c['slug']: c for c in conn.execute('SELECT * FROM shipping_carriers').fetchall()}
+    conn.close()
+    
+    # Mapping for Advanced Shipment Tracking Pro provider slugs
+    ast_provider_mapping = {
+        'inpost-paczkomaty': ('inpost', 'InPost'),
+        'inpost': ('inpost', 'InPost'),
+        'dpd': ('dpd', 'DPD'),
+        'dpd-pl': ('dpd', 'DPD'),
+    }
+    
+    result = []
+    for order in orders:
+        try:
+            result.append(process_shipped_order(order, conn, carriers, ast_provider_mapping))
+        except Exception as e:
+            print(f"Error processing shipped order {order['number']}: {e}")
+            continue
+    
+    return jsonify(result)
+
+
+@app.route('/api/shipping/ship', methods=['POST'])
+@login_required
+@shipper_required
+def ship_order():
+    """Execute shipping: add tracking number and update order status"""
+    import requests as req
+    
+    data = request.json
+    order_id = data.get('order_id')
+    tracking_number = data.get('tracking_number')
+    carrier_slug = data.get('carrier_slug')
+    send_email = data.get('send_email', True)
+    
+    if not all([order_id, tracking_number, carrier_slug]):
+        return jsonify({'success': False, 'error': '缺少必填字段'}), 400
+    
+    conn = get_db_connection()
+    
+    # Get order info including current status
+    order = conn.execute('SELECT id, number, source, status FROM orders WHERE id = ?', (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    
+    # Get site credentials
+    site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    if not site:
+        conn.close()
+        return jsonify({'success': False, 'error': '站点配置不存在'}), 404
+
+    # Get carrier info
+    carrier = conn.execute('SELECT name, tracking_url FROM shipping_carriers WHERE slug = ?', (carrier_slug,)).fetchone()
+    carrier_name = carrier['name'] if carrier else carrier_slug
+    
+    # Generate tracking URL
+    tracking_url = ''
+    if carrier and carrier['tracking_url']:
+        tracking_url = carrier['tracking_url'].replace('{tracking}', tracking_number).replace('{tracking_number}', tracking_number)
+        
+    # Override for specific Polish carriers
+    if 'inpost' in carrier_slug.lower() and tracking_number:
+        tracking_url = f"https://inpost.pl/sledzenie-przesylek?number={tracking_number}"
+    elif 'dpd' in carrier_slug.lower() and tracking_number:
+        tracking_url = f"https://tracktrace.dpd.com.pl/parcelDetails?p1={tracking_number}"
+    
+    # Check if already has tracking log - update instead of insert
+    existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
+    
+    try:
+        # 1. Call Orders Tracking API to add tracking number
+        tracking_url_api = f"{site['url']}/wp-json/woo-orders-tracking/v1/tracking/set"
+        tracking_payload = {
+            'order_id': order['number'],
+            'tracking_data': [{
+                'tracking_number': tracking_number,
+                'carrier_slug': carrier_slug
+            }],
+            'send_email': False # We will send our own reliable email via Note
+        }
+        
+        tracking_resp = req.post(
+            tracking_url_api,
+            json=tracking_payload,
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=30
+        )
+        
+        # Log warning if tracking API fails, but don't stop shipment (it might be a plugin issue)
+        if tracking_resp.status_code not in [200, 201]:
+             print(f"Warning: Tracking API failed: {tracking_resp.text}")
+
+        # 2. Send Reliable Email via Customer Note
+        if send_email:
+            note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+            
+            if tracking_url:
+                note_content = f"Order has been shipped via {carrier_name}. Tracking Number: <a href='{tracking_url}'>{tracking_number}</a>"
+                # Add tracking link line for better visibility
+                note_content += f"\n<br>Track your package: <a href='{tracking_url}'>{tracking_url}</a>"
+            else:
+                note_content = f"Order has been shipped via {carrier_name}. Tracking Number: {tracking_number}"
+                
+            note_resp = req.post(
+                note_url,
+                json={'note': note_content, 'customer_note': True}, # True = Send email to customer
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=30
+            )
+            if note_resp.status_code not in [200, 201]:
+                print(f"Warning: Failed to send customer note email: {note_resp.text}")
+        
+        # 3. Only update order status if not already on-hold
+        if order['status'] != 'on-hold':
+            status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
+            status_resp = req.put(
+                status_url,
+                json={'status': 'on-hold'},
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=30
+            )
+            
+            if status_resp.status_code not in [200, 201]:
+                raise Exception(f"更新订单状态失败: {status_resp.text}")
+            
+            # Update local database
+            conn.execute("UPDATE orders SET status = 'on-hold' WHERE id = ?", (order_id,))
+        
+        # 4. Log shipping action - update if exists, insert if new
+        if existing_log:
+            conn.execute('''
+                UPDATE shipping_logs 
+                SET tracking_number = ?, carrier_slug = ?, shipped_by = ?, shipped_at = datetime('now')
+                WHERE order_id = ?
+            ''', (tracking_number, carrier_slug, current_user.id, order_id))
+        else:
+            conn.execute('''
+                INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id))
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'success': True, 'message': '发货成功，已发送邮件通知客户'})
+        
+    except Exception as e:
+        conn.close()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/shipping/complete/<int:order_id>', methods=['POST'])
+@login_required
+@shipper_required
+def complete_order(order_id):
+    """Mark order as completed"""
+    import requests as req
+    
+    conn = get_db_connection()
+    
+    order = conn.execute('SELECT id, number, source FROM orders WHERE id = ?', (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    
+    site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    if not site:
+        conn.close()
+        return jsonify({'success': False, 'error': '站点配置不存在'}), 404
+    
+    try:
+        # Update order status via WooCommerce API
+        url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
+        resp = req.put(
+            url,
+            json={'status': 'completed'},
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=30
+        )
+        
+        if resp.status_code not in [200, 201]:
+            raise Exception(f"API错误: {resp.text}")
+        
+        # Update local database
+        conn.execute("UPDATE orders SET status = 'completed' WHERE id = ?", (order_id,))
+        conn.execute("UPDATE shipping_logs SET status = 'completed', completed_at = datetime('now') WHERE order_id = ?", (order_id,))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'success': True, 'message': '订单已完成'})
+        
+    except Exception as e:
+        conn.close()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/shipping/carriers')
+@login_required
+@shipper_required
+def get_carriers():
+    """Get list of shipping carriers"""
+    conn = get_db_connection()
+    carriers = conn.execute('SELECT id, slug, name, tracking_url FROM shipping_carriers WHERE is_active = 1').fetchall()
+    conn.close()
+    return jsonify([dict(c) for c in carriers])
+
+
+@app.route('/api/order/<int:order_id>/note', methods=['POST'])
+@login_required
+@shipper_required
+def add_order_note(order_id):
+    """Add a note to an order, optionally notifying the customer"""
+    import requests as req
+    
+    data = request.json
+    note = data.get('note', '')
+    notify_customer = data.get('notify_customer', False)
+    
+    if not note:
+        return jsonify({'success': False, 'error': '备注内容不能为空'}), 400
+    
+    conn = get_db_connection()
+    order = conn.execute('SELECT number, source FROM orders WHERE id = ?', (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    
+    site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    conn.close()
+    
+    if not site:
+        return jsonify({'success': False, 'error': '站点配置不存在'}), 404
+    
+    try:
+        url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+        resp = req.post(
+            url,
+            json={'note': note, 'customer_note': notify_customer},
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=30
+        )
+        
+        if resp.status_code not in [200, 201]:
+            raise Exception(f"API错误: {resp.text}")
+        
+        return jsonify({'success': True, 'message': '备注已添加' + ('，已通知客户' if notify_customer else '')})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/shipping/print/label/<int:order_id>')
+@login_required
+@shipper_required
+def print_shipping_label(order_id):
+    """Get order data for printing shipping label"""
+    conn = get_db_connection()
+    
+    order = conn.execute('''
+        SELECT o.*, sl.tracking_number, sl.carrier_slug, sc.name as carrier_name
+        FROM orders o
+        LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        LEFT JOIN shipping_carriers sc ON sl.carrier_slug = sc.slug
+        WHERE o.id = ?
+    ''', (order_id,)).fetchone()
+    
+    if not order:
+        conn.close()
+        return jsonify({'error': '订单不存在'}), 404
+    
+    # Get site manager
+    site = conn.execute('SELECT manager FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    conn.close()
+    
+    billing = parse_json_field(order['billing'])
+    shipping_info = parse_json_field(order['shipping'])
+    line_items = parse_json_field(order['line_items'])
+    
+    addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
+    
+    return jsonify({
+        'order_number': order['number'],
+        'date': order['date_created'][:10] if order['date_created'] else '',
+        'source': order['source'].replace('https://www.', '').replace('https://', ''),
+        'manager': site['manager'] if site else '',
+        'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
+        'customer_phone': addr.get('phone', ''),
+        'customer_address': '\n'.join(filter(None, [
+            addr.get('address_1', ''),
+            addr.get('address_2', ''),
+            f"{addr.get('postcode', '')} {addr.get('city', '')}".strip(),
+            addr.get('country', '')
+        ])),
+        'customer_inpost_id': extract_custom_billing_fields(parse_json_field(order['meta_data'])).get('customer_inpost_id', ''),
+        'customer_social': extract_custom_billing_fields(parse_json_field(order['meta_data'])).get('customer_social', ''),
+        'products': [{'name': item.get('name', ''), 'qty': item.get('quantity', 1)} for item in (line_items or [])],
+        'tracking_number': order['tracking_number'] or '',
+        'carrier_name': order['carrier_name'] or ''
+    })
+
+
+@app.route('/api/shipping/print/list')
+@login_required
+@shipper_required
+def print_shipping_list():
+    """Get today's pending orders for printing"""
+    from datetime import datetime
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    conn = get_db_connection()
+    
+    query = '''
+        SELECT o.id, o.number, o.total, o.currency, o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_total,
+               s.manager
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        WHERE o.status = 'processing'
+        AND o.date_created >= ?
+    '''
+    params = [today]
+    
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    if allowed_sources is not None:
+        placeholders = ','.join(['?' for _ in allowed_sources])
+        query += f' AND o.source IN ({placeholders})'
+        params.extend(allowed_sources)
+    
+    query += ' ORDER BY o.date_created'
+    
+    orders = conn.execute(query, params).fetchall()
+    conn.close()
+    
+    result = []
+    for order in orders:
+        billing = parse_json_field(order['billing'])
+        shipping_info = parse_json_field(order['shipping'])
+        line_items = parse_json_field(order['line_items'])
+        
+        addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
+        meta_data = parse_json_field(order['meta_data'])
+        custom_fields = extract_custom_billing_fields(meta_data)
+        
+        result.append({
+            'order_number': order['number'],
+            'source': order['source'].replace('https://www.', '').replace('https://', ''),
+            'manager': order['manager'] or '',
+            'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
+            'customer_phone': addr.get('phone', ''),
+            'customer_address': ', '.join(filter(None, [
+                addr.get('address_1', ''),
+                addr.get('address_2', ''),
+                f"{addr.get('postcode', '')} {addr.get('city', '')}".strip(),
+                addr.get('country', '')
+            ])),
+            'customer_inpost_id': custom_fields['customer_inpost_id'],
+            'customer_social': custom_fields['customer_social'],
+            'customer_social': custom_fields['customer_social'],
+            'total': f"{float(order['total'] or 0):.2f} {order['currency']}",
+            'products': [{'name': item.get('name', ''), 'qty': item.get('quantity', 1)} for item in (line_items or [])],
+            'shipping_total': float(order['shipping_total'] or 0)
+        })
+    
+    return jsonify({'date': today, 'orders': result, 'count': len(result)})
+
+
+@app.route('/api/shipping/print/pending')
+@login_required
+@shipper_required
+def print_pending_list():
+    """Get all pending orders for printing"""
+    conn = get_db_connection()
+    
+    query = '''
+        SELECT o.id, o.number, o.total, o.currency, o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_total,
+               s.manager
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        WHERE o.status = 'processing'
+    '''
+    params = []
+    
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    if allowed_sources is not None:
+        placeholders = ','.join(['?' for _ in allowed_sources])
+        query += f' AND o.source IN ({placeholders})'
+        params.extend(allowed_sources)
+    
+    query += ' ORDER BY o.date_created'
+    
+    orders = conn.execute(query, params).fetchall()
+    conn.close()
+    
+    result = []
+    for order in orders:
+        billing = parse_json_field(order['billing'])
+        shipping_info = parse_json_field(order['shipping'])
+        line_items = parse_json_field(order['line_items'])
+        
+        addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
+        meta_data = parse_json_field(order['meta_data'])
+        custom_fields = extract_custom_billing_fields(meta_data)
+        
+        result.append({
+            'order_number': order['number'],
+            'source': order['source'].replace('https://www.', '').replace('https://', ''),
+            'manager': order['manager'] or '',
+            'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
+            'customer_phone': addr.get('phone', ''),
+            'customer_address': ', '.join(filter(None, [
+                addr.get('address_1', ''),
+                addr.get('address_2', ''),
+                f"{addr.get('postcode', '')} {addr.get('city', '')}".strip(),
+                addr.get('country', '')
+            ])),
+            'customer_inpost_id': custom_fields['customer_inpost_id'],
+            'customer_social': custom_fields['customer_social'],
+            'customer_social': custom_fields['customer_social'],
+            'total': f"{float(order['total'] or 0):.2f} {order['currency']}",
+            'products': [{'name': item.get('name', ''), 'qty': item.get('quantity', 1)} for item in (line_items or [])],
+            'shipping_total': float(order['shipping_total'] or 0)
+        })
+    
+    from datetime import datetime
+    today = datetime.now().strftime('%Y-%m-%d')
+    return jsonify({'date': '截止 ' + today, 'orders': result, 'count': len(result)})
+
+
+def process_shipped_order(order, conn, carriers, ast_provider_mapping):
+    billing = parse_json_field(order['billing'])
+    shipping_info = parse_json_field(order['shipping'])
+    meta_data = parse_json_field(order['meta_data'])
+    
+    # Get shipping address for display
+    addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
+    custom_fields = extract_custom_billing_fields(meta_data)
+    
+    # Calculate customer address (Standard)
+    std_parts = [
+        addr.get('address_1', ''),
+        addr.get('address_2', ''),
+        addr.get('city', ''),
+        addr.get('postcode', ''),
+        addr.get('country', '')
+    ]
+    customer_address = ', '.join(filter(None, std_parts))
+
+    # DPD Fallback: If standard address is empty but DPD fields exist
+    if not addr.get('address_1') and (custom_fields.get('dpd_street') or custom_fields.get('dpd_city')):
+        dpd_parts = [
+            f"{custom_fields.get('dpd_street', '')} {custom_fields.get('dpd_house', '')}".strip(),
+            custom_fields.get('dpd_zip', ''),
+            custom_fields.get('dpd_city', '')
+        ]
+        customer_address = ', '.join(filter(None, dpd_parts))
+
+
+    # Get tracking info - first from shipping_logs, then from order meta_data
+    tracking_number = order['tracking_number'] or ''
+    carrier_slug = order['carrier_slug'] or ''
+    shipped_at = order['shipped_at']
+    carrier_name = ''
+    tracking_url = ''
+    
+    # If no tracking in shipping_logs, try to get from wc_shipment_tracking_items (Advanced Shipment Tracking Pro)
+    if not tracking_number and meta_data:
+        for meta in meta_data:
+            if isinstance(meta, dict) and meta.get('key') == '_wc_shipment_tracking_items':
+                tracking_items = meta.get('value', [])
+                if isinstance(tracking_items, list) and len(tracking_items) > 0:
+                    first_item = tracking_items[0]
+                    if isinstance(first_item, dict):
+                        tracking_number = first_item.get('tracking_number', '')
+                        ast_provider = first_item.get('tracking_provider', '')
+                        
+                        # Map AST provider to our carrier slugs
+                        if ast_provider in ast_provider_mapping:
+                            carrier_slug, carrier_name = ast_provider_mapping[ast_provider]
+                        else:
+                            carrier_slug = ast_provider
+                            carrier_name = ast_provider.replace('-', ' ').title()
+                        
+                        # Parse date_shipped (Unix timestamp)
+                        date_shipped = first_item.get('date_shipped')
+                        if date_shipped:
+                            try:
+                                from datetime import datetime
+                                shipped_at = datetime.fromtimestamp(int(date_shipped)).strftime('%Y-%m-%d %H:%M:%S')
+                            except:
+                                pass
+                break
+    
+    # If still no tracking, try line_items meta_data for Orders Tracking for WooCommerce (VillaTheme)
+    if not tracking_number:
+        line_items = parse_json_field(order['line_items'])
+        if line_items:
+            for item in line_items:
+                if isinstance(item, dict):
+                    item_meta = item.get('meta_data', [])
+                    for meta in item_meta:
+                        if isinstance(meta, dict) and meta.get('key') == '_vi_wot_order_item_tracking_data':
+                            try:
+                                tracking_data_str = meta.get('value', '')
+                                if isinstance(tracking_data_str, str):
+                                    import json
+                                    tracking_data = json.loads(tracking_data_str)
+                                else:
+                                    tracking_data = tracking_data_str
+                                
+                                if isinstance(tracking_data, list) and len(tracking_data) > 0:
+                                    first_track = tracking_data[0]
+                                    if isinstance(first_track, dict):
+                                        tracking_number = first_track.get('tracking_number', '')
+                                        # Get carrier name and slug
+                                        raw_carrier_name = first_track.get('carrier_name', '')
+                                        raw_carrier_slug = first_track.get('carrier_slug', '')
+                                        
+                                        carrier_name = raw_carrier_name.title() if raw_carrier_name else raw_carrier_slug.title()
+                                        carrier_slug = raw_carrier_slug
+                                        
+                                        # Normalize carrier slug for known carriers to ensure we use our verified DB URLs
+                                        cn_lower = carrier_name.lower()
+                                        plugin_tracking_url = first_track.get('carrier_url', '')
+
+                                        if 'dpd' in cn_lower:
+                                            carrier_slug = 'dpd'
+                                            carrier_name = 'DPD'
+                                            plugin_tracking_url = '' # Force use of DB configured URL
+                                        elif 'inpost' in cn_lower:
+                                            carrier_slug = 'inpost'
+                                            carrier_name = 'InPost' 
+                                            plugin_tracking_url = '' # Force use of DB configured URL
+
+                                        # Get tracking URL from plugin data only if we didn't clear it
+                                        if plugin_tracking_url and tracking_number:
+                                            tracking_url = plugin_tracking_url.replace('{tracking_number}', tracking_number)
+                                            # Fix common placeholder issues from plugins
+                                            tracking_url = tracking_url.replace('{Tracking_number}', tracking_number)
+                                        
+                                        # Parse time (Unix timestamp)
+                                        track_time = first_track.get('time')
+                                        if track_time:
+                                            try:
+                                                from datetime import datetime
+                                                shipped_at = datetime.fromtimestamp(int(track_time)).strftime('%Y-%m-%d %H:%M:%S')
+                                            except:
+                                                pass
+                            except:
+                                pass
+                            if tracking_number: break
+                if tracking_number: break
+
+    # If still no tracking, try shipping_lines meta_data 'tracking_number'
+    shipping_lines = parse_json_field(order['shipping_lines'])
+    if not tracking_number and shipping_lines:
+        for item in shipping_lines:
+            if isinstance(item, dict):
+                for meta in item.get('meta_data', []):
+                    if isinstance(meta, dict) and meta.get('key') == 'tracking_number':
+                        tracking_number = meta.get('value', '').strip()
+                        if tracking_number:
+                            break
+            if tracking_number:
+                break
+
+    # If still no tracking, try order meta_data '_tracking_number'
+    if not tracking_number and meta_data:
+            for meta in meta_data:
+                if isinstance(meta, dict) and meta.get('key') == '_tracking_number':
+                    tracking_number = meta.get('value', '').strip()
+                    if tracking_number:
+                        break
+
+    # Determine carrier if we found a tracking number via custom methods but no slug
+    if tracking_number and not carrier_slug:
+        carrier_name = 'Custom' # Default
+        
+        # Helper to check string format
+        def is_alnum(s):
+            return s.replace(' ', '').isalnum()
+
+        # Logic from poland.php: InPost (24 digits), DPD (10-14 alphanumeric)
+        if len(tracking_number) == 24 and tracking_number.isdigit():
+            carrier_slug = 'inpost'
+            carrier_name = 'InPost'
+        elif 10 <= len(tracking_number) <= 14 and is_alnum(tracking_number):
+            carrier_slug = 'dpd'
+            carrier_name = 'DPD'
+        
+        # If still unsure, check shipping method title
+        if not carrier_slug and shipping_lines and len(shipping_lines) > 0:
+            method_title = str(shipping_lines[0].get('method_title', '')).lower()
+            if 'inpost' in method_title:
+                carrier_slug = 'inpost'
+                carrier_name = 'InPost'
+            elif 'dpd' in method_title:
+                carrier_slug = 'dpd'
+                carrier_name = 'DPD'
+
+    # Build tracking URL (if not already set by plugin data)
+    if tracking_number and carrier_slug and not tracking_url:
+        carrier = carriers.get(carrier_slug)
+        if carrier and carrier['tracking_url']:
+            tracking_url = carrier['tracking_url'].replace('{tracking}', tracking_number)
+    
+    # Use date_modified as fallback if still no shipped_at
+    if not shipped_at and order['date_modified']:
+        shipped_at = order['date_modified']
+    
+    # Get carrier name from our database if not already set
+    if not carrier_name and carrier_slug and carrier_slug in carriers:
+        carrier_name = carriers[carrier_slug]['name']
+    
+    return {
+        'id': order['id'],
+        'number': order['number'],
+        'total': float(order['total'] or 0),
+        'currency': order['currency'],
+        'source': order['source'].replace('https://www.', '').replace('https://', ''),
+        'manager': order['manager'] or '',
+        'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
+        'customer_email': billing.get('email', ''),
+        'customer_phone': addr.get('phone') or billing.get('phone', ''),
+        'customer_address': customer_address,
+        'customer_address_2': addr.get('address_2', ''),
+        'customer_inpost_id': custom_fields['customer_inpost_id'],
+        'customer_social': custom_fields['customer_social'],
+        'tracking_number': tracking_number,
+        'carrier_slug': carrier_slug,
+        'carrier_name': carrier_name,
+        'tracking_url': tracking_url,
+        'shipped_at': shipped_at,
+        'has_tracking': bool(tracking_number),
+        'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (parse_json_field(order['line_items']) or [])],
+        'shipping_total': float(order['shipping_total'] or 0),
+        'product_count': sum(item.get('quantity', 1) for item in (parse_json_field(order['line_items']) or []))
+    }
 
 
 if __name__ == '__main__':
