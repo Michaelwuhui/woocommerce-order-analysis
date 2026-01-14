@@ -3398,7 +3398,7 @@ def check_site_api(site_id):
 @app.route('/api/sites/check-all', methods=['POST'])
 @login_required
 def check_all_sites_api():
-    """Check API connectivity for all sites"""
+    """Check API connectivity for all sites - tests both read and write permissions"""
     from woocommerce import API
     
     conn = get_db_connection()
@@ -3409,6 +3409,9 @@ def check_all_sites_api():
     for site in sites:
         site_id = site['id']
         site_url = site['url']
+        read_status = 'unknown'
+        write_status = 'unknown'
+        error_msg = None
         
         try:
             wcapi = API(
@@ -3419,35 +3422,100 @@ def check_all_sites_api():
                 timeout=15
             )
             
-            response = wcapi.get("orders", params={"per_page": 1})
-            
-            if response.status_code == 200:
-                conn.execute('UPDATE sites SET api_status = ?, last_api_error = NULL WHERE id = ?', 
-                             ('ok', site_id))
-                results.append({'site_id': site_id, 'url': site_url, 'status': 'ok'})
-            elif response.status_code in (401, 403):
-                error_msg = f"API认证失败 (HTTP {response.status_code})"
-                try:
-                    error_data = response.json()
-                    if 'message' in error_data:
-                        error_msg = f"{error_msg}: {error_data['message']}"
-                except:
-                    pass
+            # Test READ permission
+            try:
+                response = wcapi.get("orders", params={"per_page": 1})
                 
-                conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
-                             ('error', error_msg, site_id))
-                results.append({'site_id': site_id, 'url': site_url, 'status': 'error', 'message': error_msg})
+                if response.status_code == 200:
+                    read_status = 'ok'
+                elif response.status_code in (401, 403):
+                    read_status = 'error'
+                    error_msg = f"读权限认证失败 (HTTP {response.status_code})"
+                    try:
+                        error_data = response.json()
+                        if 'message' in error_data:
+                            error_msg = f"{error_msg}: {error_data['message']}"
+                    except:
+                        pass
+                else:
+                    read_status = 'error'
+                    error_msg = f"读取失败 HTTP {response.status_code}"
+            except Exception as e:
+                read_status = 'error'
+                error_msg = f"读权限测试失败: {str(e)}"
+            
+            # Test WRITE permission (only if read is ok)
+            if read_status == 'ok':
+                try:
+                    # Get an order to test write permission on
+                    orders_response = wcapi.get("orders", params={"per_page": 1, "status": "any"})
+                    
+                    if orders_response.status_code == 200:
+                        orders = orders_response.json()
+                        
+                        if orders and len(orders) > 0:
+                            test_order_id = orders[0]['id']
+                            
+                            # Try to add a test note (internal, not sent to customer)
+                            test_note_response = wcapi.post(
+                                f"orders/{test_order_id}/notes",
+                                data={
+                                    "note": "[API权限测试] 此消息用于验证写权限，将立即删除",
+                                    "customer_note": False
+                                }
+                            )
+                            
+                            if test_note_response.status_code in (200, 201):
+                                write_status = 'ok'
+                                
+                                # Try to delete the test note
+                                try:
+                                    note_id = test_note_response.json().get('id')
+                                    if note_id:
+                                        wcapi.delete(f"orders/{test_order_id}/notes/{note_id}")
+                                except:
+                                    pass  # 删除失败不影响写权限判定
+                            elif test_note_response.status_code in (401, 403):
+                                write_status = 'error'
+                                if not error_msg:
+                                    error_msg = "写权限被拒绝"
+                            else:
+                                write_status = 'error'
+                                if not error_msg:
+                                    error_msg = f"写入测试失败 HTTP {test_note_response.status_code}"
+                        else:
+                            write_status = 'unknown'
+                            if not error_msg:
+                                error_msg = "无订单可测试写权限"
+                    else:
+                        write_status = 'unknown'
+                except Exception as e:
+                    write_status = 'error'
+                    if not error_msg:
+                        error_msg = f"写权限测试失败: {str(e)}"
             else:
-                error_msg = f"HTTP {response.status_code}"
-                conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
-                             ('error', error_msg, site_id))
-                results.append({'site_id': site_id, 'url': site_url, 'status': 'error', 'message': error_msg})
+                # 如果读权限失败，跳过写权限测试
+                write_status = 'unknown'
                 
         except Exception as e:
+            read_status = 'error'
+            write_status = 'unknown'
             error_msg = f"连接失败: {str(e)}"
-            conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
-                         ('error', error_msg, site_id))
-            results.append({'site_id': site_id, 'url': site_url, 'status': 'error', 'message': error_msg})
+        
+        # Update database
+        conn.execute('''
+            UPDATE sites 
+            SET api_read_status = ?, api_write_status = ?, last_api_error = ?
+            WHERE id = ?
+        ''', (read_status, write_status, error_msg, site_id))
+        
+        results.append({
+            'site_id': site_id,
+            'url': site_url,
+            'read': read_status,
+            'write': write_status,
+            'message': error_msg
+        })
     
     conn.commit()
     conn.close()
@@ -5658,38 +5726,81 @@ def ship_order():
     # Note: The free version of "Orders Tracking for WooCommerce" plugin does not support REST API
     # We will still send customer notifications via order notes, which works reliably
     
-    # Send customer notification via order note
+    
+    # Add order note with tracking information
+    # Note: customer_note=True will send email notification (if send_email is True)
+    #       customer_note=False will just add internal note without email
     try:
-        if send_email:
-            note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
-            
-            if tracking_url:
-                note_content = f"Order has been shipped via {carrier_name}. Tracking Number: <a href='{tracking_url}'>{tracking_number}</a>"
-                # Add tracking link line for better visibility
-                note_content += f"\n<br>Track your package: <a href='{tracking_url}'>{tracking_url}</a>"
-            else:
-                note_content = f"Order has been shipped via {carrier_name}. Tracking Number: {tracking_number}"
-                
-            note_resp = req.post(
-                note_url,
-                json={'note': note_content, 'customer_note': True}, # True = Send email to customer
-                auth=(site['consumer_key'], site['consumer_secret']),
-                timeout=30
-            )
-            if note_resp.status_code not in [200, 201]:
-                print(f"Warning: Failed to send customer note email: {note_resp.text}")
+        note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+        
+        if tracking_url:
+            note_content = f"Order has been shipped via {carrier_name}. Tracking Number: <a href='{tracking_url}'>{tracking_number}</a>"
+            note_content += f"\n<br>Track your package: <a href='{tracking_url}'>{tracking_url}</a>"
+        else:
+            note_content = f"Order has been shipped via {carrier_name}. Tracking Number: {tracking_number}"
+        
+        # Retry logic with shorter timeout for problematic sites
+        max_retries = 2 if send_email else 1  # 发送邮件时重试，不发送时只尝试1次
+        timeout_seconds = 45 if send_email else 15  # 发送邮件时用更长超时
+        
+        for attempt in range(max_retries):
+            try:
+                note_resp = req.post(
+                    note_url,
+                    json={
+                        'note': note_content, 
+                        'customer_note': send_email  # 关键：只在需要发邮件时设为 True
+                    },
+                    auth=(site['consumer_key'], site['consumer_secret']),
+                    timeout=timeout_seconds
+                )
+                if note_resp.status_code in [200, 201]:
+                    break
+                elif attempt < max_retries - 1:
+                    print(f"Retry {attempt + 1}: Note API returned {note_resp.status_code}")
+                    import time
+                    time.sleep(1)
+                else:
+                    print(f"Warning: Failed to add note after {max_retries} attempts: {note_resp.text}")
+            except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
+                if attempt < max_retries - 1:
+                    print(f"Connection error attempt {attempt + 1}, retrying: {str(e)}")
+                    import time
+                    time.sleep(1)
+                else:
+                    # 如果添加备注失败，记录警告但继续发货流程
+                    print(f"Warning: Failed to add note due to connection issue: {str(e)}")
         
         # 3. Only update order status if not already on-hold
         if order['status'] != 'on-hold':
             status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
-            status_resp = req.put(
-                status_url,
-                json={'status': 'on-hold'},
-                auth=(site['consumer_key'], site['consumer_secret']),
-                timeout=30
-            )
+            # Retry logic for status update
+            max_retries = 3
+            status_updated = False
+            for attempt in range(max_retries):
+                try:
+                    status_resp = req.put(
+                        status_url,
+                        json={'status': 'on-hold'},
+                        auth=(site['consumer_key'], site['consumer_secret']),
+                        timeout=60
+                    )
+                    if status_resp.status_code in [200, 201]:
+                        status_updated = True
+                        break
+                    elif attempt < max_retries - 1:
+                        print(f"Retry {attempt + 1}: Status API returned {status_resp.status_code}")
+                        import time
+                        time.sleep(2)
+                except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
+                    if attempt < max_retries - 1:
+                        print(f"Connection error attempt {attempt + 1}, retrying: {str(e)}")
+                        import time
+                        time.sleep(2)
+                    else:
+                        raise Exception(f"连接失败: {str(e)}。此站点可能使用 SMTP2GO API，响应较慢。")
             
-            if status_resp.status_code not in [200, 201]:
+            if not status_updated:
                 raise Exception(f"更新订单状态失败: {status_resp.text}")
             
             # Update local database

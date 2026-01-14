@@ -169,21 +169,45 @@
                                 {% endif %}
                             </td>
                             <td>
-                                {% if site.api_status == 'error' %}
+                                <!-- Read Permission Badge -->
+                                {% if site.api_read_status == 'ok' %}
                                 <span
-                                    class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25"
-                                    title="{{ site.last_api_error or 'API连接异常' }}" style="cursor: help;">
-                                    <i class="bi bi-exclamation-triangle-fill me-1"></i>API异常
+                                    class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 me-1"
+                                    title="读权限正常">
+                                    <i class="bi bi-book me-1"></i>读
                                 </span>
-                                {% elif site.api_status == 'ok' %}
+                                {% elif site.api_read_status == 'error' %}
                                 <span
-                                    class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">
-                                    <i class="bi bi-check-circle-fill me-1"></i>已连接
+                                    class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25 me-1"
+                                    title="{{ site.last_api_error or '读权限失败' }}" style="cursor: help;">
+                                    <i class="bi bi-x-circle me-1"></i>读
                                 </span>
                                 {% else %}
                                 <span
-                                    class="badge bg-secondary bg-opacity-10 text-secondary border border-secondary border-opacity-25">
-                                    <i class="bi bi-question-circle me-1"></i>未知
+                                    class="badge bg-secondary bg-opacity-10 text-secondary border border-secondary border-opacity-25 me-1"
+                                    title="未测试读权限">
+                                    <i class="bi bi-question-circle me-1"></i>读
+                                </span>
+                                {% endif %}
+
+                                <!-- Write Permission Badge -->
+                                {% if site.api_write_status == 'ok' %}
+                                <span
+                                    class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25"
+                                    title="写权限正常">
+                                    <i class="bi bi-pencil me-1"></i>写
+                                </span>
+                                {% elif site.api_write_status == 'error' %}
+                                <span
+                                    class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25"
+                                    title="{{ site.last_api_error or '写权限失败' }}" style="cursor: help;">
+                                    <i class="bi bi-x-circle me-1"></i>写
+                                </span>
+                                {% else %}
+                                <span
+                                    class="badge bg-secondary bg-opacity-10 text-secondary border border-secondary border-opacity-25"
+                                    title="未测试写权限">
+                                    <i class="bi bi-question-circle me-1"></i>写
                                 </span>
                                 {% endif %}
                             </td>
