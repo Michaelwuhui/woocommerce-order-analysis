@@ -3334,66 +3334,91 @@ def check_site_api(site_id):
             consumer_key=site['consumer_key'],
             consumer_secret=site['consumer_secret'],
             version="wc/v3",
-            timeout=15
+            timeout=15,
+            user_agent="WooCommerce API Client-Python/3.0.0" # Critical for WAF bypass
         )
         
-        # Try to fetch just 1 order to test connection
-        response = wcapi.get("orders", params={"per_page": 1})
+        read_status = 'unknown'
+        write_status = 'unknown'
+        error_msg = None
         
-        if response.status_code == 200:
-            # API is working
-            conn.execute('UPDATE sites SET api_status = ?, last_api_error = NULL WHERE id = ?', 
-                         ('ok', site_id))
-            conn.commit()
-            conn.close()
-            return jsonify({
-                'success': True, 
-                'status': 'ok',
-                'message': 'API连接正常'
-            })
-        elif response.status_code in (401, 403):
-            # Authentication error
-            error_msg = f"API认证失败 (HTTP {response.status_code})"
-            try:
-                error_data = response.json()
-                if 'message' in error_data:
-                    error_msg = f"{error_msg}: {error_data['message']}"
-            except:
-                pass
-            
-            conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
-                         ('error', error_msg, site_id))
-            conn.commit()
-            conn.close()
-            return jsonify({
-                'success': True, 
-                'status': 'error',
-                'message': error_msg
-            })
-        else:
-            # Other error
-            error_msg = f"HTTP {response.status_code}"
-            conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
-                         ('error', error_msg, site_id))
-            conn.commit()
-            conn.close()
-            return jsonify({
-                'success': True, 
-                'status': 'error',
-                'message': error_msg
-            })
-            
-    except Exception as e:
-        error_msg = f"连接失败: {str(e)}"
-        conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
-                     ('error', error_msg, site_id))
+        # 1. Test Read Permission
+        try:
+            response = wcapi.get("orders", params={"per_page": 1})
+            if response.status_code == 200:
+                read_status = 'ok'
+                
+                # 2. Test Write Permission (Only if read is OK)
+                try:
+                    orders = response.json()
+                    if orders and len(orders) > 0:
+                        test_order_id = orders[0]['id']
+                        
+                        # Try to add test note
+                        test_note_response = wcapi.post(
+                            f"orders/{test_order_id}/notes",
+                            data={
+                                "note": "[API权限测试] 此消息用于验证写权限，将立即删除",
+                                "customer_note": False
+                            }
+                        )
+                        
+                        if test_note_response.status_code in (200, 201):
+                            write_status = 'ok'
+                            # Cleanup
+                            try:
+                                note_id = test_note_response.json().get('id')
+                                if note_id:
+                                    wcapi.delete(f"orders/{test_order_id}/notes/{note_id}")
+                            except:
+                                pass
+                        elif test_note_response.status_code in (401, 403):
+                            write_status = 'error'
+                            error_msg = "写权限被拒绝"
+                        else:
+                            write_status = 'error'
+                            error_msg = f"写入失败 HTTP {test_note_response.status_code}"
+                    else:
+                        write_status = 'unknown' # No order to test on
+                except Exception as e:
+                    write_status = 'error'
+                    error_msg = f"写测试出错: {str(e)}"
+            elif response.status_code in (401, 403):
+                read_status = 'error'
+                write_status = 'unknown'
+                error_msg = "读权限被拒绝"
+            else:
+                read_status = 'error'
+                write_status = 'unknown'
+                error_msg = f"连接异常 HTTP {response.status_code}"
+                
+        except Exception as e:
+            read_status = 'error'
+            write_status = 'unknown'
+            error_msg = f"连接失败: {str(e)}"
+
+        # Update DB
+        conn.execute('''
+            UPDATE sites 
+            SET api_read_status = ?, api_write_status = ?, last_api_error = ?
+            WHERE id = ?
+        ''', (read_status, write_status, error_msg, site_id))
         conn.commit()
         conn.close()
+
+        status = 'ok' if (read_status == 'ok' and write_status == 'ok') else 'error'
+        
         return jsonify({
             'success': True, 
-            'status': 'error',
-            'message': error_msg
+            'status': status,
+            'message': error_msg or 'API连接正常',
+            'read': read_status,
+            'write': write_status
         })
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': f"系统错误: {str(e)}"}), 500
+
 
 @app.route('/api/sites/check-all', methods=['POST'])
 @login_required
