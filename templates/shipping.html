@@ -512,7 +512,12 @@
                 if (data.success) {
                     bootstrap.Modal.getInstance(document.getElementById('shipModal')).hide();
                     loadOrders();
-                    showToast(data.message, 'success');
+
+                    if (data.warning) {
+                        alert(data.message);
+                    } else {
+                        showToast(data.message, 'success');
+                    }
                 } else {
                     alert('发货失败: ' + (data.error || '未知错误'));
                 }

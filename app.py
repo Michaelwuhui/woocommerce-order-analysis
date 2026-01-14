@@ -5727,6 +5727,10 @@ def ship_order():
     # We will still send customer notifications via order notes, which works reliably
     
     
+    
+    # Track any warnings during the process
+    warnings = []
+    
     # Add order note with tracking information
     # Note: customer_note=True will send email notification (if send_email is True)
     #       customer_note=False will just add internal note without email
@@ -5743,6 +5747,14 @@ def ship_order():
         max_retries = 2 if send_email else 1  # 发送邮件时重试，不发送时只尝试1次
         timeout_seconds = 45 if send_email else 15  # 发送邮件时用更长超时
         
+        # Define headers to simulate the official WooCommerce API client
+        # This is critical to avoid being throttled/blocked by WAFs that block/delay 'python-requests'
+        api_headers = {
+            "User-Agent": "WooCommerce API Client-Python/3.0.0",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
         for attempt in range(max_retries):
             try:
                 note_resp = req.post(
@@ -5752,7 +5764,8 @@ def ship_order():
                         'customer_note': send_email  # 关键：只在需要发邮件时设为 True
                     },
                     auth=(site['consumer_key'], site['consumer_secret']),
-                    timeout=timeout_seconds
+                    timeout=timeout_seconds,
+                    headers=api_headers
                 )
                 if note_resp.status_code in [200, 201]:
                     break
@@ -5761,52 +5774,109 @@ def ship_order():
                     import time
                     time.sleep(1)
                 else:
-                    print(f"Warning: Failed to add note after {max_retries} attempts: {note_resp.text}")
+                    error_msg = f"API returned {note_resp.status_code}: {note_resp.text}"
+                    print(f"Warning: Failed to add note: {error_msg}")
+                    warnings.append(f"添加备注失败: {error_msg}")
             except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
+                # Connection error handling
                 if attempt < max_retries - 1:
                     print(f"Connection error attempt {attempt + 1}, retrying: {str(e)}")
                     import time
                     time.sleep(1)
                 else:
-                    # 如果添加备注失败，记录警告但继续发货流程
                     print(f"Warning: Failed to add note due to connection issue: {str(e)}")
+                    warnings.append(f"添加备注连接超时")
+    except Exception as e:
+        print(f"Error adding note: {e}")
+        warnings.append(f"添加备注出错: {str(e)}")
+
+    # [Optimization] If note addition failed (likely timeout), the server might be busy or session locked.
+    # Wait a bit before trying to update status to give server time to recover.
+    if warnings:
+        print("Note addition failed, waiting 5s before status update to avoid lock...")
+        import time
+        time.sleep(5)
+
+    # 3. Update order status (Remote)
+    # Using "Verify-After-Write" strategy to handle connection timeouts
+    remote_status_updated = False
+    status_verification_success = False
+    
+    if order['status'] != 'on-hold':
+        status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
+        # Retry logic for status update
+        max_retries = 3
         
-        # 3. Only update order status if not already on-hold
-        if order['status'] != 'on-hold':
-            status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
-            # Retry logic for status update
-            max_retries = 3
-            status_updated = False
-            for attempt in range(max_retries):
-                try:
-                    status_resp = req.put(
-                        status_url,
-                        json={'status': 'on-hold'},
-                        auth=(site['consumer_key'], site['consumer_secret']),
-                        timeout=60
-                    )
-                    if status_resp.status_code in [200, 201]:
-                        status_updated = True
-                        break
-                    elif attempt < max_retries - 1:
-                        print(f"Retry {attempt + 1}: Status API returned {status_resp.status_code}")
-                        import time
-                        time.sleep(2)
-                except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
-                    if attempt < max_retries - 1:
-                        print(f"Connection error attempt {attempt + 1}, retrying: {str(e)}")
-                        import time
-                        time.sleep(2)
-                    else:
-                        raise Exception(f"连接失败: {str(e)}。此站点可能使用 SMTP2GO API，响应较慢。")
-            
-            if not status_updated:
-                raise Exception(f"更新订单状态失败: {status_resp.text}")
-            
-            # Update local database
-            conn.execute("UPDATE orders SET status = 'on-hold' WHERE id = ?", (order_id,))
+        for attempt in range(max_retries):
+            try:
+                status_resp = req.put(
+                    status_url,
+                    json={'status': 'on-hold'},
+                    auth=(site['consumer_key'], site['consumer_secret']),
+                    timeout=60,
+                    headers=api_headers
+                )
+                if status_resp.status_code in [200, 201]:
+                    remote_status_updated = True
+                    status_verification_success = True
+                    break
+                elif attempt < max_retries - 1:
+                    print(f"Retry {attempt + 1}: Status API returned {status_resp.status_code}")
+                    import time
+                    time.sleep(2)
+            except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
+                # CONNECTION FAILED: The request might have succeeded on server but response was lost
+                print(f"Connection error attempt {attempt + 1}: {str(e)}")
+                
+                # VERIFY STRATEGY: Wait and Check status
+                if attempt == max_retries - 1:
+                    print("Last attempt connection failed. Verifying actual status on server...")
+                    import time
+                    time.sleep(5) # Increased from 3s to 5s for slower servers
+                    
+                    try:
+                        # Try to GET the order status
+                        check_resp = req.get(
+                            status_url,
+                            auth=(site['consumer_key'], site['consumer_secret']),
+                            timeout=30 # Use shorter timeout for read
+                        )
+                        if check_resp.status_code == 200:
+                            current_remote_status = check_resp.json().get('status')
+                            if current_remote_status == 'on-hold':
+                                print("Verification Successful: Order is actualy on-hold!")
+                                remote_status_updated = True
+                                status_verification_success = True
+                                warnings.append("远程响应超时，但经验证状态已更新成功")
+                            else:
+                                print(f"Verification Failed: Order status is {current_remote_status}")
+                    except Exception as verify_e:
+                        print(f"Verification failed: {verify_e}")
+                
+                if not status_verification_success and attempt < max_retries - 1:
+                    import time
+                    time.sleep(2)
         
-        # 4. Log shipping action - update if exists, insert if new
+        if not remote_status_updated:
+            # If verification failed, DO NOT update local status to avoid inconsistency
+            # Unless we force it, but user wants consistency
+            conn.execute("UPDATE shipping_logs SET tracking_number = ?, carrier_slug = ?, shipped_by = ?, shipped_at = datetime('now') WHERE order_id = ?", 
+                        (tracking_number, carrier_slug, current_user.id, order_id))
+            conn.commit() # Save tracking number at least
+            conn.close()
+            
+            error_details = "; ".join(warnings) if warnings else "远程状态更新失败"
+            return jsonify({
+                'success': False, 
+                'error': f"发货连接失败: 无法确认远程状态已更新。为了保证数据一致性，本地状态未更改。已保存追踪号，请稍后重试。({error_details})"
+            }), 500
+        
+    # 4. Update local database ONLY if remote success or verified
+    try:
+        # Update local order status
+        conn.execute("UPDATE orders SET status = 'on-hold' WHERE id = ?", (order_id,))
+        
+        # Log shipping action - update if exists, insert if new
         if existing_log:
             conn.execute('''
                 UPDATE shipping_logs 
@@ -5822,11 +5892,15 @@ def ship_order():
         conn.commit()
         conn.close()
         
-        return jsonify({'success': True, 'message': '发货成功，已发送邮件通知客户'})
-        
+        if warnings:
+            warning_msg = "本地发货成功，但远程同步有警告: " + "; ".join(warnings)
+            return jsonify({'success': True, 'message': warning_msg, 'warning': True})
+        else:
+            return jsonify({'success': True, 'message': '发货成功'})
+            
     except Exception as e:
         conn.close()
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': f"本地数据库更新失败: {str(e)}"}), 500
 
 
 @app.route('/api/shipping/debug/<int:order_id>', methods=['POST'])
@@ -5883,11 +5957,19 @@ def debug_tracking_sync(order_id):
     
     # Attempt to sync
     try:
+        # Headers to simulate official WooCommerce API client to bypass WAF
+        headers = {
+            "User-Agent": "WooCommerce API Client-Python/3.0.0",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
         tracking_resp = req.post(
             tracking_url_api,
             json=tracking_payload,
             auth=(site['consumer_key'], site['consumer_secret']),
-            timeout=30
+            timeout=30,
+            headers=headers
         )
         
         debug_info['response_status'] = tracking_resp.status_code
@@ -5999,11 +6081,20 @@ def add_order_note(order_id):
     
     try:
         url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+        
+        # Headers to simulate official WooCommerce API client to bypass WAF
+        headers = {
+            "User-Agent": "WooCommerce API Client-Python/3.0.0",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
         resp = req.post(
             url,
             json={'note': note, 'customer_note': notify_customer},
             auth=(site['consumer_key'], site['consumer_secret']),
-            timeout=30
+            timeout=30,
+            headers=headers
         )
         
         if resp.status_code not in [200, 201]:
