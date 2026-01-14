@@ -3563,7 +3563,8 @@ def clean_sync_site(site_id):
                     consumer_key=site['consumer_key'],
                     consumer_secret=site['consumer_secret'],
                     version="wc/v3",
-                    timeout=30
+                    timeout=30,
+                    user_agent="WooCommerce API Client-Python/3.0.0"
                 )
                 
                 # Fetch all remote order IDs
@@ -4020,7 +4021,7 @@ def clean_all_sites():
                 total_deleted = 0
                 
                 for i, site in enumerate(sites):
-                    site_url = site['url']
+                    site_url = site['url'].strip() # Ensure no whitespace
                     SYNC_STATUS[CLEAN_ALL_ID]['message'] = f'正在处理 {site_url} ({i+1}/{len(sites)})...'
                     SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Processing {site_url}")
                     
@@ -4030,7 +4031,8 @@ def clean_all_sites():
                             consumer_key=site['consumer_key'],
                             consumer_secret=site['consumer_secret'],
                             version="wc/v3",
-                            timeout=30
+                            timeout=30,
+                            user_agent="WooCommerce API Client-Python/3.0.0" # Masquerade as official client
                         )
                         
                         # Fetch all remote order IDs

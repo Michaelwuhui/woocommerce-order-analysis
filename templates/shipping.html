@@ -417,7 +417,7 @@
                     </td>
                     <td>
                         <div class="text-white"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name}</a></div>
-                        <small class="text-muted text-truncate d-block" style="max-width: 150px;" title="${o.customer_address || ''}">${o.customer_address || ''}</small>
+                        <small class="text-muted d-block" title="${o.customer_address || ''}">${o.customer_address || ''}</small>
                     </td>
                     <td>
                         ${o.products.map(p => `
