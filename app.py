@@ -5930,6 +5930,8 @@ def print_shipping_label(order_id):
     billing = parse_json_field(order['billing'])
     shipping_info = parse_json_field(order['shipping'])
     line_items = parse_json_field(order['line_items'])
+    shipping_lines = parse_json_field(order['shipping_lines'])
+    shipping_method = shipping_lines[0].get('method_title', 'Unknown') if shipping_lines and len(shipping_lines) > 0 else ''
     
     addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
     
@@ -5939,7 +5941,8 @@ def print_shipping_label(order_id):
         'source': order['source'].replace('https://www.', '').replace('https://', ''),
         'manager': site['manager'] if site else '',
         'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
-        'customer_phone': addr.get('phone', ''),
+        'customer_phone': addr.get('phone') or billing.get('phone', ''),
+        'customer_email': billing.get('email', ''),
         'customer_address': '\n'.join(filter(None, [
             addr.get('address_1', ''),
             addr.get('address_2', ''),
@@ -5948,7 +5951,12 @@ def print_shipping_label(order_id):
         ])),
         'customer_inpost_id': extract_custom_billing_fields(parse_json_field(order['meta_data'])).get('customer_inpost_id', ''),
         'customer_social': extract_custom_billing_fields(parse_json_field(order['meta_data'])).get('customer_social', ''),
-        'products': [{'name': item.get('name', ''), 'qty': item.get('quantity', 1)} for item in (line_items or [])],
+        'customer_address_2': addr.get('address_2', ''),
+        'shipping_method': shipping_method,
+        'products': [{'name': item.get('name', ''), 'qty': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (line_items or [])],
+        'currency': order['currency'],
+        'total': f"{float(order['total'] or 0):.2f} {order['currency']}",
+        'shipping_total': f"{float(order['shipping_total'] or 0):.2f}",
         'tracking_number': order['tracking_number'] or '',
         'carrier_name': order['carrier_name'] or ''
     })
@@ -5958,63 +5966,45 @@ def print_shipping_label(order_id):
 @login_required
 @shipper_required
 def print_shipping_list():
-    """Get today's pending orders for printing"""
-    from datetime import datetime
+    """Get last 24 hours pending orders for printing - reuses get_pending_orders logic"""
+    from datetime import datetime, timedelta
     
-    today = datetime.now().strftime('%Y-%m-%d')
-    conn = get_db_connection()
+    # Call the existing pending orders function
+    with app.test_request_context('/api/shipping/pending'):
+        response = get_pending_orders()
+        all_orders = response.get_json()
     
-    query = '''
-        SELECT o.id, o.number, o.total, o.currency, o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_total,
-               s.manager
-        FROM orders o
-        LEFT JOIN sites s ON o.source = s.url
-        WHERE o.status = 'processing'
-        AND o.date_created >= ?
-    '''
-    params = [today]
-    
-    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
-    if allowed_sources is not None:
-        placeholders = ','.join(['?' for _ in allowed_sources])
-        query += f' AND o.source IN ({placeholders})'
-        params.extend(allowed_sources)
-    
-    query += ' ORDER BY o.date_created'
-    
-    orders = conn.execute(query, params).fetchall()
-    conn.close()
+    # Filter for last 24 hours
+    now = datetime.now()
+    cutoff = now - timedelta(hours=24)
     
     result = []
-    for order in orders:
-        billing = parse_json_field(order['billing'])
-        shipping_info = parse_json_field(order['shipping'])
-        line_items = parse_json_field(order['line_items'])
-        
-        addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
-        meta_data = parse_json_field(order['meta_data'])
-        custom_fields = extract_custom_billing_fields(meta_data)
-        
-        result.append({
-            'order_number': order['number'],
-            'source': order['source'].replace('https://www.', '').replace('https://', ''),
-            'manager': order['manager'] or '',
-            'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
-            'customer_phone': addr.get('phone', ''),
-            'customer_address': ', '.join(filter(None, [
-                addr.get('address_1', ''),
-                addr.get('address_2', ''),
-                f"{addr.get('postcode', '')} {addr.get('city', '')}".strip(),
-                addr.get('country', '')
-            ])),
-            'customer_inpost_id': custom_fields['customer_inpost_id'],
-            'customer_social': custom_fields['customer_social'],
-            'customer_social': custom_fields['customer_social'],
-            'total': f"{float(order['total'] or 0):.2f} {order['currency']}",
-            'products': [{'name': item.get('name', ''), 'qty': item.get('quantity', 1)} for item in (line_items or [])],
-            'shipping_total': float(order['shipping_total'] or 0)
-        })
+    for order in all_orders:
+        # Parse order date
+        try:
+            order_date = datetime.fromisoformat(order['date_created'].replace('Z', '+00:00'))
+            if order_date >= cutoff:
+                result.append({
+                    'order_number': order['number'],
+                    'source': order['source'],
+                    'manager': order.get('manager', ''),
+                    'customer_name': order['customer_name'],
+                    'customer_phone': order.get('customer_phone', ''),
+                    'customer_email': order.get('customer_email', ''),
+                    'customer_address': order['customer_address'],
+                    'customer_address_2': order.get('customer_address_2', ''),
+                    'customer_inpost_id': order.get('customer_inpost_id', ''),
+                    'customer_social': order.get('customer_social', ''),
+                    'shipping_method': order.get('shipping_method', ''),
+                    'total': f"{order['total']:.2f} {order['currency']}",
+                    'products': [{'name': p['name'], 'qty': p['quantity']} for p in order['products']],
+                    'shipping_total': order.get('shipping_total', 0)
+                })
+        except:
+            # If date parsing fails, skip this order
+            continue
     
+    today = datetime.now().strftime('%Y-%m-%d')
     return jsonify({'date': today, 'orders': result, 'count': len(result)})
 
 
@@ -6022,60 +6012,38 @@ def print_shipping_list():
 @login_required
 @shipper_required
 def print_pending_list():
-    """Get all pending orders for printing"""
-    conn = get_db_connection()
+    """Get all pending orders for printing - reuses get_pending_orders logic"""
+    from datetime import datetime
     
-    query = '''
-        SELECT o.id, o.number, o.total, o.currency, o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_total,
-               s.manager
-        FROM orders o
-        LEFT JOIN sites s ON o.source = s.url
-        WHERE o.status = 'processing'
-    '''
-    params = []
+    # Temporarily store the request context
+    original_args = dict(request.args)
     
-    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
-    if allowed_sources is not None:
-        placeholders = ','.join(['?' for _ in allowed_sources])
-        query += f' AND o.source IN ({placeholders})'
-        params.extend(allowed_sources)
+    # Clear filters to get all pending orders
+    with app.test_request_context('/api/shipping/pending'):
+        # Call the existing pending orders function
+        response = get_pending_orders()
+        orders_data = response.get_json()
     
-    query += ' ORDER BY o.date_created'
-    
-    orders = conn.execute(query, params).fetchall()
-    conn.close()
-    
+    # Format for print
     result = []
-    for order in orders:
-        billing = parse_json_field(order['billing'])
-        shipping_info = parse_json_field(order['shipping'])
-        line_items = parse_json_field(order['line_items'])
-        
-        addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
-        meta_data = parse_json_field(order['meta_data'])
-        custom_fields = extract_custom_billing_fields(meta_data)
-        
+    for order in orders_data:
         result.append({
             'order_number': order['number'],
-            'source': order['source'].replace('https://www.', '').replace('https://', ''),
-            'manager': order['manager'] or '',
-            'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
-            'customer_phone': addr.get('phone', ''),
-            'customer_address': ', '.join(filter(None, [
-                addr.get('address_1', ''),
-                addr.get('address_2', ''),
-                f"{addr.get('postcode', '')} {addr.get('city', '')}".strip(),
-                addr.get('country', '')
-            ])),
-            'customer_inpost_id': custom_fields['customer_inpost_id'],
-            'customer_social': custom_fields['customer_social'],
-            'customer_social': custom_fields['customer_social'],
-            'total': f"{float(order['total'] or 0):.2f} {order['currency']}",
-            'products': [{'name': item.get('name', ''), 'qty': item.get('quantity', 1)} for item in (line_items or [])],
-            'shipping_total': float(order['shipping_total'] or 0)
+            'source': order['source'],
+            'manager': order.get('manager', ''),
+            'customer_name': order['customer_name'],
+            'customer_phone': order.get('customer_phone', ''),
+            'customer_email': order.get('customer_email', ''),
+            'customer_address': order['customer_address'],
+            'customer_address_2': order.get('customer_address_2', ''),
+            'customer_inpost_id': order.get('customer_inpost_id', ''),
+            'customer_social': order.get('customer_social', ''),
+            'shipping_method': order.get('shipping_method', ''),
+            'total': f"{order['total']:.2f} {order['currency']}",
+            'products': [{'name': p['name'], 'qty': p['quantity']} for p in order['products']],
+            'shipping_total': order.get('shipping_total', 0)
         })
     
-    from datetime import datetime
     today = datetime.now().strftime('%Y-%m-%d')
     return jsonify({'date': '截止 ' + today, 'orders': result, 'count': len(result)})
 

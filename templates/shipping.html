@@ -581,41 +581,126 @@
                     alert(data.error);
                     return;
                 }
+
+                // Determine shipping method badge
+                const method = (data.shipping_method || '').toLowerCase();
+                const isInPost = data.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
+                const isDPD = method.includes('dpd');
+
+                let shippingBadge = '';
+                if (isInPost) {
+                    shippingBadge = '<span class="badge" style="background-color: #FFCC00; color: #000; font-weight: 700;">InPost</span>';
+                } else if (isDPD) {
+                    shippingBadge = '<span class="badge bg-primary">DPD</span>';
+                } else {
+                    shippingBadge = `<span class="badge bg-secondary">${data.shipping_method || 'Standard'}</span>`;
+                }
+
                 const content = `
-                <div class="p-4 bg-white text-dark" style="min-height: 400px;">
-                    <div class="text-center border-bottom pb-3 mb-3">
-                        <h4>📦 发货面单</h4>
+                <div class="p-4 bg-white text-dark" style="max-width: 1000px; margin: 0 auto;">
+                    <div class="text-center border-bottom pb-3 mb-4">
+                        <h3>📦 发货面单</h3>
                     </div>
+                    
+                    <!-- Order Info -->
                     <div class="row mb-3">
                         <div class="col-6">
-                            <strong>订单号:</strong> #${data.order_number}
+                            <strong>订单号:</strong> <span class="fs-5">#${data.order_number}</span>
                         </div>
                         <div class="col-6 text-end">
                             <strong>日期:</strong> ${data.date}
                         </div>
                     </div>
+                    
                     <div class="mb-3">
-                        <strong>来源:</strong> ${data.manager ? data.manager + ' - ' : ''}${data.source}
+                        <strong>来源:</strong> ${data.manager ? '<span class="badge bg-info">' + data.manager + '</span> ' : ''}${data.source}
                     </div>
-                    <hr>
-                    <div class="mb-3">
-                        <strong>收件人:</strong> ${data.customer_name}<br>
-                        <strong>电话:</strong> ${data.customer_phone}<br>
-                        <strong>地址:</strong><br>
-                        <div class="ps-3">${data.customer_address.replace(/\n/g, '<br>')}</div>
+                    
+                    <hr class="my-3">
+                    
+                    <!-- Two Column Layout -->
+                    <div class="row">
+                        <!-- Left: Customer Info -->
+                        <div class="col-md-6 mb-3">
+                            <h5 class="mb-3">👤 收件人信息</h5>
+                            <div class="ps-3">
+                                <div class="mb-2"><strong>姓名:</strong> ${data.customer_name}</div>
+                                ${data.customer_phone ? `<div class="mb-2"><strong>电话:</strong> <span class="text-primary">${data.customer_phone}</span></div>` : ''}
+                                ${data.customer_social ? `<div class="mb-2"><strong>WhatsApp:</strong> <span class="text-success">${data.customer_social}</span></div>` : ''}
+                                ${data.customer_email ? `<div class="mb-2"><strong>邮箱:</strong> <span class="text-muted small">${data.customer_email}</span></div>` : ''}
+                            </div>
+                        </div>
+                        
+                        <!-- Right: Shipping Info -->
+                        <div class="col-md-6 mb-3">
+                            <h5 class="mb-3">🚚 配送信息</h5>
+                            <div class="ps-3">
+                                <div class="mb-2"><strong>配送方式:</strong> ${shippingBadge}</div>
+                                ${data.customer_inpost_id ? `
+                                    <div class="mb-2">
+                                        <strong>InPost ID:</strong><br>
+                                        <span class="font-monospace text-primary">${data.customer_inpost_id}</span>
+                                    </div>
+                                ` : ''}
+                                ${data.customer_address_2 ? `
+                                    <div class="mb-2">
+                                        <strong>取货点:</strong>
+                                        <div class="text-warning font-monospace small">${data.customer_address_2}</div>
+                                    </div>
+                                ` : ''}
+                                ${data.shipping_total ? `<div class="mb-2"><strong>运费:</strong> ${data.shipping_total} ${data.currency || ''}</div>` : ''}
+                            </div>
+                        </div>
                     </div>
-                    <hr>
-                    <div class="mb-3">
-                        <strong>商品:</strong>
-                        <ul class="mb-0">
-                            ${data.products.map(p => `<li>${p.name} x${p.qty}</li>`).join('')}
-                        </ul>
+                    
+                    <!-- Full Width Address -->
+                    <div class="mb-4">
+                        <strong>收货地址:</strong>
+                        <div class="ps-3 border-start border-3 border-secondary mt-2 py-2" style="white-space: pre-wrap;">${data.customer_address}</div>
                     </div>
+                    
+                    <hr class="my-3">
+                    
+                    <!-- Products -->
+                    <div class="mb-4">
+                        <h5 class="mb-3">📦 商品清单</h5>
+                        <table class="table table-sm table-bordered">
+                            <thead class="table-light">
+                                <tr>
+                                    <th>#</th>
+                                    <th>商品名称</th>
+                                    <th class="text-center">数量</th>
+                                    <th class="text-end">金额</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${data.products.map((p, i) => `
+                                <tr>
+                                    <td>${i + 1}</td>
+                                    <td>${p.name}</td>
+                                    <td class="text-center"><strong>×${p.qty}</strong></td>
+                                    <td class="text-end">${p.total ? p.total.toFixed(2) + ' ' + data.currency : '-'}</td>
+                                </tr>
+                                `).join('')}
+                            </tbody>
+                            <tfoot class="table-light">
+                                <tr>
+                                    <td colspan="2" class="text-end"><strong>商品总数:</strong></td>
+                                    <td class="text-center"><strong>${data.products.reduce((sum, p) => sum + p.qty, 0)}</strong></td>
+                                    <td class="text-end"><strong>${data.total}</strong></td>
+                                </tr>
+                            </tfoot>
+                        </table>
+                    </div>
+                    
                     ${data.tracking_number ? `
-                    <hr>
-                    <div>
-                        <strong>追踪号:</strong> ${data.tracking_number}<br>
-                        <strong>物流商:</strong> ${data.carrier_name}
+                    <hr class="my-3">
+                    <div class="mb-3">
+                        <h5 class="mb-3">📍 追踪信息</h5>
+                        <div class="ps-3">
+                            <div class="mb-2"><strong>物流商:</strong> ${data.carrier_name}</div>
+                            <div class="mb-2"><strong>追踪号:</strong> <span class="font-monospace fs-5 text-primary">${data.tracking_number}</span></div>
+                        </div>
                     </div>
                     ` : ''}
                 </div>
@@ -634,45 +719,75 @@
                     return;
                 }
                 const content = `
-                <div class="p-4 bg-white text-dark">
+                <div class="p-3 bg-white text-dark">
                     <div class="text-center border-bottom pb-3 mb-3">
                         <h4>📋 今日发货清单</h4>
                         <p class="text-muted mb-0">${data.date} · 共 ${data.count} 单</p>
                     </div>
-                    <table class="table table-bordered">
-                        <thead>
-                            <tr>
-                                <th>#</th>
-                                <th>订单号</th>
-                                <th>客户</th>
-                                <th>金额</th>
+                    <table class="table table-sm table-bordered">
+                        <thead class="table-light">
+                            <tr style="font-size: 0.9em;">
+                                <th style="width: 30px;">#</th>
+                                <th style="width: 120px;">订单信息</th>
+                                <th style="width: 250px;">客户 & 联系方式</th>
+                                <th style="width: 200px;">配送信息</th>
                                 <th>商品</th>
+                                <th style="width: 80px;" class="text-end">金额</th>
                             </tr>
                         </thead>
-                        <tbody>
-                            ${data.orders.map((o, i) => `
+                        <tbody style="font-size: 0.85em;">
+                            ${data.orders.map((o, i) => {
+                    const method = (o.shipping_method || '').toLowerCase();
+                    const isInPost = o.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
+                    const isDPD = method.includes('dpd');
+                    let shippingBadge = isInPost ? '<span class="badge" style="background-color: #FFCC00; color: #000; font-size: 0.75em;">InPost</span>' :
+                        isDPD ? '<span class="badge bg-primary" style="font-size: 0.75em;">DPD</span>' :
+                            `<span class="badge bg-secondary" style="font-size: 0.75em;">${o.shipping_method || 'Standard'}</span>`;
+
+                    return `
                             <tr>
-                                <td>${i + 1}</td>
+                                <td class="text-center"><strong>${i + 1}</strong></td>
                                 <td>
-                                    <strong>#${o.order_number}</strong><br>
-                                    <small class="text-muted">${o.manager ? o.manager + ' - ' : ''}${o.source}</small>
+                                    <div class="fw-bold">#${o.order_number}</div>
+                                    <small class="text-muted">${o.manager ? '<span class="badge bg-info" style="font-size: 0.65em;">' + o.manager + '</span><br>' : ''}${o.source.replace('https://', '').replace('www.', '')}</small>
                                 </td>
                                 <td>
-                                    <strong>${o.customer_name}</strong><br>
-                                    ${o.customer_phone ? `<div><small><i class="bi bi-telephone me-1"></i>${o.customer_phone}</small></div>` : ''}
-                                    ${o.customer_social ? `<div><small class="text-success"><i class="bi bi-whatsapp me-1"></i>${o.customer_social}</small></div>` : ''}
-                                    ${o.customer_inpost_id ? `<div><small class="text-primary fw-bold">InPost: ${o.customer_inpost_id}</small></div>` : ''}
-                                    <div class="small text-muted" style="max-width: 300px; word-wrap: break-word;">${o.customer_address}</div>
+                                    <div class="fw-bold mb-1">${o.customer_name}</div>
+                                    ${o.customer_phone ? `<div class="mb-1"><i class="bi bi-telephone text-primary me-1"></i><span class="font-monospace">${o.customer_phone}</span></div>` : ''}
+                                    ${o.customer_social ? `<div class="mb-1"><i class="bi bi-whatsapp text-success me-1"></i><span>${o.customer_social}</span></div>` : ''}
+                                    ${o.customer_email ? `<div class="text-muted" style="font-size: 0.75em;">${o.customer_email}</div>` : ''}
                                 </td>
-                                <td>${o.total}</td>
                                 <td>
-                                    <ul class="mb-0 ps-3">
-                                        ${o.products.map(p => `<li>${p.name} <span class="text-muted">x${p.qty}</span></li>`).join('')}
+                                    <div class="mb-1">${shippingBadge}</div>
+                                    ${o.customer_inpost_id ? `
+                                        <div class="mb-1">
+                                            <strong class="text-primary">InPost ID:</strong><br>
+                                            <span class="font-monospace" style="font-size: 0.9em;">${o.customer_inpost_id}</span>
+                                        </div>
+                                    ` : ''}
+                                    ${o.customer_address_2 ? `
+                                        <div class="text-warning" style="font-size: 0.75em;">
+                                            <i class="bi bi-geo-alt"></i> ${o.customer_address_2}
+                                        </div>
+                                    ` : ''}
+                                    ${!isInPost ? `<div class="text-muted" style="font-size: 0.75em; max-width: 180px; word-wrap: break-word;">${o.customer_address}</div>` : ''}
+                                    ${o.shipping_total ? `<div class="mt-1"><small><strong>运费:</strong> ${o.shipping_total}</small></div>` : ''}
+                                </td>
+                                <td>
+                                    <ul class="mb-0 ps-3" style="list-style: none; padding-left: 0;">
+                                        ${o.products.map(p => `<li style="margin-bottom: 4px;">• ${p.name} <strong>×${p.qty}</strong></li>`).join('')}
                                     </ul>
                                 </td>
+                                <td class="text-end"><strong>${o.total}</strong></td>
                             </tr>
-                            `).join('')}
+                            `}).join('')}
                         </tbody>
+                        <tfoot class="table-light">
+                            <tr>
+                                <td colspan="5" class="text-end"><strong>总计:</strong></td>
+                                <td class="text-end"><strong>${data.orders.length} 单</strong></td>
+                            </tr>
+                        </tfoot>
                     </table>
                 </div>
             `;
@@ -690,45 +805,76 @@
                     return;
                 }
                 const content = `
-                <div class="p-4 bg-white text-dark">
+                <div class="p-3 bg-white text-dark">
                     <div class="text-center border-bottom pb-3 mb-3">
                         <h4>📋 未发货清单</h4>
                         <p class="text-muted mb-0">${data.date} · 共 ${data.count} 单</p>
                     </div>
-                    <table class="table table-bordered">
-                        <thead>
-                            <tr>
-                                <th>#</th>
-                                <th>订单号</th>
-                                <th>客户</th>
-                                <th>金额</th>
+                    <table class="table table-sm table-bordered">
+                        <thead class="table-light">
+                            <tr style="font-size: 0.9em;">
+                                <th style="width: 30px;">#</th>
+                                <th style="width: 120px;">订单信息</th>
+                                <th style="width: 250px;">客户 & 联系方式</th>
+                                <th style="width: 200px;">配送信息</th>
                                 <th>商品</th>
+                                <th style="width: 80px;" class="text-end">金额</th>
                             </tr>
                         </thead>
-                        <tbody>
-                            ${data.orders.map((o, i) => `
+                        <tbody style="font-size: 0.85em;">
+                            ${data.orders.map((o, i) => {
+                    const method = (o.shipping_method || '').toLowerCase();
+                    const isInPost = o.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
+                    const isDPD = method.includes('dpd');
+                    let shippingBadge = isInPost ? '<span class="badge" style="background-color: #FFCC00; color: #000; font-size: 0.75em;">InPost</span>' :
+                        isDPD ? '<span class="badge bg-primary" style ="font-size: 0.75em;">DPD</span>' :
+                            `<span class="badge bg-secondary" style="font-size: 0.75em;">${o.shipping_method || 'Standard'}</span>`;
+
+
+                    return `
                             <tr>
-                                <td>${i + 1}</td>
+                                <td class="text-center"><strong>${i + 1}</strong></td>
                                 <td>
-                                    <strong>#${o.order_number}</strong><br>
-                                    <small class="text-muted">${o.manager ? o.manager + ' - ' : ''}${o.source}</small>
+                                    <div class="fw-bold">#${o.order_number}</div>
+                                    <small class="text-muted">${o.manager ? '<span class="badge bg-info" style="font-size: 0.65em;">' + o.manager + '</span><br>' : ''}${o.source.replace('https://', '').replace('www.', '')}</small>
                                 </td>
                                 <td>
-                                    <strong>${o.customer_name}</strong><br>
-                                    ${o.customer_phone ? `<div><small><i class="bi bi-telephone me-1"></i>${o.customer_phone}</small></div>` : ''}
-                                    ${o.customer_social ? `<div><small class="text-success"><i class="bi bi-whatsapp me-1"></i>${o.customer_social}</small></div>` : ''}
-                                    ${o.customer_inpost_id ? `<div><small class="text-primary fw-bold">InPost: ${o.customer_inpost_id}</small></div>` : ''}
-                                    <div class="small text-muted" style="max-width: 300px; word-wrap: break-word;">${o.customer_address}</div>
+                                    <div class="fw-bold mb-1">${o.customer_name}</div>
+                                    ${o.customer_phone ? `<div class="mb-1"><i class="bi bi-telephone text-primary me-1"></i><span class="font-monospace">${o.customer_phone}</span></div>` : ''}
+                                    ${o.customer_social ? `<div class="mb-1"><i class="bi bi-whatsapp text-success me-1"></i><span>${o.customer_social}</span></div>` : ''}
+                                    ${o.customer_email ? `<div class="text-muted" style="font-size: 0.75em;">${o.customer_email}</div>` : ''}
                                 </td>
-                                <td>${o.total}</td>
                                 <td>
-                                    <ul class="mb-0 ps-3">
-                                        ${o.products.map(p => `<li>${p.name} <span class="text-muted">x${p.qty}</span></li>`).join('')}
+                                    <div class="mb-1">${shippingBadge}</div>
+                                    ${o.customer_inpost_id ? `
+                                        <div class="mb-1">
+                                            <strong class="text-primary">InPost ID:</strong><br>
+                                            <span class="font-monospace" style="font-size: 0.9em;">${o.customer_inpost_id}</span>
+                                        </div>
+                                    ` : ''}
+                                    ${o.customer_address_2 ? `
+                                        <div class="text-warning" style="font-size: 0.75em;">
+                                            <i class="bi bi-geo-alt"></i> ${o.customer_address_2}
+                                        </div>
+                                    ` : ''}
+                                    ${!isInPost ? `<div class="text-muted" style="font-size: 0.75em; max-width: 180px; word-wrap: break-word;">${o.customer_address}</div>` : ''}
+                                    ${o.shipping_total ? `<div class="mt-1"><small><strong>运费:</strong> ${o.shipping_total}</small></div>` : ''}
+                                </td>
+                                <td>
+                                    <ul class="mb-0 ps-3" style="list-style: none; padding-left: 0;">
+                                        ${o.products.map(p => `<li style="margin-bottom: 4px;">• ${p.name} <strong>×${p.qty}</strong></li>`).join('')}
                                     </ul>
                                 </td>
+                                <td class="text-end"><strong>${o.total}</strong></td>
                             </tr>
-                            `).join('')}
+                            `}).join('')}
                         </tbody>
+                        <tfoot class="table-light">
+                            <tr>
+                                <td colspan="5" class="text-end"><strong>总计:</strong></td>
+                                <td class="text-end"><strong>${data.orders.length} 单</strong></td>
+                            </tr>
+                        </tfoot>
                     </table>
                 </div>
             `;
