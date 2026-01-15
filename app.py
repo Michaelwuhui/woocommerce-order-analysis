@@ -1153,7 +1153,22 @@ def orders():
     site_managers = {s['url']: s['manager'] or '' for s in sites}
     
     # Add CNY conversion to summary_stats
+    # First, aggregate raw amounts by currency to avoid rounding errors
+    raw_totals_by_currency = {}
+    for stat in summary_stats:
+        currency = stat.get('currency', 'PLN')
+        if currency not in raw_totals_by_currency:
+            raw_totals_by_currency[currency] = 0
+        raw_totals_by_currency[currency] += (stat['success_net_amount'] or 0)
+    
+    # Calculate total CNY from aggregated raw amounts (sum first, then round)
     totals_cny = 0
+    for currency, amount in raw_totals_by_currency.items():
+        rate, _ = get_cny_rate(currency, current_month)
+        if rate:
+            totals_cny += amount * rate
+    
+    # Now add individual stat CNY values for display
     for stat in summary_stats:
         currency = stat.get('currency', 'PLN')
         # Use current_month for rate lookup
@@ -1163,7 +1178,6 @@ def orders():
             stat['total_amount_cny'] = round((stat['total_amount'] or 0) * rate, 2)
             stat['success_amount_cny'] = round((stat['success_amount'] or 0) * rate, 2)
             stat['success_net_amount_cny'] = round((stat['success_net_amount'] or 0) * rate, 2)
-            totals_cny += stat['success_net_amount_cny']
         else:
             stat['total_amount_cny'] = None
             stat['success_amount_cny'] = None
@@ -4639,19 +4653,33 @@ def products():
         if not isinstance(items, list):
             continue
         
-        # Calculate order items sum for shipping pro-rating
+        # Calculate order items sum for shipping pro-rating and discount calculation
         order_items_sum = sum(float(i.get('total', 0)) for i in items)
         order_shipping = float(order['shipping_total'] or 0)
+        order_total = float(order['total'] or 0)
+        
+        # Calculate order-level discount ratio
+        # order_total = items_sum - discount + shipping
+        # So: discount = items_sum + shipping - order_total
+        # discount_ratio = (order_total - shipping) / items_sum (actual revenue / item totals)
+        expected_items_value = order_total - order_shipping
+        if order_items_sum > 0:
+            discount_ratio = expected_items_value / order_items_sum
+        else:
+            discount_ratio = 1.0
         
         for item in items:
             product_name = item.get('name', '')
             quantity = item.get('quantity', 0)
-            total = float(item.get('total', 0))
+            item_total = float(item.get('total', 0))
             
-            # Pro-rate shipping
+            # Apply order-level discount to get actual item revenue
+            total = item_total * discount_ratio
+            
+            # Pro-rate shipping based on discounted total
             item_shipping = 0
             if order_items_sum > 0:
-                item_shipping = order_shipping * (total / order_items_sum)
+                item_shipping = order_shipping * (item_total / order_items_sum)
             
             gross_total = total + item_shipping
             
