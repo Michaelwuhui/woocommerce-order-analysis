@@ -264,12 +264,12 @@
                     }
 
                     var statusLabels = {
-                        'pending': '待处理', 'processing': '处理中', 'on-hold': '暂停',
-                        'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败'
+                        'pending': '待付款', 'processing': '处理中', 'on-hold': '已发货',
+                        'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败', 'checkout-draft': '草稿'
                     };
                     var statusColors = {
                         'pending': '#f59e0b', 'processing': '#3b82f6', 'on-hold': '#6b7280',
-                        'completed': '#10b981', 'cancelled': '#ef4444', 'refunded': '#f97316', 'failed': '#dc2626'
+                        'completed': '#10b981', 'cancelled': '#ef4444', 'refunded': '#f97316', 'failed': '#dc2626', 'checkout-draft': '#9ca3af'
                     };
 
                     var billing = order.billing || {};
@@ -285,7 +285,26 @@
                     html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-info-circle me-2"></i>订单信息</h6></div>';
                     html += '<div class="card-body">';
                     html += '<p><strong>订单号:</strong> #' + order.number + '</p>';
+
+                    // Status with dropdown for editing (only for users with edit permission)
+                    {% if current_user.can_edit() %}
+                    html += '<p><strong>状态:</strong> ';
+                    html += '<div class="dropdown d-inline-block">';
+                    html += '<button class="btn btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" style="background:' + (statusColors[order.status] || '#6b7280') + '; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; color: white; border: none;">';
+                    html += (statusLabels[order.status] || order.status);
+                    html += '</button>';
+                    html += '<ul class="dropdown-menu dropdown-menu-dark">';
+                    html += '<li><h6 class="dropdown-header">修改订单状态</h6></li>';
+                    var allStatuses = ['pending', 'processing', 'on-hold', 'completed', 'cancelled', 'refunded', 'failed', 'checkout-draft'];
+                    allStatuses.forEach(function (s) {
+                        var activeClass = s === order.status ? ' active' : '';
+                        html += '<li><a class="dropdown-item' + activeClass + '" href="#" onclick="updateOrderStatus(' + order.id + ', \'' + s + '\'); return false;"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + (statusColors[s] || '#6b7280') + ';margin-right:8px;"></span>' + (statusLabels[s] || s) + '</a></li>';
+                    });
+                    html += '</ul></div></p>';
+                    {% else %}
                     html += '<p><strong>状态:</strong> <span style="background:' + (statusColors[order.status] || '#6b7280') + '; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; color: white;">' + (statusLabels[order.status] || order.status) + '</span></p>';
+                    {% endif %}
+
                     html += '<p><strong>创建时间:</strong> ' + (order.date_created || '-').replace('T', ' ').substring(0, 16) + '</p>';
                     html += '<p><strong>付款时间:</strong> ' + (order.date_paid ? order.date_paid.replace('T', ' ').substring(0, 16) : '-') + '</p>';
                     html += '<p><strong>付款方式:</strong> ' + (order.payment_method_title || '-') + '</p>';
@@ -605,6 +624,52 @@
                 .catch(function (err) {
                     console.error(err);
                     document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger">加载失败: ' + err.message + '</div>';
+                });
+        }
+
+        // Update order status via API
+        function updateOrderStatus(orderId, newStatus) {
+            var statusLabels = {
+                'pending': '待付款', 'processing': '处理中', 'on-hold': '已发货',
+                'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败', 'checkout-draft': '草稿'
+            };
+
+            if (!confirm('确定要将订单状态修改为 "' + (statusLabels[newStatus] || newStatus) + '" 吗？\n\n此操作将同步到WooCommerce后台，并添加订单备注记录。')) {
+                return;
+            }
+
+            // Show loading state
+            var modalContent = document.getElementById('orderDetailContent');
+            var originalContent = modalContent.innerHTML;
+            modalContent.innerHTML = '<div class="text-center py-5"><div class="spinner-border text-primary"></div><p class="mt-2 text-muted">正在修改订单状态...</p></div>';
+
+            fetch('/api/order/' + orderId + '/status', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: newStatus })
+            })
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                    if (data.success) {
+                        // Show success and refresh modal
+                        alert(data.message);
+                        // Refresh the order detail modal
+                        showOrderDetail(orderId);
+                        // If there's a page refresh function, call it
+                        if (typeof refreshOrderList === 'function') {
+                            refreshOrderList();
+                        } else {
+                            // Reload page if no specific refresh function
+                            location.reload();
+                        }
+                    } else {
+                        alert('修改失败: ' + data.error);
+                        modalContent.innerHTML = originalContent;
+                    }
+                })
+                .catch(function (err) {
+                    alert('请求失败: ' + err.message);
+                    modalContent.innerHTML = originalContent;
                 });
         }
 

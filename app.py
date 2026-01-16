@@ -6161,6 +6161,120 @@ def add_order_note(order_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/order/<int:order_id>/status', methods=['POST'])
+@login_required
+@editor_required
+def update_order_status(order_id):
+    """Update order status manually"""
+    import requests as req
+    
+    data = request.json
+    new_status = data.get('status', '').strip()
+    
+    # WooCommerce standard statuses
+    valid_statuses = ['pending', 'processing', 'on-hold', 'completed', 'cancelled', 'refunded', 'failed', 'checkout-draft']
+    
+    if not new_status:
+        return jsonify({'success': False, 'error': '请选择新状态'}), 400
+    
+    if new_status not in valid_statuses:
+        return jsonify({'success': False, 'error': f'无效的订单状态: {new_status}'}), 400
+    
+    conn = get_db_connection()
+    
+    # Get order info
+    order = conn.execute('SELECT id, number, source, status FROM orders WHERE id = ?', (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    
+    old_status = order['status']
+    
+    # Check if status is actually changing
+    if old_status == new_status:
+        conn.close()
+        return jsonify({'success': True, 'message': '状态未变化'})
+    
+    # Get site credentials
+    site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    if not site:
+        conn.close()
+        return jsonify({'success': False, 'error': '站点配置不存在'}), 404
+    
+    # Check if site has write permission
+    if site.get('api_write_status') == 'error':
+        conn.close()
+        return jsonify({'success': False, 'error': '该站点没有API写入权限，无法修改订单状态'}), 403
+    
+    # Headers for WooCommerce API
+    api_headers = {
+        "User-Agent": "WooCommerce API Client-Python/3.0.0",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    # Status labels for note
+    status_labels = {
+        'pending': '待付款',
+        'processing': '处理中',
+        'on-hold': '已发货',
+        'completed': '已完成',
+        'cancelled': '已取消',
+        'refunded': '已退款',
+        'failed': '失败',
+        'checkout-draft': '草稿'
+    }
+    
+    try:
+        # 1. Update order status via WooCommerce API
+        status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
+        
+        status_resp = req.put(
+            status_url,
+            json={'status': new_status},
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=60,
+            headers=api_headers
+        )
+        
+        if status_resp.status_code not in [200, 201]:
+            raise Exception(f"远程API错误: {status_resp.status_code} - {status_resp.text[:200]}")
+        
+        # 2. Add order note documenting the change
+        note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+        note_content = f"订单状态由 {current_user.name} 从 {status_labels.get(old_status, old_status)} 手动修改为 {status_labels.get(new_status, new_status)}"
+        
+        try:
+            note_resp = req.post(
+                note_url,
+                json={'note': note_content, 'customer_note': False},
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=30,
+                headers=api_headers
+            )
+            # Note failure is not critical, just log it
+            if note_resp.status_code not in [200, 201]:
+                print(f"Warning: Failed to add status change note: {note_resp.status_code}")
+        except Exception as note_e:
+            print(f"Warning: Failed to add status change note: {note_e}")
+        
+        # 3. Update local database
+        conn.execute("UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'success': True, 
+            'message': f'订单状态已从 {status_labels.get(old_status, old_status)} 修改为 {status_labels.get(new_status, new_status)}',
+            'old_status': old_status,
+            'new_status': new_status
+        })
+        
+    except Exception as e:
+        conn.close()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/shipping/print/label/<int:order_id>')
 @login_required
 @shipper_required
