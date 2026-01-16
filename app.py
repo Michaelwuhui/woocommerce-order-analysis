@@ -4543,7 +4543,13 @@ def products():
     date_from = ''
     date_to = today.isoformat()
     
-    if quick_date == 'this_month':
+    if quick_date == 'last_week':
+        # Last 7 days
+        date_from = (today - timedelta(days=7)).isoformat()
+    elif quick_date == 'last_15_days':
+        # Last 15 days
+        date_from = (today - timedelta(days=15)).isoformat()
+    elif quick_date == 'this_month':
         date_from = today.replace(day=1).isoformat()
     elif quick_date == 'last_month':
         first_of_this_month = today.replace(day=1)
@@ -4860,6 +4866,124 @@ def products():
         'product_count': len(product_stats)
     }
     
+    # Calculate weekly trend data by flavor (TOP 10 flavors - ALWAYS last 8 weeks, independent of page filter)
+    # Query orders from last 8 weeks separately
+    eight_weeks_ago = (today - timedelta(weeks=8)).isoformat()
+    
+    # Build conditions for 8-week query (with same permission filtering)
+    trend_conditions = ["status NOT IN ('failed', 'cancelled')", "date_created >= ?"]
+    trend_params = [eight_weeks_ago]
+    
+    # Add permission filter
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            trend_conditions.append(f'source IN ({placeholders})')
+            trend_params.extend(allowed_sources)
+        else:
+            trend_conditions.append('1=0')
+    
+    # Add manager filter if set
+    if manager_filter:
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls_for_trend = [s['url'] for s in manager_sites]
+        if manager_urls_for_trend:
+            placeholders = ', '.join(['?' for _ in manager_urls_for_trend])
+            trend_conditions.append(f'source IN ({placeholders})')
+            trend_params.extend(manager_urls_for_trend)
+        else:
+            trend_conditions.append('1=0')
+    
+    # Add source filter if set
+    if source_filter:
+        trend_conditions.append("source = ?")
+        trend_params.append(source_filter)
+    
+    trend_where_clause = 'WHERE ' + ' AND '.join(trend_conditions)
+    
+    trend_orders = conn.execute(f'''
+        SELECT id, line_items, source, date_created
+        FROM orders {trend_where_clause}
+    ''', trend_params).fetchall()
+    
+    weekly_flavor_data = {}  # {week_key: {flavor: quantity}}
+    flavor_totals = {}  # {flavor: total_quantity} for ranking
+    
+    for order in trend_orders:
+        items = parse_json_field(order['line_items'])
+        if not isinstance(items, list):
+            continue
+        
+        # Get week number from order date
+        order_date_str = order['date_created']
+        if order_date_str:
+            try:
+                order_date = datetime.strptime(order_date_str[:10], '%Y-%m-%d')
+                # Use ISO week number with year
+                year, week_num, _ = order_date.isocalendar()
+                week_key = f"{year}-W{week_num:02d}"
+                week_start = order_date - timedelta(days=order_date.weekday())
+                week_label = week_start.strftime('%m/%d')
+                
+                if week_key not in weekly_flavor_data:
+                    weekly_flavor_data[week_key] = {'label': week_label, 'flavors': {}}
+                
+                # Sum quantities by flavor for this week
+                for item in items:
+                    quantity = item.get('quantity', 0)
+                    # Get flavor from item (check manual mappings first)
+                    product_name = item.get('name', '')
+                    full_name, flavor_only, _ = get_full_product_name(item)
+                    
+                    # Check manual mappings
+                    if full_name in manual_mappings and manual_mappings[full_name].get('flavor'):
+                        flavor = manual_mappings[full_name]['flavor']
+                    elif flavor_only:
+                        flavor = flavor_only
+                    else:
+                        flavor = '未知口味'
+                    
+                    # Aggregate
+                    if flavor not in weekly_flavor_data[week_key]['flavors']:
+                        weekly_flavor_data[week_key]['flavors'][flavor] = 0
+                    weekly_flavor_data[week_key]['flavors'][flavor] += quantity
+                    
+                    # Track totals for ranking
+                    if flavor not in flavor_totals:
+                        flavor_totals[flavor] = 0
+                    flavor_totals[flavor] += quantity
+            except:
+                pass
+    
+    # Get TOP 10 flavors by total quantity (excluding unknown)
+    flavor_ranking = sorted(
+        [(f, q) for f, q in flavor_totals.items() if f != '未知口味'],
+        key=lambda x: x[1], 
+        reverse=True
+    )[:10]
+    top_flavors = [f[0] for f in flavor_ranking]
+    
+    # Sort weeks and take last 8 weeks
+    sorted_weeks = sorted(weekly_flavor_data.keys())[-8:]
+    
+    # Build structured data for chart
+    weekly_trend_data = {
+        'weeks': [weekly_flavor_data[w]['label'] for w in sorted_weeks],
+        'flavors': top_flavors,
+        'datasets': []
+    }
+    
+    # Create dataset for each flavor
+    for flavor in top_flavors:
+        flavor_data = []
+        for week_key in sorted_weeks:
+            qty = weekly_flavor_data.get(week_key, {}).get('flavors', {}).get(flavor, 0)
+            flavor_data.append(qty)
+        weekly_trend_data['datasets'].append({
+            'flavor': flavor,
+            'data': flavor_data
+        })
+    
     conn.close()
     
     return render_template('products.html',
@@ -4871,6 +4995,7 @@ def products():
                           sources=sources,
                           puff_options=puff_options,
                           site_managers=site_managers,
+                          weekly_trend=weekly_trend_data,
                           current_filters={
                               'source': source_filter,
                               'brand': brand_filter,

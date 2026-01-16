@@ -9,6 +9,10 @@
         <div class="d-flex flex-wrap gap-3 align-items-center justify-content-between">
             <div class="d-flex flex-wrap gap-2 align-items-center">
                 <span class="text-secondary me-2"><i class="bi bi-calendar-range me-1"></i>时间：</span>
+                <a href="{{ url_for('products', quick_date='last_week', source=current_filters.source, brand=current_filters.brand) }}"
+                    class="btn btn-quick {% if current_filters.quick_date == 'last_week' %}active{% endif %}">上周</a>
+                <a href="{{ url_for('products', quick_date='last_15_days', source=current_filters.source, brand=current_filters.brand) }}"
+                    class="btn btn-quick {% if current_filters.quick_date == 'last_15_days' %}active{% endif %}">近15日</a>
                 <a href="{{ url_for('products', quick_date='this_month', source=current_filters.source, brand=current_filters.brand) }}"
                     class="btn btn-quick {% if current_filters.quick_date == 'this_month' %}active{% endif %}">本月至今</a>
                 <a href="{{ url_for('products', quick_date='last_month', source=current_filters.source, brand=current_filters.brand) }}"
@@ -266,6 +270,47 @@
         </div>
     </div>
 
+    <!-- Weekly Flavor Trend Chart - Interactive -->
+    <div class="row mt-4">
+        <div class="col-12">
+            <div class="card chart-card">
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <h5 class="mb-0"><i class="bi bi-graph-up me-2"></i>口味周销量趋势 (最近8周)</h5>
+                    <!-- Chart Type Toggle -->
+                    <div class="btn-group" role="group">
+                        <button type="button" class="btn btn-sm btn-outline-light active" id="chartTypeBar"
+                            onclick="switchChartType('bar')">
+                            <i class="bi bi-bar-chart-fill"></i> 柱状图
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-light" id="chartTypeLine"
+                            onclick="switchChartType('line')">
+                            <i class="bi bi-graph-up"></i> 折线图
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-light" id="chartTypePie"
+                            onclick="switchChartType('pie')">
+                            <i class="bi bi-pie-chart-fill"></i> 饼图
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <!-- Flavor Selection Buttons -->
+                    <div class="mb-3" id="flavorButtonsContainer">
+                        <span class="text-muted me-2"><i class="bi bi-funnel me-1"></i>选择口味:</span>
+                        <button class="btn btn-sm btn-primary me-1 mb-1 active" id="flavorBtnAll"
+                            onclick="selectFlavor('all')">
+                            全部 TOP 10
+                        </button>
+                        <!-- Flavor buttons will be dynamically generated -->
+                    </div>
+                    <!-- Chart Canvas -->
+                    <div style="height: 350px;">
+                        <canvas id="weeklyTrendChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Top Products -->
     <div class="row mt-4">
         <div class="col-12">
@@ -518,6 +563,197 @@
             cutout: '60%'
         }
     });
+
+    // Weekly Trend Interactive Chart - TOP 10 Flavors with selection
+    var weeklyTrendData = {{ weekly_trend | tojson | safe }};
+    var weeklyChart = null;
+    var currentChartType = 'bar';
+    var selectedFlavor = 'all';
+
+    // Color palette for flavors
+    var flavorColors = [
+        { bg: 'rgba(99, 102, 241, 0.7)', border: 'rgba(99, 102, 241, 1)' },   // Indigo
+        { bg: 'rgba(139, 92, 246, 0.7)', border: 'rgba(139, 92, 246, 1)' },   // Violet
+        { bg: 'rgba(236, 72, 153, 0.7)', border: 'rgba(236, 72, 153, 1)' },   // Pink
+        { bg: 'rgba(34, 197, 94, 0.7)', border: 'rgba(34, 197, 94, 1)' },     // Green
+        { bg: 'rgba(234, 179, 8, 0.7)', border: 'rgba(234, 179, 8, 1)' },     // Yellow
+        { bg: 'rgba(249, 115, 22, 0.7)', border: 'rgba(249, 115, 22, 1)' },   // Orange
+        { bg: 'rgba(14, 165, 233, 0.7)', border: 'rgba(14, 165, 233, 1)' },   // Sky
+        { bg: 'rgba(168, 85, 247, 0.7)', border: 'rgba(168, 85, 247, 1)' },   // Purple
+        { bg: 'rgba(20, 184, 166, 0.7)', border: 'rgba(20, 184, 166, 1)' },   // Teal
+        { bg: 'rgba(244, 63, 94, 0.7)', border: 'rgba(244, 63, 94, 1)' }      // Rose
+    ];
+
+    if (weeklyTrendData && weeklyTrendData.datasets && weeklyTrendData.datasets.length > 0) {
+        // Generate flavor buttons dynamically
+        var container = document.getElementById('flavorButtonsContainer');
+        weeklyTrendData.datasets.forEach((ds, idx) => {
+            var totalQty = ds.data.reduce((a, b) => a + b, 0);
+            var btn = document.createElement('button');
+            btn.className = 'btn btn-sm btn-outline-light me-1 mb-1';
+            btn.id = 'flavorBtn_' + idx;
+            btn.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + flavorColors[idx].border + ';margin-right:6px;"></span>' + ds.flavor + ' <small class="text-muted">(' + totalQty.toLocaleString() + ')</small>';
+            btn.onclick = function () { selectFlavor(idx); };
+            container.appendChild(btn);
+        });
+
+        // Initialize chart
+        renderWeeklyChart();
+    }
+
+    function selectFlavor(flavorIdx) {
+        selectedFlavor = flavorIdx;
+
+        // Update button states
+        document.getElementById('flavorBtnAll').classList.remove('active', 'btn-primary');
+        document.getElementById('flavorBtnAll').classList.add('btn-outline-primary');
+        weeklyTrendData.datasets.forEach((ds, idx) => {
+            var btn = document.getElementById('flavorBtn_' + idx);
+            if (btn) {
+                btn.classList.remove('active', 'btn-primary');
+                btn.classList.add('btn-outline-light');
+            }
+        });
+
+        if (flavorIdx === 'all') {
+            document.getElementById('flavorBtnAll').classList.add('active', 'btn-primary');
+            document.getElementById('flavorBtnAll').classList.remove('btn-outline-primary');
+        } else {
+            var activeBtn = document.getElementById('flavorBtn_' + flavorIdx);
+            if (activeBtn) {
+                activeBtn.classList.add('active', 'btn-primary');
+                activeBtn.classList.remove('btn-outline-light');
+            }
+        }
+
+        renderWeeklyChart();
+    }
+
+    function switchChartType(type) {
+        currentChartType = type;
+
+        // Update toggle button states
+        ['Bar', 'Line', 'Pie'].forEach(t => {
+            var btn = document.getElementById('chartType' + t);
+            if (btn) {
+                btn.classList.remove('active');
+                if (t.toLowerCase() === type) btn.classList.add('active');
+            }
+        });
+
+        renderWeeklyChart();
+    }
+
+    function renderWeeklyChart() {
+        if (weeklyChart) {
+            weeklyChart.destroy();
+        }
+
+        var ctx = document.getElementById('weeklyTrendChart').getContext('2d');
+        var datasets = [];
+        var isPie = currentChartType === 'pie';
+
+        if (selectedFlavor === 'all') {
+            if (isPie) {
+                // For pie chart with all flavors: show total per flavor
+                var pieData = weeklyTrendData.datasets.map((ds, idx) => ({
+                    flavor: ds.flavor,
+                    total: ds.data.reduce((a, b) => a + b, 0),
+                    color: flavorColors[idx % flavorColors.length]
+                }));
+                datasets = [{
+                    data: pieData.map(d => d.total),
+                    backgroundColor: pieData.map(d => d.color.bg),
+                    borderColor: pieData.map(d => d.color.border),
+                    borderWidth: 1
+                }];
+            } else {
+                // Bar/Line with all flavors
+                datasets = weeklyTrendData.datasets.map((ds, idx) => ({
+                    label: ds.flavor,
+                    data: ds.data,
+                    backgroundColor: flavorColors[idx % flavorColors.length].bg,
+                    borderColor: flavorColors[idx % flavorColors.length].border,
+                    borderWidth: currentChartType === 'line' ? 2 : 1,
+                    borderRadius: currentChartType === 'bar' ? 4 : 0,
+                    fill: currentChartType === 'line' ? false : true,
+                    tension: 0.3
+                }));
+            }
+        } else {
+            // Single flavor selected
+            var ds = weeklyTrendData.datasets[selectedFlavor];
+            var colorIdx = selectedFlavor % flavorColors.length;
+
+            if (isPie) {
+                // Pie chart for single flavor: show weekly breakdown
+                datasets = [{
+                    data: ds.data,
+                    backgroundColor: ds.data.map((_, i) => flavorColors[i % flavorColors.length].bg),
+                    borderColor: ds.data.map((_, i) => flavorColors[i % flavorColors.length].border),
+                    borderWidth: 1
+                }];
+            } else {
+                datasets = [{
+                    label: ds.flavor,
+                    data: ds.data,
+                    backgroundColor: flavorColors[colorIdx].bg,
+                    borderColor: flavorColors[colorIdx].border,
+                    borderWidth: currentChartType === 'line' ? 3 : 1,
+                    borderRadius: currentChartType === 'bar' ? 6 : 0,
+                    fill: currentChartType === 'line' ? true : false,
+                    tension: 0.3
+                }];
+            }
+        }
+
+        var chartConfig = {
+            type: isPie ? 'doughnut' : currentChartType,
+            data: {
+                labels: isPie && selectedFlavor === 'all' ? weeklyTrendData.datasets.map(d => d.flavor) : weeklyTrendData.weeks,
+                datasets: datasets
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        display: isPie,
+                        position: 'bottom',
+                        labels: { color: '#e2e8f0', padding: 10, boxWidth: 12, usePointStyle: true, font: { size: 11 } }
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: function (context) {
+                                var label = context.dataset.label || context.label || '';
+                                return label + ': ' + context.raw.toLocaleString() + ' 件';
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        if (!isPie) {
+            chartConfig.options.scales = {
+                x: {
+                    stacked: selectedFlavor === 'all' && currentChartType === 'bar',
+                    grid: { color: 'rgba(255, 255, 255, 0.1)' },
+                    ticks: { color: '#94a3b8' }
+                },
+                y: {
+                    stacked: selectedFlavor === 'all' && currentChartType === 'bar',
+                    beginAtZero: true,
+                    grid: { color: 'rgba(255, 255, 255, 0.1)' },
+                    ticks: { color: '#94a3b8', callback: v => v.toLocaleString() }
+                }
+            };
+        } else {
+            chartConfig.options.cutout = '50%';
+        }
+
+        weeklyChart = new Chart(ctx, chartConfig);
+    }
 
     // Product Mapping Functions
     function openProductMapping(productName, currentBrand, currentPuffs, currentFlavor) {
