@@ -270,6 +270,49 @@
         </div>
     </div>
 
+    <!-- Weekly PRODUCT Trend Chart - TOP 10 Products -->
+    <div class="row mt-4">
+        <div class="col-12">
+            <div class="card chart-card">
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <h5 class="mb-0"><i class="bi bi-box-seam me-2"></i>产品周销量趋势 (最近8周)</h5>
+                    <!-- Chart Type Toggle -->
+                    <div class="btn-group" role="group">
+                        <button type="button" class="btn btn-sm btn-outline-light active" id="productChartTypeBar"
+                            onclick="switchProductChartType('bar')">
+                            <i class="bi bi-bar-chart-fill"></i> 柱状图
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-light" id="productChartTypeLine"
+                            onclick="switchProductChartType('line')">
+                            <i class="bi bi-graph-up"></i> 折线图
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <!-- Product Selection Buttons -->
+                    <div class="mb-3">
+                        <div class="d-flex align-items-center mb-2">
+                            <span class="text-muted me-2"><i class="bi bi-funnel me-1"></i>选择产品:</span>
+                            <button class="btn btn-sm me-2 active" id="productBtnAll" onclick="selectProduct('all')"
+                                style="background:linear-gradient(135deg, #10b981 0%, #059669 100%);border:none;border-radius:8px;padding:8px 16px;color:#fff;font-weight:600;box-shadow:0 0 16px rgba(16, 185, 129, 0.5);transition:all 0.3s ease;">
+                                <i class="bi bi-stars me-1"></i>全部 TOP 10
+                            </button>
+                        </div>
+                        <!-- Two-row grid for product buttons: 1-5 first row, 6-10 second row -->
+                        <div id="productButtonsContainer"
+                            style="display:grid;grid-template-columns:repeat(5, 1fr);gap:8px;">
+                            <!-- Product buttons will be dynamically generated -->
+                        </div>
+                    </div>
+                    <!-- Chart Canvas -->
+                    <div style="height: 350px;">
+                        <canvas id="productTrendChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Weekly Flavor Trend Chart - Interactive -->
     <div class="row mt-4">
         <div class="col-12">
@@ -286,21 +329,23 @@
                             onclick="switchChartType('line')">
                             <i class="bi bi-graph-up"></i> 折线图
                         </button>
-                        <button type="button" class="btn btn-sm btn-outline-light" id="chartTypePie"
-                            onclick="switchChartType('pie')">
-                            <i class="bi bi-pie-chart-fill"></i> 饼图
-                        </button>
                     </div>
                 </div>
                 <div class="card-body">
                     <!-- Flavor Selection Buttons -->
-                    <div class="mb-3" id="flavorButtonsContainer">
-                        <span class="text-muted me-2"><i class="bi bi-funnel me-1"></i>选择口味:</span>
-                        <button class="btn btn-sm me-1 mb-1 active" id="flavorBtnAll" onclick="selectFlavor('all')"
-                            style="background:linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);border:none;border-radius:20px;padding:6px 14px;color:#fff;font-weight:600;box-shadow:0 0 16px rgba(99, 102, 241, 0.5);transition:all 0.3s ease;">
-                            <i class="bi bi-stars me-1"></i>全部 TOP 10
-                        </button>
-                        <!-- Flavor buttons will be dynamically generated -->
+                    <div class="mb-3">
+                        <div class="d-flex align-items-center mb-2">
+                            <span class="text-muted me-2"><i class="bi bi-funnel me-1"></i>选择口味:</span>
+                            <button class="btn btn-sm me-2 active" id="flavorBtnAll" onclick="selectFlavor('all')"
+                                style="background:linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);border:none;border-radius:8px;padding:8px 16px;color:#fff;font-weight:600;box-shadow:0 0 16px rgba(99, 102, 241, 0.5);transition:all 0.3s ease;">
+                                <i class="bi bi-stars me-1"></i>全部 TOP 10
+                            </button>
+                        </div>
+                        <!-- Two-row grid for flavor buttons: 1-5 first row, 6-10 second row -->
+                        <div id="flavorButtonsContainer"
+                            style="display:grid;grid-template-columns:repeat(5, 1fr);gap:8px;">
+                            <!-- Flavor buttons will be dynamically generated -->
+                        </div>
                     </div>
                     <!-- Chart Canvas -->
                     <div style="height: 350px;">
@@ -564,7 +609,164 @@
         }
     });
 
-    // Weekly Trend Interactive Chart - TOP 10 Flavors with selection
+    // ============ PRODUCT TREND CHART (TOP 10 Products) ============
+    var productTrendData = {{ product_trend | tojson | safe }};
+    var productChart = null;
+    var currentProductChartType = 'bar';
+    var selectedProduct = 'all';
+
+    // Color palette for products (different from flavors for visual distinction)
+    var productColors = [
+        { bg: 'rgba(16, 185, 129, 0.7)', border: 'rgba(16, 185, 129, 1)' },   // Emerald
+        { bg: 'rgba(59, 130, 246, 0.7)', border: 'rgba(59, 130, 246, 1)' },   // Blue
+        { bg: 'rgba(245, 158, 11, 0.7)', border: 'rgba(245, 158, 11, 1)' },   // Amber
+        { bg: 'rgba(239, 68, 68, 0.7)', border: 'rgba(239, 68, 68, 1)' },     // Red
+        { bg: 'rgba(168, 85, 247, 0.7)', border: 'rgba(168, 85, 247, 1)' },   // Purple
+        { bg: 'rgba(236, 72, 153, 0.7)', border: 'rgba(236, 72, 153, 1)' },   // Pink
+        { bg: 'rgba(20, 184, 166, 0.7)', border: 'rgba(20, 184, 166, 1)' },   // Teal
+        { bg: 'rgba(251, 146, 60, 0.7)', border: 'rgba(251, 146, 60, 1)' },   // Orange
+        { bg: 'rgba(139, 92, 246, 0.7)', border: 'rgba(139, 92, 246, 1)' },   // Violet
+        { bg: 'rgba(34, 197, 94, 0.7)', border: 'rgba(34, 197, 94, 1)' }      // Green
+    ];
+
+    if (productTrendData && productTrendData.datasets && productTrendData.datasets.length > 0) {
+        // Sort datasets by pageTotal (descending)
+        var sortedProductData = productTrendData.datasets.map((ds, idx) => ({
+            ...ds,
+            originalIndex: idx,
+            totalQty: ds.pageTotal || ds.data.reduce((a, b) => a + b, 0)
+        })).sort((a, b) => b.totalQty - a.totalQty);
+
+        // Generate product buttons dynamically with rankings
+        var prodContainer = document.getElementById('productButtonsContainer');
+
+        sortedProductData.forEach((ds, rank) => {
+            var btn = document.createElement('button');
+            btn.className = 'btn product-rank-btn';
+            btn.id = 'productBtn_' + ds.originalIndex;
+
+            // Create rank badge (larger, more visible)
+            var rankBadge = '';
+            if (rank < 3) {
+                var rankStyles = [
+                    { bg: 'linear-gradient(135deg, #ffd700 0%, #ff8c00 100%)', color: '#000', shadow: '0 0 8px rgba(255,215,0,0.5)' },
+                    { bg: 'linear-gradient(135deg, #c0c0c0 0%, #a8a8a8 100%)', color: '#000', shadow: '0 0 6px rgba(192,192,192,0.5)' },
+                    { bg: 'linear-gradient(135deg, #cd7f32 0%, #b5651d 100%)', color: '#fff', shadow: '0 0 6px rgba(205,127,50,0.5)' }
+                ];
+                rankBadge = '<span style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;font-size:13px;font-weight:700;margin-right:8px;background:' + rankStyles[rank].bg + ';color:' + rankStyles[rank].color + ';box-shadow:' + rankStyles[rank].shadow + ';">' + (rank + 1) + '</span>';
+            } else {
+                rankBadge = '<span style="display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;font-size:12px;font-weight:600;margin-right:8px;background:rgba(100,116,139,0.5);color:#e2e8f0;">' + (rank + 1) + '</span>';
+            }
+
+            // Product label and quantity - larger and clearer
+            var labelHtml = '<span style="flex:1;text-align:left;font-size:13px;font-weight:500;color:#e2e8f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + ds.label + '</span>';
+            var qtyHtml = '<span style="font-size:14px;font-weight:700;color:#10b981;margin-left:8px;">' + ds.totalQty.toLocaleString() + '</span>';
+
+            btn.innerHTML = rankBadge + labelHtml + qtyHtml;
+            btn.onclick = function () { selectProduct(ds.originalIndex); };
+            btn.style.cssText = 'display:flex;align-items:center;width:100%;background:rgba(30,41,59,0.9);border:1px solid rgba(148,163,184,0.3);border-radius:8px;padding:10px 12px;transition:all 0.3s ease;cursor:pointer;';
+
+            // Add hover effect
+            btn.onmouseenter = function () { if (!this.classList.contains('active')) { this.style.background = 'rgba(16,185,129,0.15)'; this.style.borderColor = 'rgba(16,185,129,0.5)'; } };
+            btn.onmouseleave = function () { if (!this.classList.contains('active')) { this.style.background = 'rgba(30,41,59,0.9)'; this.style.borderColor = 'rgba(148,163,184,0.3)'; } };
+
+            prodContainer.appendChild(btn);
+        });
+
+        // Initialize product chart
+        renderProductChart();
+    }
+
+    function selectProduct(productIdx) {
+        selectedProduct = productIdx;
+        // Update button states
+        document.querySelectorAll('#productButtonsContainer button').forEach(btn => {
+            btn.classList.remove('active');
+            btn.style.background = 'rgba(30,41,59,0.9)';
+            btn.style.borderColor = 'rgba(148,163,184,0.3)';
+            btn.style.boxShadow = 'none';
+        });
+        if (productIdx === 'all') {
+            document.getElementById('productBtnAll').classList.add('active');
+            document.getElementById('productBtnAll').style.background = 'linear-gradient(135deg, #10b981 0%, #059669 100%)';
+            document.getElementById('productBtnAll').style.boxShadow = '0 0 16px rgba(16, 185, 129, 0.5)';
+        } else {
+            var activeBtn = document.getElementById('productBtn_' + productIdx);
+            if (activeBtn) {
+                activeBtn.classList.add('active');
+                activeBtn.style.background = 'linear-gradient(135deg, #10b981 0%, #059669 100%)';
+                activeBtn.style.borderColor = '#10b981';
+                activeBtn.style.boxShadow = '0 0 12px rgba(16, 185, 129, 0.4)';
+            }
+        }
+        renderProductChart();
+    }
+
+    function switchProductChartType(type) {
+        currentProductChartType = type;
+        document.querySelectorAll('[id^=productChartType]').forEach(btn => btn.classList.remove('active'));
+        document.getElementById('productChartType' + type.charAt(0).toUpperCase() + type.slice(1)).classList.add('active');
+        renderProductChart();
+    }
+
+    function renderProductChart() {
+        var ctx = document.getElementById('productTrendChart').getContext('2d');
+        if (productChart) productChart.destroy();
+
+        var datasets = [];
+        if (selectedProduct === 'all') {
+            productTrendData.datasets.forEach((ds, idx) => {
+                datasets.push({
+                    label: ds.label,
+                    data: ds.data,
+                    backgroundColor: productColors[idx % 10].bg,
+                    borderColor: productColors[idx % 10].border,
+                    borderWidth: 2,
+                    tension: 0.3,
+                    fill: currentProductChartType === 'line'
+                });
+            });
+        } else {
+            var ds = productTrendData.datasets[selectedProduct];
+            if (ds) {
+                datasets.push({
+                    label: ds.label,
+                    data: ds.data,
+                    backgroundColor: productColors[selectedProduct % 10].bg,
+                    borderColor: productColors[selectedProduct % 10].border,
+                    borderWidth: 2,
+                    tension: 0.3,
+                    fill: currentProductChartType === 'line'
+                });
+            }
+        }
+
+        productChart = new Chart(ctx, {
+            type: currentProductChartType,
+            data: {
+                labels: productTrendData.weeks,
+                datasets: datasets
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        display: selectedProduct === 'all',
+                        position: 'bottom',
+                        labels: { color: '#e2e8f0', padding: 10, boxWidth: 12, usePointStyle: true, font: { size: 11 } }
+                    },
+                    tooltip: { mode: 'nearest', intersect: true }
+                },
+                scales: {
+                    x: { stacked: selectedProduct === 'all' && currentProductChartType === 'bar', grid: { color: 'rgba(255, 255, 255, 0.1)' }, ticks: { color: '#aaa' } },
+                    y: { stacked: selectedProduct === 'all' && currentProductChartType === 'bar', beginAtZero: true, grid: { color: 'rgba(255, 255, 255, 0.1)' }, ticks: { color: '#aaa' } }
+                }
+            }
+        });
+    }
+
+    // ============ FLAVOR TREND CHART (TOP 10 Flavors) ============
     var weeklyTrendData = {{ weekly_trend | tojson | safe }};
     var topProducts = {{ top_products | tojson | safe }};  // Same data as the product table
     var weeklyChart = null;
@@ -609,54 +811,38 @@
 
         // Rank badge styles based on position
         var rankStyles = [
-            { bg: 'linear-gradient(135deg, #ffd700 0%, #ff8c00 100%)', color: '#000', shadow: '0 0 12px rgba(255, 215, 0, 0.6)' },     // 1st - Gold
-            { bg: 'linear-gradient(135deg, #c0c0c0 0%, #a8a8a8 100%)', color: '#000', shadow: '0 0 10px rgba(192, 192, 192, 0.5)' },   // 2nd - Silver
-            { bg: 'linear-gradient(135deg, #cd7f32 0%, #b5651d 100%)', color: '#fff', shadow: '0 0 10px rgba(205, 127, 50, 0.5)' },    // 3rd - Bronze
+            { bg: 'linear-gradient(135deg, #ffd700 0%, #ff8c00 100%)', color: '#000', shadow: '0 0 8px rgba(255,215,0,0.5)' },
+            { bg: 'linear-gradient(135deg, #c0c0c0 0%, #a8a8a8 100%)', color: '#000', shadow: '0 0 6px rgba(192,192,192,0.5)' },
+            { bg: 'linear-gradient(135deg, #cd7f32 0%, #b5651d 100%)', color: '#fff', shadow: '0 0 6px rgba(205,127,50,0.5)' }
         ];
 
         sortedData.forEach((ds, rank) => {
             var btn = document.createElement('button');
-            btn.className = 'btn btn-sm me-1 mb-1 flavor-rank-btn';
+            btn.className = 'btn flavor-rank-btn';
             btn.id = 'flavorBtn_' + ds.originalIndex;
 
-            // Create rank badge
+            // Create rank badge (larger, more visible)
             var rankBadge = '';
             if (rank < 3) {
-                // Top 3 with special styling
-                rankBadge = '<span class="rank-badge rank-top3" style="background:' + rankStyles[rank].bg + ';color:' + rankStyles[rank].color + ';box-shadow:' + rankStyles[rank].shadow + ';">' + (rank + 1) + '</span>';
+                rankBadge = '<span style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;font-size:13px;font-weight:700;margin-right:8px;background:' + rankStyles[rank].bg + ';color:' + rankStyles[rank].color + ';box-shadow:' + rankStyles[rank].shadow + ';">' + (rank + 1) + '</span>';
             } else {
-                // Ranks 4-10 with subtle styling
-                rankBadge = '<span class="rank-badge rank-normal">' + (rank + 1) + '</span>';
+                rankBadge = '<span style="display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;font-size:12px;font-weight:600;margin-right:8px;background:rgba(100,116,139,0.5);color:#e2e8f0;">' + (rank + 1) + '</span>';
             }
 
-            // Color indicator dot
-            var colorDot = '<span class="flavor-dot" style="background:' + flavorColors[ds.originalIndex].border + ';box-shadow:0 0 6px ' + flavorColors[ds.originalIndex].border + ';"></span>';
+            // Flavor label and quantity - larger and clearer
+            var labelHtml = '<span style="flex:1;text-align:left;font-size:13px;font-weight:500;color:#e2e8f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + ds.flavor + '</span>';
+            var qtyHtml = '<span style="font-size:14px;font-weight:700;color:#8b5cf6;margin-left:8px;">' + ds.totalQty.toLocaleString() + '</span>';
 
-            btn.innerHTML = rankBadge + colorDot + '<span class="flavor-name">' + ds.flavor + '</span><span class="flavor-qty">' + ds.totalQty.toLocaleString() + '</span>';
+            btn.innerHTML = rankBadge + labelHtml + qtyHtml;
             btn.onclick = function () { selectFlavor(ds.originalIndex); };
-            btn.style.cssText = 'background:rgba(30,41,59,0.8);border:1px solid rgba(148,163,184,0.3);border-radius:20px;padding:6px 14px 6px 8px;transition:all 0.3s ease;position:relative;overflow:hidden;';
-            if (rank < 3) {
-                btn.style.borderColor = flavorColors[ds.originalIndex].border;
-                btn.style.boxShadow = '0 0 8px ' + flavorColors[ds.originalIndex].bg;
-            }
+            btn.style.cssText = 'display:flex;align-items:center;width:100%;background:rgba(30,41,59,0.9);border:1px solid rgba(148,163,184,0.3);border-radius:8px;padding:10px 12px;transition:all 0.3s ease;cursor:pointer;';
+
+            // Add hover effect
+            btn.onmouseenter = function () { if (!this.classList.contains('active')) { this.style.background = 'rgba(99,102,241,0.15)'; this.style.borderColor = 'rgba(99,102,241,0.5)'; } };
+            btn.onmouseleave = function () { if (!this.classList.contains('active')) { this.style.background = 'rgba(30,41,59,0.9)'; this.style.borderColor = 'rgba(148,163,184,0.3)'; } };
+
             container.appendChild(btn);
         });
-
-        // Add dynamic styles for flavor buttons
-        var styleEl = document.createElement('style');
-        styleEl.textContent = `
-            .flavor-rank-btn { display: inline-flex; align-items: center; gap: 6px; color: #e2e8f0 !important; }
-            .flavor-rank-btn:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4) !important; border-color: #6366f1 !important; background: rgba(99, 102, 241, 0.2) !important; }
-            .flavor-rank-btn.active { background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%) !important; border-color: transparent !important; box-shadow: 0 0 16px rgba(99, 102, 241, 0.6) !important; }
-            .rank-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; border-radius: 50%; font-size: 11px; font-weight: 700; }
-            .rank-top3 { animation: pulse-glow 2s ease-in-out infinite; }
-            .rank-normal { background: rgba(71, 85, 105, 0.6); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.3); }
-            .flavor-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
-            .flavor-name { font-weight: 500; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-            .flavor-qty { font-size: 11px; color: #94a3b8; background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 10px; }
-            @keyframes pulse-glow { 0%, 100% { opacity: 1; } 50% { opacity: 0.85; } }
-        `;
-        document.head.appendChild(styleEl);
 
         // Initialize chart
         renderWeeklyChart();
@@ -666,24 +852,29 @@
         selectedFlavor = flavorIdx;
 
         // Update button states
-        document.getElementById('flavorBtnAll').classList.remove('active', 'btn-primary');
-        document.getElementById('flavorBtnAll').classList.add('btn-outline-primary');
-        weeklyTrendData.datasets.forEach((ds, idx) => {
-            var btn = document.getElementById('flavorBtn_' + idx);
-            if (btn) {
-                btn.classList.remove('active', 'btn-primary');
-                btn.classList.add('btn-outline-light');
-            }
+        document.querySelectorAll('#flavorButtonsContainer button').forEach(btn => {
+            btn.classList.remove('active');
+            btn.style.background = 'rgba(30,41,59,0.9)';
+            btn.style.borderColor = 'rgba(148,163,184,0.3)';
+            btn.style.boxShadow = 'none';
         });
 
+        // Reset "All" button
+        document.getElementById('flavorBtnAll').classList.remove('active');
+        document.getElementById('flavorBtnAll').style.background = 'rgba(99,102,241,0.3)';
+        document.getElementById('flavorBtnAll').style.boxShadow = 'none';
+
         if (flavorIdx === 'all') {
-            document.getElementById('flavorBtnAll').classList.add('active', 'btn-primary');
-            document.getElementById('flavorBtnAll').classList.remove('btn-outline-primary');
+            document.getElementById('flavorBtnAll').classList.add('active');
+            document.getElementById('flavorBtnAll').style.background = 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)';
+            document.getElementById('flavorBtnAll').style.boxShadow = '0 0 16px rgba(99, 102, 241, 0.5)';
         } else {
             var activeBtn = document.getElementById('flavorBtn_' + flavorIdx);
             if (activeBtn) {
-                activeBtn.classList.add('active', 'btn-primary');
-                activeBtn.classList.remove('btn-outline-light');
+                activeBtn.classList.add('active');
+                activeBtn.style.background = 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)';
+                activeBtn.style.borderColor = '#6366f1';
+                activeBtn.style.boxShadow = '0 0 12px rgba(99, 102, 241, 0.4)';
             }
         }
 
@@ -737,7 +928,7 @@
                     borderColor: flavorColors[idx % flavorColors.length].border,
                     borderWidth: currentChartType === 'line' ? 2 : 1,
                     borderRadius: currentChartType === 'bar' ? 4 : 0,
-                    fill: currentChartType === 'line' ? false : true,
+                    fill: currentChartType === 'line' ? true : true,
                     tension: 0.3
                 }));
             }
@@ -779,11 +970,13 @@
                 maintainAspectRatio: false,
                 plugins: {
                     legend: {
-                        display: isPie,
+                        display: selectedFlavor === 'all',
                         position: 'bottom',
                         labels: { color: '#e2e8f0', padding: 10, boxWidth: 12, usePointStyle: true, font: { size: 11 } }
                     },
                     tooltip: {
+                        mode: 'nearest',
+                        intersect: true,
                         callbacks: {
                             label: function (context) {
                                 var label = context.dataset.label || context.label || '';

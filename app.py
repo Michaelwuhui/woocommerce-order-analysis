@@ -5023,6 +5023,93 @@ def products():
             'pageTotal': top_flavor_qtys.get(flavor, 0)  # Total from page filter period
         })
     
+    # Calculate weekly trend data by PRODUCT (TOP 10 products)
+    # Get top 10 products for the trend
+    top_10_products = top_products[:10]
+    
+    # Build product keys for matching
+    top_product_keys = {}  # {normalized_key: {brand, puffs, flavor, label}}
+    for p in top_10_products:
+        brand = p.get('brand') or 'Unknown'
+        puffs = p.get('puffs') or 'N/A'
+        flavor = normalize_flavor(p.get('flavor') or '')
+        key = f"{brand}|{puffs}|{flavor}"
+        label = f"{brand} {puffs} {p.get('flavor', '')[:15]}"  # Short label for display
+        top_product_keys[key] = {'brand': brand, 'puffs': puffs, 'flavor': flavor, 'label': label, 'pageTotal': p['quantity']}
+    
+    # Aggregate weekly data for these products from trend_orders
+    weekly_product_data = {}  # {week_key: {product_key: quantity}}
+    for order in trend_orders:
+        items = parse_json_field(order['line_items'])
+        if not isinstance(items, list):
+            continue
+        
+        order_date_str = order['date_created']
+        if order_date_str:
+            try:
+                order_date = datetime.strptime(order_date_str[:10], '%Y-%m-%d')
+                year, week_num, _ = order_date.isocalendar()
+                week_key = f"{year}-W{week_num:02d}"
+                week_start = order_date - timedelta(days=order_date.weekday())
+                week_label = week_start.strftime('%m/%d')
+                
+                if week_key not in weekly_product_data:
+                    weekly_product_data[week_key] = {'label': week_label, 'products': {}}
+                
+                for item in items:
+                    quantity = item.get('quantity', 0)
+                    product_name = item.get('name', '')
+                    
+                    # Get brand/puffs/flavor using the same logic as main aggregation
+                    meta_flavor = extract_flavor_from_meta(item)
+                    full_name, _, meta_puffs = get_full_product_name(item)
+                    
+                    if full_name in manual_mappings:
+                        mapping = manual_mappings[full_name]
+                        brand = mapping.get('brand') or 'Unknown'
+                        puffs = mapping.get('puffs') or meta_puffs
+                        flavor = mapping.get('flavor') or meta_flavor or ''
+                    elif product_name in manual_mappings:
+                        mapping = manual_mappings[product_name]
+                        brand = mapping.get('brand') or 'Unknown'
+                        puffs = mapping.get('puffs') or meta_puffs
+                        flavor = mapping.get('flavor') or meta_flavor or ''
+                    else:
+                        parsed = parse_product_name(product_name, brands_cache)
+                        brand = parsed.get('brand') or 'Unknown'
+                        puffs = meta_puffs or parsed.get('puffs')
+                        flavor = meta_flavor or parsed.get('flavor') or ''
+                    
+                    # Normalize and create key
+                    flavor_norm = normalize_flavor(flavor)
+                    product_key = f"{brand}|{puffs or 'N/A'}|{flavor_norm}"
+                    
+                    # Only aggregate for top 10 products
+                    if product_key in top_product_keys:
+                        if product_key not in weekly_product_data[week_key]['products']:
+                            weekly_product_data[week_key]['products'][product_key] = 0
+                        weekly_product_data[week_key]['products'][product_key] += quantity
+            except:
+                pass
+    
+    # Build product trend chart data
+    product_trend_data = {
+        'weeks': [weekly_product_data.get(w, {}).get('label', '') for w in sorted_weeks],
+        'products': [top_product_keys[k]['label'] for k in top_product_keys],
+        'datasets': []
+    }
+    
+    for key, info in top_product_keys.items():
+        prod_data = []
+        for week_key in sorted_weeks:
+            qty = weekly_product_data.get(week_key, {}).get('products', {}).get(key, 0)
+            prod_data.append(qty)
+        product_trend_data['datasets'].append({
+            'label': info['label'],
+            'data': prod_data,
+            'pageTotal': info['pageTotal']
+        })
+    
     conn.close()
     
     return render_template('products.html',
@@ -5035,6 +5122,7 @@ def products():
                           puff_options=puff_options,
                           site_managers=site_managers,
                           weekly_trend=weekly_trend_data,
+                          product_trend=product_trend_data,
                           current_filters={
                               'source': source_filter,
                               'brand': brand_filter,
