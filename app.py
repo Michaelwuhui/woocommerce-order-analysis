@@ -2776,6 +2776,23 @@ def init_product_tables():
 
 import re
 
+
+def normalize_flavor(flavor):
+    """
+    Normalize flavor name for consistent aggregation.
+    Handles variations like: "Love 66", "love-66", "LOVE_66" -> "LOVE 66"
+    """
+    if not flavor:
+        return ''
+    # Convert to uppercase
+    s = flavor.upper()
+    # Replace common separators (hyphens, underscores) with space
+    s = re.sub(r'[-_]+', ' ', s)
+    # Remove extra whitespace
+    s = ' '.join(s.split())
+    return s
+
+
 def parse_product_name(name, brands_cache=None):
     """
     Parse product name to extract brand, series, puff count, and flavor.
@@ -4725,13 +4742,21 @@ def products():
                 continue
             
             # Product level stats (brand + puffs + flavor)
-            product_key = f"{brand}|{puffs or 'N/A'}|{flavor or 'No Flavor'}"
+            # Normalize flavor for key AND display to ensure consistent aggregation
+            # This handles variations like "Love 66", "love-66", "LOVE_66" -> "LOVE 66"
+            flavor_normalized = normalize_flavor(flavor)
+            if not flavor_normalized:
+                flavor_normalized = 'NO FLAVOR'
+                flavor_display = ''
+            else:
+                flavor_display = flavor_normalized  # Use normalized for display too
+            product_key = f"{brand}|{puffs or 'N/A'}|{flavor_normalized}"
             if product_key not in product_stats:
                 product_stats[product_key] = {
                     'name': product_name,  # Store one sample name for mapping
                     'brand': brand,
                     'puffs': puffs,
-                    'flavor': flavor,
+                    'flavor': flavor_display,  # Store normalized flavor for consistent display
                     'quantity': 0,
                     'revenue_by_currency': {},
                     'gross_revenue_by_currency': {},
@@ -4866,11 +4891,32 @@ def products():
         'product_count': len(product_stats)
     }
     
-    # Calculate weekly trend data by flavor (TOP 10 flavors - ALWAYS last 8 weeks, independent of page filter)
-    # Query orders from last 8 weeks separately
+    # Calculate weekly trend data by flavor
+    # TOP 10 flavors are determined by the page's date filter
+    # But the chart always shows the last 8 weeks of trend data for those flavors
+    
+    # Step 1: Get TOP 10 flavors directly from top_products (same data as the product table)
+    # This ensures 100% consistency between the trend buttons and the product table
+    flavor_totals = {}  # {flavor: quantity}
+    for p in top_products:  # Use same data source as the product table
+        flavor = p.get('flavor') or ''
+        if not flavor:
+            continue
+        if flavor not in flavor_totals:
+            flavor_totals[flavor] = 0
+        flavor_totals[flavor] += p['quantity']
+    
+    # Sort by quantity and take TOP 10
+    flavor_ranking = sorted(flavor_totals.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_flavors = [f[0] for f in flavor_ranking]
+    top_flavor_qtys = {f[0]: f[1] for f in flavor_ranking}
+    # For matching in 8-week data (case-insensitive)
+    top_flavors_normalized = {f.upper().strip(): f for f in top_flavors}
+    
+    # Step 2: Query 8 weeks of data for the weekly trend chart
     eight_weeks_ago = (today - timedelta(weeks=8)).isoformat()
     
-    # Build conditions for 8-week query (with same permission filtering)
+    # Build conditions for 8-week query (with same permission filtering, but NOT date filter)
     trend_conditions = ["status NOT IN ('failed', 'cancelled')", "date_created >= ?"]
     trend_params = [eight_weeks_ago]
     
@@ -4907,7 +4953,6 @@ def products():
     ''', trend_params).fetchall()
     
     weekly_flavor_data = {}  # {week_key: {flavor: quantity}}
-    flavor_totals = {}  # {flavor: total_quantity} for ranking
     
     for order in trend_orders:
         items = parse_json_field(order['line_items'])
@@ -4928,7 +4973,7 @@ def products():
                 if week_key not in weekly_flavor_data:
                     weekly_flavor_data[week_key] = {'label': week_label, 'flavors': {}}
                 
-                # Sum quantities by flavor for this week
+                # Sum quantities by flavor for this week (only for top_flavors from page filter)
                 for item in items:
                     quantity = item.get('quantity', 0)
                     # Get flavor from item (check manual mappings first)
@@ -4943,25 +4988,17 @@ def products():
                     else:
                         flavor = '未知口味'
                     
-                    # Aggregate
-                    if flavor not in weekly_flavor_data[week_key]['flavors']:
-                        weekly_flavor_data[week_key]['flavors'][flavor] = 0
-                    weekly_flavor_data[week_key]['flavors'][flavor] += quantity
-                    
-                    # Track totals for ranking
-                    if flavor not in flavor_totals:
-                        flavor_totals[flavor] = 0
-                    flavor_totals[flavor] += quantity
+                    # Only aggregate for top flavors (determined by page filter)
+                    # Use normalized matching to handle case differences
+                    normalized_flavor = flavor.upper().strip()
+                    if normalized_flavor in top_flavors_normalized:
+                        # Use the display name from top_flavors for consistency
+                        display_flavor = top_flavors_normalized[normalized_flavor]
+                        if display_flavor not in weekly_flavor_data[week_key]['flavors']:
+                            weekly_flavor_data[week_key]['flavors'][display_flavor] = 0
+                        weekly_flavor_data[week_key]['flavors'][display_flavor] += quantity
             except:
                 pass
-    
-    # Get TOP 10 flavors by total quantity (excluding unknown)
-    flavor_ranking = sorted(
-        [(f, q) for f, q in flavor_totals.items() if f != '未知口味'],
-        key=lambda x: x[1], 
-        reverse=True
-    )[:10]
-    top_flavors = [f[0] for f in flavor_ranking]
     
     # Sort weeks and take last 8 weeks
     sorted_weeks = sorted(weekly_flavor_data.keys())[-8:]
@@ -4973,7 +5010,8 @@ def products():
         'datasets': []
     }
     
-    # Create dataset for each flavor
+    # Create dataset for each flavor (preserving page filter ranking order)
+    # Include the page-filter-period total for correct frontend sorting
     for flavor in top_flavors:
         flavor_data = []
         for week_key in sorted_weeks:
@@ -4981,7 +5019,8 @@ def products():
             flavor_data.append(qty)
         weekly_trend_data['datasets'].append({
             'flavor': flavor,
-            'data': flavor_data
+            'data': flavor_data,
+            'pageTotal': top_flavor_qtys.get(flavor, 0)  # Total from page filter period
         })
     
     conn.close()

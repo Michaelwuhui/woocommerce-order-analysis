@@ -296,9 +296,9 @@
                     <!-- Flavor Selection Buttons -->
                     <div class="mb-3" id="flavorButtonsContainer">
                         <span class="text-muted me-2"><i class="bi bi-funnel me-1"></i>选择口味:</span>
-                        <button class="btn btn-sm btn-primary me-1 mb-1 active" id="flavorBtnAll"
-                            onclick="selectFlavor('all')">
-                            全部 TOP 10
+                        <button class="btn btn-sm me-1 mb-1 active" id="flavorBtnAll" onclick="selectFlavor('all')"
+                            style="background:linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);border:none;border-radius:20px;padding:6px 14px;color:#fff;font-weight:600;box-shadow:0 0 16px rgba(99, 102, 241, 0.5);transition:all 0.3s ease;">
+                            <i class="bi bi-stars me-1"></i>全部 TOP 10
                         </button>
                         <!-- Flavor buttons will be dynamically generated -->
                     </div>
@@ -566,9 +566,20 @@
 
     // Weekly Trend Interactive Chart - TOP 10 Flavors with selection
     var weeklyTrendData = {{ weekly_trend | tojson | safe }};
+    var topProducts = {{ top_products | tojson | safe }};  // Same data as the product table
     var weeklyChart = null;
     var currentChartType = 'bar';
     var selectedFlavor = 'all';
+
+    // Calculate flavor TOTALS from top_products (sum of all products with same flavor)
+    // This shows the true total sales for each flavor across all brands/puff variants
+    var flavorTotalsFromTable = {};
+    topProducts.forEach(function (p) {
+        var flavor = p.flavor || '';
+        if (!flavor) return;
+        if (!flavorTotalsFromTable[flavor]) flavorTotalsFromTable[flavor] = 0;
+        flavorTotalsFromTable[flavor] += p.quantity;
+    });
 
     // Color palette for flavors
     var flavorColors = [
@@ -585,17 +596,67 @@
     ];
 
     if (weeklyTrendData && weeklyTrendData.datasets && weeklyTrendData.datasets.length > 0) {
-        // Generate flavor buttons dynamically
+        // Use flavor totals calculated directly from the product table data
+        // This guarantees 100% consistency with the table display
+        var sortedData = weeklyTrendData.datasets.map((ds, idx) => ({
+            ...ds,
+            originalIndex: idx,
+            totalQty: flavorTotalsFromTable[ds.flavor] || 0  // Use totals from product table
+        })).sort((a, b) => b.totalQty - a.totalQty);
+
+        // Generate flavor buttons dynamically with rankings
         var container = document.getElementById('flavorButtonsContainer');
-        weeklyTrendData.datasets.forEach((ds, idx) => {
-            var totalQty = ds.data.reduce((a, b) => a + b, 0);
+
+        // Rank badge styles based on position
+        var rankStyles = [
+            { bg: 'linear-gradient(135deg, #ffd700 0%, #ff8c00 100%)', color: '#000', shadow: '0 0 12px rgba(255, 215, 0, 0.6)' },     // 1st - Gold
+            { bg: 'linear-gradient(135deg, #c0c0c0 0%, #a8a8a8 100%)', color: '#000', shadow: '0 0 10px rgba(192, 192, 192, 0.5)' },   // 2nd - Silver
+            { bg: 'linear-gradient(135deg, #cd7f32 0%, #b5651d 100%)', color: '#fff', shadow: '0 0 10px rgba(205, 127, 50, 0.5)' },    // 3rd - Bronze
+        ];
+
+        sortedData.forEach((ds, rank) => {
             var btn = document.createElement('button');
-            btn.className = 'btn btn-sm btn-outline-light me-1 mb-1';
-            btn.id = 'flavorBtn_' + idx;
-            btn.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + flavorColors[idx].border + ';margin-right:6px;"></span>' + ds.flavor + ' <small class="text-muted">(' + totalQty.toLocaleString() + ')</small>';
-            btn.onclick = function () { selectFlavor(idx); };
+            btn.className = 'btn btn-sm me-1 mb-1 flavor-rank-btn';
+            btn.id = 'flavorBtn_' + ds.originalIndex;
+
+            // Create rank badge
+            var rankBadge = '';
+            if (rank < 3) {
+                // Top 3 with special styling
+                rankBadge = '<span class="rank-badge rank-top3" style="background:' + rankStyles[rank].bg + ';color:' + rankStyles[rank].color + ';box-shadow:' + rankStyles[rank].shadow + ';">' + (rank + 1) + '</span>';
+            } else {
+                // Ranks 4-10 with subtle styling
+                rankBadge = '<span class="rank-badge rank-normal">' + (rank + 1) + '</span>';
+            }
+
+            // Color indicator dot
+            var colorDot = '<span class="flavor-dot" style="background:' + flavorColors[ds.originalIndex].border + ';box-shadow:0 0 6px ' + flavorColors[ds.originalIndex].border + ';"></span>';
+
+            btn.innerHTML = rankBadge + colorDot + '<span class="flavor-name">' + ds.flavor + '</span><span class="flavor-qty">' + ds.totalQty.toLocaleString() + '</span>';
+            btn.onclick = function () { selectFlavor(ds.originalIndex); };
+            btn.style.cssText = 'background:rgba(30,41,59,0.8);border:1px solid rgba(148,163,184,0.3);border-radius:20px;padding:6px 14px 6px 8px;transition:all 0.3s ease;position:relative;overflow:hidden;';
+            if (rank < 3) {
+                btn.style.borderColor = flavorColors[ds.originalIndex].border;
+                btn.style.boxShadow = '0 0 8px ' + flavorColors[ds.originalIndex].bg;
+            }
             container.appendChild(btn);
         });
+
+        // Add dynamic styles for flavor buttons
+        var styleEl = document.createElement('style');
+        styleEl.textContent = `
+            .flavor-rank-btn { display: inline-flex; align-items: center; gap: 6px; color: #e2e8f0 !important; }
+            .flavor-rank-btn:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4) !important; border-color: #6366f1 !important; background: rgba(99, 102, 241, 0.2) !important; }
+            .flavor-rank-btn.active { background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%) !important; border-color: transparent !important; box-shadow: 0 0 16px rgba(99, 102, 241, 0.6) !important; }
+            .rank-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; border-radius: 50%; font-size: 11px; font-weight: 700; }
+            .rank-top3 { animation: pulse-glow 2s ease-in-out infinite; }
+            .rank-normal { background: rgba(71, 85, 105, 0.6); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.3); }
+            .flavor-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+            .flavor-name { font-weight: 500; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .flavor-qty { font-size: 11px; color: #94a3b8; background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 10px; }
+            @keyframes pulse-glow { 0%, 100% { opacity: 1; } 50% { opacity: 0.85; } }
+        `;
+        document.head.appendChild(styleEl);
 
         // Initialize chart
         renderWeeklyChart();
@@ -774,10 +835,30 @@
         document.getElementById('autoParsedFlavor').className =
             !currentFlavor ? 'text-muted' : 'text-white';
 
-        // Clear manual override fields (user fills only what needs correction)
-        document.getElementById('mappingBrand').value = '';
-        document.getElementById('mappingPuffs').value = '';
-        document.getElementById('mappingFlavor').value = '';
+        // Pre-fill manual override fields with current auto-parsed values
+        // This allows user to only modify what needs correction
+
+        // For brand: find the select option matching the current brand name
+        var brandSelect = document.getElementById('mappingBrand');
+        var brandFound = false;
+        if (currentBrand && currentBrand !== 'Unknown') {
+            for (var i = 0; i < brandSelect.options.length; i++) {
+                if (brandSelect.options[i].text === currentBrand) {
+                    brandSelect.selectedIndex = i;
+                    brandFound = true;
+                    break;
+                }
+            }
+        }
+        if (!brandFound) {
+            brandSelect.selectedIndex = 0;  // "-- 不修改 --"
+        }
+
+        // For puffs: fill in if recognized
+        document.getElementById('mappingPuffs').value = currentPuffs || '';
+
+        // For flavor: fill in if recognized
+        document.getElementById('mappingFlavor').value = currentFlavor || '';
 
         // Load sources and orders info
         document.getElementById('productSources').innerHTML = '<span class="text-muted">加载中...</span>';
