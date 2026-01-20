@@ -28,8 +28,8 @@
                 class="btn btn-quick {% if current_filters.quick_date == 'one_year' %}active{% endif %}">
                 <i class="bi bi-calendar-event me-1"></i>近一年
             </a>
-            <a href="{{ url_for('orders', manager=current_filters.manager) }}"
-                class="btn btn-outline-secondary btn-sm ms-2">
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, quick_date='all') }}"
+                class="btn btn-quick {% if current_filters.quick_date == 'all' %}active{% endif %} ms-2">
                 <i class="bi bi-arrow-counterclockwise me-1"></i>全部
             </a>
         </div>

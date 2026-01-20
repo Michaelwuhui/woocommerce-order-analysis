@@ -599,14 +599,15 @@ def dashboard():
     stats = {}
     
     # Total orders
-    stats['total_orders'] = conn.execute(f'SELECT COUNT(*) FROM orders {date_condition}', params).fetchone()[0]
+    stats['total_orders'] = conn.execute(f"SELECT COUNT(*) FROM orders {date_condition} AND status NOT IN ('checkout-draft', 'trash')", params).fetchone()[0]
     
     # Cancelled/failed orders count
     stats['cancelled_orders'] = conn.execute(f"SELECT COUNT(*) FROM orders {date_condition} AND status IN ('cancelled', 'failed')", params).fetchone()[0]
     
     # Total revenue by currency - add status filter
     revenue_conditions = conditions.copy()
-    revenue_conditions.append('status NOT IN ("failed", "cancelled")')
+    revenue_conditions = conditions.copy()
+    revenue_conditions.append('status NOT IN ("failed", "cancelled", "checkout-draft", "trash", "cheat")')
     revenue_where = 'WHERE ' + ' AND '.join(revenue_conditions)
     
     # Valid orders count (for AOV calculation)
@@ -649,13 +650,14 @@ def dashboard():
     # Query 1: All orders for total count and total revenue (销售额)
     source_data_raw = conn.execute(f'''
         SELECT source, currency, COUNT(*) as count, SUM(total) as revenue
-        FROM orders {date_condition}
+        FROM orders {date_condition} AND status NOT IN ('checkout-draft', 'trash')
         GROUP BY source, currency
     ''', params).fetchall()
     
     # Query 2: Only successful orders for net revenue (净销售额)
     source_success_conditions = conditions.copy()
-    source_success_conditions.append('status NOT IN ("failed", "cancelled")')
+    source_success_conditions = conditions.copy()
+    source_success_conditions.append('status NOT IN ("failed", "cancelled", "checkout-draft", "trash", "cheat")')
     source_success_where = 'WHERE ' + ' AND '.join(source_success_conditions)
     
     source_success_raw = conn.execute(f'''
@@ -747,7 +749,7 @@ def dashboard():
             SELECT strftime('%Y-%m-%d', date_created) as period, 
                    COUNT(*) as orders,
                    SUM(total) as revenue
-            FROM orders {date_condition}
+            FROM orders {date_condition} AND status NOT IN ('checkout-draft', 'trash')
             GROUP BY period
             ORDER BY period
         ''', params).fetchall()
@@ -757,7 +759,7 @@ def dashboard():
             SELECT strftime('%Y-%m', date_created) as period, 
                    COUNT(*) as orders,
                    SUM(total) as revenue
-            FROM orders {date_condition}
+            FROM orders {date_condition} AND status NOT IN ('checkout-draft', 'trash')
             GROUP BY period
             ORDER BY period
         ''', params).fetchall()
@@ -919,6 +921,10 @@ def orders():
     page = int(request.args.get('page', 1))
     per_page = 20
     
+    # Default to 'this_month' if no filters are active
+    if not any([quick_date, date_from, date_to, search]):
+        quick_date = 'this_month'
+    
     # Get all managers
     all_managers = get_all_managers()
     
@@ -978,6 +984,10 @@ def orders():
     if status_filter:
         conditions.append('status = ?')
         params.append(status_filter)
+    else:
+        # Default behavior: exclude draft/trash unless filtered
+        conditions.append("status NOT IN ('checkout-draft', 'trash')")
+        
     if date_from:
         conditions.append('date_created >= ?')
         params.append(date_from)
@@ -996,9 +1006,9 @@ def orders():
             COUNT(*) as total_orders,
             SUM(total) as total_amount,
             SUM(shipping_total) as total_shipping,
-            SUM(CASE WHEN status NOT IN ('failed','cancelled') THEN 1 ELSE 0 END) as success_orders,
-            SUM(CASE WHEN status NOT IN ('failed','cancelled') THEN total ELSE 0 END) as success_amount,
-            SUM(CASE WHEN status NOT IN ('failed','cancelled') THEN shipping_total ELSE 0 END) as success_shipping,
+            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') THEN 1 ELSE 0 END) as success_orders,
+            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') THEN total ELSE 0 END) as success_amount,
+            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') THEN shipping_total ELSE 0 END) as success_shipping,
             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_orders,
             SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled_orders
         FROM orders {where_clause} GROUP BY source, currency
@@ -1417,7 +1427,7 @@ def monthly():
         total_products = gdf['product_qty'].sum()
         total_amount = gdf['total'].sum()
         
-        success_mask = ~gdf['status'].isin(['failed', 'cancelled'])
+        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat'])
         success_orders = int(success_mask.sum())
         success_amount = gdf.loc[success_mask, 'total'].sum()
         success_products = gdf.loc[success_mask, 'product_qty'].sum()
@@ -2212,7 +2222,7 @@ def get_customer_details(email):
     orders = conn.execute('''
         SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing
         FROM orders
-        WHERE billing LIKE ?
+        WHERE billing LIKE ? AND status NOT IN ('checkout-draft', 'trash')
         ORDER BY date_created DESC
     ''', (f'%"{email}"%',)).fetchall()
     
@@ -4155,6 +4165,20 @@ def clean_all_sites():
                         else:
                             SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] No orphaned orders in {site_url}")
                             
+                        # Clean up draft/trash orders regardless of remote status
+                        conn = get_db_connection()
+                        draft_orders = conn.execute("SELECT id FROM orders WHERE source = ? AND status IN ('checkout-draft', 'trash')", (site_url,)).fetchall()
+                        draft_ids = [str(o['id']) for o in draft_orders]
+                        
+                        if draft_ids:
+                            placeholders = ','.join(['?' for _ in draft_ids])
+                            conn.execute(f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})", 
+                                         [site_url] + list(draft_ids))
+                            conn.commit()
+                            total_deleted += len(draft_ids)
+                            SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Deleted {len(draft_ids)} draft/trash orders from {site_url}")
+                        conn.close()
+                            
                     except Exception as e:
                         SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)[:100]}")
                 
@@ -4635,7 +4659,7 @@ def products():
         date_to = ''
     
     # Build filter conditions with permission check
-    conditions = ["status NOT IN ('failed', 'cancelled')"]
+    conditions = ["status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat')"]
     params = []
     
     # Add permission filter
