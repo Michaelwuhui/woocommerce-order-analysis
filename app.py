@@ -2808,9 +2808,16 @@ def parse_product_name(name, brands_cache=None):
     result = {'brand': None, 'series': None, 'puffs': None, 'flavor': None, 'normalized': None}
     
     # 1. Extract puff count
-    puff_match = re.search(r'(\d+)\s*puffs?', name, re.IGNORECASE)
+    # Handle optional "+" and Polish term "zaciągnięć"
+    puff_match = re.search(r'(\d+)\+?\s*(?:puffs?|zaciągnięć)', name, re.IGNORECASE)
     if puff_match:
         result['puffs'] = int(puff_match.group(1))
+    else:
+        # Fallback: Look for "Number Disposable" pattern e.g. "9000 Disposable"
+        # Only for numbers >= 100 to avoid matching "1 Disposable"
+        disposable_match = re.search(r'(\d{3,})\s*Disposable', name, re.IGNORECASE)
+        if disposable_match:
+            result['puffs'] = int(disposable_match.group(1))
     
     # 2. Get brands from cache or database
     if brands_cache is None:
@@ -4531,6 +4538,49 @@ def update_user_permissions(user_id):
 
 # ============== PRODUCT ANALYSIS ==============
 
+@app.route('/api/products/mapping', methods=['POST'])
+@login_required
+@editor_required
+def save_product_mapping():
+    """Save manual product mapping"""
+    try:
+        data = request.json
+        raw_name = data.get('raw_name')
+        brand_name = data.get('brand_name')
+        puff_count = data.get('puff_count')
+        flavor = data.get('flavor')
+        
+        if not raw_name:
+            return jsonify({'success': False, 'error': 'Product name is required'})
+            
+        conn = get_db_connection()
+        
+        # Resolve brand_id if brand provided
+        brand_id = None
+        if brand_name:
+            brand_row = conn.execute('SELECT id FROM brands WHERE name = ?', (brand_name,)).fetchone()
+            if brand_row:
+                brand_id = brand_row['id']
+        
+        # Insert or update mapping
+        conn.execute('''
+            INSERT INTO product_mappings (raw_name, brand_id, puff_count, flavor, is_manual, source)
+            VALUES (?, ?, ?, ?, 1, 'manual')
+            ON CONFLICT(raw_name, source) DO UPDATE SET
+            brand_id = excluded.brand_id,
+            puff_count = excluded.puff_count,
+            flavor = excluded.flavor,
+            updated_at = CURRENT_TIMESTAMP
+        ''', (raw_name, brand_id, puff_count, flavor))
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'success': True})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
 @app.route('/products')
 @login_required
 def products():
@@ -4670,6 +4720,7 @@ def products():
     product_stats = {}
     brand_stats = {}
     puff_stats = {}
+    unknown_products_map = {}
     
     for order in orders:
         items = parse_json_field(order['line_items'])
@@ -4793,6 +4844,17 @@ def products():
                 puff_stats[puff_key]['gross_revenue_by_currency'][currency] = 0
             puff_stats[puff_key]['revenue_by_currency'][currency] += total
             puff_stats[puff_key]['gross_revenue_by_currency'][currency] += gross_total
+            
+            # Collect unknown products for manual mapping
+            if puffs is None or brand == 'Unknown':
+                if product_name not in unknown_products_map:
+                    unknown_products_map[product_name] = {
+                        'name': product_name,
+                        'brand': brand,
+                        'puffs': puffs or 'Unknown',
+                        'count': 0
+                    }
+                unknown_products_map[product_name]['count'] += 1
     
     # Sort products by quantity (top sellers)
     top_products = sorted(product_stats.values(), key=lambda x: x['quantity'], reverse=True)[:50]

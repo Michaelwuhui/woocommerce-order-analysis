@@ -1,0 +1,116 @@
+<!-- Unknown Products Modal -->
+<div class="modal fade" id="unknownProductsModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content text-light" style="background-color: var(--bg-card);">
+            <div class="modal-header border-secondary">
+                <h5 class="modal-title"><i class="bi bi-exclamation-triangle me-2 text-warning"></i>手动映射产品信息</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="table-responsive">
+                    <table class="table table-dark table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>产品原始名称</th>
+                                <th>当前品牌</th>
+                                <th>当前口数</th>
+                                <th class="text-end">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for p in unknown_products %}
+                            <tr>
+                                <td>{{ p.name }} <br><small class="text-muted">出现 {{ p.count }} 次</small></td>
+                                <td>{{ p.brand }}</td>
+                                <td>{{ p.puffs }}</td>
+                                <td class="text-end">
+                                    <button class="btn btn-sm btn-primary" onclick='openMappingForm({{ p|tojson }})'>
+                                        修复
+                                    </button>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Fix Form (Hidden by default) -->
+                <div id="mappingForm" class="d-none mt-4 pt-4 border-top border-secondary">
+                    <h6 class="mb-3">修正产品: <span id="targetProduct" class="text-info"></span></h6>
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <label class="form-label">品牌</label>
+                            <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                id="mapBrand" list="brandList">
+                            <datalist id="brandList">
+                                {% for b in brands %}
+                                <option value="{{ b.name }}">
+                                    {% endfor %}
+                            </datalist>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">口数</label>
+                            <input type="number"
+                                class="form-control form-control-sm bg-dark text-light border-secondary" id="mapPuffs">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">口味</label>
+                            <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                id="mapFlavor">
+                        </div>
+                        <div class="col-md-2 d-flex align-items-end">
+                            <button class="btn btn-sm btn-success w-100" onclick="saveMapping()">保存</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    var currentMappingProduct = null;
+
+    function openMappingForm(product) {
+        currentMappingProduct = product.name;
+        document.getElementById('targetProduct').innerText = product.name;
+        document.getElementById('mapBrand').value = product.brand !== 'Unknown' ? product.brand : '';
+        document.getElementById('mapPuffs').value = product.puffs !== 'Unknown' ? product.puffs : '';
+        document.getElementById('mapFlavor').value = ''; // Flavor usually needs manual input for unknown ones
+
+        document.getElementById('mappingForm').classList.remove('d-none');
+    }
+
+    function saveMapping() {
+        if (!currentMappingProduct) return;
+
+        var brand = document.getElementById('mapBrand').value;
+        var puffs = document.getElementById('mapPuffs').value;
+        var flavor = document.getElementById('mapFlavor').value;
+
+        fetch('/api/products/mapping', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                raw_name: currentMappingProduct,
+                brand_id: null, // Logic in backend resolves name to ID if needed, or we send name as brand_name
+                brand_name: brand, // Backend expects brand_name to resolve ID
+                puff_count: puffs,
+                flavor: flavor
+            })
+        })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert('映射保存成功，页面将刷新以更新数据');
+                    location.reload();
+                } else {
+                    alert('保存失败: ' + data.error);
+                }
+            })
+            .catch(err => {
+                alert('请求错误');
+                console.error(err);
+            });
+    }
+</script>
