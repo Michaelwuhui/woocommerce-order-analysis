@@ -2444,6 +2444,7 @@ STATUS_LABELS = {
     'pending': '待处理',
     'processing': '处理中',
     'on-hold': '已发货',
+    'shipped': '已发货',
     'completed': '已完成',
     'cancelled': '已取消',
     'refunded': '已退款',
