@@ -6972,6 +6972,107 @@ def process_shipped_order(order, conn, carriers, ast_provider_mapping):
     }
 
 
+@app.route('/api/export_orders')
+@login_required
+@admin_required
+def export_orders():
+    """Export all orders to CSV"""
+    import csv
+    import io
+    from flask import make_response
+
+    conn = get_db_connection()
+    
+    # Get user's allowed sources
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    
+    # Build query
+    query = 'SELECT o.*, s.manager FROM orders o LEFT JOIN sites s ON o.source = s.url'
+    conditions = []
+    params = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ','.join(['?' for _ in allowed_sources])
+            conditions.append(f'o.source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+            
+    if conditions:
+        query += ' WHERE ' + ' AND '.join(conditions)
+        
+    query += ' ORDER BY o.date_created DESC'
+    
+    orders = conn.execute(query, params).fetchall()
+    conn.close()
+    
+    # Prepare CSV
+    si = io.StringIO()
+    cw = csv.writer(si)
+    
+    # Write BOM for Excel support with UTF-8
+    si.write('\ufeff')
+    
+    # Header
+    cw.writerow(['订单号', '创建日期', '状态', '来源', '负责人', '客户姓名', '客户邮箱', '产品明细', '总数量', '运费', '订单金额', '净额', '汇率', '货币', '¥净额'])
+    
+    for order in orders:
+        # Calculate CNY amount
+        currency = order['currency']
+        total = float(order['total'] or 0)
+        shipping = float(order['shipping_total'] or 0)
+        net_total = total - shipping
+        
+        month = order['date_created'][:7] if order['date_created'] else None
+        rate, _ = get_cny_rate(currency, month)
+        net_total_cny = round(net_total * rate, 2) if rate else 0
+        
+        status_text = STATUS_LABELS.get(order['status'], order['status'])
+        source = order['source'].replace('https://www.', '').replace('https://', '')
+        
+        billing = parse_json_field(order['billing'])
+        customer_name = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip()
+        
+        # Process product details
+        line_items = parse_json_field(order['line_items'])
+        product_details = []
+        total_quantity = 0
+        if isinstance(line_items, list):
+            for item in line_items:
+                qty = item.get('quantity', 0)
+                name = item.get('name', 'Unknown')
+                # Extract simplified name if possible or use full name ?? 
+                # For now use the name from line_item
+                product_details.append(f"{name} x{qty}")
+                total_quantity += qty
+        
+        products_str = " | ".join(product_details)
+        
+        cw.writerow([
+            f"#{order['number']}",
+            order['date_created'],
+            status_text,
+            source,
+            order['manager'] or '',
+            customer_name,
+            billing.get('email', ''),
+            products_str,
+            total_quantity,
+            f"{shipping:.2f}",
+            f"{total:.2f}",
+            f"{net_total:.2f}",
+            rate or '',
+            currency,
+            f"{net_total_cny:.2f}"
+        ])
+        
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = f"attachment; filename=orders_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    output.headers["Content-type"] = "text/csv"
+    return output
+
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
 

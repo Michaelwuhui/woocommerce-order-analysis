@@ -195,6 +195,11 @@
             <span class="badge bg-info ms-2">{{ current_month }} ({{ orders|length }} 条)</span>
             {% endif %}
         </h5>
+        {% if current_user.is_authenticated and current_user.is_admin() %}
+        <a href="{{ url_for('export_orders') }}" class="btn btn-success btn-sm">
+            <i class="bi bi-file-earmark-excel me-1"></i>导出所有订单
+        </a>
+        {% endif %}
     </div>
 
     <!-- Orders Table -->
