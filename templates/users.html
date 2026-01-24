@@ -157,7 +157,13 @@
                                 <i class="bi bi-truck me-1"></i>发货权限
                             </label>
                         </div>
-                        <small class="text-muted">允许该用户访问发货管理功能</small>
+                        <div class="form-check mt-2">
+                            <input class="form-check-input" type="checkbox" id="editCanViewReport">
+                            <label class="form-check-label text-white-50" for="editCanViewReport">
+                                <i class="bi bi-file-earmark-bar-graph me-1"></i>查看报告权限
+                            </label>
+                        </div>
+                        <small class="text-muted">允许该用户访问发货管理和数据报告功能</small>
                     </div>
                 </div>
                 <div class="modal-footer border-top border-secondary border-opacity-25">
@@ -231,7 +237,7 @@
             } else if (btn.classList.contains('btn-edit')) {
                 const user = window._usersData && window._usersData[userId];
                 if (user) {
-                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0);
+                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0);
                 }
             } else if (btn.classList.contains('btn-delete')) {
                 deleteUser(userId);
@@ -309,12 +315,13 @@
         });
 
         // Edit User
-        window.openEditUser = function (id, username, name, role, can_ship) {
+        window.openEditUser = function (id, username, name, role, can_ship, can_view_report) {
             document.getElementById('editUserId').value = id;
             document.getElementById('editUsername').value = username;
             document.getElementById('editName').value = name;
             document.getElementById('editRole').value = role;
             document.getElementById('editCanShip').checked = can_ship == 1;
+            document.getElementById('editCanViewReport').checked = can_view_report == 1;
             document.getElementById('editPassword').value = '';
             bootstrap.Modal.getOrCreateInstance(document.getElementById('editUserModal')).show();
         };
@@ -329,7 +336,8 @@
                     name: document.getElementById('editName').value,
                     role: document.getElementById('editRole').value,
                     password: document.getElementById('editPassword').value,
-                    can_ship: document.getElementById('editCanShip').checked ? 1 : 0
+                    can_ship: document.getElementById('editCanShip').checked ? 1 : 0,
+                    can_view_report: document.getElementById('editCanViewReport').checked ? 1 : 0
                 })
             })
                 .then(res => res.json())

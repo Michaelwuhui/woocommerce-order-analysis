@@ -64,6 +64,21 @@ class User(UserMixin):
         conn.close()
         return user and user['can_ship'] == 1
 
+    def can_view_report(self):
+        """Check if user has report viewing permission"""
+        if self.role == 'admin':
+            return True
+        # Check database for can_view_report flag
+        from flask import current_app
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_view_report FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return user and user['can_view_report'] == 1
+        except:
+            # Column might not exist yet if migration failed or legacy db
+            return False
+
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -438,6 +453,92 @@ def shipper_required(f):
             return redirect(url_for('login'))
         if not current_user.can_ship():
             return jsonify({'error': '无发货权限', 'permission': 'shipping'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def report_viewer_required(f):
+    """Decorator to require report viewing permission"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login'))
+        if not current_user.can_view_report():
+            return render_template_string('''
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>访问受限 - WooCommerce 订单分析</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: #e0e0e0;
+        }
+        .container {
+            text-align: center;
+            padding: 60px 40px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 24px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            max-width: 480px;
+        }
+        .icon {
+            width: 120px;
+            height: 120px;
+            margin: 0 auto 30px;
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(239, 68, 68, 0.1));
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 2px solid rgba(239, 68, 68, 0.3);
+        }
+        .icon i { font-size: 48px; color: #ef4444; }
+        h1 {
+            font-size: 28px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            background: linear-gradient(135deg, #f87171, #ef4444);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        p { color: #9ca3af; font-size: 16px; line-height: 1.6; margin-bottom: 30px; }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 14px 32px;
+            background: linear-gradient(135deg, #3b82f6, #2563eb);
+            color: white;
+            text-decoration: none;
+            border-radius: 12px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(59, 130, 246, 0.3); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon"><i class="bi bi-file-earmark-lock"></i></div>
+        <h1>访问受限</h1>
+        <p>您没有查看报告的权限。<br>请联系管理员申请权限。</p>
+        <a href="/" class="btn"><i class="bi bi-house"></i> 返回首页</a>
+    </div>
+</body>
+</html>
+            '''), 403
         return f(*args, **kwargs)
     return decorated_function
 
@@ -2536,6 +2637,11 @@ def init_sites_table():
         conn.execute('ALTER TABLE sites ADD COLUMN last_api_error TEXT')
     except:
         pass  # Column already exists
+    # Add tracking_api_status column for woo-tracking REST API plugin availability
+    try:
+        conn.execute('ALTER TABLE sites ADD COLUMN tracking_api_status TEXT')
+    except:
+        pass  # Column already exists
     conn.commit()
     conn.close()
 
@@ -3064,6 +3170,7 @@ def add_site():
     ck = data.get('consumer_key')
     cs = data.get('consumer_secret')
     manager = data.get('manager', '')
+    mask_id = data.get('mask_id', '')
     
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -3074,8 +3181,8 @@ def add_site():
         
     conn = get_db_connection()
     try:
-        conn.execute('INSERT INTO sites (url, consumer_key, consumer_secret, manager) VALUES (?, ?, ?, ?)',
-                     (url, ck, cs, manager))
+        conn.execute('INSERT INTO sites (url, consumer_key, consumer_secret, manager, mask_id) VALUES (?, ?, ?, ?, ?)',
+                     (url, ck, cs, manager, mask_id))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
@@ -3094,6 +3201,7 @@ def update_site(site_id):
     ck = data.get('consumer_key')
     cs = data.get('consumer_secret')
     manager = data.get('manager', '')
+    mask_id = data.get('mask_id', '')
     
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -3104,8 +3212,8 @@ def update_site(site_id):
         
     conn = get_db_connection()
     try:
-        conn.execute('UPDATE sites SET url = ?, consumer_key = ?, consumer_secret = ?, manager = ? WHERE id = ?',
-                     (url, ck, cs, manager, site_id))
+        conn.execute('UPDATE sites SET url = ?, consumer_key = ?, consumer_secret = ?, manager = ?, mask_id = ? WHERE id = ?',
+                     (url, ck, cs, manager, mask_id, site_id))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
@@ -3467,6 +3575,161 @@ def check_site_api(site_id):
 
     except Exception as e:
         return jsonify({'success': False, 'error': f"系统错误: {str(e)}"}), 500
+
+
+@app.route('/api/site/<int:site_id>/check-tracking-api', methods=['POST'])
+@login_required
+def check_tracking_api(site_id):
+    """Check if woo-tracking REST API plugin is available on the site"""
+    import requests as req
+    
+    conn = get_db_connection()
+    site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
+    
+    if not site:
+        conn.close()
+        return jsonify({'success': False, 'error': '站点不存在'}), 404
+    
+    tracking_api_url = f"{site['url']}/wp-json/woo-tracking/v1/carriers"
+    
+    # Headers to simulate official WooCommerce API client
+    headers = {
+        "User-Agent": "WooCommerce API Client-Python/3.0.0",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    try:
+        response = req.get(
+            tracking_api_url,
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=15,
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            carriers = data.get('carriers', [])
+            tracking_status = 'ok'
+            message = f"物流API可用，支持 {len(carriers)} 个物流商"
+        elif response.status_code == 404:
+            tracking_status = 'not_installed'
+            message = "物流追踪插件未安装"
+        elif response.status_code in (401, 403):
+            tracking_status = 'auth_error'
+            message = "物流API权限不足"
+        else:
+            tracking_status = 'error'
+            message = f"物流API异常 HTTP {response.status_code}"
+        
+        # Update database
+        conn.execute('UPDATE sites SET tracking_api_status = ? WHERE id = ?', (tracking_status, site_id))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'success': True,
+            'tracking_api_status': tracking_status,
+            'message': message,
+            'carriers': data.get('carriers', []) if response.status_code == 200 else []
+        })
+        
+    except req.exceptions.Timeout:
+        conn.execute('UPDATE sites SET tracking_api_status = ? WHERE id = ?', ('timeout', site_id))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': False, 'tracking_api_status': 'timeout', 'error': '连接超时'})
+    except Exception as e:
+        conn.close()
+        return jsonify({'success': False, 'error': f"检测失败: {str(e)}"}), 500
+
+
+@app.route('/api/site/<int:site_id>/email-logs')
+@login_required
+def get_site_email_logs(site_id):
+    """Get email logs from WordPress site via woo-tracking REST API"""
+    import requests as req
+    
+    conn = get_db_connection()
+    site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
+    
+    if not site:
+        conn.close()
+        return jsonify({'success': False, 'error': '站点不存在'}), 404
+    
+    conn.close()
+    
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    
+    email_logs_url = f"{site['url']}/wp-json/woo-tracking/v1/email-logs"
+    
+    headers = {
+        "User-Agent": "WooCommerce API Client-Python/3.0.0",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    try:
+        response = req.get(
+            email_logs_url,
+            params={'page': page, 'per_page': per_page},
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=30,
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            return jsonify({'success': True, **response.json()})
+        elif response.status_code == 404:
+            return jsonify({'success': False, 'error': '邮件日志API不可用', 'logs': []})
+        else:
+            return jsonify({'success': False, 'error': f'API错误 {response.status_code}', 'logs': []})
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'请求失败: {str(e)}', 'logs': []})
+
+
+@app.route('/api/site/<int:site_id>/email-stats')
+@login_required
+def get_site_email_stats(site_id):
+    """Get email statistics from WordPress site via woo-tracking REST API"""
+    import requests as req
+    
+    conn = get_db_connection()
+    site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
+    
+    if not site:
+        conn.close()
+        return jsonify({'success': False, 'error': '站点不存在'}), 404
+    
+    conn.close()
+    
+    email_stats_url = f"{site['url']}/wp-json/woo-tracking/v1/email-stats"
+    
+    headers = {
+        "User-Agent": "WooCommerce API Client-Python/3.0.0",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    try:
+        response = req.get(
+            email_stats_url,
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=15,
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            return jsonify({'success': True, **response.json()})
+        elif response.status_code == 404:
+            return jsonify({'success': False, 'error': '邮件统计API不可用'})
+        else:
+            return jsonify({'success': False, 'error': f'API错误 {response.status_code}'})
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'请求失败: {str(e)}'})
 
 
 @app.route('/api/sites/check-all', methods=['POST'])
@@ -4411,7 +4674,11 @@ def users_page():
 def get_users():
     """Get all users"""
     conn = get_db_connection()
-    users = conn.execute('SELECT id, username, name, role, can_ship, created_at FROM users').fetchall()
+    try:
+        users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, created_at FROM users').fetchall()
+    except sqlite3.OperationalError:
+        # Fallback if column doesn't exist yet
+        users = conn.execute('SELECT id, username, name, role, can_ship, 0 as can_view_report, created_at FROM users').fetchall()
     conn.close()
     return jsonify([dict(row) for row in users])
 
@@ -4457,6 +4724,7 @@ def update_user(user_id):
     role = data.get('role', 'user')
     password = data.get('password', '')
     can_ship = data.get('can_ship', 0)
+    can_view_report = data.get('can_view_report', 0)
     
     if role not in ['admin', 'user', 'viewer']:
         role = 'user'
@@ -4464,11 +4732,11 @@ def update_user(user_id):
     conn = get_db_connection()
     try:
         if password:
-            conn.execute('UPDATE users SET name = ?, role = ?, can_ship = ?, password_hash = ? WHERE id = ?',
-                        (name, role, can_ship, generate_password_hash(password), user_id))
+            conn.execute('UPDATE users SET name = ?, role = ?, can_ship = ?, can_view_report = ?, password_hash = ? WHERE id = ?',
+                        (name, role, can_ship, can_view_report, generate_password_hash(password), user_id))
         else:
-            conn.execute('UPDATE users SET name = ?, role = ?, can_ship = ? WHERE id = ?',
-                        (name, role, can_ship, user_id))
+            conn.execute('UPDATE users SET name = ?, role = ?, can_ship = ?, can_view_report = ? WHERE id = ?',
+                        (name, role, can_ship, can_view_report, user_id))
         conn.commit()
         return jsonify({'success': True})
     finally:
@@ -5830,6 +6098,8 @@ def shipping():
     allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
     if allowed_sources is None:
         sites = conn.execute('SELECT id, url, manager FROM sites').fetchall()
+    elif not allowed_sources:
+        sites = []
     else:
         placeholders = ','.join(['?' for _ in allowed_sources])
         sites = conn.execute(f'SELECT id, url, manager FROM sites WHERE url IN ({placeholders})', allowed_sources).fetchall()
@@ -5898,9 +6168,13 @@ def get_pending_orders():
     # Apply source filter
     allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
     if allowed_sources is not None:
-        placeholders = ','.join(['?' for _ in allowed_sources])
-        query += f' AND o.source IN ({placeholders})'
-        params.extend(allowed_sources)
+        if not allowed_sources:
+            # User has restricted access but valid sources list is empty -> no access
+            query += ' AND 1=0'
+        else:
+            placeholders = ','.join(['?' for _ in allowed_sources])
+            query += f' AND o.source IN ({placeholders})'
+            params.extend(allowed_sources)
     
     if source_filter:
         query += ' AND o.source = ?'
@@ -6073,7 +6347,12 @@ def get_shipped_orders():
 @login_required
 @shipper_required
 def ship_order():
-    """Execute shipping: add tracking number and update order status"""
+    """Execute shipping: add tracking number and update order status
+    
+    Supports two shipping modes:
+    - 'api': Use woo-tracking REST API to write tracking directly to WordPress
+    - 'note': Use order notes to send tracking information (legacy method)
+    """
     import requests as req
     
     data = request.json
@@ -6081,6 +6360,7 @@ def ship_order():
     tracking_number = data.get('tracking_number')
     carrier_slug = data.get('carrier_slug')
     send_email = data.get('send_email', True)
+    shipping_mode = data.get('shipping_mode', 'api')  # 'api' or 'note'
     
     if not all([order_id, tracking_number, carrier_slug]):
         return jsonify({'success': False, 'error': '缺少必填字段'}), 400
@@ -6117,86 +6397,140 @@ def ship_order():
     # Check if already has tracking log - update instead of insert
     existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
     
-    # Note: The free version of "Orders Tracking for WooCommerce" plugin does not support REST API
-    # We will still send customer notifications via order notes, which works reliably
-    
-    
-    
     # Track any warnings during the process
     warnings = []
+    used_mode = shipping_mode  # Track actual mode used (may fallback)
     
-    # Add order note with tracking information
-    # Note: customer_note=True will send email notification (if send_email is True)
-    #       customer_note=False will just add internal note without email
-    try:
-        note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
-        
-        if tracking_url:
-            note_content = f"Order has been shipped via {carrier_name}. Tracking Number: <a href='{tracking_url}'>{tracking_number}</a>"
-            note_content += f"\n<br>Track your package: <a href='{tracking_url}'>{tracking_url}</a>"
-        else:
-            note_content = f"Order has been shipped via {carrier_name}. Tracking Number: {tracking_number}"
-        
-        # Retry logic with shorter timeout for problematic sites
-        max_retries = 2 if send_email else 1  # 发送邮件时重试，不发送时只尝试1次
-        timeout_seconds = 45 if send_email else 15  # 发送邮件时用更长超时
-        
-        # Define headers to simulate the official WooCommerce API client
-        # This is critical to avoid being throttled/blocked by WAFs that block/delay 'python-requests'
-        api_headers = {
-            "User-Agent": "WooCommerce API Client-Python/3.0.0",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        
-        for attempt in range(max_retries):
-            try:
-                note_resp = req.post(
-                    note_url,
-                    json={
-                        'note': note_content, 
-                        'customer_note': send_email  # 关键：只在需要发邮件时设为 True
-                    },
-                    auth=(site['consumer_key'], site['consumer_secret']),
-                    timeout=timeout_seconds,
-                    headers=api_headers
-                )
-                if note_resp.status_code in [200, 201]:
-                    break
-                elif attempt < max_retries - 1:
-                    print(f"Retry {attempt + 1}: Note API returned {note_resp.status_code}")
-                    import time
-                    time.sleep(1)
-                else:
-                    error_msg = f"API returned {note_resp.status_code}: {note_resp.text}"
-                    print(f"Warning: Failed to add note: {error_msg}")
-                    warnings.append(f"添加备注失败: {error_msg}")
-            except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
-                # Connection error handling
-                if attempt < max_retries - 1:
-                    print(f"Connection error attempt {attempt + 1}, retrying: {str(e)}")
-                    import time
-                    time.sleep(1)
-                else:
-                    print(f"Warning: Failed to add note due to connection issue: {str(e)}")
-                    warnings.append(f"添加备注连接超时")
-    except Exception as e:
-        print(f"Error adding note: {e}")
-        warnings.append(f"添加备注出错: {str(e)}")
-
-    # [Optimization] If note addition failed (likely timeout), the server might be busy or session locked.
-    # Wait a bit before trying to update status to give server time to recover.
-    if warnings:
-        print("Note addition failed, waiting 5s before status update to avoid lock...")
-        import time
-        time.sleep(5)
-
-    # 3. Update order status (Remote)
-    # Using "Verify-After-Write" strategy to handle connection timeouts
-    remote_status_updated = False
-    status_verification_success = False
+    # Define headers for all API calls
+    api_headers = {
+        "User-Agent": "WooCommerce API Client-Python/3.0.0",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
     
-    if order['status'] != 'on-hold':
+    # ===== API MODE: Use woo-tracking REST API =====
+    api_tracking_success = False
+    if shipping_mode == 'api':
+        # Use URL params for auth to avoid WordPress Basic Auth interception
+        tracking_api_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['number']}/tracking?consumer_key={site['consumer_key']}&consumer_secret={site['consumer_secret']}"
+        
+        print(f"[DEBUG] API Mode - URL: {site['url']}/wp-json/woo-tracking/v1/orders/{order['number']}/tracking")
+        print(f"[DEBUG] API Mode - Order Number: {order['number']}, Tracking: {tracking_number}")
+        
+        try:
+            # Call woo-tracking plugin API (no Basic Auth, using URL params)
+            tracking_resp = req.post(
+                tracking_api_url,
+                json={
+                    'tracking_number': tracking_number,
+                    'carrier_slug': carrier_slug,
+                    'send_email': send_email,
+                    'change_order_status': 'on-hold'  # Also change status via plugin
+                },
+                timeout=45,
+                headers=api_headers
+            )
+            
+            print(f"[DEBUG] API Response - Status: {tracking_resp.status_code}")
+            print(f"[DEBUG] API Response - Body: {tracking_resp.text[:500] if tracking_resp.text else 'empty'}")
+            
+            # Check if response is HTML (plugin not installed or auth error)
+            response_text = tracking_resp.text or ''
+            if response_text.strip().startswith('<!') or response_text.strip().startswith('<html'):
+                print(f"[DEBUG] API returned HTML instead of JSON - plugin may not be installed")
+                warnings.append("物流API返回HTML(插件未安装或认证失败)，已回退到备注模式")
+                used_mode = 'note'
+            elif tracking_resp.status_code in [200, 201]:
+                api_tracking_success = True
+                try:
+                    response_data = tracking_resp.json()
+                    print(f"API mode success: {response_data}")
+                except Exception as json_err:
+                    print(f"[DEBUG] JSON parse error: {json_err}")
+                    warnings.append(f"API响应解析失败，已回退到备注模式")
+                    used_mode = 'note'
+                    api_tracking_success = False
+            elif tracking_resp.status_code == 404:
+                # Plugin not installed, fallback to note mode
+                warnings.append(f"物流API不可用(404)，已回退到备注模式")
+                used_mode = 'note'
+            else:
+                # API error, fallback to note mode
+                error_preview = response_text[:200] if response_text else 'no content'
+                warnings.append(f"物流API返回 {tracking_resp.status_code}: {error_preview}，已回退到备注模式")
+                used_mode = 'note'
+                
+        except req.exceptions.Timeout:
+            warnings.append("物流API超时，已回退到备注模式")
+            used_mode = 'note'
+        except Exception as e:
+            warnings.append(f"物流API异常: {str(e)}，已回退到备注模式")
+            used_mode = 'note'
+    
+    # ===== NOTE MODE: Add order note with tracking info =====
+    if used_mode == 'note' or (shipping_mode == 'api' and not api_tracking_success):
+        # Add order note with tracking information
+        try:
+            note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+            
+            if tracking_url:
+                note_content = f"Order has been shipped via {carrier_name}. Tracking Number: <a href='{tracking_url}'>{tracking_number}</a>"
+                note_content += f"\n<br>Track your package: <a href='{tracking_url}'>{tracking_url}</a>"
+            else:
+                note_content = f"Order has been shipped via {carrier_name}. Tracking Number: {tracking_number}"
+            
+            # Retry logic with shorter timeout for problematic sites
+            max_retries = 2 if send_email else 1  # 发送邮件时重试，不发送时只尝试1次
+            timeout_seconds = 45 if send_email else 15  # 发送邮件时用更长超时
+            
+            for attempt in range(max_retries):
+                try:
+                    note_resp = req.post(
+                        note_url,
+                        json={
+                            'note': note_content, 
+                            'customer_note': send_email  # 关键：只在需要发邮件时设为 True
+                        },
+                        auth=(site['consumer_key'], site['consumer_secret']),
+                        timeout=timeout_seconds,
+                        headers=api_headers
+                    )
+                    if note_resp.status_code in [200, 201]:
+                        break
+                    elif attempt < max_retries - 1:
+                        print(f"Retry {attempt + 1}: Note API returned {note_resp.status_code}")
+                        import time
+                        time.sleep(1)
+                    else:
+                        error_msg = f"API returned {note_resp.status_code}: {note_resp.text}"
+                        print(f"Warning: Failed to add note: {error_msg}")
+                        warnings.append(f"添加备注失败: {error_msg}")
+                except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
+                    # Connection error handling
+                    if attempt < max_retries - 1:
+                        print(f"Connection error attempt {attempt + 1}, retrying: {str(e)}")
+                        import time
+                        time.sleep(1)
+                    else:
+                        print(f"Warning: Failed to add note due to connection issue: {str(e)}")
+                        warnings.append(f"添加备注连接超时")
+        except Exception as e:
+            print(f"Error adding note: {e}")
+            warnings.append(f"添加备注出错: {str(e)}")
+        
+        # Wait a bit before trying to update status if note failed
+        if warnings:
+            print("Note addition failed, waiting 5s before status update to avoid lock...")
+            import time
+            time.sleep(5)
+
+    # ===== STATUS UPDATE: Only needed if not using API mode successfully =====
+    # API mode already handles status change via plugin
+    remote_status_updated = api_tracking_success  # If API succeeded, status was already updated
+    status_verification_success = api_tracking_success
+    
+    # Only update status if API mode didn't already do it
+    if order['status'] != 'on-hold' and not api_tracking_success:
         status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
         # Retry logic for status update
         max_retries = 3
@@ -6288,9 +6622,10 @@ def ship_order():
         
         if warnings:
             warning_msg = "本地发货成功，但远程同步有警告: " + "; ".join(warnings)
-            return jsonify({'success': True, 'message': warning_msg, 'warning': True})
+            return jsonify({'success': True, 'message': warning_msg, 'warning': True, 'mode': used_mode})
         else:
-            return jsonify({'success': True, 'message': '发货成功'})
+            mode_label = 'API模式' if used_mode == 'api' and api_tracking_success else '备注模式'
+            return jsonify({'success': True, 'message': f'发货成功（{mode_label}）', 'mode': used_mode})
             
     except Exception as e:
         conn.close()
@@ -6541,7 +6876,8 @@ def update_order_status(order_id):
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
     
     # Check if site has write permission
-    if site.get('api_write_status') == 'error':
+    api_write_status = site['api_write_status'] if 'api_write_status' in site.keys() else None
+    if api_write_status == 'error':
         conn.close()
         return jsonify({'success': False, 'error': '该站点没有API写入权限，无法修改订单状态'}), 403
     
@@ -6568,6 +6904,9 @@ def update_order_status(order_id):
         # 1. Update order status via WooCommerce API
         status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
         
+        print(f"[DEBUG] Update Status - URL: {status_url}")
+        print(f"[DEBUG] Update Status - Order Number: {order['number']}, New Status: {new_status}")
+        
         status_resp = req.put(
             status_url,
             json={'status': new_status},
@@ -6576,8 +6915,16 @@ def update_order_status(order_id):
             headers=api_headers
         )
         
+        print(f"[DEBUG] Update Status - Response Code: {status_resp.status_code}")
+        
+        # Check if response is HTML instead of JSON
+        response_text = status_resp.text or ''
+        if response_text.strip().startswith('<!') or response_text.strip().startswith('<html'):
+            print(f"[DEBUG] API returned HTML: {response_text[:200]}")
+            raise Exception(f"WordPress返回HTML而非JSON，可能是WAF阻止或认证问题")
+        
         if status_resp.status_code not in [200, 201]:
-            raise Exception(f"远程API错误: {status_resp.status_code} - {status_resp.text[:200]}")
+            raise Exception(f"远程API错误: {status_resp.status_code} - {response_text[:200]}")
         
         # 2. Add order note documenting the change
         note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
@@ -7073,6 +7420,290 @@ def export_orders():
     return output
 
 
+
+
+# ============== 51.LA API INTEGRATION ==============
+
+# 51.la API Configuration
+LA_API_CONFIG = {
+    'access_key': 'j4dwJjSlJ30MUnhEdfRDqVDcbDuB6UTz',
+    'secret_key': 'F3r4EIJpqhCl9hYZ5MI6m667WdgRX14c',
+    'api_url': 'https://v6-open.51.la/open/trend/day',
+    'sites': {
+        'strefajednorazowek.pl': 'KqaoIzZaCgNcnxBY',
+        'buchmistrz.pl': 'KqmtdhxdOsN9a7i7',
+        'vapepolska.pl': 'L2T2pX4NmvjHYcyO',
+        'vapeprime.pl': 'L1loh4Allytc0m4m',
+        'vapico.pl': 'L4Nl5AtWBgRcaVlT',
+    }
+}
+
+
+def fetch_51la_traffic(mask_id, start_day, end_day):
+    """
+    Fetch traffic data from 51.la API
+    Low security mode: sign = accessKey
+    """
+    import requests
+    import time
+    import random
+    import string
+    
+    timestamp = str(int(time.time() * 1000))
+    nonce = ''.join(random.choices(string.ascii_letters + string.digits, k=4))
+    
+    payload = {
+        'maskId': mask_id,
+        'startDay': start_day,
+        'endDay': end_day,
+        'accessKey': LA_API_CONFIG['access_key'],
+        'nonce': nonce,
+        'timestamp': timestamp,
+        'sign': LA_API_CONFIG['access_key']  # Low security mode
+    }
+    
+    headers = {'Content-Type': 'application/json'}
+    
+    try:
+        response = requests.post(LA_API_CONFIG['api_url'], json=payload, headers=headers, timeout=30)
+        result = response.json()
+        
+        if result.get('success') and result.get('code') == '0000':
+            return result.get('data', [])
+        else:
+            app.logger.error(f"51.la API error: {result.get('message')}")
+            return []
+    except Exception as e:
+        app.logger.error(f"51.la API request failed: {e}")
+        return []
+
+
+def get_all_traffic_data(start_day, end_day):
+    """Fetch traffic data for all configured sites"""
+    all_traffic = {}
+    
+    for site_name, mask_id in LA_API_CONFIG['sites'].items():
+        traffic = fetch_51la_traffic(mask_id, start_day, end_day)
+        all_traffic[site_name] = traffic
+    
+    return all_traffic
+
+
+def aggregate_traffic_by_month(traffic_data):
+    """Aggregate daily traffic data by month"""
+    from collections import defaultdict
+    
+    monthly = defaultdict(lambda: {
+        'uv': 0, 'pv': 0, 'newUserCount': 0, 'sv': 0, 'ip': 0,
+        'bounceRate_sum': 0, 'bounceRate_count': 0
+    })
+    
+    for day_data in traffic_data:
+        time_str = day_data.get('time', '')
+        if len(time_str) >= 7:
+            month = time_str[:7]  # YYYY-MM
+            monthly[month]['uv'] += day_data.get('uv', 0)
+            monthly[month]['pv'] += day_data.get('pv', 0)
+            monthly[month]['newUserCount'] += day_data.get('newUserCount', 0)
+            monthly[month]['sv'] += day_data.get('sv', 0)
+            monthly[month]['ip'] += day_data.get('ip', 0)
+            monthly[month]['bounceRate_sum'] += day_data.get('bounceRate', 0)
+            monthly[month]['bounceRate_count'] += 1
+    
+    # Calculate average bounce rate
+    result = {}
+    for month, data in monthly.items():
+        result[month] = {
+            'uv': data['uv'],
+            'pv': data['pv'],
+            'newUserCount': data['newUserCount'],
+            'sv': data['sv'],
+            'ip': data['ip'],
+            'bounceRate': round(data['bounceRate_sum'] / data['bounceRate_count'], 4) if data['bounceRate_count'] > 0 else 0
+        }
+    
+    return result
+
+
+def get_orders_by_month_for_report(start_date, end_date, source=None):
+    """Get orders aggregated by source and month for report"""
+    conn = get_db_connection()
+    
+    query = '''
+        SELECT 
+            source,
+            strftime('%Y-%m', date_created) as month,
+            COUNT(*) as order_count,
+            SUM(total) as total_amount,
+            SUM(total - shipping_total) as net_amount,
+            currency,
+            SUM(CASE WHEN status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') 
+                THEN total - shipping_total ELSE 0 END) as success_net
+        FROM orders
+        WHERE date_created >= ? AND date_created <= ?
+          AND status NOT IN ('checkout-draft', 'trash')
+    '''
+    params = [start_date, end_date + 'T23:59:59']
+    
+    if source:
+        query += ' AND source = ?'
+        params.append(source)
+    
+    query += ' GROUP BY source, month, currency ORDER BY source, month'
+    
+    orders = conn.execute(query, params).fetchall()
+    conn.close()
+    
+    result = {}
+    for row in orders:
+        source = row['source']
+        month = row['month']
+        currency = row['currency']
+        
+        if source not in result:
+            result[source] = {}
+        
+        if month not in result[source]:
+            result[source][month] = {
+                'order_count': 0,
+                'total_amount': 0,
+                'net_amount': 0,
+                'net_cny': 0
+            }
+        
+        rate, _ = get_cny_rate(currency, month)
+        rate = rate or 1
+        
+        result[source][month]['order_count'] += row['order_count']
+        result[source][month]['total_amount'] += row['total_amount'] or 0
+        result[source][month]['net_amount'] += row['success_net'] or 0
+        result[source][month]['net_cny'] += (row['success_net'] or 0) * rate
+    
+    return result
+
+
+@app.route('/report')
+@login_required
+@report_viewer_required
+def report():
+    """Combined traffic and orders report page"""
+    return render_template('report.html')
+
+
+@app.route('/api/report/data')
+@login_required
+@report_viewer_required
+def api_report_data():
+    """API to get combined report data"""
+    from datetime import datetime, timedelta
+    
+    start_date = request.args.get('start_date', '')
+    end_date = request.args.get('end_date', '')
+    
+    if not end_date:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+    if not start_date:
+        start_dt = datetime.now() - timedelta(days=180)
+        start_date = start_dt.strftime('%Y-%m-%d')
+    
+    all_traffic = {}
+    orders_data = get_orders_by_month_for_report(start_date, end_date)
+    
+    # Get sites config from database
+    conn = get_db_connection()
+    db_sites = conn.execute('SELECT url, mask_id FROM sites').fetchall()
+    conn.close()
+    
+    def normalize_domain(url):
+        return url.lower().replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
+
+    # Create mask_id mapping (normalized)
+    site_mask_map = {}
+    for site in db_sites:
+        domain = normalize_domain(site['url'])
+        if site['mask_id']:
+            site_mask_map[domain] = site['mask_id']
+            
+    # Add hardcoded sites if not in DB (backward compatibility)
+    for site, mask_id in LA_API_CONFIG['sites'].items():
+        norm_site = normalize_domain(site)
+        if norm_site not in site_mask_map:
+            site_mask_map[norm_site] = mask_id
+            
+    # Fetch traffic data for each site
+    for site_name, mask_id in site_mask_map.items():
+        traffic = fetch_51la_traffic(mask_id, start_date, end_date)
+        if traffic:
+            all_traffic[site_name] = traffic
+
+    combined = {}
+    all_months = set()
+    
+    for site_name, traffic_list in all_traffic.items():
+        if site_name not in combined:
+            combined[site_name] = {}
+        
+        monthly_traffic = aggregate_traffic_by_month(traffic_list)
+        
+        for month, data in monthly_traffic.items():
+            all_months.add(month)
+            if month not in combined[site_name]:
+                combined[site_name][month] = {}
+            combined[site_name][month]['uv'] = data['uv']
+            combined[site_name][month]['pv'] = data['pv']
+            combined[site_name][month]['newUserCount'] = data['newUserCount']
+            combined[site_name][month]['bounceRate'] = data['bounceRate']
+    
+    for source, months in orders_data.items():
+        site_name = None
+        norm_source = normalize_domain(source)
+        
+        # 1. Direct match
+        if norm_source in site_mask_map:
+            site_name = norm_source
+        else:
+            # 2. Partial match (in case source implies a known site)
+            for name in site_mask_map.keys():
+                if name in norm_source:
+                    site_name = name
+                    break
+        
+        if not site_name:
+            site_name = norm_source # Fallback to normalized source, at least it cleans up 'https://'
+        
+        if site_name not in combined:
+            combined[site_name] = {}
+        
+        for month, data in months.items():
+            all_months.add(month)
+            if month not in combined[site_name]:
+                combined[site_name][month] = {}
+            
+            current = combined[site_name][month]
+            current['order_count'] = current.get('order_count', 0) + data['order_count']
+            current['total_amount'] = current.get('total_amount', 0) + data['total_amount']
+            current['net_amount'] = current.get('net_amount', 0) + data['net_amount']
+            current['net_cny'] = current.get('net_cny', 0) + data['net_cny']
+    
+    for site_name, months in combined.items():
+        for month, data in months.items():
+            uv = data.get('uv', 0)
+            orders = data.get('order_count', 0)
+            net_cny = data.get('net_cny', 0)
+            
+            data['conversion_rate'] = round(orders / uv * 100, 2) if uv > 0 else None
+            data['aov_cny'] = round(net_cny / orders, 2) if orders > 0 else None
+    
+    sorted_months = sorted(all_months)
+    
+    return jsonify({
+        'success': True,
+        'data': combined,
+        'months': sorted_months,
+        'sites': list(site_mask_map.keys()),
+        'date_range': {'start': start_date, 'end': end_date}
+    })
+
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
-

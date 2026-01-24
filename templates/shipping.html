@@ -182,6 +182,20 @@
                     <input class="form-check-input" type="checkbox" id="shipSendEmail" checked>
                     <label class="form-check-label text-white-50" for="shipSendEmail">发送邮件通知客户</label>
                 </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">发货模式</label>
+                    <div class="btn-group w-100" role="group">
+                        <input type="radio" class="btn-check" name="shipMode" id="modeAPI" value="api" checked>
+                        <label class="btn btn-outline-primary" for="modeAPI">
+                            <i class="bi bi-plug me-1"></i>API模式
+                        </label>
+                        <input type="radio" class="btn-check" name="shipMode" id="modeNote" value="note">
+                        <label class="btn btn-outline-secondary" for="modeNote">
+                            <i class="bi bi-chat-left-text me-1"></i>备注模式
+                        </label>
+                    </div>
+                    <small class="text-muted d-block mt-1">API模式直接写入物流信息，备注模式通过订单备注发送</small>
+                </div>
             </div>
             <div class="modal-footer border-top border-secondary border-opacity-25">
                 <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
@@ -246,77 +260,142 @@
             </div>
         </div>
     </div>
-</div>
 
-<script>
-    document.addEventListener('DOMContentLoaded', function () {
-        // Initialize date pickers
-        var dateConfig = {
-            locale: 'zh',
-            dateFormat: 'Y-m-d',
-            altInput: true,
-            altFormat: 'Y年m月d日',
-            allowInput: true,
-            disableMobile: true
-        };
-        flatpickr('#dateFrom', dateConfig);
-        flatpickr('#dateTo', dateConfig);
+    <!-- Email Logs Modal -->
+    <div class="modal fade" id="emailLogsModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content bg-dark border border-secondary border-opacity-25">
+                <div class="modal-header border-bottom border-secondary border-opacity-25">
+                    <h5 class="modal-title text-white"><i class="bi bi-envelope me-2"></i>邮件发送记录</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="emailLogsSiteId">
 
-        loadOrders();
+                    <!-- Email Stats -->
+                    <div class="row mb-4" id="emailStatsRow">
+                        <div class="col-md-4">
+                            <div class="card bg-success bg-opacity-10 border-success border-opacity-25 h-100">
+                                <div class="card-body text-center py-3">
+                                    <div class="text-success h3 mb-0" id="emailStatsSent">0</div>
+                                    <small class="text-success-50">发送成功</small>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card bg-danger bg-opacity-10 border-danger border-opacity-25 h-100">
+                                <div class="card-body text-center py-3">
+                                    <div class="text-danger h3 mb-0" id="emailStatsFailed">0</div>
+                                    <small class="text-danger-50">发送失败</small>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card bg-info bg-opacity-10 border-info border-opacity-25 h-100">
+                                <div class="card-body text-center py-3">
+                                    <div class="text-info h3 mb-0" id="emailStatsRate">0%</div>
+                                    <small class="text-info-50">成功率</small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
 
-        // Filter change handlers
-        document.getElementById('siteFilter').addEventListener('change', loadOrders);
-        document.getElementById('managerFilter').addEventListener('change', loadOrders);
-        document.getElementById('dateFrom').addEventListener('change', loadOrders);
-        document.getElementById('dateTo').addEventListener('change', loadOrders);
+                    <!-- Email Logs Table -->
+                    <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                        <table class="table table-dark table-hover align-middle mb-0"
+                            style="--bs-table-bg: transparent;">
+                            <thead>
+                                <tr>
+                                    <th>时间</th>
+                                    <th>收件人</th>
+                                    <th>主题</th>
+                                    <th>状态</th>
+                                </tr>
+                            </thead>
+                            <tbody id="emailLogsTableBody">
+                                <tr>
+                                    <td colspan="4" class="text-center py-4 text-muted">加载中...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="modal-footer border-top border-secondary border-opacity-25">
+                    <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">关闭</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
-        // Search enter key
-        document.getElementById('searchInput').addEventListener('keypress', function (e) {
-            if (e.key === 'Enter') loadOrders();
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            // Initialize date pickers
+            var dateConfig = {
+                locale: 'zh',
+                dateFormat: 'Y-m-d',
+                altInput: true,
+                altFormat: 'Y年m月d日',
+                allowInput: true,
+                disableMobile: true
+            };
+            flatpickr('#dateFrom', dateConfig);
+            flatpickr('#dateTo', dateConfig);
+
+            loadOrders();
+
+            // Filter change handlers
+            document.getElementById('siteFilter').addEventListener('change', loadOrders);
+            document.getElementById('managerFilter').addEventListener('change', loadOrders);
+            document.getElementById('dateFrom').addEventListener('change', loadOrders);
+            document.getElementById('dateTo').addEventListener('change', loadOrders);
+
+            // Search enter key
+            document.getElementById('searchInput').addEventListener('keypress', function (e) {
+                if (e.key === 'Enter') loadOrders();
+            });
+
+            // Tab change - reload data
+            document.querySelectorAll('#shippingTabs a').forEach(tab => {
+                tab.addEventListener('shown.bs.tab', loadOrders);
+            });
+
+            // Confirm ship button
+            document.getElementById('confirmShipBtn').addEventListener('click', shipOrder);
+
+            // Confirm note button
+            document.getElementById('confirmNoteBtn').addEventListener('click', addNote);
+
+            // Print list button
+            document.getElementById('printListBtn').addEventListener('click', printTodayList);
+            document.getElementById('printPendingBtn').addEventListener('click', printPendingList);
         });
 
-        // Tab change - reload data
-        document.querySelectorAll('#shippingTabs a').forEach(tab => {
-            tab.addEventListener('shown.bs.tab', loadOrders);
-        });
+        function loadOrders() {
+            const source = document.getElementById('siteFilter').value;
+            const manager = document.getElementById('managerFilter').value;
+            const dateFrom = document.getElementById('dateFrom').value;
+            const dateTo = document.getElementById('dateTo').value;
+            const search = document.getElementById('searchInput').value;
 
-        // Confirm ship button
-        document.getElementById('confirmShipBtn').addEventListener('click', shipOrder);
+            const params = new URLSearchParams({
+                source: source,
+                manager: manager,
+                start_date: dateFrom,
+                end_date: dateTo,
+                search: search
+            });
 
-        // Confirm note button
-        document.getElementById('confirmNoteBtn').addEventListener('click', addNote);
-
-        // Print list button
-        document.getElementById('printListBtn').addEventListener('click', printTodayList);
-        document.getElementById('printPendingBtn').addEventListener('click', printPendingList);
-    });
-
-    function loadOrders() {
-        const source = document.getElementById('siteFilter').value;
-        const manager = document.getElementById('managerFilter').value;
-        const dateFrom = document.getElementById('dateFrom').value;
-        const dateTo = document.getElementById('dateTo').value;
-        const search = document.getElementById('searchInput').value;
-
-        const params = new URLSearchParams({
-            source: source,
-            manager: manager,
-            start_date: dateFrom,
-            end_date: dateTo,
-            search: search
-        });
-
-        // Load pending orders
-        fetch(`/api/shipping/pending?${params.toString()}`)
-            .then(res => res.json())
-            .then(orders => {
-                document.getElementById('pendingCount').textContent = `待发货: ${orders.length}`;
-                const tbody = document.getElementById('pendingOrdersBody');
-                if (orders.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4 text-muted">暂无待发货订单</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = orders.map(o => `
+            // Load pending orders
+            fetch(`/api/shipping/pending?${params.toString()}`)
+                .then(res => res.json())
+                .then(orders => {
+                    document.getElementById('pendingCount').textContent = `待发货: ${orders.length}`;
+                    const tbody = document.getElementById('pendingOrdersBody');
+                    if (orders.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4 text-muted">暂无待发货订单</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = orders.map(o => `
                 <tr>
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a></div>
@@ -336,12 +415,12 @@
                         <!-- Smart Shipping Info -->
                         <div class="mt-1">
                             ${(() => {
-                        const method = (o.shipping_method || '').toLowerCase();
-                        const isInPost = o.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
-                        const isDPD = method.includes('dpd');
+                            const method = (o.shipping_method || '').toLowerCase();
+                            const isInPost = o.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
+                            const isDPD = method.includes('dpd');
 
-                        if (isInPost) {
-                            return `<div>
+                            if (isInPost) {
+                                return `<div>
                                         <div class="d-flex align-items-center">
                                             <span class="badge me-2" style="background-color: #FFCC00; color: #000; font-weight: 700;">InPost</span>
                                             <span class="text-white small font-monospace">${o.customer_inpost_id || ''}</span>
@@ -349,18 +428,18 @@
                                         ${o.customer_address_2 ? `<div class="text-warning small mt-1 font-monospace"><i class="bi bi-geo-alt me-1"></i>${o.customer_address_2}</div>` : ''}
                                         ${!o.customer_inpost_id ? `<div class="text-muted small text-break mt-1">${o.customer_address || ''}</div>` : ''}
                                     </div>`;
-                        } else if (isDPD) {
-                            return `<div>
+                            } else if (isDPD) {
+                                return `<div>
                                         <div class="mb-1"><span class="badge bg-primary text-white small">${o.shipping_method}</span></div>
                                         <div class="text-muted small text-break">${o.customer_address || '-'}</div>
                                     </div>`;
-                        } else {
-                            return `<div>
+                            } else {
+                                return `<div>
                                         <div class="mb-1"><span class="badge bg-secondary bg-opacity-50 text-light small">${o.shipping_method || 'Delivery'}</span></div>
                                         <div class="text-muted small text-break">${o.customer_address || '-'}</div>
                                     </div>`;
-                        }
-                    })()}
+                            }
+                        })()}
                         </div>
                     <td>
                         ${o.products.map(p => `
@@ -378,9 +457,9 @@
                         ${o.tracking_number ? `
                             <div><strong class="text-white">${o.carrier_name}</strong></div>
                             ${o.tracking_url ?
-                            `<a href="${o.tracking_url}" target="_blank" class="text-info text-decoration-none small"><i class="bi bi-link-45deg"></i>${o.tracking_number}</a>` :
-                            `<small class="text-muted">${o.tracking_number}</small>`
-                        }
+                                `<a href="${o.tracking_url}" target="_blank" class="text-info text-decoration-none small"><i class="bi bi-link-45deg"></i>${o.tracking_number}</a>` :
+                                `<small class="text-muted">${o.tracking_number}</small>`
+                            }
                             <div class="text-muted small">${o.shipped_at || '-'}</div>
                         ` : '<span class="text-muted small">-</span>'}
                     </td>
@@ -397,19 +476,19 @@
                     </td>
                 </tr>
             `).join('');
-            });
+                });
 
-        // Load shipped orders
-        fetch(`/api/shipping/shipped?${params.toString()}`)
-            .then(res => res.json())
-            .then(orders => {
-                document.getElementById('shippedCount').textContent = `已发货: ${orders.length}`;
-                const tbody = document.getElementById('shippedOrdersBody');
-                if (orders.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-muted">暂无已发货订单</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = orders.map(o => `
+            // Load shipped orders
+            fetch(`/api/shipping/shipped?${params.toString()}`)
+                .then(res => res.json())
+                .then(orders => {
+                    document.getElementById('shippedCount').textContent = `已发货: ${orders.length}`;
+                    const tbody = document.getElementById('shippedOrdersBody');
+                    if (orders.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-muted">暂无已发货订单</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = orders.map(o => `
                 <tr>
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a></div>
@@ -435,12 +514,12 @@
                         ${o.has_tracking ? (o.tracking_number ? `
                             <div><strong class="text-white">${o.carrier_name || o.carrier_slug || ''}</strong></div>
                             ${o.tracking_url ?
-                            `<a href="${o.tracking_url}" target="_blank" class="text-info text-decoration-none small"><i class="bi bi-link-45deg"></i>${o.tracking_number}</a>` :
-                            `<small class="text-muted">${o.tracking_number}</small>`
-                        }
+                                `<a href="${o.tracking_url}" target="_blank" class="text-info text-decoration-none small"><i class="bi bi-link-45deg"></i>${o.tracking_number}</a>` :
+                                `<small class="text-muted">${o.tracking_number}</small>`
+                            }
                             <div class="text-muted small">${o.shipped_at || '-'}</div>
                         ` : '<span class="text-muted small">-</span>') :
-                        '<span class="text-warning small"><i class="bi bi-exclamation-triangle me-1"></i>无追踪号</span>'}
+                            '<span class="text-warning small"><i class="bi bi-exclamation-triangle me-1"></i>无追踪号</span>'}
                     </td>
                     <td class="text-end pe-3 text-nowrap">
                         <a href="javascript:void(0)" class="text-secondary text-decoration-none" onclick="openNoteModal(${o.id}, '${o.number}')" title="备注">
@@ -449,159 +528,161 @@
                     </td>
                 </tr>
             `).join('');
-            });
-    }
+                });
+        }
 
-    function openShipModal(orderId, orderNumber, customerName, customerAddress) {
-        document.getElementById('shipOrderId').value = orderId;
-        document.getElementById('shipOrderNumber').value = '#' + orderNumber;
-        document.getElementById('shipCustomerInfo').innerHTML = `
+        function openShipModal(orderId, orderNumber, customerName, customerAddress) {
+            document.getElementById('shipOrderId').value = orderId;
+            document.getElementById('shipOrderNumber').value = '#' + orderNumber;
+            document.getElementById('shipCustomerInfo').innerHTML = `
         <div class="fw-bold">${customerName}</div>
         <small class="text-muted">${customerAddress}</small>
     `;
-        document.getElementById('shipCarrier').value = '';
-        document.getElementById('shipTrackingNumber').value = '';
-        document.getElementById('shipSendEmail').checked = true;
-        bootstrap.Modal.getOrCreateInstance(document.getElementById('shipModal')).show();
-    }
+            document.getElementById('shipCarrier').value = '';
+            document.getElementById('shipTrackingNumber').value = '';
+            document.getElementById('shipSendEmail').checked = true;
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('shipModal')).show();
+        }
 
-    // For orders already in on-hold status but without tracking
-    function openShipModalForExisting(orderId, orderNumber, customerName) {
-        document.getElementById('shipOrderId').value = orderId;
-        document.getElementById('shipOrderNumber').value = '#' + orderNumber;
-        document.getElementById('shipCustomerInfo').innerHTML = `
+        // For orders already in on-hold status but without tracking
+        function openShipModalForExisting(orderId, orderNumber, customerName) {
+            document.getElementById('shipOrderId').value = orderId;
+            document.getElementById('shipOrderNumber').value = '#' + orderNumber;
+            document.getElementById('shipCustomerInfo').innerHTML = `
         <div class="fw-bold">${customerName}</div>
         <small class="text-warning">补录追踪号（已发货订单）</small>
     `;
-        document.getElementById('shipCarrier').value = '';
-        document.getElementById('shipTrackingNumber').value = '';
-        document.getElementById('shipSendEmail').checked = false; // 不默认发邮件，因为可能已经通知过
-        bootstrap.Modal.getOrCreateInstance(document.getElementById('shipModal')).show();
-    }
-
-    function shipOrder() {
-        const orderId = document.getElementById('shipOrderId').value;
-        const carrier = document.getElementById('shipCarrier').value;
-        const trackingNumber = document.getElementById('shipTrackingNumber').value.trim();
-        const sendEmail = document.getElementById('shipSendEmail').checked;
-
-        if (!carrier || !trackingNumber) {
-            alert('请填写物流商和追踪号码');
-            return;
+            document.getElementById('shipCarrier').value = '';
+            document.getElementById('shipTrackingNumber').value = '';
+            document.getElementById('shipSendEmail').checked = false; // 不默认发邮件，因为可能已经通知过
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('shipModal')).show();
         }
 
-        const btn = document.getElementById('confirmShipBtn');
-        btn.disabled = true;
-        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>处理中...';
+        function shipOrder() {
+            const orderId = document.getElementById('shipOrderId').value;
+            const carrier = document.getElementById('shipCarrier').value;
+            const trackingNumber = document.getElementById('shipTrackingNumber').value.trim();
+            const sendEmail = document.getElementById('shipSendEmail').checked;
+            const shippingMode = document.querySelector('input[name="shipMode"]:checked').value;
 
-        fetch('/api/shipping/ship', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                order_id: orderId,
-                carrier_slug: carrier,
-                tracking_number: trackingNumber,
-                send_email: sendEmail
+            if (!carrier || !trackingNumber) {
+                alert('请填写物流商和追踪号码');
+                return;
+            }
+
+            const btn = document.getElementById('confirmShipBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>处理中...';
+
+            fetch('/api/shipping/ship', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    order_id: orderId,
+                    carrier_slug: carrier,
+                    tracking_number: trackingNumber,
+                    send_email: sendEmail,
+                    shipping_mode: shippingMode
+                })
             })
-        })
-            .then(res => res.json())
-            .then(data => {
-                btn.disabled = false;
-                btn.innerHTML = '<i class="bi bi-truck me-1"></i> 确认发货';
+                .then(res => res.json())
+                .then(data => {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="bi bi-truck me-1"></i> 确认发货';
 
-                if (data.success) {
-                    bootstrap.Modal.getInstance(document.getElementById('shipModal')).hide();
-                    loadOrders();
+                    if (data.success) {
+                        bootstrap.Modal.getInstance(document.getElementById('shipModal')).hide();
+                        loadOrders();
 
-                    if (data.warning) {
-                        alert(data.message);
+                        if (data.warning) {
+                            alert(data.message);
+                        } else {
+                            showToast(data.message, 'success');
+                        }
                     } else {
-                        showToast(data.message, 'success');
+                        alert('发货失败: ' + (data.error || '未知错误'));
                     }
-                } else {
-                    alert('发货失败: ' + (data.error || '未知错误'));
-                }
-            })
-            .catch(err => {
-                btn.disabled = false;
-                btn.innerHTML = '<i class="bi bi-truck me-1"></i> 确认发货';
-                alert('请求失败: ' + err);
-            });
-    }
-
-    function completeOrder(orderId) {
-        if (!confirm('确认将此订单标记为已完成？')) return;
-
-        fetch(`/api/shipping/complete/${orderId}`, { method: 'POST' })
-            .then(res => res.json())
-            .then(data => {
-                if (data.success) {
-                    loadOrders();
-                    showToast('订单已完成', 'success');
-                } else {
-                    alert('操作失败: ' + (data.error || '未知错误'));
-                }
-            });
-    }
-
-    function openNoteModal(orderId, orderNumber) {
-        document.getElementById('noteOrderId').value = orderId;
-        document.getElementById('noteOrderNumber').textContent = '#' + orderNumber;
-        document.getElementById('noteContent').value = '';
-        document.getElementById('noteNotifyCustomer').checked = false;
-        bootstrap.Modal.getOrCreateInstance(document.getElementById('noteModal')).show();
-    }
-
-    function addNote() {
-        const orderId = document.getElementById('noteOrderId').value;
-        const note = document.getElementById('noteContent').value.trim();
-        const notifyCustomer = document.getElementById('noteNotifyCustomer').checked;
-
-        if (!note) {
-            alert('请输入备注内容');
-            return;
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="bi bi-truck me-1"></i> 确认发货';
+                    alert('请求失败: ' + err);
+                });
         }
 
-        fetch(`/api/order/${orderId}/note`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ note, notify_customer: notifyCustomer })
-        })
-            .then(res => res.json())
-            .then(data => {
-                if (data.success) {
-                    bootstrap.Modal.getInstance(document.getElementById('noteModal')).hide();
-                    showToast(data.message, 'success');
-                } else {
-                    alert('添加备注失败: ' + (data.error || '未知错误'));
-                }
-            });
-    }
+        function completeOrder(orderId) {
+            if (!confirm('确认将此订单标记为已完成？')) return;
 
-    function printLabel(orderId) {
-        fetch(`/api/shipping/print/label/${orderId}`)
-            .then(res => res.json())
-            .then(data => {
-                if (data.error) {
-                    alert(data.error);
-                    return;
-                }
+            fetch(`/api/shipping/complete/${orderId}`, { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        loadOrders();
+                        showToast('订单已完成', 'success');
+                    } else {
+                        alert('操作失败: ' + (data.error || '未知错误'));
+                    }
+                });
+        }
 
-                // Determine shipping method badge
-                const method = (data.shipping_method || '').toLowerCase();
-                const isInPost = data.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
-                const isDPD = method.includes('dpd');
+        function openNoteModal(orderId, orderNumber) {
+            document.getElementById('noteOrderId').value = orderId;
+            document.getElementById('noteOrderNumber').textContent = '#' + orderNumber;
+            document.getElementById('noteContent').value = '';
+            document.getElementById('noteNotifyCustomer').checked = false;
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('noteModal')).show();
+        }
 
-                let shippingBadge = '';
-                if (isInPost) {
-                    shippingBadge = '<span class="badge" style="background-color: #FFCC00; color: #000; font-weight: 700;">InPost</span>';
-                } else if (isDPD) {
-                    shippingBadge = '<span class="badge bg-primary">DPD</span>';
-                } else {
-                    shippingBadge = `<span class="badge bg-secondary">${data.shipping_method || 'Standard'}</span>`;
-                }
+        function addNote() {
+            const orderId = document.getElementById('noteOrderId').value;
+            const note = document.getElementById('noteContent').value.trim();
+            const notifyCustomer = document.getElementById('noteNotifyCustomer').checked;
 
-                const content = `
+            if (!note) {
+                alert('请输入备注内容');
+                return;
+            }
+
+            fetch(`/api/order/${orderId}/note`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ note, notify_customer: notifyCustomer })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        bootstrap.Modal.getInstance(document.getElementById('noteModal')).hide();
+                        showToast(data.message, 'success');
+                    } else {
+                        alert('添加备注失败: ' + (data.error || '未知错误'));
+                    }
+                });
+        }
+
+        function printLabel(orderId) {
+            fetch(`/api/shipping/print/label/${orderId}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.error) {
+                        alert(data.error);
+                        return;
+                    }
+
+                    // Determine shipping method badge
+                    const method = (data.shipping_method || '').toLowerCase();
+                    const isInPost = data.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
+                    const isDPD = method.includes('dpd');
+
+                    let shippingBadge = '';
+                    if (isInPost) {
+                        shippingBadge = '<span class="badge" style="background-color: #FFCC00; color: #000; font-weight: 700;">InPost</span>';
+                    } else if (isDPD) {
+                        shippingBadge = '<span class="badge bg-primary">DPD</span>';
+                    } else {
+                        shippingBadge = `<span class="badge bg-secondary">${data.shipping_method || 'Standard'}</span>`;
+                    }
+
+                    const content = `
                 <div class="p-4 bg-white text-dark" style="max-width: 1000px; margin: 0 auto;">
                     <div class="text-center border-bottom pb-3 mb-4">
                         <h3>📦 发货面单</h3>
@@ -710,20 +791,20 @@
                     ` : ''}
                 </div>
             `;
-                document.getElementById('printLabelContent').innerHTML = content;
-                bootstrap.Modal.getOrCreateInstance(document.getElementById('printLabelModal')).show();
-            });
-    }
+                    document.getElementById('printLabelContent').innerHTML = content;
+                    bootstrap.Modal.getOrCreateInstance(document.getElementById('printLabelModal')).show();
+                });
+        }
 
-    function printTodayList() {
-        fetch('/api/shipping/print/list')
-            .then(res => res.json())
-            .then(data => {
-                if (data.count === 0) {
-                    alert('今日暂无待发货订单');
-                    return;
-                }
-                const content = `
+        function printTodayList() {
+            fetch('/api/shipping/print/list')
+                .then(res => res.json())
+                .then(data => {
+                    if (data.count === 0) {
+                        alert('今日暂无待发货订单');
+                        return;
+                    }
+                    const content = `
                 <div class="p-3 bg-white text-dark">
                     <div class="text-center border-bottom pb-3 mb-3">
                         <h4>📋 今日发货清单</h4>
@@ -742,14 +823,14 @@
                         </thead>
                         <tbody style="font-size: 0.85em;">
                             ${data.orders.map((o, i) => {
-                    const method = (o.shipping_method || '').toLowerCase();
-                    const isInPost = o.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
-                    const isDPD = method.includes('dpd');
-                    let shippingBadge = isInPost ? '<span class="badge" style="background-color: #FFCC00; color: #000; font-size: 0.75em;">InPost</span>' :
-                        isDPD ? '<span class="badge bg-primary" style="font-size: 0.75em;">DPD</span>' :
-                            `<span class="badge bg-secondary" style="font-size: 0.75em;">${o.shipping_method || 'Standard'}</span>`;
+                        const method = (o.shipping_method || '').toLowerCase();
+                        const isInPost = o.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
+                        const isDPD = method.includes('dpd');
+                        let shippingBadge = isInPost ? '<span class="badge" style="background-color: #FFCC00; color: #000; font-size: 0.75em;">InPost</span>' :
+                            isDPD ? '<span class="badge bg-primary" style="font-size: 0.75em;">DPD</span>' :
+                                `<span class="badge bg-secondary" style="font-size: 0.75em;">${o.shipping_method || 'Standard'}</span>`;
 
-                    return `
+                        return `
                             <tr>
                                 <td class="text-center"><strong>${i + 1}</strong></td>
                                 <td>
@@ -796,20 +877,20 @@
                     </table>
                 </div>
             `;
-                document.getElementById('printLabelContent').innerHTML = content;
-                bootstrap.Modal.getOrCreateInstance(document.getElementById('printLabelModal')).show();
-            });
-    }
+                    document.getElementById('printLabelContent').innerHTML = content;
+                    bootstrap.Modal.getOrCreateInstance(document.getElementById('printLabelModal')).show();
+                });
+        }
 
-    function printPendingList() {
-        fetch('/api/shipping/print/pending')
-            .then(res => res.json())
-            .then(data => {
-                if (data.count === 0) {
-                    alert('暂无未发货订单');
-                    return;
-                }
-                const content = `
+        function printPendingList() {
+            fetch('/api/shipping/print/pending')
+                .then(res => res.json())
+                .then(data => {
+                    if (data.count === 0) {
+                        alert('暂无未发货订单');
+                        return;
+                    }
+                    const content = `
                 <div class="p-3 bg-white text-dark">
                     <div class="text-center border-bottom pb-3 mb-3">
                         <h4>📋 未发货清单</h4>
@@ -828,15 +909,15 @@
                         </thead>
                         <tbody style="font-size: 0.85em;">
                             ${data.orders.map((o, i) => {
-                    const method = (o.shipping_method || '').toLowerCase();
-                    const isInPost = o.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
-                    const isDPD = method.includes('dpd');
-                    let shippingBadge = isInPost ? '<span class="badge" style="background-color: #FFCC00; color: #000; font-size: 0.75em;">InPost</span>' :
-                        isDPD ? '<span class="badge bg-primary" style ="font-size: 0.75em;">DPD</span>' :
-                            `<span class="badge bg-secondary" style="font-size: 0.75em;">${o.shipping_method || 'Standard'}</span>`;
+                        const method = (o.shipping_method || '').toLowerCase();
+                        const isInPost = o.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
+                        const isDPD = method.includes('dpd');
+                        let shippingBadge = isInPost ? '<span class="badge" style="background-color: #FFCC00; color: #000; font-size: 0.75em;">InPost</span>' :
+                            isDPD ? '<span class="badge bg-primary" style ="font-size: 0.75em;">DPD</span>' :
+                                `<span class="badge bg-secondary" style="font-size: 0.75em;">${o.shipping_method || 'Standard'}</span>`;
 
 
-                    return `
+                        return `
                             <tr>
                                 <td class="text-center"><strong>${i + 1}</strong></td>
                                 <td>
@@ -883,116 +964,167 @@
                     </table>
                 </div>
             `;
-                document.getElementById('printLabelContent').innerHTML = content;
-                bootstrap.Modal.getOrCreateInstance(document.getElementById('printLabelModal')).show();
-            });
-    }
+                    document.getElementById('printLabelContent').innerHTML = content;
+                    bootstrap.Modal.getOrCreateInstance(document.getElementById('printLabelModal')).show();
+                });
+        }
 
-    function showToast(message, type = 'info', duration = 3000) {
-        const toast = document.createElement('div');
-        toast.className = `toast align-items-center text-white bg-${type} border-0 show position-fixed top-0 end-0 m-3`;
-        toast.style.zIndex = 9999;
-        toast.innerHTML = `
+        function openEmailLogsModal(siteId) {
+            document.getElementById('emailLogsSiteId').value = siteId;
+            loadEmailStats(siteId);
+            loadEmailLogs(siteId);
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('emailLogsModal')).show();
+        }
+
+        function loadEmailStats(siteId) {
+            fetch(`/api/site/${siteId}/email-stats`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        document.getElementById('emailStatsSent').textContent = data.sent || 0;
+                        document.getElementById('emailStatsFailed').textContent = data.failed || 0;
+                        document.getElementById('emailStatsRate').textContent = data.success_rate || '0%';
+                    }
+                })
+                .catch(err => console.error('Error loading email stats:', err));
+        }
+
+        function loadEmailLogs(siteId, page = 1) {
+            const tbody = document.getElementById('emailLogsTableBody');
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center py-4 text-muted">加载中...</td></tr>';
+
+            fetch(`/api/site/${siteId}/email-logs?page=${page}&per_page=20`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success && data.logs && data.logs.length > 0) {
+                        tbody.innerHTML = data.logs.map(log => `
+                            <tr>
+                                <td class="text-muted small">${log.created_at}</td>
+                                <td class="text-white small">${log.recipient}</td>
+                                <td class="text-white small" title="${log.subject}">${log.subject.substring(0, 40)}${log.subject.length > 40 ? '...' : ''}</td>
+                                <td>
+                                    ${log.status === 'sent'
+                                ? '<span class="badge bg-success">已发送</span>'
+                                : '<span class="badge bg-danger" title="' + (log.error_message || '') + '">失败</span>'}
+                                </td>
+                            </tr>
+                        `).join('');
+                    } else if (data.success && (!data.logs || data.logs.length === 0)) {
+                        tbody.innerHTML = '<tr><td colspan="4" class="text-center py-4 text-muted"><i class="bi bi-inbox display-6 d-block mb-2 opacity-50"></i>暂无邮件记录</td></tr>';
+                    } else {
+                        tbody.innerHTML = `<tr><td colspan="4" class="text-center py-4 text-warning"><i class="bi bi-exclamation-triangle me-1"></i>${data.error || '加载失败'}</td></tr>`;
+                    }
+                })
+                .catch(err => {
+                    tbody.innerHTML = `<tr><td colspan="4" class="text-center py-4 text-danger">请求失败: ${err}</td></tr>`;
+                });
+        }
+
+        function showToast(message, type = 'info', duration = 3000) {
+            const toast = document.createElement('div');
+            toast.className = `toast align-items-center text-white bg-${type} border-0 show position-fixed top-0 end-0 m-3`;
+            toast.style.zIndex = 9999;
+            toast.innerHTML = `
         <div class="d-flex">
             <div class="toast-body">${message}</div>
             <button type="button" class="btn-close btn-close-white me-2 m-auto" onclick="this.parentElement.parentElement.remove()"></button>
         </div>
     `;
-        document.body.appendChild(toast);
-        setTimeout(() => toast.remove(), duration);
-    }
-</script>
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), duration);
+        }
+    </script>
 
-<style>
-    /* Tab styles for shipping page */
-    #shippingTabs .nav-link {
-        border: 1px solid transparent;
-        border-top-left-radius: 0.375rem;
-        border-top-right-radius: 0.375rem;
-        padding: 0.75rem 1.25rem !important;
-    }
-
-    #shippingTabs .nav-link.active {
-        background-color: rgba(102, 126, 234, 0.2) !important;
-        border-color: rgba(102, 126, 234, 0.3) rgba(102, 126, 234, 0.3) transparent !important;
-        color: #fff !important;
-    }
-
-    #shippingTabs .nav-link:not(.active):hover {
-        border-color: rgba(255, 255, 255, 0.1);
-    }
-
-    @media print {
-
-        .modal-header,
-        .modal-footer,
-        .navbar,
-        .btn,
-        nav {
-            display: none !important;
+    <style>
+        /* Tab styles for shipping page */
+        #shippingTabs .nav-link {
+            border: 1px solid transparent;
+            border-top-left-radius: 0.375rem;
+            border-top-right-radius: 0.375rem;
+            padding: 0.75rem 1.25rem !important;
         }
 
-        .modal-dialog {
-            max-width: 100%;
-            margin: 0;
+        #shippingTabs .nav-link.active {
+            background-color: rgba(102, 126, 234, 0.2) !important;
+            border-color: rgba(102, 126, 234, 0.3) rgba(102, 126, 234, 0.3) transparent !important;
+            color: #fff !important;
         }
 
-        .modal-content {
-            border: none !important;
-            background: white !important;
+        #shippingTabs .nav-link:not(.active):hover {
+            border-color: rgba(255, 255, 255, 0.1);
         }
-    }
 
-    /* Product Item Styling - Matching Orders List Structure */
-    .product-item {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 6px 0;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    }
+        @media print {
 
-    .product-item:last-child {
-        border-bottom: none;
-    }
+            .modal-header,
+            .modal-footer,
+            .navbar,
+            .btn,
+            nav {
+                display: none !important;
+            }
 
-    .product-name {
-        flex: 1;
-        color: #e2e8f0;
-        font-size: 0.875rem;
-        /* User requested no truncation */
-        white-space: normal;
-        line-height: 1.3;
-        min-width: 0;
-    }
+            .modal-dialog {
+                max-width: 100%;
+                margin: 0;
+            }
 
-    .product-qty {
-        width: 40px;
-        height: 22px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background-color: rgba(102, 126, 234, 0.2);
-        border-radius: 10px;
-        font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
-        font-size: 12px;
-        line-height: 1;
-        font-weight: 600;
-        color: #A0AEC0;
-        /* Prevent shrinking */
-        flex-shrink: 0;
-    }
+            .modal-content {
+                border: none !important;
+                background: white !important;
+            }
+        }
 
-    .product-total {
-        width: 100px;
-        text-align: right;
-        font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
-        font-size: 13.6px;
-        line-height: 20.4px;
-        font-weight: 500;
-        color: #38EF7D;
-        /* Prevent shrinking */
-        flex-shrink: 0;
-    }
-</style>
-{% endblock %}
+        /* Product Item Styling - Matching Orders List Structure */
+        .product-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 6px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .product-item:last-child {
+            border-bottom: none;
+        }
+
+        .product-name {
+            flex: 1;
+            color: #e2e8f0;
+            font-size: 0.875rem;
+            /* User requested no truncation */
+            white-space: normal;
+            line-height: 1.3;
+            min-width: 0;
+        }
+
+        .product-qty {
+            width: 40px;
+            height: 22px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: rgba(102, 126, 234, 0.2);
+            border-radius: 10px;
+            font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+            font-size: 12px;
+            line-height: 1;
+            font-weight: 600;
+            color: #A0AEC0;
+            /* Prevent shrinking */
+            flex-shrink: 0;
+        }
+
+        .product-total {
+            width: 100px;
+            text-align: right;
+            font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+            font-size: 13.6px;
+            line-height: 20.4px;
+            font-weight: 500;
+            color: #38EF7D;
+            /* Prevent shrinking */
+            flex-shrink: 0;
+        }
+    </style>
+    {% endblock %}

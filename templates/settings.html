@@ -134,6 +134,7 @@
                         <tr>
                             <th class="ps-4">站点</th>
                             <th>Consumer Key</th>
+                            <th>Mask ID</th>
                             <th>上次同步时间</th>
                             <th>状态</th>
                             <th class="text-end pe-4">操作</th>
@@ -161,6 +162,13 @@
                                 </div>
                             </td>
                             <td class="text-white-50 font-monospace small">{{ site.consumer_key[:10] }}...</td>
+                            <td class="text-white-50 font-monospace small">
+                                {% if site.mask_id %}
+                                {{ site.mask_id }}
+                                {% else %}
+                                <span class="text-muted">-</span>
+                                {% endif %}
+                            </td>
                             <td class="text-white-50">
                                 {% if site.last_sync %}
                                 {{ site.last_sync }}
@@ -229,14 +237,15 @@
                                 <button class="btn btn-sm btn-outline-secondary me-2 edit-btn"
                                     data-site-id="{{ site.id }}" data-url="{{ site.url }}"
                                     data-key="{{ site.consumer_key }}" data-secret="{{ site.consumer_secret }}"
-                                    data-manager="{{ site.manager or '' }}"><i class="bi bi-pencil"></i></button>
+                                    data-manager="{{ site.manager or '' }}" data-mask-id="{{ site.mask_id or '' }}"><i
+                                        class="bi bi-pencil"></i></button>
                                 <button class="btn btn-sm btn-outline-danger delete-btn" data-site-id="{{ site.id }}"><i
                                         class="bi bi-trash"></i></button>
                             </td>
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="5" class="text-center py-5 text-muted">
+                            <td colspan="6" class="text-center py-5 text-muted">
                                 <i class="bi bi-hdd-network display-4 d-block mb-3 opacity-50"></i>
                                 暂无已连接的站点，请点击右上角添加
                             </td>
@@ -638,6 +647,12 @@
                             name="manager" placeholder="输入负责人姓名">
                     </div>
                     <div class="mb-3">
+                        <label class="form-label text-white-50">51.la Mask ID</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="mask_id" placeholder="如：KqmtdhxdOsN9a7i7">
+                        <div class="form-text text-muted">可选：用于获取51.la流量数据</div>
+                    </div>
+                    <div class="mb-3">
                         <label class="form-label text-white-50">站点 URL</label>
                         <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25"
                             name="url" placeholder="https://example.com" required>
@@ -678,6 +693,11 @@
                         <label class="form-label text-white-50">负责人</label>
                         <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
                             name="manager" id="editSiteManager" placeholder="输入负责人姓名">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">51.la Mask ID</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="mask_id" id="editSiteMaskId" placeholder="如：KqmtdhxdOsN9a7i7">
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">站点 URL</label>
@@ -1528,12 +1548,14 @@
                 const key = editBtn.dataset.key;
                 const secret = editBtn.dataset.secret;
                 const manager = editBtn.dataset.manager || '';
+                const maskId = editBtn.dataset.maskId || '';
 
                 document.getElementById('editSiteId').value = siteId;
                 document.getElementById('editSiteUrl').value = url;
                 document.getElementById('editSiteKey').value = key;
                 document.getElementById('editSiteSecret').value = secret;
                 document.getElementById('editSiteManager').value = manager;
+                document.getElementById('editSiteMaskId').value = maskId;
 
                 const modal = getModal('editSiteModal');
                 if (modal) modal.show();

@@ -1,0 +1,847 @@
+{% extends 'base.html' %}
+
+{% block title %}综合报表 - 流量与订单分析{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+    <!-- Header -->
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h1 class="h3 mb-1">
+                <i class="bi bi-graph-up-arrow text-primary me-2"></i>综合报表
+            </h1>
+            <p class="text-white-50 mb-0">流量数据 + 订单数据综合分析</p>
+        </div>
+        <div class="d-flex gap-2">
+            <!-- Sites Filter -->
+            <div class="dropdown">
+                <button class="btn btn-outline-primary dropdown-toggle" type="button" data-bs-toggle="dropdown"
+                    data-bs-auto-close="outside">
+                    <i class="bi bi-hdd-network me-1"></i>显示站点
+                </button>
+                <ul class="dropdown-menu dropdown-menu-end bg-dark border-secondary border-opacity-50 p-3"
+                    style="min-width: 250px; max-height: 400px; overflow-y: auto;">
+                    <li>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" checked onchange="toggleAllSites(this)"
+                                id="checkAllSites">
+                            <label class="form-check-label text-white" for="checkAllSites">全选</label>
+                        </div>
+                    </li>
+                    <li>
+                        <hr class="dropdown-divider bg-secondary opacity-25">
+                    </li>
+                    <div id="sitesFilterList">
+                        <!-- Sites checkbox will be injected here -->
+                    </div>
+                </ul>
+            </div>
+
+            <!-- Metrics Filter -->
+            <div class="dropdown">
+                <button class="btn btn-outline-info dropdown-toggle" type="button" data-bs-toggle="dropdown"
+                    data-bs-auto-close="outside">
+                    <i class="bi bi-funnel me-1"></i>显示指标
+                </button>
+                <ul class="dropdown-menu dropdown-menu-end bg-dark border-secondary border-opacity-50 p-3"
+                    style="min-width: 200px;">
+                    <li>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" checked onchange="toggleAllMetrics(this)"
+                                id="checkAllMetrics">
+                            <label class="form-check-label text-white" for="checkAllMetrics">全选</label>
+                        </div>
+                    </li>
+                    <li>
+                        <hr class="dropdown-divider bg-secondary opacity-25">
+                    </li>
+                    <div id="metricsFilterList">
+                        <!-- Metrics checkbox will be injected here -->
+                    </div>
+                </ul>
+            </div>
+
+            <button class="btn btn-outline-secondary" onclick="exportCSV()">
+                <i class="bi bi-download me-1"></i>导出CSV
+            </button>
+            <button class="btn btn-primary" onclick="loadReportData(true)">
+                <i class="bi bi-arrow-clockwise me-1"></i>刷新数据
+            </button>
+        </div>
+    </div>
+
+    <!-- Date Range Filter -->
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="row align-items-end g-3">
+                <div class="col-md-3">
+                    <label class="form-label text-white-50">开始日期</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label text-white-50">结束日期</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label text-white-50">快速选择</label>
+                    <div class="btn-group w-100" role="group">
+                        <button type="button" class="btn btn-outline-primary" onclick="setDateRange(30)">近30天</button>
+                        <button type="button" class="btn btn-outline-primary" onclick="setDateRange(90)">近3个月</button>
+                        <button type="button" class="btn btn-outline-primary active"
+                            onclick="setDateRange(180)">近6个月</button>
+                        <button type="button" class="btn btn-outline-primary" onclick="setDateRange(365)">近1年</button>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <button class="btn btn-primary w-100" onclick="loadReportData(true)">
+                        <i class="bi bi-search me-1"></i>查询
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading State -->
+    <div id="loadingState" class="text-center py-5" style="display: none;">
+        <div class="spinner-border text-primary mb-3" role="status">
+            <span class="visually-hidden">加载中...</span>
+        </div>
+        <p class="text-muted">正在从 51.la API 获取流量数据...</p>
+    </div>
+
+    <!-- Chart Card -->
+    <div class="card mb-4" id="chartCard" style="display: none;">
+        <div class="card-header">
+            <h5 class="card-title text-white mb-0"><i class="bi bi-graph-up me-2"></i>流量与订单趋势 (Traffic vs Orders)</h5>
+        </div>
+        <div class="card-body">
+            <div style="height: 350px;">
+                <canvas id="trendChart"></canvas>
+            </div>
+            <div class="text-center mt-3">
+                <small class="text-muted"><i class="bi bi-info-circle me-1"></i>图表显示筛选范围内所有选中站点的月度汇总数据</small>
+            </div>
+        </div>
+    </div>
+
+    <!-- Report Table -->
+    <div class="card" id="reportCard" style="display: none;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <span class="text-white"><i class="bi bi-table me-2"></i>综合数据报表</span>
+            <small class="text-white-50 font-monospace" id="dateRangeInfo"></small>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-bordered table-hover mb-0" id="reportTable">
+                    <thead class="table-dark">
+                        <tr>
+                            <th class="sticky-col">站点</th>
+                            <th class="sticky-col-2">指标</th>
+                            <!-- Month columns will be added dynamically -->
+                        </tr>
+                    </thead>
+                    <tbody id="reportBody">
+                        <!-- Data will be loaded here -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Error State -->
+    <div id="errorState" class="alert alert-danger" style="display: none;">
+        <i class="bi bi-exclamation-triangle me-2"></i>
+        <span id="errorMessage">加载数据失败</span>
+    </div>
+</div>
+
+<style>
+    .sticky-col {
+        position: sticky;
+        left: 0;
+        background: #fff;
+        z-index: 1;
+        min-width: 140px;
+        max-width: 150px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .sticky-col-2 {
+        position: sticky;
+        left: 140px;
+        background: #fff;
+        z-index: 1;
+        min-width: 100px;
+    }
+
+    .table thead th {
+        white-space: nowrap;
+        text-align: center;
+        vertical-align: middle;
+    }
+
+    .table tbody td {
+        text-align: center;
+        white-space: nowrap;
+        vertical-align: middle;
+    }
+
+    .table tbody td:first-child,
+    .table tbody td:nth-child(2) {
+        text-align: center;
+        font-weight: 500;
+    }
+
+    .site-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
+        color: white !important;
+    }
+
+    .metric-uv {
+        color: #3b82f6;
+    }
+
+    .metric-pv {
+        color: #8b5cf6;
+    }
+
+    .metric-orders {
+        color: #10b981;
+    }
+
+    .metric-amount {
+        color: #f59e0b;
+    }
+
+    .metric-cny {
+        color: #ef4444;
+    }
+
+    .metric-rate {
+        color: #06b6d4;
+    }
+
+    .metric-aov {
+        color: #ec4899;
+    }
+
+    .summary-col {
+        font-weight: 600;
+    }
+
+    .table tbody td.summary-col {
+        background: #f8fafc !important;
+    }
+
+    .card-header {
+        background: linear-gradient(135deg, rgba(59, 130, 246, 0.1), rgba(139, 92, 246, 0.1));
+    }
+</style>
+
+<script>
+    // Global Constants
+    const ALL_METRICS = [
+        { key: 'uv', label: 'UV (访客数)', class: 'metric-uv', sum: true },
+        { key: 'pv', label: 'PV (浏览量)', class: 'metric-pv', sum: true },
+        { key: 'order_count', label: '订单数', class: 'metric-orders', sum: true },
+        { key: 'total_amount', label: '订单金额', class: 'metric-amount', sum: true, format: 'currency' },
+        { key: 'net_cny', label: '净额(CNY)', class: 'metric-cny', sum: true, format: 'cny' },
+        { key: 'conversion_rate', label: '转化率', class: 'metric-rate', avg: true, format: 'percent' },
+        { key: 'aov_cny', label: '客单价(CNY)', class: 'metric-aov', avg: true, format: 'cny' }
+    ];
+
+    let currentResult = null; // Store current API result for re-rendering
+    let trendChart = null; // Chart instance
+
+    // Initialize
+    document.addEventListener('DOMContentLoaded', function () {
+        initMetricsFilter();
+
+        const savedStart = localStorage.getItem('report_startDate');
+        const savedEnd = localStorage.getItem('report_endDate');
+
+        if (savedStart && savedEnd) {
+            document.getElementById('startDate').value = savedStart;
+            document.getElementById('endDate').value = savedEnd;
+            checkActiveButton(savedStart, savedEnd);
+        } else {
+            setDateRange(180);
+        }
+
+        loadReportData(false);
+    });
+
+    // Metrics Filter Logic
+    function initMetricsFilter() {
+        const container = document.getElementById('metricsFilterList');
+        const savedMetrics = JSON.parse(localStorage.getItem('report_selected_metrics') || 'null');
+
+        // If no saved, default to All
+        const selectedKeys = savedMetrics || ALL_METRICS.map(m => m.key);
+
+        container.innerHTML = ALL_METRICS.map(m => `
+            <div class="form-check mb-2">
+                <input class="form-check-input metric-check" type="checkbox" 
+                    value="${m.key}" id="check_${m.key}"
+                    ${selectedKeys.includes(m.key) ? 'checked' : ''}
+                    onchange="onMetricChange()">
+                <label class="form-check-label text-white-50" for="check_${m.key}">
+                    ${m.label}
+                </label>
+            </div>
+        `).join('');
+
+        updateCheckAllState();
+    }
+
+    // Sites Filter Logic
+    function initSitesFilter(sites) {
+        const container = document.getElementById('sitesFilterList');
+        const savedSites = JSON.parse(localStorage.getItem('report_selected_sites') || 'null');
+
+        let selectedSites = savedSites;
+        if (selectedSites === null) {
+            selectedSites = sites;
+        }
+
+        container.innerHTML = sites.map(site => `
+            <div class="form-check mb-2">
+                <input class="form-check-input site-check" type="checkbox" 
+                    value="${site}" id="check_site_${site}" 
+                    ${selectedSites.includes(site) ? 'checked' : ''}
+                    onchange="onSiteChange()">
+                <label class="form-check-label text-white-50 text-break" for="check_site_${site}">
+                    ${site}
+                </label>
+            </div>
+        `).join('');
+
+        updateCheckAllSitesState();
+    }
+
+    function toggleAllSites(source) {
+        document.querySelectorAll('.site-check').forEach(cb => { cb.checked = source.checked; });
+        onSiteChange();
+    }
+
+    function updateCheckAllSitesState() {
+        const all = document.querySelectorAll('.site-check');
+        const checked = document.querySelectorAll('.site-check:checked');
+        const checkAll = document.getElementById('checkAllSites');
+        checkAll.checked = all.length > 0 && all.length === checked.length;
+        checkAll.indeterminate = checked.length > 0 && checked.length < all.length;
+    }
+
+    function onSiteChange() {
+        updateCheckAllSitesState();
+        const selected = Array.from(document.querySelectorAll('.site-check:checked')).map(cb => cb.value);
+        localStorage.setItem('report_selected_sites', JSON.stringify(selected));
+        if (currentResult) renderReport(currentResult);
+    }
+
+    function toggleAllMetrics(source) {
+        document.querySelectorAll('.metric-check').forEach(cb => {
+            cb.checked = source.checked;
+        });
+        onMetricChange();
+    }
+
+    function updateCheckAllState() {
+        const all = document.querySelectorAll('.metric-check');
+        const checked = document.querySelectorAll('.metric-check:checked');
+        const checkAll = document.getElementById('checkAllMetrics');
+
+        checkAll.checked = all.length === checked.length;
+        checkAll.indeterminate = checked.length > 0 && checked.length < all.length;
+    }
+
+    function onMetricChange() {
+        updateCheckAllState();
+
+        // Save state
+        const selected = Array.from(document.querySelectorAll('.metric-check:checked')).map(cb => cb.value);
+        localStorage.setItem('report_selected_metrics', JSON.stringify(selected));
+
+        // Re-render if data exists
+        if (currentResult) {
+            renderReport(currentResult);
+        }
+    }
+
+    function setDateRange(days) {
+        const end = new Date();
+        const start = new Date();
+        start.setDate(start.getDate() - days);
+
+        const startStr = start.toISOString().split('T')[0];
+        const endStr = end.toISOString().split('T')[0];
+
+        document.getElementById('startDate').value = startStr;
+        document.getElementById('endDate').value = endStr;
+
+        updateActiveButton(days);
+    }
+
+    function updateActiveButton(days) {
+        document.querySelectorAll('.btn-group .btn').forEach(btn => {
+            btn.classList.remove('active');
+            if (btn.textContent.includes(days + '天') ||
+                (days === 90 && btn.textContent.includes('3个月')) ||
+                (days === 180 && btn.textContent.includes('6个月')) ||
+                (days === 365 && btn.textContent.includes('1年'))) {
+                btn.classList.add('active');
+            }
+        });
+    }
+
+    function checkActiveButton(start, end) {
+        const startDate = new Date(start);
+        const endDate = new Date(end);
+        const diffTime = Math.abs(endDate - startDate);
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+        // Allow small margin of error for "months" calculation
+        if (Math.abs(diffDays - 30) <= 1) updateActiveButton(30);
+        else if (Math.abs(diffDays - 90) <= 2) updateActiveButton(90);
+        else if (Math.abs(diffDays - 180) <= 3) updateActiveButton(180);
+        else if (Math.abs(diffDays - 365) <= 4) updateActiveButton(365);
+        else document.querySelectorAll('.btn-group .btn').forEach(btn => btn.classList.remove('active'));
+    }
+
+    async function loadReportData(forceRefresh = false) {
+        const startDate = document.getElementById('startDate').value;
+        const endDate = document.getElementById('endDate').value;
+
+        // Try load from cache first
+        if (!forceRefresh) {
+            const cachedData = localStorage.getItem('report_last_result');
+            const cachedParams = localStorage.getItem('report_last_params');
+
+            if (cachedData && cachedParams) {
+                try {
+                    const params = JSON.parse(cachedParams);
+                    // Match current date inputs
+                    if (params.start === startDate && params.end === endDate) {
+                        const result = JSON.parse(cachedData);
+                        currentResult = result;
+
+                        // Init sites filter
+                        const allSites = Array.from(new Set([...result.sites, ...Object.keys(result.data)]));
+                        initSitesFilter(allSites);
+
+                        renderReport(result);
+                        document.getElementById('reportCard').style.display = 'block';
+                        document.getElementById('chartCard').style.display = 'block';
+                        document.getElementById('dateRangeInfo').innerHTML =
+                            `${result.date_range.start} ~ ${result.date_range.end} <small class="text-white-50 ms-2">(缓存数据)</small>`;
+                        return;
+                    }
+                } catch (e) { console.error('Cache parse error', e); }
+            }
+        }
+
+        document.getElementById('loadingState').style.display = 'block';
+        document.getElementById('reportCard').style.display = 'none';
+        document.getElementById('errorState').style.display = 'none';
+
+        try {
+            const response = await fetch(`/api/report/data?start_date=${startDate}&end_date=${endDate}`);
+            const result = await response.json();
+
+            if (result.success) {
+                // Save state and data cache
+                localStorage.setItem('report_startDate', startDate);
+                localStorage.setItem('report_endDate', endDate);
+                localStorage.setItem('report_last_result', JSON.stringify(result));
+                localStorage.setItem('report_last_params', JSON.stringify({ start: startDate, end: endDate }));
+
+                currentResult = result;
+
+                // Init sites filter
+                const allSites = Array.from(new Set([...result.sites, ...Object.keys(result.data)]));
+                initSitesFilter(allSites);
+
+                renderReport(result);
+                document.getElementById('reportCard').style.display = 'block';
+                document.getElementById('chartCard').style.display = 'block';
+                document.getElementById('dateRangeInfo').textContent =
+                    `${result.date_range.start} ~ ${result.date_range.end}`;
+            } else {
+                throw new Error(result.message || '数据加载失败');
+            }
+        } catch (error) {
+            document.getElementById('errorMessage').textContent = error.message;
+            document.getElementById('errorState').style.display = 'block';
+        } finally {
+            document.getElementById('loadingState').style.display = 'none';
+        }
+    }
+
+    function renderReport(result) {
+        const { data, months, sites } = result;
+
+        // Get Selected Metrics
+        const selectedKeys = Array.from(document.querySelectorAll('.metric-check:checked')).map(cb => cb.value);
+        const activeMetrics = ALL_METRICS.filter(m => selectedKeys.includes(m.key));
+
+        if (activeMetrics.length === 0) {
+            document.getElementById('reportBody').innerHTML = '<tr><td colspan="100" class="text-center text-white-50 py-4">请至少选择一个指标</td></tr>';
+            return;
+        }
+
+        // Get Selected Sites
+        let allSitesRaw = new Set([...sites, ...Object.keys(data)]);
+        const siteChecks = document.querySelectorAll('.site-check');
+        let activeSites = Array.from(allSitesRaw);
+
+        if (siteChecks.length > 0) {
+            const selectedSiteKeys = Array.from(document.querySelectorAll('.site-check:checked')).map(cb => cb.value);
+            activeSites = activeSites.filter(s => selectedSiteKeys.includes(s));
+        }
+
+        if (activeSites.length === 0) {
+            document.getElementById('reportBody').innerHTML = '<tr><td colspan="100" class="text-center text-white-50 py-4">请至少选择一个站点</td></tr>';
+            return;
+        }
+
+        // Update table header with months
+        const thead = document.querySelector('#reportTable thead tr');
+        thead.innerHTML = `
+        <th class="sticky-col">站点</th>
+        <th class="sticky-col-2">指标</th>
+        ${months.map(m => `<th>${formatMonth(m)}</th>`).join('')}
+        <th class="summary-col">合计/平均</th>
+    `;
+
+        // Build table body
+        const tbody = document.getElementById('reportBody');
+        tbody.innerHTML = '';
+
+        activeSites.forEach(site => {
+            const siteData = data[site] || {};
+
+            activeMetrics.forEach((metric, idx) => {
+                const row = document.createElement('tr');
+
+                // Site name (only for first metric)
+                if (idx === 0) {
+                    const siteCell = document.createElement('td');
+                    siteCell.className = 'sticky-col';
+                    siteCell.rowSpan = activeMetrics.length;
+                    siteCell.innerHTML = `<strong>${site}</strong>`;
+                    row.appendChild(siteCell);
+                }
+
+                // Metric name
+                const metricCell = document.createElement('td');
+                metricCell.className = `sticky-col-2 ${metric.class}`;
+                metricCell.textContent = metric.label;
+                row.appendChild(metricCell);
+
+                // Values for each month
+                let total = 0;
+                let count = 0;
+
+                months.forEach(month => {
+                    const cell = document.createElement('td');
+                    const monthData = siteData[month] || {};
+                    const value = monthData[metric.key];
+
+                    if (value !== undefined && value !== null) {
+                        cell.textContent = formatValue(value, metric.format);
+                        total += value;
+                        count++;
+                    } else {
+                        cell.textContent = '-';
+                        cell.style.color = '#ccc';
+                    }
+
+                    row.appendChild(cell);
+                });
+
+                // Summary column
+                const summaryCell = document.createElement('td');
+                summaryCell.className = 'summary-col';
+
+                if (metric.sum && count > 0) {
+                    summaryCell.textContent = formatValue(total, metric.format);
+                } else if (metric.avg && count > 0) {
+                    // For conversion rate, recalculate from totals
+                    // Note: This summary logic needs strict recalculation for accuracy
+                    if (metric.key === 'conversion_rate') {
+                        let totalUV = 0, totalOrders = 0;
+                        months.forEach(month => {
+                            if (siteData[month]) {
+                                totalUV += siteData[month].uv || 0;
+                                totalOrders += siteData[month].order_count || 0;
+                            }
+                        });
+                        const avgRate = totalUV > 0 ? (totalOrders / totalUV * 100) : 0;
+                        summaryCell.textContent = avgRate.toFixed(2) + '%';
+                    } else if (metric.key === 'aov_cny') {
+                        let totalCNY = 0, totalOrders = 0;
+                        months.forEach(month => {
+                            if (siteData[month]) {
+                                totalCNY += siteData[month].net_cny || 0;
+                                totalOrders += siteData[month].order_count || 0;
+                            }
+                        });
+                        const avgAOV = totalOrders > 0 ? (totalCNY / totalOrders) : 0;
+                        summaryCell.textContent = '¥' + avgAOV.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                    } else {
+                        summaryCell.textContent = formatValue(total / count, metric.format);
+                    }
+                } else {
+                    summaryCell.textContent = '-';
+                }
+
+                row.appendChild(summaryCell);
+                tbody.appendChild(row);
+            });
+        });
+        // Update Chart
+        updateChart(activeSites, months, data, activeMetrics);
+    }
+
+    function updateChart(activeSites, months, allData, activeMetrics) {
+        const ctx = document.getElementById('trendChart').getContext('2d');
+
+        // Destroy existing chart if it exists
+        if (trendChart) {
+            trendChart.destroy();
+        }
+
+        // Site Colors Palette
+        const SITE_COLORS = [
+            '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6',
+            '#ec4899', '#06b6d4', '#6366f1', '#84cc16', '#f43f5e'
+        ];
+
+        const datasets = [];
+
+        // 1. Interleaved Datasets (Bar + Line for each site)
+        activeSites.forEach((site, index) => {
+            const color = SITE_COLORS[index % SITE_COLORS.length];
+
+            // Check visibility based on metrics filter
+            const showUV = activeMetrics.some(m => m.key === 'uv');
+            const showOrders = activeMetrics.some(m => m.key === 'order_count');
+
+            // Dataset 1: UV Bar
+            // We only add it if UV metric is selected, or if user wants default view.
+            // Based on request "display according to indicators", we respect the filter.
+            if (showUV) {
+                const uvData = months.map(month => {
+                    return (allData[site] && allData[site][month]) ? (allData[site][month].uv || 0) : 0;
+                });
+
+                datasets.push({
+                    label: site + ' (UV)',
+                    data: uvData,
+                    backgroundColor: color,
+                    stack: 'uv_stack',
+                    yAxisID: 'y',
+                    type: 'bar',
+                    // order removed
+                    borderColor: 'transparent',
+                    borderWidth: 0
+                });
+            }
+
+            // Dataset 2: Order Line
+            if (showOrders) {
+                const orderData = months.map(month => {
+                    return (allData[site] && allData[site][month]) ? (allData[site][month].order_count || 0) : 0;
+                });
+
+                datasets.push({
+                    label: site + ' (订单)',
+                    data: orderData,
+                    type: 'line',
+                    borderColor: color,
+                    backgroundColor: color,
+                    boxShadow: 'none',
+                    borderWidth: 2,
+                    pointRadius: 3,
+                    pointHoverRadius: 5,
+                    pointStyle: 'rectRounded',
+                    yAxisID: 'y1',
+                    order: 0,
+                    tension: 0.3
+                });
+            }
+        });
+
+        // Check if we have data to show
+        const hasData = datasets.some(ds => ds.data.some(v => v > 0));
+        if (!hasData) return;
+
+        trendChart = new Chart(ctx, {
+            type: 'bar', // Default type
+            data: {
+                labels: months.map(m => formatMonth(m)),
+                datasets: datasets
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {
+                    mode: 'index',
+                    intersect: false,
+                },
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: {
+                            color: '#e2e8f0',
+                            usePointStyle: true,
+                            padding: 20
+                        }
+                    },
+                    tooltip: {
+                        backgroundColor: 'rgba(15, 23, 42, 0.95)',
+                        titleColor: '#e2e8f0',
+                        bodyColor: '#cbd5e1',
+                        borderColor: 'rgba(148, 163, 184, 0.2)',
+                        borderWidth: 1,
+                        padding: 12,
+                        itemSort: function (a, b) {
+                            return a.datasetIndex - b.datasetIndex;
+                        },
+                        callbacks: {
+                            footer: function (tooltipItems) {
+                                const idx = tooltipItems[0].dataIndex;
+                                const month = months[idx];
+                                const lines = [];
+
+                                lines.push('');
+                                lines.push('━━━━━━━━━━━━━━━━');
+                                lines.push('【 当月汇总指标 】');
+
+                                // Calculate summary for this month across active sites
+                                let stats = {
+                                    uv: 0, pv: 0, order_count: 0,
+                                    total_amount: 0, net_cny: 0,
+                                    net_amount: 0
+                                };
+
+                                activeSites.forEach(site => {
+                                    if (allData[site] && allData[site][month]) {
+                                        let d = allData[site][month];
+                                        stats.uv += d.uv || 0;
+                                        stats.pv += d.pv || 0;
+                                        stats.order_count += d.order_count || 0;
+                                        stats.total_amount += d.total_amount || 0;
+                                        stats.net_cny += d.net_cny || 0;
+                                    }
+                                });
+
+                                activeMetrics.forEach(m => {
+                                    let val = 0;
+                                    // Map metric key to stats
+                                    if (m.key === 'uv') val = stats.uv;
+                                    else if (m.key === 'pv') val = stats.pv;
+                                    else if (m.key === 'order_count') val = stats.order_count;
+                                    else if (m.key === 'total_amount') val = stats.total_amount;
+                                    else if (m.key === 'net_cny') val = stats.net_cny;
+                                    else if (m.key === 'conversion_rate') val = stats.uv > 0 ? (stats.order_count / stats.uv * 100) : 0;
+                                    else if (m.key === 'aov_cny') val = stats.order_count > 0 ? (stats.net_cny / stats.order_count) : 0;
+
+                                    lines.push(`${m.label}: ${formatValue(val, m.format)}`);
+                                });
+
+                                return lines.join('\n');
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        stacked: true, // Enable stacking for X
+                        grid: { color: 'rgba(148, 163, 184, 0.1)' },
+                        ticks: { color: '#94a3b8' }
+                    },
+                    y: {
+                        stacked: true, // Enable stacking for Y
+                        type: 'linear',
+                        display: true,
+                        position: 'left',
+                        title: { display: true, text: '访客数 (UV)', color: '#3b82f6' },
+                        grid: { color: 'rgba(148, 163, 184, 0.1)' },
+                        ticks: { color: '#94a3b8' }
+                    },
+                    y1: {
+                        type: 'linear',
+                        display: true,
+                        position: 'right',
+                        title: { display: true, text: '订单数', color: '#f59e0b' },
+                        grid: { drawOnChartArea: false },
+                        ticks: { color: '#94a3b8' }
+                    }
+                }
+            }
+        });
+    }
+
+    function formatMonth(monthStr) {
+        const [year, month] = monthStr.split('-');
+        return `${year}年${parseInt(month)}月`;
+    }
+
+    function formatValue(value, format) {
+        if (value === null || value === undefined) return '-';
+        if (typeof value === 'number' && value === 0) return '-';
+
+        switch (format) {
+            case 'currency':
+                return value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            case 'cny':
+                return '¥' + value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            case 'percent':
+                if (value === 0) return '-';
+                return value.toFixed(2) + '%';
+            default:
+                return typeof value === 'number' ? value.toLocaleString() : value;
+        }
+    }
+
+    function exportCSV() {
+        const table = document.getElementById('reportTable');
+        let csv = [];
+
+        // Header
+        const headers = [];
+        table.querySelectorAll('thead th').forEach(th => {
+            headers.push(th.textContent.replace(/\n/g, '').trim());
+        });
+        csv.push(headers.join(','));
+
+        // Body
+        let currentSite = '';
+        table.querySelectorAll('tbody tr').forEach(row => {
+            const rowCells = Array.from(row.querySelectorAll('td'));
+            const rowTexts = rowCells.map(td => td.textContent.trim());
+
+            // If row has full columns (matches header count), first col is Site
+            if (rowTexts.length === headers.length) {
+                currentSite = rowTexts[0];
+            } else if (rowTexts.length < headers.length) {
+                // If fewer columns, prepends currentSite
+                rowTexts.unshift(currentSite);
+            }
+
+            // Quote strings
+            const csvRow = rowTexts.map(t => '"' + t.replace(/"/g, '""') + '"').join(',');
+            csv.push(csvRow);
+        });
+
+        // Download
+        const blob = new Blob(['\ufeff' + csv.join('\n')], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `combined_report_${new Date().toISOString().slice(0, 10)}.csv`;
+        link.click();
+    }
+</script>
+{% endblock %}
