@@ -7606,16 +7606,44 @@ def api_report_data():
         start_dt = datetime.now() - timedelta(days=180)
         start_date = start_dt.strftime('%Y-%m-%d')
     
+    # Cache Logic
+    cache_key = f"traffic_{start_date}_{end_date}"
+    force_refresh = request.args.get('force', 'false') == 'true'
+    
+    # Try load from server cache first (if not forced)
+    conn = get_db_connection() # Use woocommerce_orders.db which has report_cache
+    if not force_refresh:
+        try:
+            cached_row = conn.execute('SELECT cache_value FROM report_cache WHERE cache_key = ?', (cache_key,)).fetchone()
+            if cached_row and cached_row['cache_value']:
+                print(f"DEBUG: Hit server cache for {cache_key}")
+                cached_data = json.loads(cached_row['cache_value'])
+                conn.close()
+                return jsonify(cached_data)
+        except Exception as e:
+            print(f"Cache read error: {e}")
+            # Continue to fetch real data
+    
     all_traffic = {}
     orders_data = get_orders_by_month_for_report(start_date, end_date)
     
-    # Get sites config from database
-    conn = get_db_connection()
+    # Get sites config from database (already opened connection)
     db_sites = conn.execute('SELECT url, mask_id FROM sites').fetchall()
-    conn.close()
     
     def normalize_domain(url):
-        return url.lower().replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
+        if not url: return "unknown"
+        # 移除不可见字符，统一转小写
+        url = url.lower().strip()
+        # 移除协议头
+        if 'https://' in url:
+            url = url.replace('https://', '')
+        if 'http://' in url:
+            url = url.replace('http://', '')
+        # 移除 www.
+        if 'www.' in url:
+            url = url.replace('www.', '')
+        # 取域名第一部分（移除路径）
+        return url.split('/')[0]
 
     # Create mask_id mapping (normalized)
     site_mask_map = {}
@@ -7696,13 +7724,67 @@ def api_report_data():
     
     sorted_months = sorted(all_months)
     
-    return jsonify({
+    final_result = {
         'success': True,
         'data': combined,
         'months': sorted_months,
         'sites': list(site_mask_map.keys()),
         'date_range': {'start': start_date, 'end': end_date}
-    })
+    }
+    
+    # Save to server cache if we have traffic data (to avoid caching empty/failed API calls)
+    # Only cache if at least one site has traffic data
+    has_traffic = any('uv' in m for s in combined.values() for m in s.values())
+    if has_traffic:
+        try:
+            conn.execute('INSERT OR REPLACE INTO report_cache (cache_key, cache_value) VALUES (?, ?)', 
+                        (cache_key, json.dumps(final_result)))
+            conn.commit()
+            print(f"DEBUG: Updated server cache for {cache_key}")
+        except Exception as e:
+            print(f"Cache write error: {e}")
+            
+    conn.close()
+    return jsonify(final_result)
+
+
+@app.route('/api/report/cache/sync', methods=['POST'])
+@login_required
+def report_cache_sync():
+    """Sync client-side traffic data cache to server"""
+    # Only admin should start this (or anyone with report view permission)
+    if not current_user.can_view_report():
+         return jsonify({'success': False, 'error': '无权限'}), 403
+         
+    try:
+        data = request.json
+        if not data:
+             return jsonify({'success': False, 'error': '无数据'}), 400
+             
+        start_date = data.get('start_date')
+        end_date = data.get('end_date')
+        traffic_data = data.get('data') # Expecting the full result object structure
+        
+        if not start_date or not end_date or not traffic_data:
+            return jsonify({'success': False, 'error': '数据不完整'}), 400
+            
+        cache_key = f"traffic_{start_date}_{end_date}"
+        
+        # Verify structure roughly
+        if 'data' not in traffic_data or 'months' not in traffic_data:
+             return jsonify({'success': False, 'error': '数据格式错误'}), 400
+             
+        # Save to DB
+        conn = get_db_connection()
+        conn.execute('INSERT OR REPLACE INTO report_cache (cache_key, cache_value) VALUES (?, ?)', 
+                    (cache_key, json.dumps(traffic_data)))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'success': True, 'message': '缓存已同步到服务器'})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 if __name__ == '__main__':

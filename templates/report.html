@@ -61,6 +61,11 @@
                 </ul>
             </div>
 
+            <!-- Sync Cache Button (Admin Only) -->
+            <button class="btn btn-outline-warning" onclick="syncCacheToServer()" title="将当前缓存上传供他人使用">
+                <i class="bi bi-cloud-upload me-1"></i>同步缓存
+            </button>
+
             <button class="btn btn-outline-secondary" onclick="exportCSV()">
                 <i class="bi bi-download me-1"></i>导出CSV
             </button>
@@ -231,11 +236,32 @@
     }
 
     .table tbody td.summary-col {
-        background: #f8fafc !important;
+        /* background removed here to allow row-based coloring */
     }
 
     .card-header {
         background: linear-gradient(135deg, rgba(59, 130, 246, 0.1), rgba(139, 92, 246, 0.1));
+    }
+
+    /* Site Grouping Zebra Striping */
+    .site-group-odd td:not(.sticky-col):not(.sticky-col-2) {
+        background-color: #ffffff;
+    }
+
+    .site-group-even td:not(.sticky-col):not(.sticky-col-2) {
+        background-color: #f8fafc;
+        /* Very light gray/blue */
+    }
+
+    /* Ensure sticky columns match the row background to prevent transparency issues */
+    .site-group-odd .sticky-col,
+    .site-group-odd .sticky-col-2 {
+        background-color: #ffffff;
+    }
+
+    .site-group-even .sticky-col,
+    .site-group-even .sticky-col-2 {
+        background-color: #f8fafc;
     }
 </style>
 
@@ -415,8 +441,8 @@
 
         // Try load from cache first
         if (!forceRefresh) {
-            const cachedData = localStorage.getItem('report_last_result');
-            const cachedParams = localStorage.getItem('report_last_params');
+            const cachedData = localStorage.getItem('report_last_result_v2');
+            const cachedParams = localStorage.getItem('report_last_params_v2');
 
             if (cachedData && cachedParams) {
                 try {
@@ -446,15 +472,17 @@
         document.getElementById('errorState').style.display = 'none';
 
         try {
-            const response = await fetch(`/api/report/data?start_date=${startDate}&end_date=${endDate}`);
+            // Add force=true param if forceRefresh is requested
+            const url = `/api/report/data?start_date=${startDate}&end_date=${endDate}${forceRefresh ? '&force=true' : ''}`;
+            const response = await fetch(url);
             const result = await response.json();
 
             if (result.success) {
                 // Save state and data cache
                 localStorage.setItem('report_startDate', startDate);
                 localStorage.setItem('report_endDate', endDate);
-                localStorage.setItem('report_last_result', JSON.stringify(result));
-                localStorage.setItem('report_last_params', JSON.stringify({ start: startDate, end: endDate }));
+                localStorage.setItem('report_last_result_v2', JSON.stringify(result));
+                localStorage.setItem('report_last_params_v2', JSON.stringify({ start: startDate, end: endDate }));
 
                 currentResult = result;
 
@@ -476,6 +504,43 @@
         } finally {
             document.getElementById('loadingState').style.display = 'none';
         }
+    }
+
+    function syncCacheToServer() {
+        if (!currentResult) {
+            alert('当前没有可同步的数据');
+            return;
+        }
+
+        if (!confirm('确定将当前显示的报表数据同步到服务器吗？\n其他用户打开报表时将默认加载此数据。')) {
+            return;
+        }
+
+        const startDate = document.getElementById('startDate').value;
+        const endDate = document.getElementById('endDate').value;
+
+        const payload = {
+            start_date: startDate,
+            end_date: endDate,
+            data: currentResult
+        };
+
+        fetch('/api/report/cache/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    alert('同步成功！其他用户现在可以看到这些数据了。');
+                } else {
+                    alert('同步失败: ' + (data.error || '未知错误'));
+                }
+            })
+            .catch(err => {
+                alert('网络请求失败: ' + err);
+            });
     }
 
     function renderReport(result) {
@@ -518,11 +583,14 @@
         const tbody = document.getElementById('reportBody');
         tbody.innerHTML = '';
 
-        activeSites.forEach(site => {
+        activeSites.forEach((site, siteIndex) => {
             const siteData = data[site] || {};
+            // Determine class for this site group (odd/even)
+            const rowClass = siteIndex % 2 === 0 ? 'site-group-odd' : 'site-group-even';
 
             activeMetrics.forEach((metric, idx) => {
                 const row = document.createElement('tr');
+                row.className = rowClass;
 
                 // Site name (only for first metric)
                 if (idx === 0) {
