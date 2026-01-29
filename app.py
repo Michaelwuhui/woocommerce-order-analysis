@@ -7525,14 +7525,88 @@ def aggregate_traffic_by_month(traffic_data):
     return result
 
 
-def get_orders_by_month_for_report(start_date, end_date, source=None):
-    """Get orders aggregated by source and month for report"""
+def aggregate_traffic_by_day(traffic_data):
+    """Keep daily traffic data (no aggregation needed, just restructure)"""
+    result = {}
+    for day_data in traffic_data:
+        time_str = day_data.get('time', '')
+        if len(time_str) >= 10:
+            day = time_str[:10]  # YYYY-MM-DD
+            result[day] = {
+                'uv': day_data.get('uv', 0),
+                'pv': day_data.get('pv', 0),
+                'newUserCount': day_data.get('newUserCount', 0),
+                'sv': day_data.get('sv', 0),
+                'ip': day_data.get('ip', 0),
+                'bounceRate': day_data.get('bounceRate', 0)
+            }
+    return result
+
+
+def aggregate_traffic_by_week(traffic_data):
+    """Aggregate daily traffic data by week (ISO week number)"""
+    from collections import defaultdict
+    from datetime import datetime
+    
+    weekly = defaultdict(lambda: {
+        'uv': 0, 'pv': 0, 'newUserCount': 0, 'sv': 0, 'ip': 0,
+        'bounceRate_sum': 0, 'bounceRate_count': 0
+    })
+    
+    for day_data in traffic_data:
+        time_str = day_data.get('time', '')
+        if len(time_str) >= 10:
+            try:
+                dt = datetime.strptime(time_str[:10], '%Y-%m-%d')
+                # ISO week format: YYYY-Www
+                week_key = f"{dt.isocalendar()[0]}-W{dt.isocalendar()[1]:02d}"
+                
+                weekly[week_key]['uv'] += day_data.get('uv', 0)
+                weekly[week_key]['pv'] += day_data.get('pv', 0)
+                weekly[week_key]['newUserCount'] += day_data.get('newUserCount', 0)
+                weekly[week_key]['sv'] += day_data.get('sv', 0)
+                weekly[week_key]['ip'] += day_data.get('ip', 0)
+                weekly[week_key]['bounceRate_sum'] += day_data.get('bounceRate', 0)
+                weekly[week_key]['bounceRate_count'] += 1
+            except:
+                continue
+    
+    # Calculate average bounce rate
+    result = {}
+    for week, data in weekly.items():
+        result[week] = {
+            'uv': data['uv'],
+            'pv': data['pv'],
+            'newUserCount': data['newUserCount'],
+            'sv': data['sv'],
+            'ip': data['ip'],
+            'bounceRate': round(data['bounceRate_sum'] / data['bounceRate_count'], 4) if data['bounceRate_count'] > 0 else 0
+        }
+    
+    return result
+
+
+def get_orders_for_report(start_date, end_date, granularity='month', source=None):
+    """Get orders aggregated by source and time period for report
+    
+    Args:
+        granularity: 'day', 'week', or 'month'
+    """
     conn = get_db_connection()
     
-    query = '''
+    # Build time grouping expression based on granularity
+    if granularity == 'day':
+        time_expr = "strftime('%Y-%m-%d', date_created)"
+    elif granularity == 'week':
+        # ISO week format: YYYY-Www
+        time_expr = "strftime('%Y-W%W', date_created)"
+    else:  # month
+        time_expr = "strftime('%Y-%m', date_created)"
+    
+    query = f'''
         SELECT 
             source,
-            strftime('%Y-%m', date_created) as month,
+            {time_expr} as period,
             COUNT(*) as order_count,
             SUM(total) as total_amount,
             SUM(total - shipping_total) as net_amount,
@@ -7549,35 +7623,37 @@ def get_orders_by_month_for_report(start_date, end_date, source=None):
         query += ' AND source = ?'
         params.append(source)
     
-    query += ' GROUP BY source, month, currency ORDER BY source, month'
+    query += f' GROUP BY source, period, currency ORDER BY source, period'
     
     orders = conn.execute(query, params).fetchall()
     conn.close()
     
     result = {}
     for row in orders:
-        source = row['source']
-        month = row['month']
+        source_url = row['source']
+        period = row['period']
         currency = row['currency']
         
-        if source not in result:
-            result[source] = {}
+        if source_url not in result:
+            result[source_url] = {'currency': currency, 'periods': {}}
         
-        if month not in result[source]:
-            result[source][month] = {
+        if period not in result[source_url]['periods']:
+            result[source_url]['periods'][period] = {
                 'order_count': 0,
                 'total_amount': 0,
                 'net_amount': 0,
                 'net_cny': 0
             }
         
-        rate, _ = get_cny_rate(currency, month)
+        # Get exchange rate (use month from period for rate lookup)
+        rate_month = period[:7] if len(period) >= 7 else period
+        rate, _ = get_cny_rate(currency, rate_month)
         rate = rate or 1
         
-        result[source][month]['order_count'] += row['order_count']
-        result[source][month]['total_amount'] += row['total_amount'] or 0
-        result[source][month]['net_amount'] += row['success_net'] or 0
-        result[source][month]['net_cny'] += (row['success_net'] or 0) * rate
+        result[source_url]['periods'][period]['order_count'] += row['order_count']
+        result[source_url]['periods'][period]['total_amount'] += row['total_amount'] or 0
+        result[source_url]['periods'][period]['net_amount'] += row['success_net'] or 0
+        result[source_url]['periods'][period]['net_cny'] += (row['success_net'] or 0) * rate
     
     return result
 
@@ -7594,11 +7670,16 @@ def report():
 @login_required
 @report_viewer_required
 def api_report_data():
-    """API to get combined report data"""
+    """API to get combined report data with granularity support"""
     from datetime import datetime, timedelta
     
     start_date = request.args.get('start_date', '')
     end_date = request.args.get('end_date', '')
+    granularity = request.args.get('granularity', 'month')  # day, week, month
+    
+    # Validate granularity
+    if granularity not in ('day', 'week', 'month'):
+        granularity = 'month'
     
     if not end_date:
         end_date = datetime.now().strftime('%Y-%m-%d')
@@ -7606,12 +7687,12 @@ def api_report_data():
         start_dt = datetime.now() - timedelta(days=180)
         start_date = start_dt.strftime('%Y-%m-%d')
     
-    # Cache Logic
-    cache_key = f"traffic_{start_date}_{end_date}"
+    # Cache Logic - include granularity in key
+    cache_key = f"traffic_{start_date}_{end_date}_{granularity}"
     force_refresh = request.args.get('force', 'false') == 'true'
     
     # Try load from server cache first (if not forced)
-    conn = get_db_connection() # Use woocommerce_orders.db which has report_cache
+    conn = get_db_connection()
     if not force_refresh:
         try:
             cached_row = conn.execute('SELECT cache_value FROM report_cache WHERE cache_key = ?', (cache_key,)).fetchone()
@@ -7622,27 +7703,23 @@ def api_report_data():
                 return jsonify(cached_data)
         except Exception as e:
             print(f"Cache read error: {e}")
-            # Continue to fetch real data
     
     all_traffic = {}
-    orders_data = get_orders_by_month_for_report(start_date, end_date)
+    # Use the new function with granularity support
+    orders_data = get_orders_for_report(start_date, end_date, granularity)
     
-    # Get sites config from database (already opened connection)
+    # Get sites config from database
     db_sites = conn.execute('SELECT url, mask_id FROM sites').fetchall()
     
     def normalize_domain(url):
         if not url: return "unknown"
-        # 移除不可见字符，统一转小写
         url = url.lower().strip()
-        # 移除协议头
         if 'https://' in url:
             url = url.replace('https://', '')
         if 'http://' in url:
             url = url.replace('http://', '')
-        # 移除 www.
         if 'www.' in url:
             url = url.replace('www.', '')
-        # 取域名第一部分（移除路径）
         return url.split('/')[0]
 
     # Create mask_id mapping (normalized)
@@ -7665,56 +7742,73 @@ def api_report_data():
             all_traffic[site_name] = traffic
 
     combined = {}
-    all_months = set()
+    all_periods = set()
     
+    # Select aggregation function based on granularity
     for site_name, traffic_list in all_traffic.items():
         if site_name not in combined:
             combined[site_name] = {}
         
-        monthly_traffic = aggregate_traffic_by_month(traffic_list)
+        # Aggregate traffic based on granularity
+        if granularity == 'day':
+            aggregated_traffic = aggregate_traffic_by_day(traffic_list)
+        elif granularity == 'week':
+            aggregated_traffic = aggregate_traffic_by_week(traffic_list)
+        else:
+            aggregated_traffic = aggregate_traffic_by_month(traffic_list)
         
-        for month, data in monthly_traffic.items():
-            all_months.add(month)
-            if month not in combined[site_name]:
-                combined[site_name][month] = {}
-            combined[site_name][month]['uv'] = data['uv']
-            combined[site_name][month]['pv'] = data['pv']
-            combined[site_name][month]['newUserCount'] = data['newUserCount']
-            combined[site_name][month]['bounceRate'] = data['bounceRate']
+        for period, data in aggregated_traffic.items():
+            all_periods.add(period)
+            if period not in combined[site_name]:
+                combined[site_name][period] = {}
+            combined[site_name][period]['uv'] = data['uv']
+            combined[site_name][period]['pv'] = data['pv']
+            combined[site_name][period]['newUserCount'] = data['newUserCount']
+            combined[site_name][period]['bounceRate'] = data['bounceRate']
     
-    for source, months in orders_data.items():
+    # Process orders data (new structure with currency)
+    site_currencies = {}  # Store currency per site
+    for source, source_data in orders_data.items():
         site_name = None
         norm_source = normalize_domain(source)
         
-        # 1. Direct match
         if norm_source in site_mask_map:
             site_name = norm_source
         else:
-            # 2. Partial match (in case source implies a known site)
             for name in site_mask_map.keys():
                 if name in norm_source:
                     site_name = name
                     break
         
         if not site_name:
-            site_name = norm_source # Fallback to normalized source, at least it cleans up 'https://'
+            site_name = norm_source
+        
+        # Save currency for this site
+        if 'currency' in source_data:
+            site_currencies[site_name] = source_data['currency']
         
         if site_name not in combined:
             combined[site_name] = {}
         
-        for month, data in months.items():
-            all_months.add(month)
-            if month not in combined[site_name]:
-                combined[site_name][month] = {}
+        # Get periods from the new structure
+        periods_data = source_data.get('periods', source_data)  # Fallback for old structure
+        
+        for period, data in periods_data.items():
+            if period == 'currency':  # Skip the currency field
+                continue
+            all_periods.add(period)
+            if period not in combined[site_name]:
+                combined[site_name][period] = {}
             
-            current = combined[site_name][month]
+            current = combined[site_name][period]
             current['order_count'] = current.get('order_count', 0) + data['order_count']
             current['total_amount'] = current.get('total_amount', 0) + data['total_amount']
             current['net_amount'] = current.get('net_amount', 0) + data['net_amount']
             current['net_cny'] = current.get('net_cny', 0) + data['net_cny']
     
-    for site_name, months in combined.items():
-        for month, data in months.items():
+    # Calculate derived metrics
+    for site_name, periods in combined.items():
+        for period, data in periods.items():
             uv = data.get('uv', 0)
             orders = data.get('order_count', 0)
             net_cny = data.get('net_cny', 0)
@@ -7722,15 +7816,19 @@ def api_report_data():
             data['conversion_rate'] = round(orders / uv * 100, 2) if uv > 0 else None
             data['aov_cny'] = round(net_cny / orders, 2) if orders > 0 else None
     
-    sorted_months = sorted(all_months)
+    sorted_periods = sorted(all_periods)
     
     final_result = {
         'success': True,
         'data': combined,
-        'months': sorted_months,
+        'periods': sorted_periods,
+        'months': sorted_periods,   # Keep for backward compatibility
         'sites': list(site_mask_map.keys()),
-        'date_range': {'start': start_date, 'end': end_date}
+        'site_currencies': site_currencies,  # Currency per site
+        'date_range': {'start': start_date, 'end': end_date},
+        'granularity': granularity
     }
+
     
     # Save to server cache if we have traffic data (to avoid caching empty/failed API calls)
     # Only cache if at least one site has traffic data

@@ -103,6 +103,31 @@
                     </button>
                 </div>
             </div>
+            <!-- 时间粒度切换 -->
+            <div class="row mt-3">
+                <div class="col-12">
+                    <label class="form-label text-white-50 me-3">显示粒度</label>
+                    <div class="btn-group" role="group" id="granularityBtnGroup">
+                        <button type="button" class="btn btn-outline-info btn-sm" data-granularity="day"
+                            onclick="setGranularity('day')">
+                            <i class="bi bi-calendar-day me-1"></i>按天
+                        </button>
+                        <button type="button" class="btn btn-outline-info btn-sm" data-granularity="week"
+                            onclick="setGranularity('week')">
+                            <i class="bi bi-calendar-week me-1"></i>按周
+                        </button>
+                        <button type="button" class="btn btn-outline-info btn-sm active" data-granularity="month"
+                            onclick="setGranularity('month')">
+                            <i class="bi bi-calendar-month me-1"></i>按月
+                        </button>
+                        <button type="button" class="btn btn-outline-secondary btn-sm" data-granularity="auto"
+                            onclick="setGranularity('auto')">
+                            <i class="bi bi-magic me-1"></i>智能
+                        </button>
+                    </div>
+                    <small class="text-white-50 ms-3" id="granularityHint"></small>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -124,7 +149,8 @@
                 <canvas id="trendChart"></canvas>
             </div>
             <div class="text-center mt-3">
-                <small class="text-muted"><i class="bi bi-info-circle me-1"></i>图表显示筛选范围内所有选中站点的月度汇总数据</small>
+                <small class="text-muted"><i class="bi bi-info-circle me-1"></i>图表显示筛选范围内所有选中站点的<span
+                        id="chartGranularityInfo">月度</span>汇总数据</small>
             </div>
         </div>
     </div>
@@ -235,9 +261,7 @@
         font-weight: 600;
     }
 
-    .table tbody td.summary-col {
-        /* background removed here to allow row-based coloring */
-    }
+    /* .table tbody td.summary-col - background removed to allow row-based coloring */
 
     .card-header {
         background: linear-gradient(135deg, rgba(59, 130, 246, 0.1), rgba(139, 92, 246, 0.1));
@@ -279,6 +303,8 @@
 
     let currentResult = null; // Store current API result for re-rendering
     let trendChart = null; // Chart instance
+    let currentGranularity = 'month'; // day, week, month
+    let isManualGranularity = false; // true = user manually selected, false = auto/smart
 
     // Initialize
     document.addEventListener('DOMContentLoaded', function () {
@@ -286,6 +312,12 @@
 
         const savedStart = localStorage.getItem('report_startDate');
         const savedEnd = localStorage.getItem('report_endDate');
+        const savedGranularity = localStorage.getItem('report_granularity');
+
+        if (savedGranularity) {
+            currentGranularity = savedGranularity;
+            updateGranularityUI(currentGranularity);
+        }
 
         if (savedStart && savedEnd) {
             document.getElementById('startDate').value = savedStart;
@@ -407,10 +439,86 @@
         document.getElementById('endDate').value = endStr;
 
         updateActiveButton(days);
+
+        // 方案A: 30天按钮自动设为按天显示
+        if (days === 30) {
+            currentGranularity = 'day';
+            isManualGranularity = false;
+            updateGranularityUI('day');
+        } else if (!isManualGranularity) {
+            // 如果不是手动设置，使用智能粒度
+            currentGranularity = getSmartGranularity(days);
+            updateGranularityUI(currentGranularity);
+        }
+    }
+
+    // 智能粒度计算 (方案B)
+    function getSmartGranularity(days) {
+        if (days <= 30) return 'day';
+        if (days <= 90) return 'week';
+        return 'month';
+    }
+
+    // 获取当前日期范围天数
+    function getCurrentDayRange() {
+        const startDate = new Date(document.getElementById('startDate').value);
+        const endDate = new Date(document.getElementById('endDate').value);
+        const diffTime = Math.abs(endDate - startDate);
+        return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    }
+
+    // 手动设置粒度 (方案C)
+    function setGranularity(granularity) {
+        if (granularity === 'auto') {
+            // 智能模式
+            isManualGranularity = false;
+            const days = getCurrentDayRange();
+            currentGranularity = getSmartGranularity(days);
+            updateGranularityHint(`智能选择: ${granularityLabel(currentGranularity)}`);
+        } else {
+            isManualGranularity = true;
+            currentGranularity = granularity;
+            updateGranularityHint('');
+        }
+
+        updateGranularityUI(granularity === 'auto' ? 'auto' : currentGranularity);
+        localStorage.setItem('report_granularity', currentGranularity);
+
+        // 如果已有数据，重新加载
+        if (currentResult) {
+            loadReportData(true);
+        }
+    }
+
+    function granularityLabel(g) {
+        const labels = { 'day': '按天', 'week': '按周', 'month': '按月' };
+        return labels[g] || g;
+    }
+
+    function updateGranularityUI(active) {
+        document.querySelectorAll('#granularityBtnGroup button').forEach(btn => {
+            btn.classList.remove('active');
+            if (btn.dataset.granularity === active) {
+                btn.classList.add('active');
+            }
+        });
+
+        // 更新图表提示
+        const infoSpan = document.getElementById('chartGranularityInfo');
+        if (infoSpan) {
+            const labels = { 'day': '每日', 'week': '每周', 'month': '月度' };
+            infoSpan.textContent = labels[currentGranularity] || '月度';
+        }
+    }
+
+    function updateGranularityHint(text) {
+        const hint = document.getElementById('granularityHint');
+        if (hint) hint.textContent = text;
     }
 
     function updateActiveButton(days) {
-        document.querySelectorAll('.btn-group .btn').forEach(btn => {
+        // 只更新日期范围按钮，不影响粒度按钮
+        document.querySelectorAll('.col-md-4 .btn-group .btn').forEach(btn => {
             btn.classList.remove('active');
             if (btn.textContent.includes(days + '天') ||
                 (days === 90 && btn.textContent.includes('3个月')) ||
@@ -439,16 +547,25 @@
         const startDate = document.getElementById('startDate').value;
         const endDate = document.getElementById('endDate').value;
 
+        // 计算智能粒度 (方案B: 点击查询时智能切换)
+        if (!isManualGranularity) {
+            const days = getCurrentDayRange();
+            currentGranularity = getSmartGranularity(days);
+            updateGranularityUI(currentGranularity);
+        }
+
+        const granularity = currentGranularity;
+
         // Try load from cache first
         if (!forceRefresh) {
-            const cachedData = localStorage.getItem('report_last_result_v2');
-            const cachedParams = localStorage.getItem('report_last_params_v2');
+            const cachedData = localStorage.getItem('report_last_result_v3');
+            const cachedParams = localStorage.getItem('report_last_params_v3');
 
             if (cachedData && cachedParams) {
                 try {
                     const params = JSON.parse(cachedParams);
-                    // Match current date inputs
-                    if (params.start === startDate && params.end === endDate) {
+                    // Match current date inputs AND granularity
+                    if (params.start === startDate && params.end === endDate && params.granularity === granularity) {
                         const result = JSON.parse(cachedData);
                         currentResult = result;
 
@@ -472,17 +589,18 @@
         document.getElementById('errorState').style.display = 'none';
 
         try {
-            // Add force=true param if forceRefresh is requested
-            const url = `/api/report/data?start_date=${startDate}&end_date=${endDate}${forceRefresh ? '&force=true' : ''}`;
+            // Add granularity param to API request
+            const url = `/api/report/data?start_date=${startDate}&end_date=${endDate}&granularity=${granularity}${forceRefresh ? '&force=true' : ''}`;
             const response = await fetch(url);
             const result = await response.json();
 
             if (result.success) {
-                // Save state and data cache
+                // Save state and data cache (with granularity)
                 localStorage.setItem('report_startDate', startDate);
                 localStorage.setItem('report_endDate', endDate);
-                localStorage.setItem('report_last_result_v2', JSON.stringify(result));
-                localStorage.setItem('report_last_params_v2', JSON.stringify({ start: startDate, end: endDate }));
+                localStorage.setItem('report_granularity', granularity);
+                localStorage.setItem('report_last_result_v3', JSON.stringify(result));
+                localStorage.setItem('report_last_params_v3', JSON.stringify({ start: startDate, end: endDate, granularity: granularity }));
 
                 currentResult = result;
 
@@ -544,7 +662,30 @@
     }
 
     function renderReport(result) {
-        const { data, months, sites } = result;
+        const { data, months, sites, site_currencies } = result;
+
+        // 货币符号映射
+        const CURRENCY_SYMBOLS = {
+            'PLN': 'zł',
+            'EUR': '€',
+            'USD': '$',
+            'GBP': '£',
+            'AED': 'AED',
+            'AUD': 'A$',
+            'CAD': 'C$',
+            'CHF': 'CHF',
+            'JPY': '¥',
+            'KRW': '₩',
+            'SAR': 'SAR',
+            'QAR': 'QAR',
+            'KWD': 'KWD'
+        };
+
+        function getCurrencySymbol(siteName) {
+            if (!site_currencies) return '';
+            const currency = site_currencies[siteName];
+            return currency ? (CURRENCY_SYMBOLS[currency] || currency) : '';
+        }
 
         // Get Selected Metrics
         const selectedKeys = Array.from(document.querySelectorAll('.metric-check:checked')).map(cb => cb.value);
@@ -617,7 +758,15 @@
                     const value = monthData[metric.key];
 
                     if (value !== undefined && value !== null) {
-                        cell.textContent = formatValue(value, metric.format);
+                        let displayValue = formatValue(value, metric.format);
+                        // 为订单金额添加货币符号
+                        if (metric.key === 'total_amount' && value > 0) {
+                            const currencySymbol = getCurrencySymbol(site);
+                            if (currencySymbol) {
+                                displayValue = displayValue + ' ' + currencySymbol;
+                            }
+                        }
+                        cell.textContent = displayValue;
                         total += value;
                         count++;
                     } else {
@@ -633,7 +782,15 @@
                 summaryCell.className = 'summary-col';
 
                 if (metric.sum && count > 0) {
-                    summaryCell.textContent = formatValue(total, metric.format);
+                    let summaryValue = formatValue(total, metric.format);
+                    // 为订单金额合计添加货币符号
+                    if (metric.key === 'total_amount' && total > 0) {
+                        const currencySymbol = getCurrencySymbol(site);
+                        if (currencySymbol) {
+                            summaryValue = summaryValue + ' ' + currencySymbol;
+                        }
+                    }
+                    summaryCell.textContent = summaryValue;
                 } else if (metric.avg && count > 0) {
                     // For conversion rate, recalculate from totals
                     // Note: This summary logic needs strict recalculation for accuracy
@@ -852,9 +1009,28 @@
         });
     }
 
+    function formatPeriod(periodStr) {
+        // 日期格式: YYYY-MM-DD
+        if (periodStr.match(/^\d{4}-\d{2}-\d{2}$/)) {
+            const [year, month, day] = periodStr.split('-');
+            return `${parseInt(month)}月${parseInt(day)}日`;
+        }
+        // 周格式: YYYY-Www 或 YYYY-W0w
+        if (periodStr.match(/^\d{4}-W\d{1,2}$/)) {
+            const parts = periodStr.split('-W');
+            return `${parts[0]}年第${parseInt(parts[1])}周`;
+        }
+        // 月格式: YYYY-MM
+        if (periodStr.match(/^\d{4}-\d{2}$/)) {
+            const [year, month] = periodStr.split('-');
+            return `${year}年${parseInt(month)}月`;
+        }
+        return periodStr;
+    }
+
+    // 保留旧函数名以兼容
     function formatMonth(monthStr) {
-        const [year, month] = monthStr.split('-');
-        return `${year}年${parseInt(month)}月`;
+        return formatPeriod(monthStr);
     }
 
     function formatValue(value, format) {
