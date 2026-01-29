@@ -3732,132 +3732,178 @@ def get_site_email_stats(site_id):
         return jsonify({'success': False, 'error': f'请求失败: {str(e)}'})
 
 
+# Global status dict for API check progress
+CHECK_STATUS = {}
+
 @app.route('/api/sites/check-all', methods=['POST'])
 @login_required
 def check_all_sites_api():
-    """Check API connectivity for all sites - tests both read and write permissions"""
-    from woocommerce import API
+    """Check API connectivity for all sites - runs in background thread to avoid timeout"""
+    import threading
     
-    conn = get_db_connection()
-    sites = conn.execute('SELECT * FROM sites').fetchall()
+    # Use a unique ID for this check operation
+    CHECK_ALL_ID = 888888
     
-    results = []
+    CHECK_STATUS[CHECK_ALL_ID] = {
+        'status': 'running',
+        'message': '正在启动API检测...',
+        'results': [],
+        'progress': 0,
+        'total': 0
+    }
     
-    for site in sites:
-        site_id = site['id']
-        site_url = site['url']
-        read_status = 'unknown'
-        write_status = 'unknown'
-        error_msg = None
+    def run_check_all(app_context, status_id):
+        from woocommerce import API
         
-        try:
-            wcapi = API(
-                url=site_url,
-                consumer_key=site['consumer_key'],
-                consumer_secret=site['consumer_secret'],
-                version="wc/v3",
-                timeout=15
-            )
-            
-            # Test READ permission
+        with app_context:
             try:
-                response = wcapi.get("orders", params={"per_page": 1})
+                conn = get_db_connection()
+                sites = conn.execute('SELECT * FROM sites').fetchall()
                 
-                if response.status_code == 200:
-                    read_status = 'ok'
-                elif response.status_code in (401, 403):
-                    read_status = 'error'
-                    error_msg = f"读权限认证失败 (HTTP {response.status_code})"
-                    try:
-                        error_data = response.json()
-                        if 'message' in error_data:
-                            error_msg = f"{error_msg}: {error_data['message']}"
-                    except:
-                        pass
-                else:
-                    read_status = 'error'
-                    error_msg = f"读取失败 HTTP {response.status_code}"
-            except Exception as e:
-                read_status = 'error'
-                error_msg = f"读权限测试失败: {str(e)}"
-            
-            # Test WRITE permission (only if read is ok)
-            if read_status == 'ok':
-                try:
-                    # Get an order to test write permission on
-                    orders_response = wcapi.get("orders", params={"per_page": 1, "status": "any"})
+                total_sites = len(sites)
+                CHECK_STATUS[status_id]['total'] = total_sites
+                results = []
+                
+                for index, site in enumerate(sites):
+                    site_id = site['id']
+                    site_url = site['url']
+                    read_status = 'unknown'
+                    write_status = 'unknown'
+                    error_msg = None
                     
-                    if orders_response.status_code == 200:
-                        orders = orders_response.json()
+                    CHECK_STATUS[status_id]['message'] = f'正在检测 {site_url} ({index+1}/{total_sites})...'
+                    CHECK_STATUS[status_id]['progress'] = index + 1
+                    
+                    try:
+                        wcapi = API(
+                            url=site_url,
+                            consumer_key=site['consumer_key'],
+                            consumer_secret=site['consumer_secret'],
+                            version="wc/v3",
+                            timeout=15,
+                            user_agent="WooCommerce API Client-Python/3.0.0"
+                        )
                         
-                        if orders and len(orders) > 0:
-                            test_order_id = orders[0]['id']
+                        # Test READ permission
+                        try:
+                            response = wcapi.get("orders", params={"per_page": 1})
                             
-                            # Try to add a test note (internal, not sent to customer)
-                            test_note_response = wcapi.post(
-                                f"orders/{test_order_id}/notes",
-                                data={
-                                    "note": "[API权限测试] 此消息用于验证写权限，将立即删除",
-                                    "customer_note": False
-                                }
-                            )
-                            
-                            if test_note_response.status_code in (200, 201):
-                                write_status = 'ok'
-                                
-                                # Try to delete the test note
+                            if response.status_code == 200:
+                                read_status = 'ok'
+                            elif response.status_code in (401, 403):
+                                read_status = 'error'
+                                error_msg = f"读权限认证失败 (HTTP {response.status_code})"
                                 try:
-                                    note_id = test_note_response.json().get('id')
-                                    if note_id:
-                                        wcapi.delete(f"orders/{test_order_id}/notes/{note_id}")
+                                    error_data = response.json()
+                                    if 'message' in error_data:
+                                        error_msg = f"{error_msg}: {error_data['message']}"
                                 except:
-                                    pass  # 删除失败不影响写权限判定
-                            elif test_note_response.status_code in (401, 403):
-                                write_status = 'error'
-                                if not error_msg:
-                                    error_msg = "写权限被拒绝"
+                                    pass
                             else:
+                                read_status = 'error'
+                                error_msg = f"读取失败 HTTP {response.status_code}"
+                        except Exception as e:
+                            read_status = 'error'
+                            error_msg = f"读权限测试失败: {str(e)}"
+                        
+                        # Test WRITE permission (only if read is ok)
+                        if read_status == 'ok':
+                            try:
+                                orders_response = wcapi.get("orders", params={"per_page": 1, "status": "any"})
+                                
+                                if orders_response.status_code == 200:
+                                    orders = orders_response.json()
+                                    
+                                    if orders and len(orders) > 0:
+                                        test_order_id = orders[0]['id']
+                                        
+                                        test_note_response = wcapi.post(
+                                            f"orders/{test_order_id}/notes",
+                                            data={
+                                                "note": "[API权限测试] 此消息用于验证写权限，将立即删除",
+                                                "customer_note": False
+                                            }
+                                        )
+                                        
+                                        if test_note_response.status_code in (200, 201):
+                                            write_status = 'ok'
+                                            try:
+                                                note_id = test_note_response.json().get('id')
+                                                if note_id:
+                                                    wcapi.delete(f"orders/{test_order_id}/notes/{note_id}")
+                                            except:
+                                                pass
+                                        elif test_note_response.status_code in (401, 403):
+                                            write_status = 'error'
+                                            if not error_msg:
+                                                error_msg = "写权限被拒绝"
+                                        else:
+                                            write_status = 'error'
+                                            if not error_msg:
+                                                error_msg = f"写入测试失败 HTTP {test_note_response.status_code}"
+                                    else:
+                                        write_status = 'unknown'
+                                        if not error_msg:
+                                            error_msg = "无订单可测试写权限"
+                                else:
+                                    write_status = 'unknown'
+                            except Exception as e:
                                 write_status = 'error'
                                 if not error_msg:
-                                    error_msg = f"写入测试失败 HTTP {test_note_response.status_code}"
+                                    error_msg = f"写权限测试失败: {str(e)}"
                         else:
                             write_status = 'unknown'
-                            if not error_msg:
-                                error_msg = "无订单可测试写权限"
-                    else:
+                            
+                    except Exception as e:
+                        read_status = 'error'
                         write_status = 'unknown'
-                except Exception as e:
-                    write_status = 'error'
-                    if not error_msg:
-                        error_msg = f"写权限测试失败: {str(e)}"
-            else:
-                # 如果读权限失败，跳过写权限测试
-                write_status = 'unknown'
+                        error_msg = f"连接失败: {str(e)}"
+                    
+                    # Update database
+                    conn.execute('''
+                        UPDATE sites 
+                        SET api_read_status = ?, api_write_status = ?, last_api_error = ?
+                        WHERE id = ?
+                    ''', (read_status, write_status, error_msg, site_id))
+                    conn.commit()
+                    
+                    results.append({
+                        'site_id': site_id,
+                        'url': site_url,
+                        'read': read_status,
+                        'write': write_status,
+                        'message': error_msg
+                    })
+                    
+                    CHECK_STATUS[status_id]['results'] = results
                 
-        except Exception as e:
-            read_status = 'error'
-            write_status = 'unknown'
-            error_msg = f"连接失败: {str(e)}"
-        
-        # Update database
-        conn.execute('''
-            UPDATE sites 
-            SET api_read_status = ?, api_write_status = ?, last_api_error = ?
-            WHERE id = ?
-        ''', (read_status, write_status, error_msg, site_id))
-        
-        results.append({
-            'site_id': site_id,
-            'url': site_url,
-            'read': read_status,
-            'write': write_status,
-            'message': error_msg
-        })
+                conn.close()
+                
+                # Calculate final stats
+                ok_count = sum(1 for r in results if r['read'] == 'ok' and r['write'] == 'ok')
+                error_count = sum(1 for r in results if r['read'] == 'error' or r['write'] == 'error')
+                
+                CHECK_STATUS[status_id]['status'] = 'success'
+                CHECK_STATUS[status_id]['message'] = f'检测完成！正常: {ok_count} 个，异常: {error_count} 个'
+                
+            except Exception as e:
+                CHECK_STATUS[status_id]['status'] = 'error'
+                CHECK_STATUS[status_id]['message'] = f'检测失败: {str(e)}'
     
-    conn.commit()
-    conn.close()
+    thread = threading.Thread(target=run_check_all, args=(app.app_context(), CHECK_ALL_ID))
+    thread.start()
     
-    return jsonify({'success': True, 'results': results})
+    return jsonify({'success': True, 'check_id': CHECK_ALL_ID, 'message': 'API检测已启动'})
+
+
+@app.route('/api/sites/check-status/<int:check_id>')
+@login_required
+def get_check_status(check_id):
+    """Get the status of an ongoing API check operation"""
+    if check_id not in CHECK_STATUS:
+        return jsonify({'status': 'unknown', 'message': '检测任务不存在'})
+    
+    return jsonify(CHECK_STATUS[check_id])
 
 @app.route('/api/sync/clean/<int:site_id>', methods=['POST'])
 @login_required

@@ -899,23 +899,60 @@
                 btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> 检测中...';
 
                 fetch('/api/sites/check-all', { method: 'POST' })
-                    .then(res => res.json())
+                    .then(res => {
+                        if (res.redirected || res.status === 302 || res.status === 401) {
+                            throw new Error('登录已过期，请刷新页面重新登录');
+                        }
+                        if (!res.ok) {
+                            throw new Error(`服务器错误 (HTTP ${res.status})`);
+                        }
+                        return res.json();
+                    })
                     .then(data => {
-                        btn.disabled = false;
-                        btn.innerHTML = originalHtml;
+                        if (data.success && data.check_id) {
+                            // Start polling for status
+                            const checkId = data.check_id;
+                            const pollInterval = setInterval(() => {
+                                fetch(`/api/sites/check-status/${checkId}`)
+                                    .then(res => res.json())
+                                    .then(status => {
+                                        // Update button text with progress
+                                        if (status.total > 0) {
+                                            btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span> 检测中 (${status.progress}/${status.total})...`;
+                                        }
 
-                        if (data.success) {
-                            const okCount = data.results.filter(r => r.status === 'ok').length;
-                            const errorCount = data.results.filter(r => r.status === 'error').length;
+                                        if (status.status === 'success') {
+                                            clearInterval(pollInterval);
+                                            btn.disabled = false;
+                                            btn.innerHTML = originalHtml;
 
-                            if (errorCount > 0) {
-                                alert(`检测完成！\n✅ 正常: ${okCount} 个\n❌ 异常: ${errorCount} 个`);
-                            } else {
-                                alert(`检测完成！所有 ${okCount} 个站点连接正常 ✅`);
-                            }
-                            location.reload();
+                                            const okCount = status.results.filter(r => r.read === 'ok' && r.write === 'ok').length;
+                                            const errorCount = status.results.filter(r => r.read === 'error' || r.write === 'error').length;
+
+                                            if (errorCount > 0) {
+                                                alert(`检测完成！\n✅ 正常: ${okCount} 个\n❌ 异常: ${errorCount} 个`);
+                                            } else {
+                                                alert(`检测完成！所有 ${okCount} 个站点连接正常 ✅`);
+                                            }
+                                            location.reload();
+                                        } else if (status.status === 'error') {
+                                            clearInterval(pollInterval);
+                                            btn.disabled = false;
+                                            btn.innerHTML = originalHtml;
+                                            alert('检测失败: ' + status.message);
+                                        }
+                                    })
+                                    .catch(err => {
+                                        clearInterval(pollInterval);
+                                        btn.disabled = false;
+                                        btn.innerHTML = originalHtml;
+                                        alert('状态查询失败: ' + err.message);
+                                    });
+                            }, 2000);
                         } else {
-                            alert('检测失败: ' + (data.error || '未知错误'));
+                            btn.disabled = false;
+                            btn.innerHTML = originalHtml;
+                            alert('检测启动失败: ' + (data.error || '未知错误'));
                         }
                     })
                     .catch(err => {
