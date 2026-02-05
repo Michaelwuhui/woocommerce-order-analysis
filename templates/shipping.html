@@ -35,7 +35,15 @@
                         {% endfor %}
                     </select>
                 </div>
-                <div class="col-md-2">
+                <div class="col-md-1">
+                    <select class="form-select form-select-sm bg-dark text-white border-secondary" id="countryFilter">
+                        <option value="">全部国家</option>
+                        {% for country in all_countries %}
+                        <option value="{{ country }}">{{ country }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-1">
                     <select class="form-select form-select-sm bg-dark text-white border-secondary" id="managerFilter">
                         <option value="">全部负责人</option>
                         {% for manager in managers %}
@@ -345,6 +353,7 @@
 
             // Filter change handlers
             document.getElementById('siteFilter').addEventListener('change', loadOrders);
+            document.getElementById('countryFilter').addEventListener('change', loadOrders);
             document.getElementById('managerFilter').addEventListener('change', loadOrders);
             document.getElementById('dateFrom').addEventListener('change', loadOrders);
             document.getElementById('dateTo').addEventListener('change', loadOrders);
@@ -372,6 +381,7 @@
 
         function loadOrders() {
             const source = document.getElementById('siteFilter').value;
+            const country = document.getElementById('countryFilter').value;
             const manager = document.getElementById('managerFilter').value;
             const dateFrom = document.getElementById('dateFrom').value;
             const dateTo = document.getElementById('dateTo').value;
@@ -379,6 +389,7 @@
 
             const params = new URLSearchParams({
                 source: source,
+                country: country,
                 manager: manager,
                 start_date: dateFrom,
                 end_date: dateTo,

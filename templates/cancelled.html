@@ -17,17 +17,17 @@
         <div class="d-flex flex-wrap gap-3 align-items-center justify-content-between">
             <div class="d-flex flex-wrap gap-2 align-items-center">
                 <span class="text-secondary me-2"><i class="bi bi-calendar-range me-1"></i>快速筛选：</span>
-                <a href="{{ url_for('cancelled_analysis', quick_date='this_month', source=source_filter, manager=manager_filter) }}"
+                <a href="{{ url_for('cancelled_analysis', quick_date='this_month', source=source_filter, manager=manager_filter, country=country_filter) }}"
                     class="btn btn-quick {% if quick_date == 'this_month' %}active{% endif %}">本月至今</a>
-                <a href="{{ url_for('cancelled_analysis', quick_date='last_month', source=source_filter, manager=manager_filter) }}"
+                <a href="{{ url_for('cancelled_analysis', quick_date='last_month', source=source_filter, manager=manager_filter, country=country_filter) }}"
                     class="btn btn-quick {% if quick_date == 'last_month' %}active{% endif %}">上个月</a>
-                <a href="{{ url_for('cancelled_analysis', quick_date='last_quarter', source=source_filter, manager=manager_filter) }}"
+                <a href="{{ url_for('cancelled_analysis', quick_date='last_quarter', source=source_filter, manager=manager_filter, country=country_filter) }}"
                     class="btn btn-quick {% if quick_date == 'last_quarter' %}active{% endif %}">近三个月</a>
-                <a href="{{ url_for('cancelled_analysis', quick_date='half_year', source=source_filter, manager=manager_filter) }}"
+                <a href="{{ url_for('cancelled_analysis', quick_date='half_year', source=source_filter, manager=manager_filter, country=country_filter) }}"
                     class="btn btn-quick {% if quick_date == 'half_year' %}active{% endif %}">近半年</a>
-                <a href="{{ url_for('cancelled_analysis', quick_date='one_year', source=source_filter, manager=manager_filter) }}"
+                <a href="{{ url_for('cancelled_analysis', quick_date='one_year', source=source_filter, manager=manager_filter, country=country_filter) }}"
                     class="btn btn-quick {% if quick_date == 'one_year' %}active{% endif %}">近一年</a>
-                <a href="{{ url_for('cancelled_analysis', quick_date='all', source=source_filter, manager=manager_filter) }}"
+                <a href="{{ url_for('cancelled_analysis', quick_date='all', source=source_filter, manager=manager_filter, country=country_filter) }}"
                     class="btn btn-outline-secondary btn-sm {% if quick_date == 'all' %}active{% endif %}">全部</a>
             </div>
             <div class="d-flex align-items-center gap-3">
@@ -39,6 +39,18 @@
                         <option value="">全部</option>
                         {% for month in available_months %}
                         <option value="{{ month }}" {% if current_month==month %}selected{% endif %}>{{ month }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <!-- Country Filter -->
+                <div class="d-flex align-items-center gap-2">
+                    <span class="text-secondary"><i class="bi bi-globe2 me-1"></i>国家：</span>
+                    <select id="countryFilter" class="form-select form-select-sm" style="width: auto; min-width: 120px;"
+                        onchange="applyFilters()">
+                        <option value="">全部国家</option>
+                        {% for country in all_countries %}
+                        <option value="{{ country }}" {% if country_filter==country %}selected{% endif %}>{{ country }}
                         </option>
                         {% endfor %}
                     </select>
@@ -379,12 +391,12 @@
         <div class="d-flex justify-content-center align-items-center flex-wrap gap-2">
             <span class="text-secondary me-2"><i class="bi bi-calendar3 me-1"></i>选择月份：</span>
             {% for month in available_months %}
-            <a href="{{ url_for('cancelled_analysis', month=month, source=source_filter, manager=manager_filter) }}"
+            <a href="{{ url_for('cancelled_analysis', month=month, source=source_filter, manager=manager_filter, country=country_filter) }}"
                 class="btn btn-month {% if month == current_month %}active{% endif %}">
                 {{ month }}
             </a>
             {% endfor %}
-            <a href="{{ url_for('cancelled_analysis', quick_date='all', source=source_filter, manager=manager_filter) }}"
+            <a href="{{ url_for('cancelled_analysis', quick_date='all', source=source_filter, manager=manager_filter, country=country_filter) }}"
                 class="btn btn-month btn-month-all {% if quick_date == 'all' and not current_month %}active{% endif %}">
                 <i class="bi bi-collection me-1"></i>全部
             </a>
@@ -448,6 +460,7 @@
         var month = document.getElementById('monthFilter').value;
         var manager = document.getElementById('managerFilter').value;
         var source = document.getElementById('sourceFilter').value;
+        var country = document.getElementById('countryFilter').value;
 
         var params = new URLSearchParams();
         // If month is selected, use month filter; otherwise keep quick_date
@@ -458,6 +471,7 @@
         }
         if (manager) params.set('manager', manager);
         if (source) params.set('source', source);
+        if (country) params.set('country', country);
 
         window.location.href = '{{ url_for("cancelled_analysis") }}?' + params.toString();
     }

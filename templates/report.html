@@ -13,6 +13,33 @@
             <p class="text-white-50 mb-0">流量数据 + 订单数据综合分析</p>
         </div>
         <div class="d-flex gap-2">
+            <!-- Country Filter -->
+            <div class="dropdown">
+                <button class="btn btn-outline-success dropdown-toggle" type="button" data-bs-toggle="dropdown"
+                    data-bs-auto-close="outside" id="countryFilterBtn">
+                    <i class="bi bi-globe me-1"></i>全部国家
+                </button>
+                <ul class="dropdown-menu dropdown-menu-end bg-dark border-secondary border-opacity-50 p-1"
+                    style="min-width: 150px; max-height: 400px; overflow-y: auto;">
+                    <li>
+                        <button class="dropdown-item text-white active" type="button" onclick="onCountryChange('')">
+                            <i class="bi bi-check2 me-2 opacity-0"></i>全部国家
+                        </button>
+                    </li>
+                    <li>
+                        <hr class="dropdown-divider bg-secondary opacity-25 my-1">
+                    </li>
+                    {% for country in all_countries %}
+                    <li>
+                        <button class="dropdown-item text-white" type="button"
+                            onclick="onCountryChange('{{ country }}')">
+                            <span class="d-inline-block" style="width: 20px;"></span>{{ country }}
+                        </button>
+                    </li>
+                    {% endfor %}
+                </ul>
+            </div>
+
             <!-- Sites Filter -->
             <div class="dropdown">
                 <button class="btn btn-outline-primary dropdown-toggle" type="button" data-bs-toggle="dropdown"
@@ -305,6 +332,7 @@
     let trendChart = null; // Chart instance
     let currentGranularity = 'month'; // day, week, month
     let isManualGranularity = false; // true = user manually selected, false = auto/smart
+    let currentCountry = ''; // Current selected country
 
     // Initialize
     document.addEventListener('DOMContentLoaded', function () {
@@ -317,6 +345,13 @@
         if (savedGranularity) {
             currentGranularity = savedGranularity;
             updateGranularityUI(currentGranularity);
+        }
+
+        // Restore country
+        const savedCountry = localStorage.getItem('report_country');
+        if (savedCountry) {
+            currentCountry = savedCountry;
+            updateCountryUI(currentCountry);
         }
 
         if (savedStart && savedEnd) {
@@ -495,6 +530,34 @@
         return labels[g] || g;
     }
 
+    // Country Filter Logic
+    function onCountryChange(country) {
+        currentCountry = country;
+        localStorage.setItem('report_country', country);
+        updateCountryUI(country);
+        loadReportData(true);
+    }
+
+    function updateCountryUI(country) {
+        const btn = document.getElementById('countryFilterBtn');
+        if (!country) {
+            btn.innerHTML = '<i class="bi bi-globe me-1"></i>全部国家';
+        } else {
+            btn.innerHTML = `<i class="bi bi-globe me-1"></i>${country}`;
+        }
+
+        // Update active state in dropdown
+        document.querySelectorAll('#countryFilterBtn + .dropdown-menu .dropdown-item').forEach(item => {
+            item.classList.remove('active');
+            const text = item.textContent.trim();
+            if (country) {
+                if (text === country) item.classList.add('active');
+            } else {
+                if (text === '全部国家') item.classList.add('active');
+            }
+        });
+    }
+
     function updateGranularityUI(active) {
         document.querySelectorAll('#granularityBtnGroup button').forEach(btn => {
             btn.classList.remove('active');
@@ -564,8 +627,8 @@
             if (cachedData && cachedParams) {
                 try {
                     const params = JSON.parse(cachedParams);
-                    // Match current date inputs AND granularity
-                    if (params.start === startDate && params.end === endDate && params.granularity === granularity) {
+                    // Match current date inputs AND granularity AND country
+                    if (params.start === startDate && params.end === endDate && params.granularity === granularity && params.country === currentCountry) {
                         const result = JSON.parse(cachedData);
                         currentResult = result;
 
@@ -589,8 +652,8 @@
         document.getElementById('errorState').style.display = 'none';
 
         try {
-            // Add granularity param to API request
-            const url = `/api/report/data?start_date=${startDate}&end_date=${endDate}&granularity=${granularity}${forceRefresh ? '&force=true' : ''}`;
+            // Add granularity and country param to API request
+            const url = `/api/report/data?start_date=${startDate}&end_date=${endDate}&granularity=${granularity}&country=${currentCountry}${forceRefresh ? '&force=true' : ''}`;
             const response = await fetch(url);
             const result = await response.json();
 
@@ -600,7 +663,7 @@
                 localStorage.setItem('report_endDate', endDate);
                 localStorage.setItem('report_granularity', granularity);
                 localStorage.setItem('report_last_result_v3', JSON.stringify(result));
-                localStorage.setItem('report_last_params_v3', JSON.stringify({ start: startDate, end: endDate, granularity: granularity }));
+                localStorage.setItem('report_last_params_v3', JSON.stringify({ start: startDate, end: endDate, granularity: granularity, country: currentCountry }));
 
                 currentResult = result;
 

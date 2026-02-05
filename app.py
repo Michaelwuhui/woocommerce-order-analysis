@@ -1019,6 +1019,7 @@ def orders():
     search = request.args.get('search', '')
     quick_date = request.args.get('quick_date', '')
     manager_filter = request.args.get('manager', '')
+    country_filter = request.args.get('country', '')
     page = int(request.args.get('page', 1))
     per_page = 20
     
@@ -1028,6 +1029,10 @@ def orders():
     
     # Get all managers
     all_managers = get_all_managers()
+    
+    # Get all countries
+    all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
+    all_countries = [c['country'] for c in all_countries]
     
     # Validate source_filter against allowed sources
     if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
@@ -1076,6 +1081,17 @@ def orders():
             placeholders = ', '.join(['?' for _ in manager_urls])
             conditions.append(f'source IN ({placeholders})')
             params.extend(manager_urls)
+        else:
+            conditions.append('1=0')
+            
+    # Add country filter
+    if country_filter:
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country_filter,)).fetchall()
+        country_urls = [s['url'] for s in country_sites]
+        if country_urls:
+            placeholders = ', '.join(['?' for _ in country_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(country_urls)
         else:
             conditions.append('1=0')
     
@@ -1394,6 +1410,7 @@ def orders():
                          site_managers=site_managers,
                          customer_attributes=customer_attributes,
                          all_managers=all_managers,
+                         all_countries=all_countries, # 4. 在render_template中返回country_filter和all_countries
                          current_filters={
                              'source': source_filter,
                              'status': status_filter,
@@ -1401,7 +1418,8 @@ def orders():
                              'date_to': date_to,
                              'search': search,
                              'quick_date': quick_date,
-                             'manager': manager_filter
+                             'manager': manager_filter,
+                             'country': country_filter # 4. 在render_template中返回country_filter和all_countries
                          },
                          available_months=available_months,
                          current_month=current_month,
@@ -1422,6 +1440,8 @@ def monthly():
     source_filter = request.args.get('source', '')
     manager_filter = request.args.get('manager', '')
     country_filter = request.args.get('country', '')
+    start_month = request.args.get('start_month', '')
+    end_month = request.args.get('end_month', '')
     
     # Get all managers
     all_managers = get_all_managers()
@@ -1520,6 +1540,14 @@ def monthly():
     if source_filter:
         conditions.append('source = ?')
         params.append(source_filter)
+        
+    if start_month:
+        conditions.append("strftime('%Y-%m', date_created) >= ?")
+        params.append(start_month)
+        
+    if end_month:
+        conditions.append("strftime('%Y-%m', date_created) <= ?")
+        params.append(end_month)
     
     where_clause = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
     
@@ -1534,7 +1562,7 @@ def monthly():
     conn.close()
     
     if len(df) == 0:
-        return render_template('monthly.html', monthly_stats=[], sources=all_sources, source_filter=source_filter, country_filter=country_filter, all_countries=all_countries)
+        return render_template('monthly.html', monthly_stats=[], sources=all_sources, source_filter=source_filter, country_filter=country_filter, all_countries=all_countries, start_month=start_month, end_month=end_month)
     
     # Calculate product quantities
     def get_product_qty(line_items):
@@ -1622,13 +1650,17 @@ def monthly():
         monthly_aggregates[m]['total_orders'] += row['total_orders']
         monthly_aggregates[m]['total_products'] += row['total_products']
         
-    return render_template('monthly.html', monthly_stats=rows, monthly_aggregates=monthly_aggregates, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, country_filter=country_filter, all_managers=all_managers, all_countries=all_countries, sort_by=sort_by, site_managers=site_managers)
+    return render_template('monthly.html', monthly_stats=rows, monthly_aggregates=monthly_aggregates, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, country_filter=country_filter, all_managers=all_managers, all_countries=all_countries, sort_by=sort_by, site_managers=site_managers, start_month=start_month, end_month=end_month)
 
 
 @app.route('/api/monthly/export')
 @login_required
 def monthly_export():
-    """Export monthly statistics to Excel"""
+    """Export monthly statistics to Excel - Admin only"""
+    # Check admin permission
+    if not current_user.is_admin():
+        return jsonify({'error': '只有管理员才能导出数据'}), 403
+    
     from io import BytesIO
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -1643,7 +1675,10 @@ def monthly_export():
     # Get filters
     source_filter = request.args.get('source', '')
     manager_filter = request.args.get('manager', '')
+    manager_filter = request.args.get('manager', '')
     country_filter = request.args.get('country', '')
+    start_month = request.args.get('start_month', '')
+    end_month = request.args.get('end_month', '')
     
     # Build query conditions
     conditions = []
@@ -1680,6 +1715,14 @@ def monthly_export():
     if source_filter:
         conditions.append('source = ?')
         params.append(source_filter)
+        
+    if start_month:
+        conditions.append("strftime('%Y-%m', date_created) >= ?")
+        params.append(start_month)
+        
+    if end_month:
+        conditions.append("strftime('%Y-%m', date_created) <= ?")
+        params.append(end_month)
     
     where_clause = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
     
@@ -2034,8 +2077,430 @@ def cancelled_analysis():
     # Get filters
     source_filter = request.args.get('source', '')
     manager_filter = request.args.get('manager', '')
+    country_filter = request.args.get('country', '')
     quick_date = request.args.get('quick_date', 'this_month')
     month_filter = request.args.get('month', '')
+    
+    # Get all countries for filter
+    all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
+    all_countries = [c['country'] for c in all_countries]
+    
+    # Calculate date range based on quick_date or month
+    from datetime import timedelta
+    today = datetime.now().date()
+    date_from = ''
+    date_to = today.isoformat()
+    
+    # If month filter is specified, it overrides quick_date
+    if month_filter:
+        # Month filter takes priority - set quick_date to empty to show no button is active
+        quick_date = ''
+        date_from = month_filter + '-01'
+        # Calculate last day of month
+        import calendar
+        year, month = int(month_filter[:4]), int(month_filter[5:7])
+        last_day = calendar.monthrange(year, month)[1]
+        date_to = f"{month_filter}-{last_day:02d}"
+    elif quick_date == 'this_month':
+        date_from = today.replace(day=1).isoformat()
+    elif quick_date == 'last_month':
+        last_month_end = today.replace(day=1) - timedelta(days=1)
+        date_from = last_month_end.replace(day=1).isoformat()
+        date_to = last_month_end.isoformat()
+    elif quick_date == 'last_quarter':
+        date_from = (today - timedelta(days=90)).isoformat()
+    elif quick_date == 'half_year':
+        date_from = (today - timedelta(days=180)).isoformat()
+    elif quick_date == 'one_year':
+        date_from = (today - timedelta(days=365)).isoformat()
+    elif quick_date == 'all':
+        date_from = ''
+        date_to = ''
+    
+    # Get all managers
+    all_managers_rows = get_all_managers()
+    # If get_all_managers returns a list of strings, use it directly. Assuming it does based on other usages.
+    all_managers = all_managers_rows 
+
+    # Get site managers mapping for display
+    site_managers_rows = conn.execute('SELECT url, manager FROM sites').fetchall()
+    site_managers = {row['url']: row['manager'] for row in site_managers_rows if row['manager']}
+    
+    # Validate source_filter against allowed sources
+    if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
+        source_filter = ''
+    
+    # Get available sources
+    source_query = 'SELECT DISTINCT source FROM orders'
+    source_params = []
+    source_conditions = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(allowed_sources)
+        else:
+            source_conditions.append('1=0')
+            
+    if manager_filter:
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(manager_urls)
+        else:
+            source_conditions.append('1=0')
+            
+    if country_filter:
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country_filter,)).fetchall()
+        country_urls = [s['url'] for s in country_sites]
+        if country_urls:
+            placeholders = ', '.join(['?' for _ in country_urls])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(country_urls)
+        else:
+            source_conditions.append('1=0')
+
+    if source_conditions:
+        source_query += ' WHERE ' + ' AND '.join(source_conditions)
+        
+    source_query += ' ORDER BY source'
+    all_sources = conn.execute(source_query, source_params).fetchall()
+    
+    # Build query conditions for cancelled/failed orders
+    conditions = ["status IN ('cancelled', 'failed')"]
+    params = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+    
+    manager_urls = []
+    if manager_filter:
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(manager_urls)
+        else:
+            conditions.append('1=0')
+            
+    if country_filter:
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country_filter,)).fetchall()
+        country_urls = [s['url'] for s in country_sites]
+        if country_urls:
+            placeholders = ', '.join(['?' for _ in country_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(country_urls)
+        else:
+            conditions.append('1=0')
+    
+    if source_filter:
+        conditions.append('source = ?')
+        params.append(source_filter)
+    
+    # Add date range filter
+    if date_from:
+        conditions.append('date_created >= ?')
+        params.append(date_from)
+    if date_to:
+        conditions.append('date_created <= ?')
+        params.append(date_to + 'T23:59:59')
+    
+    where_clause = 'WHERE ' + ' AND '.join(conditions)
+    
+    # Query cancelled/failed orders with date information
+    query = f'''
+        SELECT id, number, status, total, shipping_total, currency, date_created, date_modified, source, line_items, billing
+        FROM orders
+        {where_clause}
+        ORDER BY date_created DESC
+    '''
+    
+    orders_data = conn.execute(query, params).fetchall()
+    
+    # Get available months
+    months_query = '''
+        SELECT DISTINCT strftime('%Y-%m', date_created) as month 
+        FROM orders 
+        WHERE status IN ('cancelled', 'failed')
+        ORDER BY month DESC
+    '''
+    available_months = conn.execute(months_query).fetchall()
+    available_months = [m['month'] for m in available_months if m['month']]
+    
+    # Process data for stats
+    total_cancelled = 0
+    total_amount = 0
+    cancellation_rate = 0
+    orders_list = []
+    
+    timing_stats = {
+        'within_1_day': {'count': 0, 'amount': 0},
+        '1_to_7_days': {'count': 0, 'amount': 0},
+        'over_7_days': {'count': 0, 'amount': 0}
+    }
+    
+    status_stats = {
+        'cancelled': {'count': 0, 'amount': 0},
+        'failed': {'count': 0, 'amount': 0}
+    }
+    
+    source_stats = {}
+    customer_type_stats = {
+        'new': {'count': 0, 'amount': 0},
+        'repeat': {'count': 0, 'amount': 0}
+    }
+    
+    # Helper to check customer history
+    customer_order_counts = {}
+    if orders_data:
+        # Get customer order counts for all customers in this batch
+        # This is a simplified approach - ideally check against all historical orders
+        emails = []
+        for o in orders_data:
+            if o['billing']:
+                billing = parse_json_field(o['billing'])
+                if billing and billing.get('email'):
+                    emails.append(billing.get('email'))
+        
+        if emails:
+            placeholders = ', '.join(['?' for _ in emails])
+            # Check historical success orders
+            history_query = f'''
+                SELECT json_extract(billing, '$.email') as email, COUNT(*) as count
+                FROM orders 
+                WHERE status = 'completed' 
+                AND json_extract(billing, '$.email') IN ({placeholders})
+                GROUP BY email
+            '''
+            history_counts = conn.execute(history_query, emails).fetchall()
+            customer_order_counts = {r['email']: r['count'] for r in history_counts}
+
+    from datetime import datetime as dt
+    
+    for order in orders_data:
+        od = dict(order)
+        status = order['status']
+        total = float(order['total'] or 0)
+        source = order['source']
+        
+        # Parse dates
+        date_created = order['date_created']
+        date_modified = order['date_modified']
+        
+        days_to_cancel = 0
+        if date_created and date_modified:
+            try:
+                created = dt.fromisoformat(date_created[:19])
+                modified = dt.fromisoformat(date_modified[:19])
+                days_to_cancel = (modified - created).days
+            except:
+                days_to_cancel = 0
+        
+        od['days_to_cancel'] = days_to_cancel
+        
+        # Timing classification
+        if days_to_cancel <= 1:
+            timing_stats['within_1_day']['count'] += 1
+            timing_stats['within_1_day']['amount'] += total
+            od['timing_category'] = '1天内'
+        elif days_to_cancel <= 7:
+            timing_stats['1_to_7_days']['count'] += 1
+            timing_stats['1_to_7_days']['amount'] += total
+            od['timing_category'] = '1-7天'
+        else:
+            timing_stats['over_7_days']['count'] += 1
+            timing_stats['over_7_days']['amount'] += total
+            od['timing_category'] = '7天+'
+        
+        # Status stats
+        if status in status_stats:
+            status_stats[status]['count'] += 1
+            status_stats[status]['amount'] += total
+        
+        # Source stats
+        if source not in source_stats:
+            source_stats[source] = {'count': 0, 'amount': 0, 'cancelled': 0, 'failed': 0}
+        source_stats[source]['count'] += 1
+        source_stats[source]['amount'] += total
+        if status == 'cancelled':
+            source_stats[source]['cancelled'] += 1
+        else:
+            source_stats[source]['failed'] += 1
+        
+        # Customer type classification
+        billing = parse_json_field(order['billing'])
+        email = billing.get('email', '') if billing else ''
+        od['customer_name'] = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip() if billing else ''
+        od['customer_email'] = email
+        
+        if email:
+            order_count = customer_order_counts.get(email, 0)
+            if order_count <= 1:
+                customer_type_stats['new']['count'] += 1
+                customer_type_stats['new']['amount'] += total
+                od['customer_type'] = '新客'
+            else:
+                customer_type_stats['repeat']['count'] += 1
+                customer_type_stats['repeat']['amount'] += total
+                od['customer_type'] = '老客'
+        else:
+            od['customer_type'] = '未知'
+        
+        # Parse line items for product count
+        items = parse_json_field(order['line_items'])
+        od['product_count'] = sum(i.get('quantity', 0) for i in items) if isinstance(items, list) else 0
+        
+        # Calculate net amount and CNY conversion
+        shipping = float(order['shipping_total'] or 0)
+        od['shipping_total'] = shipping
+        od['net_total'] = total - shipping
+        
+        # Get CNY rate
+        order_month = order['date_created'][:7] if order['date_created'] else None
+        currency = order['currency']
+        rate, _ = get_cny_rate(currency, order_month)
+        od['rate_to_cny'] = rate
+        od['total_cny'] = round(total * rate, 2) if rate else None
+        od['net_total_cny'] = round(od['net_total'] * rate, 2) if rate else None
+        
+        orders_list.append(od)
+    
+    # Get total orders for cancellation rate
+    total_query_conditions = []
+    total_params = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            total_query_conditions.append(f'source IN ({placeholders})')
+            total_params.extend(allowed_sources)
+            
+    if manager_filter and manager_urls:
+        placeholders = ', '.join(['?' for _ in manager_urls])
+        total_query_conditions.append(f'source IN ({placeholders})')
+        total_params.extend(manager_urls)
+
+    if country_filter and country_urls:
+        placeholders = ', '.join(['?' for _ in country_urls])
+        total_query_conditions.append(f'source IN ({placeholders})')
+        total_params.extend(country_urls)
+    
+    if source_filter:
+        total_query_conditions.append('source = ?')
+        total_params.append(source_filter)
+    
+    if date_from:
+        total_query_conditions.append('date_created >= ?')
+        total_params.append(date_from)
+    if date_to:
+        total_query_conditions.append('date_created <= ?')
+        total_params.append(date_to + 'T23:59:59')
+    
+    total_where = 'WHERE ' + ' AND '.join(total_query_conditions) if total_query_conditions else ''
+    total_orders_count = conn.execute(f'SELECT COUNT(*) FROM orders {total_where}', total_params).fetchone()[0]
+    
+    # Calculate totals
+    total_cancelled = len(orders_list)
+    total_amount = sum(float(o['total'] or 0) for o in orders_list)
+    cancellation_rate = (total_cancelled / total_orders_count * 100) if total_orders_count > 0 else 0
+    
+    # Group amounts by currency
+    currency_amounts = {}
+    for o in orders_list:
+        currency = o.get('currency', 'USD')
+        amount = float(o.get('total') or 0)
+        if currency not in currency_amounts:
+            currency_amounts[currency] = 0
+        currency_amounts[currency] += amount
+    
+    # Calculate total CNY amount
+    total_cny = 0
+    currency_stats = []
+    for currency, amount in sorted(currency_amounts.items(), key=lambda x: x[1], reverse=True):
+        rate, _ = get_cny_rate(currency, None)  # Use current rate
+        cny_amount = round(amount * rate, 2) if rate else 0
+        total_cny += cny_amount
+        currency_stats.append({
+            'currency': currency,
+            'amount': round(amount, 2),
+            'cny_amount': cny_amount,
+            'rate': rate
+        })
+    
+    # Convert source_stats to list for template
+    source_stats_list = []
+    for source, stats in source_stats.items():
+        source_stats_list.append({
+            'source': source,
+            'manager': site_managers.get(source, ''),
+            'count': stats['count'],
+            'amount': stats['amount'],
+            'cancelled': stats['cancelled'],
+            'failed': stats['failed']
+        })
+    source_stats_list.sort(key=lambda x: x['count'], reverse=True)
+    
+    # Get source display mode for user
+    source_display_mode = 'full'
+    if current_user.is_authenticated:
+        user_pref = conn.execute('''
+            SELECT preference_value FROM user_preferences 
+            WHERE user_id = ? AND preference_key = 'source_display_mode'
+        ''', (current_user.id,)).fetchone()
+        if user_pref:
+            source_display_mode = user_pref['preference_value']
+    
+    conn.close()
+    
+    return render_template('cancelled.html',
+        orders=orders_list,
+        total_cancelled=total_cancelled,
+        total_amount=total_amount,
+        total_orders=total_orders_count,
+        cancellation_rate=round(cancellation_rate, 2),
+        timing_stats=timing_stats,
+        status_stats=status_stats,
+        source_stats=source_stats_list,
+        customer_type_stats=customer_type_stats,
+        source_filter=source_filter,
+        manager_filter=manager_filter,
+        country_filter=country_filter,
+        sources=all_sources, # pass all available sources for filter
+        all_managers=all_managers,
+        site_managers=site_managers,
+        all_countries=all_countries,
+        quick_date=quick_date,
+        available_months=available_months,
+        current_month=month_filter,
+        source_display_mode=source_display_mode,
+        currency_stats=currency_stats,
+        total_cny=total_cny
+    )
+    """Cancelled/Failed Order Analysis Page"""
+    conn = get_db_connection()
+    # Get user's allowed sources for permission filtering
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    
+    # Get filters
+    source_filter = request.args.get('source', '')
+    manager_filter = request.args.get('manager', '')
+    country_filter = request.args.get('country', '')
+    quick_date = request.args.get('quick_date', 'this_month')
+    month_filter = request.args.get('month', '')
+    
+    # Get all countries for filter
+    all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
+    all_countries = [c['country'] for c in all_countries]
     
     # Calculate date range based on quick_date or month
     from datetime import timedelta
@@ -2126,6 +2591,16 @@ def cancelled_analysis():
             placeholders = ', '.join(['?' for _ in manager_urls])
             conditions.append(f'source IN ({placeholders})')
             params.extend(manager_urls)
+        else:
+            conditions.append('1=0')
+            
+    if country_filter:
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country_filter,)).fetchall()
+        country_urls = [s['url'] for s in country_sites]
+        if country_urls:
+            placeholders = ', '.join(['?' for _ in country_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(country_urls)
         else:
             conditions.append('1=0')
     
@@ -2384,11 +2859,12 @@ def cancelled_analysis():
         status_stats=status_stats,
         source_stats=source_stats_list,
         customer_type_stats=customer_type_stats,
-        sources=all_sources,
         source_filter=source_filter,
         manager_filter=manager_filter,
+        country_filter=country_filter,
+        sources=all_sources, # pass all available sources for filter
         all_managers=all_managers,
-        site_managers=site_managers,
+        all_countries=all_countries,
         quick_date=quick_date,
         available_months=available_months,
         current_month=month_filter,
@@ -5369,9 +5845,14 @@ def products():
     puff_filter = request.args.get('puffs', '')
     quick_date = request.args.get('quick_date', 'this_month')
     manager_filter = request.args.get('manager', '')
+    country_filter = request.args.get('country', '')
     
     # Get all managers
     all_managers = get_all_managers()
+
+    # Get all countries
+    all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
+    all_countries = [c['country'] for c in all_countries]
     
     # Validate source_filter against allowed sources
     if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
@@ -5430,6 +5911,17 @@ def products():
             placeholders = ', '.join(['?' for _ in manager_urls])
             conditions.append(f'source IN ({placeholders})')
             params.extend(manager_urls)
+        else:
+            conditions.append('1=0')
+
+    # Add country filter
+    if country_filter:
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country_filter,)).fetchall()
+        country_urls = [s['url'] for s in country_sites]
+        if country_urls:
+            placeholders = ', '.join(['?' for _ in country_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(country_urls)
         else:
             conditions.append('1=0')
     
@@ -5962,9 +6454,11 @@ def products():
                               'brand': brand_filter,
                               'puffs': puff_filter,
                               'quick_date': quick_date,
-                              'manager': manager_filter
+                              'manager': manager_filter,
+                              'country': country_filter
                           },
-                          all_managers=all_managers)
+                          all_managers=all_managers,
+                          all_countries=all_countries)
 
 
 @app.route('/api/brands')
@@ -6583,8 +7077,12 @@ def shipping():
         placeholders = ','.join(['?' for _ in allowed_sources])
         sites = conn.execute(f'SELECT id, url, manager FROM sites WHERE url IN ({placeholders})', allowed_sources).fetchall()
     
+    # Get all countries
+    all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
+    all_countries = [c['country'] for c in all_countries]
+    
     conn.close()
-    return render_template('shipping.html', carriers=carriers, managers=managers, sites=sites)
+    return render_template('shipping.html', carriers=carriers, managers=managers, sites=sites, all_countries=all_countries)
 
 
 def extract_custom_billing_fields(meta_data):
@@ -6632,6 +7130,7 @@ def get_pending_orders():
     # Get filter parameters
     source_filter = request.args.get('source', '')
     manager_filter = request.args.get('manager', '')
+    country_filter = request.args.get('country', '')
     
     # Build query
     query = '''
@@ -6662,6 +7161,10 @@ def get_pending_orders():
     if manager_filter:
         query += ' AND s.manager = ?'
         params.append(manager_filter)
+        
+    if country_filter:
+        query += ' AND s.country = ?'
+        params.append(country_filter)
     
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
@@ -6749,6 +7252,7 @@ def get_shipped_orders():
     
     # Get filter parameters
     source_filter = request.args.get('source', '')
+    country_filter = request.args.get('country', '')
     
     query = '''
         SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, o.date_modified,
@@ -6771,6 +7275,10 @@ def get_shipped_orders():
     if source_filter:
         query += ' AND o.source = ?'
         params.append(source_filter)
+        
+    if country_filter:
+        query += ' AND s.country = ?'
+        params.append(country_filter)
 
     manager_filter = request.args.get('manager', '')
     if manager_filter:
@@ -8065,7 +8573,7 @@ def aggregate_traffic_by_week(traffic_data):
     return result
 
 
-def get_orders_for_report(start_date, end_date, granularity='month', source=None):
+def get_orders_for_report(start_date, end_date, granularity='month', source=None, country=None):
     """Get orders aggregated by source and time period for report
     
     Args:
@@ -8097,6 +8605,16 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
           AND status NOT IN ('checkout-draft', 'trash')
     '''
     params = [start_date, end_date + 'T23:59:59']
+    
+    if country:
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country,)).fetchall()
+        country_urls = [s['url'] for s in country_sites]
+        if country_urls:
+            placeholders = ', '.join(['?' for _ in country_urls])
+            query += f' AND source IN ({placeholders})'
+            params.extend(country_urls)
+        else:
+            query += ' AND 1=0'
     
     if source:
         query += ' AND source = ?'
@@ -8142,7 +8660,11 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
 @report_viewer_required
 def report():
     """Combined traffic and orders report page"""
-    return render_template('report.html')
+    conn = get_db_connection()
+    all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
+    all_countries = [c['country'] for c in all_countries]
+    conn.close()
+    return render_template('report.html', all_countries=all_countries)
 
 
 @app.route('/api/report/data')
@@ -8155,6 +8677,7 @@ def api_report_data():
     start_date = request.args.get('start_date', '')
     end_date = request.args.get('end_date', '')
     granularity = request.args.get('granularity', 'month')  # day, week, month
+    country = request.args.get('country', '')
     
     # Validate granularity
     if granularity not in ('day', 'week', 'month'):
@@ -8166,8 +8689,8 @@ def api_report_data():
         start_dt = datetime.now() - timedelta(days=180)
         start_date = start_dt.strftime('%Y-%m-%d')
     
-    # Cache Logic - include granularity in key
-    cache_key = f"traffic_{start_date}_{end_date}_{granularity}"
+    # Cache Logic - include granularity and country in key
+    cache_key = f"traffic_{start_date}_{end_date}_{granularity}_{country}"
     force_refresh = request.args.get('force', 'false') == 'true'
     
     # Try load from server cache first (if not forced)
@@ -8185,7 +8708,7 @@ def api_report_data():
     
     all_traffic = {}
     # Use the new function with granularity support
-    orders_data = get_orders_for_report(start_date, end_date, granularity)
+    orders_data = get_orders_for_report(start_date, end_date, granularity, country=country)
     
     # Get sites config from database
     db_sites = conn.execute('SELECT url, mask_id FROM sites').fetchall()
@@ -8207,6 +8730,14 @@ def api_report_data():
         domain = normalize_domain(site['url'])
         if site['mask_id']:
             site_mask_map[domain] = site['mask_id']
+            
+    # Filter sites by country if selected
+    if country:
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country,)).fetchall()
+        country_domains = set([normalize_domain(s['url']) for s in country_sites])
+        
+        # Filter site_mask_map to only include sites from this country
+        site_mask_map = {k: v for k, v in site_mask_map.items() if k in country_domains}
             
     # Add hardcoded sites if not in DB (backward compatibility)
     for site, mask_id in LA_API_CONFIG['sites'].items():

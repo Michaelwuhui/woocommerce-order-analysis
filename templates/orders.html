@@ -8,27 +8,27 @@
     <div class="quick-filters mb-4">
         <div class="d-flex flex-wrap gap-2 align-items-center">
             <span class="text-secondary me-2"><i class="bi bi-calendar-range me-1"></i>快速筛选：</span>
-            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, quick_date='this_month') }}"
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, country=current_filters.country, quick_date='this_month') }}"
                 class="btn btn-quick {% if current_filters.quick_date == 'this_month' %}active{% endif %}">
                 <i class="bi bi-calendar-check me-1"></i>本月至今
             </a>
-            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, quick_date='last_month') }}"
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, country=current_filters.country, quick_date='last_month') }}"
                 class="btn btn-quick {% if current_filters.quick_date == 'last_month' %}active{% endif %}">
                 <i class="bi bi-calendar-minus me-1"></i>上个月
             </a>
-            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, quick_date='last_quarter') }}"
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, country=current_filters.country, quick_date='last_quarter') }}"
                 class="btn btn-quick {% if current_filters.quick_date == 'last_quarter' %}active{% endif %}">
                 <i class="bi bi-calendar3 me-1"></i>近三个月
             </a>
-            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, quick_date='half_year') }}"
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, country=current_filters.country, quick_date='half_year') }}"
                 class="btn btn-quick {% if current_filters.quick_date == 'half_year' %}active{% endif %}">
                 <i class="bi bi-calendar2 me-1"></i>近半年
             </a>
-            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, quick_date='one_year') }}"
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, country=current_filters.country, quick_date='one_year') }}"
                 class="btn btn-quick {% if current_filters.quick_date == 'one_year' %}active{% endif %}">
                 <i class="bi bi-calendar-event me-1"></i>近一年
             </a>
-            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, quick_date='all') }}"
+            <a href="{{ url_for('orders', source=current_filters.source, status=current_filters.status, search=current_filters.search, manager=current_filters.manager, country=current_filters.country, quick_date='all') }}"
                 class="btn btn-quick {% if current_filters.quick_date == 'all' %}active{% endif %} ms-2">
                 <i class="bi bi-arrow-counterclockwise me-1"></i>全部
             </a>
@@ -40,6 +40,17 @@
         <div class="card-body">
             <form method="GET" action="{{ url_for('orders') }}" class="row g-3 align-items-end">
                 <input type="hidden" name="quick_date" value="{{ current_filters.quick_date }}">
+                <div class="col-md-2">
+                    <label class="form-label">国家</label>
+                    <select name="country" class="form-select" onchange="this.form.submit()">
+                        <option value="">全部国家</option>
+                        {% for country in all_countries %}
+                        <option value="{{ country }}" {% if current_filters.country==country %}selected{% endif %}>
+                            {{ country }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
                 <div class="col-md-2">
                     <label class="form-label">负责人</label>
                     <select name="manager" class="form-select" onchange="this.form.submit()">
@@ -317,12 +328,12 @@
         <div class="d-flex justify-content-center align-items-center flex-wrap gap-2">
             <span class="text-secondary me-2"><i class="bi bi-calendar3 me-1"></i>选择月份：</span>
             {% for month in available_months %}
-            <a href="?month={{ month }}&source={{ current_filters.source }}&status={{ current_filters.status }}&date_from={{ current_filters.date_from }}&date_to={{ current_filters.date_to }}&search={{ current_filters.search }}&quick_date={{ current_filters.quick_date }}&manager={{ current_filters.manager }}"
+            <a href="?month={{ month }}&source={{ current_filters.source }}&status={{ current_filters.status }}&date_from={{ current_filters.date_from }}&date_to={{ current_filters.date_to }}&search={{ current_filters.search }}&quick_date={{ current_filters.quick_date }}&manager={{ current_filters.manager }}&country={{ current_filters.country }}"
                 class="btn btn-month {% if month == current_month %}active{% endif %}">
                 {{ month }}
             </a>
             {% endfor %}
-            <a href="?month=all&source={{ current_filters.source }}&status={{ current_filters.status }}&date_from={{ current_filters.date_from }}&date_to={{ current_filters.date_to }}&search={{ current_filters.search }}&quick_date={{ current_filters.quick_date }}&manager={{ current_filters.manager }}"
+            <a href="?month=all&source={{ current_filters.source }}&status={{ current_filters.status }}&date_from={{ current_filters.date_from }}&date_to={{ current_filters.date_to }}&search={{ current_filters.search }}&quick_date={{ current_filters.quick_date }}&manager={{ current_filters.manager }}&country={{ current_filters.country }}"
                 class="btn btn-month btn-month-all {% if current_month == 'all' %}active{% endif %}">
                 <i class="bi bi-collection me-1"></i>全部
             </a>

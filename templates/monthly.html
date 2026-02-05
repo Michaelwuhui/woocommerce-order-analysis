@@ -10,10 +10,12 @@
             {% if source_filter %}<small class="text-muted ms-2">({{ source_filter.replace('https://www.',
                 '').replace('https://', '')
                 }})</small>{% endif %}
-            <a href="{{ url_for('monthly_export', source=source_filter, manager=manager_filter, country=country_filter) }}"
+            {% if current_user.is_admin() %}
+            <a href="{{ url_for('monthly_export', source=source_filter, manager=manager_filter, country=country_filter, start_month=start_month, end_month=end_month) }}"
                 class="btn btn-sm btn-success ms-3">
                 <i class="bi bi-download me-1"></i>导出Excel
             </a>
+            {% endif %}
         </h5>
         <div class="d-flex align-items-center gap-3">
             <div class="d-flex align-items-center gap-2">
@@ -30,9 +32,21 @@
                 </div>
             </div>
             <div class="d-flex align-items-center gap-2">
+                <span class="text-secondary"><i class="bi bi-calendar-range me-1"></i>月份：</span>
+                <input type="text"
+                    class="form-control form-control-sm bg-dark text-white border-secondary border-opacity-25 flatpickr-month"
+                    style="width: auto;" value="{{ start_month }}" onchange="updateParams('start_month', this.value)"
+                    placeholder="开始月份">
+                <span class="text-secondary">-</span>
+                <input type="text"
+                    class="form-control form-control-sm bg-dark text-white border-secondary border-opacity-25 flatpickr-month"
+                    style="width: auto;" value="{{ end_month }}" onchange="updateParams('end_month', this.value)"
+                    placeholder="结束月份">
+            </div>
+            <div class="d-flex align-items-center gap-2">
                 <span class="text-secondary"><i class="bi bi-globe2 me-1"></i>国家：</span>
                 <select id="countryFilter" class="form-select form-select-sm" style="width: auto; min-width: 120px;"
-                    onchange="window.location.href='{{ url_for('monthly', sort=sort_by) }}&country=' + this.value">
+                    onchange="updateParams('country', this.value)">
                     <option value="">全部国家</option>
                     {% for country in all_countries %}
                     <option value="{{ country }}" {% if country_filter==country %}selected{% endif %}>
@@ -44,7 +58,7 @@
             <div class="d-flex align-items-center gap-2">
                 <span class="text-secondary"><i class="bi bi-person-badge me-1"></i>负责人：</span>
                 <select id="managerFilter" class="form-select form-select-sm" style="width: auto; min-width: 120px;"
-                    onchange="window.location.href='{{ url_for('monthly', sort=sort_by, country=country_filter) }}&manager=' + this.value">
+                    onchange="updateParams('manager', this.value)">
                     <option value="">全部负责人</option>
                     {% for manager in all_managers %}
                     <option value="{{ manager }}" {% if manager_filter==manager %}selected{% endif %}>
@@ -56,7 +70,7 @@
             <div class="d-flex align-items-center gap-2">
                 <span class="text-secondary"><i class="bi bi-globe me-1"></i>网站：</span>
                 <select id="sourceFilter" class="form-select form-select-sm" style="width: auto; min-width: 180px;"
-                    onchange="window.location.href='{{ url_for('monthly', sort=sort_by, country=country_filter, manager=manager_filter) }}&source=' + this.value">
+                    onchange="updateParams('source', this.value)">
                     <option value="">全部网站</option>
                     {% for source in sources %}
                     <option value="{{ source.source }}" {% if source_filter==source.source %}selected{% endif %}>
@@ -183,6 +197,40 @@
 {% endblock %}
 
 {% block scripts %}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/dark.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/plugins/monthSelect/style.css">
+<script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+<script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/zh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/plugins/monthSelect/index.js"></script>
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        flatpickr(".flatpickr-month", {
+            plugins: [
+                new monthSelectPlugin({
+                    shorthand: true,
+                    dateFormat: "Y-m",
+                    altFormat: "Y年m月",
+                    theme: "dark"
+                })
+            ],
+            locale: "zh",
+            theme: "dark",
+            disableMobile: true,
+            allowInput: true
+        });
+    });
+
+    function updateParams(key, value) {
+        const urlParams = new URLSearchParams(window.location.search);
+        if (value) {
+            urlParams.set(key, value);
+        } else {
+            urlParams.delete(key);
+        }
+        window.location.search = urlParams.toString();
+    }
+</script>
 {% if monthly_stats %}
 <script>
     var monthlyStats = {{ monthly_stats | tojson | safe }};

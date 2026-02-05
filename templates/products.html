@@ -9,24 +9,36 @@
         <div class="d-flex flex-wrap gap-3 align-items-center justify-content-between">
             <div class="d-flex flex-wrap gap-2 align-items-center">
                 <span class="text-secondary me-2"><i class="bi bi-calendar-range me-1"></i>时间：</span>
-                <a href="{{ url_for('products', quick_date='last_week', source=current_filters.source, brand=current_filters.brand) }}"
+                <a href="{{ url_for('products', quick_date='last_week', source=current_filters.source, brand=current_filters.brand, manager=current_filters.manager, country=current_filters.country) }}"
                     class="btn btn-quick {% if current_filters.quick_date == 'last_week' %}active{% endif %}">上周</a>
-                <a href="{{ url_for('products', quick_date='last_15_days', source=current_filters.source, brand=current_filters.brand) }}"
+                <a href="{{ url_for('products', quick_date='last_15_days', source=current_filters.source, brand=current_filters.brand, manager=current_filters.manager, country=current_filters.country) }}"
                     class="btn btn-quick {% if current_filters.quick_date == 'last_15_days' %}active{% endif %}">近15日</a>
-                <a href="{{ url_for('products', quick_date='this_month', source=current_filters.source, brand=current_filters.brand) }}"
+                <a href="{{ url_for('products', quick_date='this_month', source=current_filters.source, brand=current_filters.brand, manager=current_filters.manager, country=current_filters.country) }}"
                     class="btn btn-quick {% if current_filters.quick_date == 'this_month' %}active{% endif %}">本月至今</a>
-                <a href="{{ url_for('products', quick_date='last_month', source=current_filters.source, brand=current_filters.brand) }}"
+                <a href="{{ url_for('products', quick_date='last_month', source=current_filters.source, brand=current_filters.brand, manager=current_filters.manager, country=current_filters.country) }}"
                     class="btn btn-quick {% if current_filters.quick_date == 'last_month' %}active{% endif %}">上个月</a>
-                <a href="{{ url_for('products', quick_date='last_quarter', source=current_filters.source, brand=current_filters.brand) }}"
+                <a href="{{ url_for('products', quick_date='last_quarter', source=current_filters.source, brand=current_filters.brand, manager=current_filters.manager, country=current_filters.country) }}"
                     class="btn btn-quick {% if current_filters.quick_date == 'last_quarter' %}active{% endif %}">近三个月</a>
-                <a href="{{ url_for('products', quick_date='half_year', source=current_filters.source, brand=current_filters.brand) }}"
+                <a href="{{ url_for('products', quick_date='half_year', source=current_filters.source, brand=current_filters.brand, manager=current_filters.manager, country=current_filters.country) }}"
                     class="btn btn-quick {% if current_filters.quick_date == 'half_year' %}active{% endif %}">近半年</a>
-                <a href="{{ url_for('products', quick_date='one_year', source=current_filters.source, brand=current_filters.brand) }}"
+                <a href="{{ url_for('products', quick_date='one_year', source=current_filters.source, brand=current_filters.brand, manager=current_filters.manager, country=current_filters.country) }}"
                     class="btn btn-quick {% if current_filters.quick_date == 'one_year' %}active{% endif %}">近一年</a>
-                <a href="{{ url_for('products', quick_date='all', source=current_filters.source, brand=current_filters.brand) }}"
+                <a href="{{ url_for('products', quick_date='all', source=current_filters.source, brand=current_filters.brand, manager=current_filters.manager, country=current_filters.country) }}"
                     class="btn btn-outline-secondary btn-sm {% if current_filters.quick_date == 'all' %}active{% endif %}">全部</a>
             </div>
             <div class="d-flex align-items-center gap-3">
+                <div class="d-flex align-items-center gap-2">
+                    <span class="text-secondary"><i class="bi bi-globe2 me-1"></i>国家：</span>
+                    <select class="form-select form-select-sm" style="width: auto; min-width: 120px;"
+                        onchange="updateFilters('country', this.value)">
+                        <option value="">全部国家</option>
+                        {% for country in all_countries %}
+                        <option value="{{ country }}" {% if current_filters.country==country %}selected{% endif %}>
+                            {{ country }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
                 <div class="d-flex align-items-center gap-2">
                     <span class="text-secondary"><i class="bi bi-person-badge me-1"></i>负责人：</span>
                     <select class="form-select form-select-sm" style="width: auto; min-width: 120px;"
@@ -182,7 +194,7 @@
                                             {% endif %}
                                     </td>
                                     <td>
-                                        <a href="{{ url_for('products', brand=brand.name, quick_date=current_filters.quick_date, source=current_filters.source) }}"
+                                        <a href="{{ url_for('products', brand=brand.name, quick_date=current_filters.quick_date, source=current_filters.source, manager=current_filters.manager, country=current_filters.country) }}"
                                             class="text-info text-decoration-none">{{ brand.name }}</a>
                                     </td>
                                     <td class="text-end"><strong>{{ "{:,}".format(brand.quantity) }}</strong></td>
