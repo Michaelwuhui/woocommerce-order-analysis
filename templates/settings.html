@@ -237,8 +237,8 @@
                                 <button class="btn btn-sm btn-outline-secondary me-2 edit-btn"
                                     data-site-id="{{ site.id }}" data-url="{{ site.url }}"
                                     data-key="{{ site.consumer_key }}" data-secret="{{ site.consumer_secret }}"
-                                    data-manager="{{ site.manager or '' }}" data-mask-id="{{ site.mask_id or '' }}"><i
-                                        class="bi bi-pencil"></i></button>
+                                    data-manager="{{ site.manager or '' }}" data-mask-id="{{ site.mask_id or '' }}"
+                                    data-country="{{ site.country or '' }}"><i class="bi bi-pencil"></i></button>
                                 <button class="btn btn-sm btn-outline-danger delete-btn" data-site-id="{{ site.id }}"><i
                                         class="bi bi-trash"></i></button>
                             </td>
@@ -653,6 +653,22 @@
                         <div class="form-text text-muted">可选：用于获取51.la流量数据</div>
                     </div>
                     <div class="mb-3">
+                        <label class="form-label text-white-50">国家/地区</label>
+                        <select class="form-select bg-dark text-white border-secondary border-opacity-25"
+                            name="country">
+                            <option value="">请选择国家</option>
+                            <option value="PL">波兰 (Poland)</option>
+                            <option value="AU">澳大利亚 (Australia)</option>
+                            <option value="AE">阿联酋 (UAE)</option>
+                            <option value="DE">德国 (Germany)</option>
+                            <option value="FR">法国 (France)</option>
+                            <option value="UK">英国 (UK)</option>
+                            <option value="US">美国 (USA)</option>
+                            <option value="CN">中国 (China)</option>
+                            <option value="OTHER">其他</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
                         <label class="form-label text-white-50">站点 URL</label>
                         <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25"
                             name="url" placeholder="https://example.com" required>
@@ -698,6 +714,22 @@
                         <label class="form-label text-white-50">51.la Mask ID</label>
                         <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
                             name="mask_id" id="editSiteMaskId" placeholder="如：KqmtdhxdOsN9a7i7">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">国家/地区</label>
+                        <select class="form-select bg-dark text-white border-secondary border-opacity-25" name="country"
+                            id="editSiteCountry">
+                            <option value="">请选择国家</option>
+                            <option value="PL">波兰 (Poland)</option>
+                            <option value="AU">澳大利亚 (Australia)</option>
+                            <option value="AE">阿联酋 (UAE)</option>
+                            <option value="DE">德国 (Germany)</option>
+                            <option value="FR">法国 (France)</option>
+                            <option value="UK">英国 (UK)</option>
+                            <option value="US">美国 (USA)</option>
+                            <option value="CN">中国 (China)</option>
+                            <option value="OTHER">其他</option>
+                        </select>
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">站点 URL</label>
@@ -1586,6 +1618,7 @@
                 const secret = editBtn.dataset.secret;
                 const manager = editBtn.dataset.manager || '';
                 const maskId = editBtn.dataset.maskId || '';
+                const country = editBtn.dataset.country || '';
 
                 document.getElementById('editSiteId').value = siteId;
                 document.getElementById('editSiteUrl').value = url;
@@ -1593,6 +1626,7 @@
                 document.getElementById('editSiteSecret').value = secret;
                 document.getElementById('editSiteManager').value = manager;
                 document.getElementById('editSiteMaskId').value = maskId;
+                document.getElementById('editSiteCountry').value = country;
 
                 const modal = getModal('editSiteModal');
                 if (modal) modal.show();

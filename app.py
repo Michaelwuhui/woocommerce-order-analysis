@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 from functools import wraps
 
-from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session, send_file
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
@@ -1421,9 +1421,14 @@ def monthly():
     # Get source filter
     source_filter = request.args.get('source', '')
     manager_filter = request.args.get('manager', '')
+    country_filter = request.args.get('country', '')
     
     # Get all managers
     all_managers = get_all_managers()
+    
+    # Get all countries from sites table
+    all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
+    all_countries = [c['country'] for c in all_countries]
     
     # Validate source_filter against allowed sources
     if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
@@ -1453,6 +1458,17 @@ def monthly():
             placeholders = ', '.join(['?' for _ in manager_urls])
             source_conditions.append(f'source IN ({placeholders})')
             source_params.extend(manager_urls)
+        else:
+            source_conditions.append('1=0')
+            
+    if country_filter:
+        # Get sites in this country
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country_filter,)).fetchall()
+        country_urls = [s['url'] for s in country_sites]
+        if country_urls:
+            placeholders = ', '.join(['?' for _ in country_urls])
+            source_conditions.append(f'source IN ({placeholders})')
+            source_params.extend(country_urls)
         else:
             source_conditions.append('1=0')
             
@@ -1487,6 +1503,19 @@ def monthly():
             params.extend(manager_urls)
         else:
             conditions.append('1=0')
+            
+    # Add country filter
+    if country_filter:
+        if 'country_urls' not in locals():
+            country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country_filter,)).fetchall()
+            country_urls = [s['url'] for s in country_sites]
+        
+        if country_urls:
+            placeholders = ', '.join(['?' for _ in country_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(country_urls)
+        else:
+            conditions.append('1=0')
     
     if source_filter:
         conditions.append('source = ?')
@@ -1505,7 +1534,7 @@ def monthly():
     conn.close()
     
     if len(df) == 0:
-        return render_template('monthly.html', monthly_stats=[], sources=all_sources, source_filter=source_filter)
+        return render_template('monthly.html', monthly_stats=[], sources=all_sources, source_filter=source_filter, country_filter=country_filter, all_countries=all_countries)
     
     # Calculate product quantities
     def get_product_qty(line_items):
@@ -1593,8 +1622,405 @@ def monthly():
         monthly_aggregates[m]['total_orders'] += row['total_orders']
         monthly_aggregates[m]['total_products'] += row['total_products']
         
-    return render_template('monthly.html', monthly_stats=rows, monthly_aggregates=monthly_aggregates, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, all_managers=all_managers, sort_by=sort_by, site_managers=site_managers)
+    return render_template('monthly.html', monthly_stats=rows, monthly_aggregates=monthly_aggregates, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, country_filter=country_filter, all_managers=all_managers, all_countries=all_countries, sort_by=sort_by, site_managers=site_managers)
 
+
+@app.route('/api/monthly/export')
+@login_required
+def monthly_export():
+    """Export monthly statistics to Excel"""
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.chart import BarChart, LineChart, Reference
+    from openpyxl.chart.label import DataLabelList
+    
+    conn = get_db_connection()
+    
+    # Get user's allowed sources for permission filtering
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    
+    # Get filters
+    source_filter = request.args.get('source', '')
+    manager_filter = request.args.get('manager', '')
+    country_filter = request.args.get('country', '')
+    
+    # Build query conditions
+    conditions = []
+    params = []
+    
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ', '.join(['?' for _ in allowed_sources])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+    
+    if manager_filter:
+        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
+        manager_urls = [s['url'] for s in manager_sites]
+        if manager_urls:
+            placeholders = ', '.join(['?' for _ in manager_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(manager_urls)
+        else:
+            conditions.append('1=0')
+    
+    if country_filter:
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country_filter,)).fetchall()
+        country_urls = [s['url'] for s in country_sites]
+        if country_urls:
+            placeholders = ', '.join(['?' for _ in country_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(country_urls)
+        else:
+            conditions.append('1=0')
+    
+    if source_filter:
+        conditions.append('source = ?')
+        params.append(source_filter)
+    
+    where_clause = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
+    
+    query = f'''
+        SELECT id, status, date_created, total, shipping_total, source, currency, line_items
+        FROM orders
+        {where_clause}
+        ORDER BY date_created DESC
+    '''
+    
+    df = pd.read_sql_query(query, conn, params=params if params else None)
+    
+    # Get site managers
+    sites = conn.execute('SELECT url, manager FROM sites').fetchall()
+    site_managers = {s['url']: s['manager'] or '' for s in sites}
+    conn.close()
+    
+    if len(df) == 0:
+        return jsonify({'error': '没有数据可导出'}), 400
+    
+    # Calculate product quantities
+    def get_product_qty(line_items):
+        try:
+            items = json.loads(line_items) if line_items else []
+            return sum(item.get('quantity', 0) for item in items)
+        except:
+            return 0
+    
+    df['product_qty'] = df['line_items'].apply(get_product_qty)
+    df['month'] = pd.to_datetime(df['date_created']).dt.to_period('M')
+    
+    # Group by month, source
+    rows = []
+    for (month, source), gdf in df.groupby(['month', 'source']):
+        currency = gdf['currency'].iloc[0] if len(gdf) > 0 else 'N/A'
+        
+        total_orders = len(gdf)
+        total_products = gdf['product_qty'].sum()
+        total_amount = gdf['total'].sum()
+        
+        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat'])
+        success_orders = int(success_mask.sum())
+        success_amount = gdf.loc[success_mask, 'total'].sum()
+        success_products = gdf.loc[success_mask, 'product_qty'].sum()
+        success_shipping = gdf.loc[success_mask, 'shipping_total'].sum()
+        success_net_amount = success_amount - success_shipping
+        
+        failed_orders = int((gdf['status'] == 'failed').sum())
+        cancelled_orders = int((gdf['status'] == 'cancelled').sum())
+        
+        # Get CNY rate
+        rate, _ = get_cny_rate(currency, str(month))
+        success_net_amount_cny = round(success_net_amount * rate, 2) if rate else 0
+        
+        rows.append({
+            '月份': str(month),
+            '网站': source.replace('https://www.', '').replace('https://', ''),
+            '负责人': site_managers.get(source, ''),
+            '货币': currency,
+            '总订单数': total_orders,
+            '总产品数': int(total_products),
+            '总金额': round(float(total_amount), 2),
+            '成功订单数': success_orders,
+            '成功产品数': int(success_products),
+            '成功金额': round(float(success_amount), 2),
+            '成功净金额': round(float(success_net_amount), 2),
+            '失败订单': failed_orders,
+            '取消订单': cancelled_orders,
+            '汇率': round(rate, 4) if rate else 0,
+            '净金额(CNY)': round(success_net_amount_cny, 2),
+            '_total_amount': float(total_amount),
+            '_success_amount': float(success_amount),
+            '_success_net_amount': float(success_net_amount),
+            '_net_amount_cny': success_net_amount_cny
+        })
+    
+    # Sort by month descending
+    rows.sort(key=lambda x: x['月份'], reverse=True)
+    
+    # Calculate monthly totals with all fields
+    monthly_totals = {}
+    for row in rows:
+        m = row['月份']
+        if m not in monthly_totals:
+            monthly_totals[m] = {
+                'site_count': 0,
+                'total_orders': 0,
+                'total_products': 0,
+                'total_amount': 0,
+                'success_orders': 0,
+                'success_products': 0,
+                'success_amount': 0,
+                'success_net_amount': 0,
+                'failed_orders': 0,
+                'cancelled_orders': 0,
+                'net_amount_cny': 0
+            }
+        monthly_totals[m]['site_count'] += 1
+        monthly_totals[m]['total_orders'] += row['总订单数']
+        monthly_totals[m]['total_products'] += row['总产品数']
+        monthly_totals[m]['total_amount'] += row['_total_amount']
+        monthly_totals[m]['success_orders'] += row['成功订单数']
+        monthly_totals[m]['success_products'] += row['成功产品数']
+        monthly_totals[m]['success_amount'] += row['_success_amount']
+        monthly_totals[m]['success_net_amount'] += row['_success_net_amount']
+        monthly_totals[m]['failed_orders'] += row['失败订单']
+        monthly_totals[m]['cancelled_orders'] += row['取消订单']
+        monthly_totals[m]['net_amount_cny'] += row['_net_amount_cny']
+    
+    # Create Excel workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '月度统计'
+    
+    # Determine header currency based on country filter
+    country_currency_map = {
+        'PL': 'PLN',
+        'AU': 'AUD',
+        'AE': 'AED',
+        'DE': 'EUR',
+        'FR': 'EUR',
+        'UK': 'GBP',
+        'US': 'USD',
+        'CN': 'CNY'
+    }
+    header_currency = country_currency_map.get(country_filter, '混合货币') if country_filter else '混合货币'
+    
+    # Write headers (exclude hidden fields starting with _)
+    headers = [k for k in rows[0].keys() if not k.startswith('_')] if rows else []
+    
+    # Modify header names to include currency
+    header_display_map = {
+        '总金额': f'总金额({header_currency})',
+        '成功金额': f'成功金额({header_currency})',
+        '成功净金额': f'成功净金额({header_currency})'
+    }
+    
+    header_font = Font(bold=True, color='FFFFFF')
+    header_fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
+    
+    for col, header in enumerate(headers, 1):
+        display_header = header_display_map.get(header, header)
+        cell = ws.cell(row=1, column=col, value=display_header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+    
+    # Write data (exclude hidden fields) with center alignment
+    center_align = Alignment(horizontal='center', vertical='center')
+    for row_idx, row_data in enumerate(rows, 2):
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=row_data[header])
+            cell.alignment = center_align
+    
+    # Add empty row
+    summary_start_row = len(rows) + 3
+    
+    # Determine summary currency based on country filter
+    country_currency_map = {
+        'PL': 'PLN',
+        'AU': 'AUD',
+        'AE': 'AED',
+        'DE': 'EUR',
+        'FR': 'EUR',
+        'UK': 'GBP',
+        'US': 'USD',
+        'CN': 'CNY'
+    }
+    summary_currency = country_currency_map.get(country_filter, '混合货币') if country_filter else '混合货币'
+    
+    # Add monthly summary with all columns
+    summary_font = Font(bold=True, color='006400')
+    for idx, (month, totals) in enumerate(sorted(monthly_totals.items(), reverse=True)):
+        row_num = summary_start_row + idx
+        # Column A: 月份收入总计
+        cell = ws.cell(row=row_num, column=1, value=f'{month}月收入总计')
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column B: 站点数量
+        cell = ws.cell(row=row_num, column=2, value=f'{totals["site_count"]}个站点')
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column C: 负责人 - 留空
+        ws.cell(row=row_num, column=3, value='').alignment = center_align
+        # Column D: 货币 - 显示汇总货币
+        cell = ws.cell(row=row_num, column=4, value=summary_currency)
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column E: 总订单数
+        cell = ws.cell(row=row_num, column=5, value=totals['total_orders'])
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column F: 总产品数
+        cell = ws.cell(row=row_num, column=6, value=totals['total_products'])
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column G: 总金额
+        cell = ws.cell(row=row_num, column=7, value=round(totals['total_amount'], 2))
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column H: 成功订单数
+        cell = ws.cell(row=row_num, column=8, value=totals['success_orders'])
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column I: 成功产品数
+        cell = ws.cell(row=row_num, column=9, value=totals['success_products'])
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column J: 成功金额
+        cell = ws.cell(row=row_num, column=10, value=round(totals['success_amount'], 2))
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column K: 成功净金额
+        cell = ws.cell(row=row_num, column=11, value=round(totals['success_net_amount'], 2))
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column L: 失败订单
+        cell = ws.cell(row=row_num, column=12, value=totals['failed_orders'])
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column M: 取消订单
+        cell = ws.cell(row=row_num, column=13, value=totals['cancelled_orders'])
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column N: 汇率 - 留空
+        ws.cell(row=row_num, column=14, value='').alignment = center_align
+        # Column O: 净金额(CNY)
+        cell = ws.cell(row=row_num, column=15, value=f'¥{round(totals["net_amount_cny"], 2)}')
+        cell.font = summary_font
+        cell.alignment = center_align
+    
+    # Auto-adjust column widths
+    for column in ws.columns:
+        max_length = 0
+        col_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if cell.value:
+                    cell_len = len(str(cell.value))
+                    # Chinese characters count as 2
+                    for ch in str(cell.value):
+                        if ord(ch) > 127:
+                            cell_len += 1
+                    if cell_len > max_length:
+                        max_length = cell_len
+            except:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_length + 2, 50)
+    
+    # Freeze first row
+    ws.freeze_panes = 'A2'
+    
+    # Create charts based on monthly summary data
+    if monthly_totals:
+        # Sort months chronologically for charts
+        sorted_months = sorted(monthly_totals.keys())
+        
+        # Create a new sheet for chart data
+        chart_data_start_row = summary_start_row + len(monthly_totals) + 3
+        
+        # Write chart data headers
+        ws.cell(row=chart_data_start_row, column=1, value='月份').font = header_font
+        ws.cell(row=chart_data_start_row, column=1).fill = header_fill
+        ws.cell(row=chart_data_start_row, column=1).alignment = center_align
+        ws.cell(row=chart_data_start_row, column=2, value='净金额(CNY)').font = header_font
+        ws.cell(row=chart_data_start_row, column=2).fill = header_fill
+        ws.cell(row=chart_data_start_row, column=2).alignment = center_align
+        ws.cell(row=chart_data_start_row, column=3, value='订单数').font = header_font
+        ws.cell(row=chart_data_start_row, column=3).fill = header_fill
+        ws.cell(row=chart_data_start_row, column=3).alignment = center_align
+        
+        # Write chart data (chronological order)
+        for idx, month in enumerate(sorted_months):
+            row_num = chart_data_start_row + 1 + idx
+            ws.cell(row=row_num, column=1, value=month).alignment = center_align
+            ws.cell(row=row_num, column=2, value=round(monthly_totals[month]['net_amount_cny'], 2)).alignment = center_align
+            ws.cell(row=row_num, column=3, value=monthly_totals[month]['success_orders']).alignment = center_align
+        
+        chart_data_end_row = chart_data_start_row + len(sorted_months)
+        
+        # Create Bar Chart for Net Amount
+        bar_chart = BarChart()
+        bar_chart.type = "col"
+        bar_chart.grouping = "clustered"
+        bar_chart.title = "月度净金额趋势"
+        bar_chart.y_axis.title = "净金额 (CNY)"
+        bar_chart.x_axis.title = "月份"
+        bar_chart.style = 12
+        bar_chart.width = 18
+        bar_chart.height = 10
+        
+        data = Reference(ws, min_col=2, min_row=chart_data_start_row, max_row=chart_data_end_row, max_col=2)
+        cats = Reference(ws, min_col=1, min_row=chart_data_start_row + 1, max_row=chart_data_end_row)
+        bar_chart.add_data(data, titles_from_data=True)
+        bar_chart.set_categories(cats)
+        bar_chart.shape = 4
+        
+        # Add data labels
+        bar_chart.dataLabels = DataLabelList()
+        bar_chart.dataLabels.showVal = True
+        
+        # Place bar chart
+        chart_row = chart_data_end_row + 2
+        ws.add_chart(bar_chart, f"A{chart_row}")
+        
+        # Create Line Chart for Orders
+        line_chart = LineChart()
+        line_chart.title = "月度订单数趋势"
+        line_chart.y_axis.title = "订单数"
+        line_chart.x_axis.title = "月份"
+        line_chart.style = 13
+        line_chart.width = 18
+        line_chart.height = 10
+        
+        order_data = Reference(ws, min_col=3, min_row=chart_data_start_row, max_row=chart_data_end_row, max_col=3)
+        line_chart.add_data(order_data, titles_from_data=True)
+        line_chart.set_categories(cats)
+        
+        # Add data labels
+        line_chart.dataLabels = DataLabelList()
+        line_chart.dataLabels.showVal = True
+        
+        # Place line chart next to bar chart
+        ws.add_chart(line_chart, f"K{chart_row}")
+    
+    # Save to BytesIO
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    
+    # Generate filename
+    timestamp = datetime.now().strftime('%Y%m%d%H%M')
+    country_name = country_filter if country_filter else '全部'
+    filename = f'月度统计汇总（{country_name}）{timestamp}.xlsx'
+    
+    return send_file(
+        output,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=filename
+    )
 
 @app.route('/cancelled-analysis')
 @login_required
@@ -2642,6 +3068,11 @@ def init_sites_table():
         conn.execute('ALTER TABLE sites ADD COLUMN tracking_api_status TEXT')
     except:
         pass  # Column already exists
+    # Add country column for site categorization by country
+    try:
+        conn.execute('ALTER TABLE sites ADD COLUMN country TEXT')
+    except:
+        pass  # Column already exists
     conn.commit()
     conn.close()
 
@@ -3171,6 +3602,7 @@ def add_site():
     cs = data.get('consumer_secret')
     manager = data.get('manager', '')
     mask_id = data.get('mask_id', '')
+    country = data.get('country', '')
     
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -3181,8 +3613,8 @@ def add_site():
         
     conn = get_db_connection()
     try:
-        conn.execute('INSERT INTO sites (url, consumer_key, consumer_secret, manager, mask_id) VALUES (?, ?, ?, ?, ?)',
-                     (url, ck, cs, manager, mask_id))
+        conn.execute('INSERT INTO sites (url, consumer_key, consumer_secret, manager, mask_id, country) VALUES (?, ?, ?, ?, ?, ?)',
+                     (url, ck, cs, manager, mask_id, country))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
@@ -3202,6 +3634,7 @@ def update_site(site_id):
     cs = data.get('consumer_secret')
     manager = data.get('manager', '')
     mask_id = data.get('mask_id', '')
+    country = data.get('country', '')
     
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -3212,8 +3645,8 @@ def update_site(site_id):
         
     conn = get_db_connection()
     try:
-        conn.execute('UPDATE sites SET url = ?, consumer_key = ?, consumer_secret = ?, manager = ?, mask_id = ? WHERE id = ?',
-                     (url, ck, cs, manager, mask_id, site_id))
+        conn.execute('UPDATE sites SET url = ?, consumer_key = ?, consumer_secret = ?, manager = ?, mask_id = ?, country = ? WHERE id = ?',
+                     (url, ck, cs, manager, mask_id, country, site_id))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:

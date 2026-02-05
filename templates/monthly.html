@@ -10,6 +10,10 @@
             {% if source_filter %}<small class="text-muted ms-2">({{ source_filter.replace('https://www.',
                 '').replace('https://', '')
                 }})</small>{% endif %}
+            <a href="{{ url_for('monthly_export', source=source_filter, manager=manager_filter, country=country_filter) }}"
+                class="btn btn-sm btn-success ms-3">
+                <i class="bi bi-download me-1"></i>导出Excel
+            </a>
         </h5>
         <div class="d-flex align-items-center gap-3">
             <div class="d-flex align-items-center gap-2">
@@ -26,9 +30,21 @@
                 </div>
             </div>
             <div class="d-flex align-items-center gap-2">
+                <span class="text-secondary"><i class="bi bi-globe2 me-1"></i>国家：</span>
+                <select id="countryFilter" class="form-select form-select-sm" style="width: auto; min-width: 120px;"
+                    onchange="window.location.href='{{ url_for('monthly', sort=sort_by) }}&country=' + this.value">
+                    <option value="">全部国家</option>
+                    {% for country in all_countries %}
+                    <option value="{{ country }}" {% if country_filter==country %}selected{% endif %}>
+                        {{ country }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="d-flex align-items-center gap-2">
                 <span class="text-secondary"><i class="bi bi-person-badge me-1"></i>负责人：</span>
                 <select id="managerFilter" class="form-select form-select-sm" style="width: auto; min-width: 120px;"
-                    onchange="window.location.href='{{ url_for('monthly', sort=sort_by) }}&manager=' + this.value">
+                    onchange="window.location.href='{{ url_for('monthly', sort=sort_by, country=country_filter) }}&manager=' + this.value">
                     <option value="">全部负责人</option>
                     {% for manager in all_managers %}
                     <option value="{{ manager }}" {% if manager_filter==manager %}selected{% endif %}>
@@ -40,7 +56,7 @@
             <div class="d-flex align-items-center gap-2">
                 <span class="text-secondary"><i class="bi bi-globe me-1"></i>网站：</span>
                 <select id="sourceFilter" class="form-select form-select-sm" style="width: auto; min-width: 180px;"
-                    onchange="window.location.href='{{ url_for('monthly', sort=sort_by) }}&source=' + this.value">
+                    onchange="window.location.href='{{ url_for('monthly', sort=sort_by, country=country_filter, manager=manager_filter) }}&source=' + this.value">
                     <option value="">全部网站</option>
                     {% for source in sources %}
                     <option value="{{ source.source }}" {% if source_filter==source.source %}selected{% endif %}>
