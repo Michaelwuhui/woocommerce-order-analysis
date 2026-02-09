@@ -143,6 +143,7 @@
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint == 'customers' else '' }}"
                             href="{{ url_for('customers') }}">
+                            <i class="bi bi-people me-1"></i>客户分析
                         </a>
                     </li>
                     {% if current_user.is_admin() or current_user.can_view_report() %}

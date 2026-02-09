@@ -930,8 +930,8 @@ def dashboard():
             stats_row = conn.execute('''
                 SELECT 
                     COUNT(*) as total_orders,
-                    SUM(CASE WHEN status IN ('completed', 'processing') THEN 1 ELSE 0 END) as successful_orders,
-                    SUM(CASE WHEN status IN ('completed', 'processing') THEN total ELSE 0 END) as total_spending,
+                    SUM(CASE WHEN status IN ('completed', 'on-hold') THEN 1 ELSE 0 END) as successful_orders,
+                    SUM(CASE WHEN status IN ('completed', 'on-hold') THEN total ELSE 0 END) as total_spending,
                     MAX(date_created) as last_order_date,
                     MIN(date_created) as first_order_date
                 FROM orders 
@@ -1353,8 +1353,8 @@ def orders():
             stats = conn.execute('''
                 SELECT 
                     COUNT(*) as total_orders,
-                    SUM(CASE WHEN status IN ('completed', 'processing') THEN 1 ELSE 0 END) as successful_orders,
-                    SUM(CASE WHEN status IN ('completed', 'processing') THEN total ELSE 0 END) as total_spending,
+                    SUM(CASE WHEN status IN ('completed', 'on-hold') THEN 1 ELSE 0 END) as successful_orders,
+                    SUM(CASE WHEN status IN ('completed', 'on-hold') THEN total ELSE 0 END) as total_spending,
                     MAX(date_created) as last_order_date,
                     MIN(date_created) as first_order_date
                 FROM orders 
@@ -2965,8 +2965,8 @@ def customers():
             json_extract(billing, '$.first_name') || ' ' || json_extract(billing, '$.last_name') as name,
             json_extract(billing, '$.phone') as phone,
             COUNT(*) as total_orders,
-            SUM(CASE WHEN status IN ('completed', 'processing') THEN 1 ELSE 0 END) as successful_orders,
-            SUM(CASE WHEN status IN ('completed', 'processing') THEN total ELSE 0 END) as total_spent,
+            SUM(CASE WHEN status IN ('completed', 'on-hold') THEN 1 ELSE 0 END) as successful_orders,
+            SUM(CASE WHEN status IN ('completed', 'on-hold') THEN total ELSE 0 END) as total_spent,
             MAX(date_created) as last_order_date,
             MIN(date_created) as first_order_date,
             GROUP_CONCAT(DISTINCT source) as sources
@@ -3156,7 +3156,7 @@ def get_order_details(order_id):
         customer_stats = conn.execute('''
             SELECT COUNT(*) as count, SUM(total) as total
             FROM orders 
-            WHERE billing LIKE ? AND status IN ('completed', 'processing')
+            WHERE billing LIKE ? AND status IN ('completed', 'on-hold')
         ''', (f'%"{email}"%',)).fetchone()
         
         # 按状态分类统计所有订单
@@ -3294,7 +3294,7 @@ def get_customer_details(email):
         # Status counting
         status = order['status']
         currency = order['currency'] or 'N/A'
-        if status in ['completed', 'processing']:
+        if status in ['completed', 'on-hold']:
             successful_orders += 1
             order_total = float(order['total'] or 0)
             total_spending += order_total
