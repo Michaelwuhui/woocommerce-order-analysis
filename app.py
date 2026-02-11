@@ -5183,6 +5183,137 @@ def get_sync_logs():
     return jsonify([dict(row) for row in logs])
 
 
+@app.route('/api/sync/file-logs')
+@login_required
+def get_sync_file_logs():
+    """读取同步日志文件的最近内容"""
+    import os
+    log_type = request.args.get('type', 'auto')
+    lines_count = min(int(request.args.get('lines', 200)), 500)
+    
+    log_files = {
+        'auto': '/www/wwwroot/woo-analysis/auto_sync.log',
+        'deep': '/www/wwwroot/woo-analysis/deep_sync.log',
+        'clean': '/www/wwwroot/woo-analysis/clean_sync.log',
+    }
+    
+    log_file = log_files.get(log_type)
+    if not log_file or not os.path.exists(log_file):
+        return jsonify({'lines': [], 'total_lines': 0, 'file_size': 0})
+    
+    file_size = os.path.getsize(log_file)
+    
+    # 从文件末尾读取指定行数
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['tail', '-n', str(lines_count), log_file],
+            capture_output=True, text=True, timeout=5
+        )
+        content_lines = result.stdout.strip().split('\n') if result.stdout.strip() else []
+        
+        # 统计总行数
+        wc_result = subprocess.run(
+            ['wc', '-l', log_file],
+            capture_output=True, text=True, timeout=5
+        )
+        total_lines = int(wc_result.stdout.strip().split()[0]) if wc_result.stdout.strip() else 0
+        
+    except Exception:
+        content_lines = []
+        total_lines = 0
+    
+    return jsonify({
+        'lines': content_lines,
+        'total_lines': total_lines,
+        'file_size': file_size,
+        'file_size_mb': round(file_size / 1024 / 1024, 2)
+    })
+
+
+@app.route('/api/sync/dashboard')
+@login_required
+def get_sync_dashboard():
+    """获取全局同步状态摘要"""
+    import subprocess, os
+    
+    conn = get_db_connection()
+    
+    # 1. 获取自动同步设置
+    autosync_enabled_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_enabled'").fetchone()
+    autosync_interval_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_interval'").fetchone()
+    
+    autosync_enabled = autosync_enabled_row['value'] == 'true' if autosync_enabled_row else False
+    autosync_interval = int(autosync_interval_row['value']) if autosync_interval_row else 900
+    
+    # 2. 获取 Crontab 配置
+    cron_info = {}
+    try:
+        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        crontab = result.stdout if result.returncode == 0 else ''
+        for line in crontab.split('\n'):
+            if 'auto_sync.py' in line and not line.startswith('#'):
+                parts = line.split()
+                if len(parts) >= 5:
+                    cron_info['auto_sync'] = ' '.join(parts[:5])
+            elif '1.wooorders_sqlite.py' in line and '--clean' not in line and not line.startswith('#'):
+                parts = line.split()
+                if len(parts) >= 5:
+                    cron_info['deep_sync'] = ' '.join(parts[:5])
+            elif '1.wooorders_sqlite.py' in line and '--clean' in line and not line.startswith('#'):
+                parts = line.split()
+                if len(parts) >= 5:
+                    cron_info['clean_sync'] = ' '.join(parts[:5])
+    except Exception:
+        pass
+    
+    # 3. 获取最近同步记录统计
+    stats_24h = conn.execute('''
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success,
+            SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) as failed,
+            SUM(new_orders) as new_orders,
+            SUM(updated_orders) as updated_orders
+        FROM sync_logs 
+        WHERE sync_time >= datetime('now', '-24 hours')
+    ''').fetchone()
+    
+    last_sync = conn.execute('''
+        SELECT sync_time, status, message FROM sync_logs 
+        ORDER BY sync_time DESC LIMIT 1
+    ''').fetchone()
+    
+    # 4. 日志文件大小
+    log_sizes = {}
+    for name, path in [('auto', 'auto_sync.log'), ('deep', 'deep_sync.log'), ('clean', 'clean_sync.log')]:
+        full_path = f'/www/wwwroot/woo-analysis/{path}'
+        if os.path.exists(full_path):
+            size = os.path.getsize(full_path)
+            log_sizes[name] = round(size / 1024 / 1024, 2)
+        else:
+            log_sizes[name] = 0
+    
+    conn.close()
+    
+    return jsonify({
+        'autosync': {
+            'enabled': autosync_enabled,
+            'interval': autosync_interval,
+            'cron_schedule': cron_info.get('auto_sync'),
+        },
+        'deep_sync': {
+            'cron_schedule': cron_info.get('deep_sync'),
+        },
+        'clean_sync': {
+            'cron_schedule': cron_info.get('clean_sync'),
+        },
+        'stats_24h': dict(stats_24h) if stats_24h else {},
+        'last_sync': dict(last_sync) if last_sync else None,
+        'log_sizes': log_sizes
+    })
+
+
 @app.route('/api/sync/summary')
 @login_required
 def get_sync_summary():
@@ -7001,6 +7132,7 @@ def settings_api():
     elif request.method == 'POST':
         data = request.json
         try:
+            need_update_cron = False
             for key, value in data.items():
                 # source_display_mode is now per-user
                 if key == 'source_display_mode':
@@ -7012,7 +7144,52 @@ def settings_api():
                 elif key in ['autosync_enabled', 'autosync_interval']:
                     # These remain global settings (admin only)
                     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+                    need_update_cron = True
             conn.commit()
+            
+            # 如果自动同步设置发生变更，同步更新 Crontab 定时任务
+            if need_update_cron:
+                try:
+                    import subprocess
+                    # 重新读取最新的数据库设置
+                    enabled_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_enabled'").fetchone()
+                    interval_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_interval'").fetchone()
+                    
+                    sync_enabled = enabled_row['value'] == 'true' if enabled_row else False
+                    sync_interval = int(interval_row['value']) if interval_row else 900
+                    
+                    # 获取现有 crontab
+                    result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+                    existing_crontab = result.stdout if result.returncode == 0 else ''
+                    
+                    # 移除已有的 auto_sync.py 条目
+                    lines = [line for line in existing_crontab.split('\n') 
+                             if line.strip() and 'auto_sync.py' not in line]
+                    
+                    if sync_enabled:
+                        # 将间隔（秒）转换为 cron 表达式
+                        interval_mins = sync_interval // 60
+                        
+                        if interval_mins < 60:
+                            cron_schedule = f"*/{interval_mins} * * * *"
+                        elif interval_mins < 1440:
+                            hours = interval_mins // 60
+                            cron_schedule = f"0 */{hours} * * *"
+                        else:
+                            cron_schedule = "0 6 * * *"
+                        
+                        script_path = '/www/wwwroot/woo-analysis'
+                        cron_line = f"{cron_schedule} cd {script_path} && {script_path}/venv/bin/python auto_sync.py >> {script_path}/auto_sync.log 2>&1"
+                        lines.append(cron_line)
+                    
+                    # 写入新的 crontab
+                    new_crontab = '\n'.join(lines) + '\n' if lines else ''
+                    process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+                    process.communicate(input=new_crontab)
+                except Exception as cron_err:
+                    # cron 更新失败不影响设置保存的成功返回，但记录日志
+                    app.logger.error(f"更新 crontab 失败: {str(cron_err)}")
+            
             conn.close()
             return jsonify({'success': True})
         except Exception as e:

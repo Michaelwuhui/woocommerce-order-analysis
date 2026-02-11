@@ -207,6 +207,9 @@
             {% endif %}
         </h5>
         {% if current_user.is_authenticated and current_user.is_admin() %}
+        <button class="btn btn-primary btn-sm me-2" id="syncAllBtn">
+            <i class="bi bi-arrow-repeat me-1"></i>快速同步
+        </button>
         <a href="{{ url_for('export_orders') }}" class="btn btn-success btn-sm">
             <i class="bi bi-file-earmark-excel me-1"></i>导出所有订单
         </a>

@@ -98,6 +98,9 @@
                                 <option value="3600">每1小时</option>
                                 <option value="7200">每2小时</option>
                             </select>
+                            <button class="btn btn-sm btn-outline-secondary" id="openSyncLogsDashboardBtn" title="同步日志">
+                                <i class="bi bi-journal-text"></i>
+                            </button>
                         </div>
                     </div>
                     <div class="d-flex gap-2">
@@ -574,7 +577,239 @@
     </div>
 </div>
 
-<!-- Sync Logs Modal -->
+<!-- Sync Logs Dashboard Modal -->
+<div class="modal fade" id="syncLogsDashboardModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-journal-text me-2"></i>同步日志中心</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-0">
+                <ul class="nav nav-tabs px-3 pt-3" id="syncLogsTabs" role="tablist"
+                    style="border-bottom-color: rgba(108,117,125,0.25);">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active text-white" id="tab-overview" data-bs-toggle="tab"
+                            data-bs-target="#pane-overview" type="button" role="tab"
+                            style="background:transparent;border-color:transparent transparent rgba(108,117,125,0.25);">
+                            <i class="bi bi-speedometer2 me-1"></i>概览
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link text-white-50" id="tab-auto" data-bs-toggle="tab"
+                            data-bs-target="#pane-auto" type="button" role="tab"
+                            style="background:transparent;border-color:transparent;">
+                            <i class="bi bi-arrow-repeat me-1"></i>自动同步
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link text-white-50" id="tab-deep" data-bs-toggle="tab"
+                            data-bs-target="#pane-deep" type="button" role="tab"
+                            style="background:transparent;border-color:transparent;">
+                            <i class="bi bi-cloud-download me-1"></i>深度同步
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link text-white-50" id="tab-clean" data-bs-toggle="tab"
+                            data-bs-target="#pane-clean" type="button" role="tab"
+                            style="background:transparent;border-color:transparent;">
+                            <i class="bi bi-trash2 me-1"></i>清理同步
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link text-white-50" id="tab-api" data-bs-toggle="tab"
+                            data-bs-target="#pane-api" type="button" role="tab"
+                            style="background:transparent;border-color:transparent;">
+                            <i class="bi bi-database me-1"></i>API同步记录
+                        </button>
+                    </li>
+                </ul>
+
+                <div class="tab-content p-3" id="syncLogsTabContent">
+                    <!-- 概览 Tab -->
+                    <div class="tab-pane fade show active" id="pane-overview" role="tabpanel">
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-3">
+                                <div
+                                    class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                                    <div class="card-body text-center py-3">
+                                        <div class="text-primary mb-1"><i class="bi bi-arrow-repeat"
+                                                style="font-size:1.4rem;"></i></div>
+                                        <div class="text-white-50 small">自动同步</div>
+                                        <div id="dashAutoStatus" class="mt-1"><span
+                                                class="badge bg-secondary">加载中...</span></div>
+                                        <div id="dashAutoSchedule" class="text-muted small mt-1"></div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div
+                                    class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                                    <div class="card-body text-center py-3">
+                                        <div class="text-info mb-1"><i class="bi bi-cloud-download"
+                                                style="font-size:1.4rem;"></i></div>
+                                        <div class="text-white-50 small">深度同步</div>
+                                        <div id="dashDeepStatus" class="mt-1"><span
+                                                class="badge bg-secondary">加载中...</span></div>
+                                        <div id="dashDeepSchedule" class="text-muted small mt-1"></div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div
+                                    class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                                    <div class="card-body text-center py-3">
+                                        <div class="text-warning mb-1"><i class="bi bi-trash2"
+                                                style="font-size:1.4rem;"></i></div>
+                                        <div class="text-white-50 small">清理同步</div>
+                                        <div id="dashCleanStatus" class="mt-1"><span
+                                                class="badge bg-secondary">加载中...</span></div>
+                                        <div id="dashCleanSchedule" class="text-muted small mt-1"></div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div
+                                    class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                                    <div class="card-body text-center py-3">
+                                        <div class="text-success mb-1"><i class="bi bi-graph-up"
+                                                style="font-size:1.4rem;"></i></div>
+                                        <div class="text-white-50 small">24小时统计</div>
+                                        <div id="dashStats24h" class="mt-1"><span
+                                                class="badge bg-secondary">加载中...</span></div>
+                                        <div id="dashStatsDetail" class="text-muted small mt-1"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25">
+                            <div
+                                class="card-header bg-transparent border-bottom border-secondary border-opacity-25 py-2">
+                                <span class="text-white-50"><i class="bi bi-clock-history me-1"></i>最近同步活动</span>
+                            </div>
+                            <div class="card-body p-0">
+                                <div class="table-responsive" style="max-height:300px;overflow-y:auto;">
+                                    <table class="table table-dark table-hover align-middle mb-0"
+                                        style="--bs-table-bg:transparent;">
+                                        <thead>
+                                            <tr>
+                                                <th>站点</th>
+                                                <th>时间</th>
+                                                <th>状态</th>
+                                                <th>新订单</th>
+                                                <th>更新</th>
+                                                <th>耗时</th>
+                                                <th>消息</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="dashRecentSyncBody">
+                                            <tr>
+                                                <td colspan="7" class="text-center text-muted py-4">加载中...</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 自动同步 Tab -->
+                    <div class="tab-pane fade" id="pane-auto" role="tabpanel">
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <span class="text-white-50 small" id="autoLogInfo">日志文件: auto_sync.log</span>
+                            <button class="btn btn-sm btn-outline-secondary" onclick="loadFileLog('auto')"><i
+                                    class="bi bi-arrow-clockwise me-1"></i>刷新</button>
+                        </div>
+                        <div class="card bg-black border border-secondary border-opacity-25">
+                            <div class="card-body p-2"
+                                style="height:450px;overflow-y:auto;font-family:'Courier New',monospace;font-size:0.8rem;"
+                                id="autoLogContent">
+                                <span class="text-muted">点击标签加载日志...</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 深度同步 Tab -->
+                    <div class="tab-pane fade" id="pane-deep" role="tabpanel">
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <span class="text-white-50 small" id="deepLogInfo">日志文件: deep_sync.log</span>
+                            <button class="btn btn-sm btn-outline-secondary" onclick="loadFileLog('deep')"><i
+                                    class="bi bi-arrow-clockwise me-1"></i>刷新</button>
+                        </div>
+                        <div class="card bg-black border border-secondary border-opacity-25">
+                            <div class="card-body p-2"
+                                style="height:450px;overflow-y:auto;font-family:'Courier New',monospace;font-size:0.8rem;"
+                                id="deepLogContent">
+                                <span class="text-muted">点击标签加载日志...</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 清理同步 Tab -->
+                    <div class="tab-pane fade" id="pane-clean" role="tabpanel">
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <span class="text-white-50 small" id="cleanLogInfo">日志文件: clean_sync.log</span>
+                            <button class="btn btn-sm btn-outline-secondary" onclick="loadFileLog('clean')"><i
+                                    class="bi bi-arrow-clockwise me-1"></i>刷新</button>
+                        </div>
+                        <div class="card bg-black border border-secondary border-opacity-25">
+                            <div class="card-body p-2"
+                                style="height:450px;overflow-y:auto;font-family:'Courier New',monospace;font-size:0.8rem;"
+                                id="cleanLogContent">
+                                <span class="text-muted">点击标签加载日志...</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- API同步记录 Tab -->
+                    <div class="tab-pane fade" id="pane-api" role="tabpanel">
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <span class="text-white-50 small">数据库同步记录</span>
+                            <div class="d-flex gap-2">
+                                <select class="form-select form-select-sm bg-dark text-white border-secondary"
+                                    id="apiLogFilterSite" style="width:180px;">
+                                    <option value="">所有站点</option>
+                                </select>
+                                <button class="btn btn-sm btn-outline-secondary" onclick="loadApiSyncLogs()"><i
+                                        class="bi bi-arrow-clockwise me-1"></i>刷新</button>
+                            </div>
+                        </div>
+                        <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25">
+                            <div class="card-body p-0">
+                                <div class="table-responsive" style="max-height:450px;overflow-y:auto;">
+                                    <table class="table table-dark table-hover align-middle mb-0"
+                                        style="--bs-table-bg:transparent;">
+                                        <thead style="position:sticky;top:0;z-index:1;background:#111;">
+                                            <tr>
+                                                <th>站点</th>
+                                                <th>时间</th>
+                                                <th>状态</th>
+                                                <th>新订单</th>
+                                                <th>更新订单</th>
+                                                <th>耗时</th>
+                                                <th>消息</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="apiSyncLogsBody">
+                                            <tr>
+                                                <td colspan="7" class="text-center text-muted py-4">点击标签加载数据...</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">关闭</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Sync Logs Modal (legacy) -->
 <div class="modal fade" id="syncLogsModal" tabindex="-1">
     <div class="modal-dialog modal-xl">
         <div class="modal-content bg-dark border border-secondary border-opacity-25">
@@ -583,26 +818,21 @@
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
-                <!-- Summary Cards -->
-                <div class="row mb-4" id="syncSummaryCards">
-                    <!-- Cards will be populated by JavaScript -->
-                </div>
-
-                <!-- Logs Table -->
+                <div class="row mb-4" id="syncSummaryCards"></div>
                 <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25">
                     <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 py-2">
                         <div class="d-flex justify-content-between align-items-center">
                             <span class="text-white-50">最近同步记录</span>
                             <select class="form-select form-select-sm bg-dark text-white border-secondary"
-                                id="logsFilterSite" style="width: 200px;">
+                                id="logsFilterSite" style="width:200px;">
                                 <option value="">所有站点</option>
                             </select>
                         </div>
                     </div>
                     <div class="card-body p-0">
-                        <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                        <div class="table-responsive" style="max-height:400px;overflow-y:auto;">
                             <table class="table table-dark table-hover align-middle mb-0"
-                                style="--bs-table-bg: transparent;">
+                                style="--bs-table-bg:transparent;">
                                 <thead>
                                     <tr>
                                         <th>站点</th>
@@ -919,6 +1149,38 @@
                     });
             });
         }
+
+        // === 同步日志中心 ===
+        const openSyncLogsDashboardBtn = document.getElementById('openSyncLogsDashboardBtn');
+        if (openSyncLogsDashboardBtn) {
+            openSyncLogsDashboardBtn.addEventListener('click', function () {
+                const modal = new bootstrap.Modal(document.getElementById('syncLogsDashboardModal'));
+                modal.show();
+                loadSyncDashboard();
+            });
+        }
+
+        // Tab 样式切换
+        document.querySelectorAll('#syncLogsTabs .nav-link').forEach(tab => {
+            tab.addEventListener('shown.bs.tab', function () {
+                document.querySelectorAll('#syncLogsTabs .nav-link').forEach(t => {
+                    t.classList.remove('text-white');
+                    t.classList.add('text-white-50');
+                    t.style.borderColor = 'transparent';
+                });
+                this.classList.remove('text-white-50');
+                this.classList.add('text-white');
+                this.style.borderColor = 'transparent transparent rgba(108,117,125,0.25)';
+
+                // 按需加载各 Tab 数据
+                const target = this.getAttribute('data-bs-target');
+                if (target === '#pane-auto') loadFileLog('auto');
+                else if (target === '#pane-deep') loadFileLog('deep');
+                else if (target === '#pane-clean') loadFileLog('clean');
+                else if (target === '#pane-api') loadApiSyncLogs();
+                else if (target === '#pane-overview') loadSyncDashboard();
+            });
+        });
 
         // Check All APIs Button
         const checkAllApisBtn = document.getElementById('checkAllApisBtn');
@@ -2304,6 +2566,226 @@
                 });
         });
     });
+
+    // === 同步日志中心 - 数据加载函数 ===
+
+    function cronToReadable(cron) {
+        if (!cron) return '未设置';
+        const parts = cron.split(' ');
+        if (parts.length < 5) return cron;
+        const [min, hour, dom, mon, dow] = parts;
+
+        if (min.startsWith('*/') && hour === '*') return `每 ${min.slice(2)} 分钟`;
+        if (min === '0' && hour.startsWith('*/')) return `每 ${hour.slice(2)} 小时`;
+        if (min === '0' && !hour.startsWith('*') && dom === '*' && dow === '*') return `每天 ${hour}:00`;
+        if (min === '0' && !hour.startsWith('*') && dow !== '*') {
+            const dayNames = ['日', '一', '二', '三', '四', '五', '六'];
+            return `每周${dayNames[parseInt(dow)] || dow} ${hour}:00`;
+        }
+        return cron;
+    }
+
+    function loadSyncDashboard() {
+        // 加载概览数据
+        fetch('/api/sync/dashboard')
+            .then(r => r.json())
+            .then(data => {
+                // 自动同步状态卡片
+                const autoEl = document.getElementById('dashAutoStatus');
+                const autoSchEl = document.getElementById('dashAutoSchedule');
+                if (data.autosync.enabled) {
+                    autoEl.innerHTML = '<span class="badge bg-success">已启用</span>';
+                    autoSchEl.textContent = cronToReadable(data.autosync.cron_schedule);
+                } else {
+                    autoEl.innerHTML = '<span class="badge bg-secondary">未启用</span>';
+                    autoSchEl.textContent = '';
+                }
+
+                // 深度同步
+                const deepEl = document.getElementById('dashDeepStatus');
+                const deepSchEl = document.getElementById('dashDeepSchedule');
+                if (data.deep_sync.cron_schedule) {
+                    deepEl.innerHTML = '<span class="badge bg-success">已启用</span>';
+                    deepSchEl.textContent = cronToReadable(data.deep_sync.cron_schedule);
+                } else {
+                    deepEl.innerHTML = '<span class="badge bg-secondary">未设置</span>';
+                    deepSchEl.textContent = '';
+                }
+
+                // 清理同步
+                const cleanEl = document.getElementById('dashCleanStatus');
+                const cleanSchEl = document.getElementById('dashCleanSchedule');
+                if (data.clean_sync.cron_schedule) {
+                    cleanEl.innerHTML = '<span class="badge bg-success">已启用</span>';
+                    cleanSchEl.textContent = cronToReadable(data.clean_sync.cron_schedule);
+                } else {
+                    cleanEl.innerHTML = '<span class="badge bg-secondary">未设置</span>';
+                    cleanSchEl.textContent = '';
+                }
+
+                // 24h 统计
+                const stats = data.stats_24h || {};
+                const statsEl = document.getElementById('dashStats24h');
+                const statsDetailEl = document.getElementById('dashStatsDetail');
+                const total = stats.total || 0;
+                const success = stats.success || 0;
+                const failed = stats.failed || 0;
+                statsEl.innerHTML = `<span class="badge bg-success">${success} 成功</span>` +
+                    (failed > 0 ? ` <span class="badge bg-danger">${failed} 失败</span>` : '');
+                statsDetailEl.textContent = `共 ${total} 次，新增 ${stats.new_orders || 0}，更新 ${stats.updated_orders || 0}`;
+            })
+            .catch(() => { });
+
+        // 加载最近同步记录表格
+        fetch('/api/sync/logs?limit=30')
+            .then(r => r.json())
+            .then(logs => {
+                const body = document.getElementById('dashRecentSyncBody');
+                if (!logs.length) {
+                    body.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-4">暂无同步记录</td></tr>';
+                    return;
+                }
+                body.innerHTML = logs.map(log => {
+                    const siteName = (log.site_url || '').replace(/^https?:\/\//, '');
+                    const siteId = log.site_id || '';
+                    const statusBadge = log.status === 'success'
+                        ? '<span class="badge bg-success">成功</span>'
+                        : '<span class="badge bg-danger">失败</span>';
+                    return `<tr style="cursor:pointer;" onclick="filterBySite(${siteId}, '${siteName}')" title="点击查看 ${siteName} 全部记录">
+                        <td class="small"><span class="text-decoration-underline">${siteName}</span></td>
+                        <td class="small text-nowrap">${log.sync_time || '-'}</td>
+                        <td>${statusBadge}</td>
+                        <td class="text-center">${log.new_orders || 0}</td>
+                        <td class="text-center">${log.updated_orders || 0}</td>
+                        <td class="small">${log.duration ? log.duration + 's' : '-'}</td>
+                        <td class="small text-truncate" style="max-width:200px;" title="${(log.message || '').replace(/"/g, '&quot;')}">${log.message || '-'}</td>
+                    </tr>`;
+                }).join('');
+            })
+            .catch(() => { });
+    }
+
+    function filterBySite(siteId, siteName) {
+        // 切换到 API同步记录 Tab
+        const apiTab = document.getElementById('tab-api');
+        if (apiTab) {
+            bootstrap.Tab.getOrCreateInstance(apiTab).show();
+        }
+        // 确保下拉框有该站点选项，然后选中
+        const siteFilter = document.getElementById('apiLogFilterSite');
+        if (siteFilter) {
+            let found = false;
+            for (let opt of siteFilter.options) {
+                if (opt.value == siteId) { found = true; break; }
+            }
+            if (!found) {
+                const opt = document.createElement('option');
+                opt.value = siteId;
+                opt.textContent = siteName;
+                siteFilter.appendChild(opt);
+            }
+            siteFilter.value = siteId;
+            loadApiSyncLogs();
+        }
+    }
+
+    function loadFileLog(type) {
+        const container = document.getElementById(type + 'LogContent');
+        const info = document.getElementById(type + 'LogInfo');
+        container.innerHTML = '<span class="text-muted">加载中...</span>';
+
+        fetch(`/api/sync/file-logs?type=${type}&lines=200`)
+            .then(r => r.json())
+            .then(data => {
+                if (info) {
+                    const names = { auto: 'auto_sync.log', deep: 'deep_sync.log', clean: 'clean_sync.log' };
+                    info.textContent = `${names[type] || type} | 共 ${data.total_lines.toLocaleString()} 行 | ${data.file_size_mb} MB`;
+                }
+                if (!data.lines || !data.lines.length) {
+                    container.innerHTML = '<span class="text-muted">日志文件为空</span>';
+                    return;
+                }
+                // 高亮渲染日志行
+                container.innerHTML = data.lines.map(line => {
+                    let cls = 'text-white-50';
+                    if (/\berror\b|失败|✗/i.test(line)) cls = 'text-danger';
+                    else if (/success|成功|✓|完成/i.test(line)) cls = 'text-success';
+                    else if (/\[20\d{2}-\d{2}-\d{2}/.test(line)) cls = 'text-info';
+                    else if (/syncing|处理站点|获取|Connecting/i.test(line)) cls = 'text-warning';
+                    return `<div class="${cls}" style="white-space:pre-wrap;word-break:break-all;line-height:1.5;">${escapeHtml(line)}</div>`;
+                }).join('');
+                // 自动滚动到底部
+                container.scrollTop = container.scrollHeight;
+            })
+            .catch(() => {
+                container.innerHTML = '<span class="text-danger">加载失败</span>';
+            });
+    }
+
+    function escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    function loadApiSyncLogs() {
+        const siteFilter = document.getElementById('apiLogFilterSite');
+        const siteId = siteFilter ? siteFilter.value : '';
+        const body = document.getElementById('apiSyncLogsBody');
+        body.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-4">加载中...</td></tr>';
+
+        // 加载 API 同步记录
+        const url = siteId ? `/api/sync/logs?site_id=${siteId}&limit=100` : '/api/sync/logs?limit=100';
+        fetch(url)
+            .then(r => r.json())
+            .then(logs => {
+                // 从日志中提取站点列表填充下拉框（仅在未筛选时）
+                if (siteFilter && !siteId && siteFilter.options.length <= 1) {
+                    const siteMap = new Map();
+                    logs.forEach(log => {
+                        if (log.site_id && !siteMap.has(log.site_id)) {
+                            siteMap.set(log.site_id, (log.site_url || '').replace(/^https?:\/\//, ''));
+                        }
+                    });
+                    siteMap.forEach((name, id) => {
+                        const opt = document.createElement('option');
+                        opt.value = id;
+                        opt.textContent = name;
+                        siteFilter.appendChild(opt);
+                    });
+                }
+
+                if (!logs.length) {
+                    body.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-4">暂无记录</td></tr>';
+                    return;
+                }
+                body.innerHTML = logs.map(log => {
+                    const siteName = (log.site_url || '').replace(/^https?:\/\//, '');
+                    const statusBadge = log.status === 'success'
+                        ? '<span class="badge bg-success">成功</span>'
+                        : '<span class="badge bg-danger">失败</span>';
+                    return `<tr>
+                        <td class="small">${siteName}</td>
+                        <td class="small text-nowrap">${log.sync_time || '-'}</td>
+                        <td>${statusBadge}</td>
+                        <td class="text-center">${log.new_orders || 0}</td>
+                        <td class="text-center">${log.updated_orders || 0}</td>
+                        <td class="small">${log.duration ? log.duration + 's' : '-'}</td>
+                        <td class="small text-truncate" style="max-width:200px;" title="${(log.message || '').replace(/"/g, '&quot;')}">${log.message || '-'}</td>
+                    </tr>`;
+                }).join('');
+            })
+            .catch(() => {
+                body.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">加载失败</td></tr>';
+            });
+    }
+
+    // API同步记录筛选变化事件
+    const apiLogFilterSite = document.getElementById('apiLogFilterSite');
+    if (apiLogFilterSite) {
+        apiLogFilterSite.addEventListener('change', loadApiSyncLogs);
+    }
+
 </script>
 
 {% endblock %}

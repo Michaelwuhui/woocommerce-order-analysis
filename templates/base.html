@@ -255,8 +255,143 @@
         </div>
     </div>
 
+    <!-- Sync Progress Modal -->
+    <div class="modal fade" id="syncProgressModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content bg-dark border border-secondary border-opacity-25">
+                <div class="modal-header border-bottom border-secondary border-opacity-25">
+                    <h5 class="modal-title text-white">正在同步数据...</h5>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <div class="d-flex justify-content-between mb-1">
+                            <span class="text-white-50" id="syncStatusText">准备中...</span>
+                            <span class="text-white-50" id="syncTimeText">00:00</span>
+                        </div>
+                        <div class="progress bg-secondary bg-opacity-25" style="height: 10px;">
+                            <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary"
+                                id="syncProgressBar" style="width: 0%"></div>
+                        </div>
+                    </div>
+
+                    <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25">
+                        <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 py-2">
+                            <small class="text-white-50">同步日志</small>
+                        </div>
+                        <div class="card-body p-2"
+                            style="height: 200px; overflow-y: auto; font-family: monospace; font-size: 0.85rem;"
+                            id="syncLogConsole">
+                            <!-- Logs will appear here -->
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer border-top border-secondary border-opacity-25">
+                    <button type="button" class="btn btn-primary" id="closeSyncModalBtn" disabled
+                        data-bs-dismiss="modal">完成</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     <script>
+        // Sync All Logic
+        document.addEventListener('DOMContentLoaded', function () {
+            const syncAllBtn = document.getElementById('syncAllBtn');
+            if (syncAllBtn) {
+                syncAllBtn.addEventListener('click', function () {
+                    const modalEl = document.getElementById('syncProgressModal');
+                    const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+                    const progressBar = document.getElementById('syncProgressBar');
+                    const statusText = document.getElementById('syncStatusText');
+                    const logConsole = document.getElementById('syncLogConsole');
+                    const closeBtn = document.getElementById('closeSyncModalBtn');
+                    const timeText = document.getElementById('syncTimeText');
+
+                    // Reset UI
+                    progressBar.style.width = '0%';
+                    progressBar.classList.add('progress-bar-animated');
+                    progressBar.classList.remove('bg-success', 'bg-danger');
+                    progressBar.classList.add('bg-primary');
+                    statusText.textContent = '正在启动全局同步任务...';
+                    logConsole.innerHTML = '';
+                    closeBtn.disabled = true;
+                    closeBtn.textContent = '完成'; // Reset button text
+                    closeBtn.onclick = null; // Remove custom click handler
+                    const startTime = Date.now();
+
+                    modal.show();
+
+                    // Start Sync All
+                    fetch('/api/sync/all', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    })
+                        .then(response => response.json())
+                        .then(result => {
+                            if (result.success) {
+                                const syncId = result.sync_id;
+
+                                // Start Polling
+                                const syncPollInterval = setInterval(() => {
+                                    // Update timer
+                                    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                                    const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
+                                    const secs = (elapsed % 60).toString().padStart(2, '0');
+                                    timeText.textContent = `${mins}:${secs}`;
+
+                                    fetch(`/api/sync/status/${syncId}`)
+                                        .then(res => res.json())
+                                        .then(status => {
+                                            // Update Logs
+                                            if (status.logs && status.logs.length > 0) {
+                                                logConsole.innerHTML = status.logs.map(log =>
+                                                    `<div class="text-white-50 mb-1">${log}</div>`
+                                                ).join('');
+                                                logConsole.scrollTop = logConsole.scrollHeight;
+                                            }
+
+                                            // Update Status
+                                            statusText.textContent = status.message;
+
+                                            if (status.status === 'running') {
+                                                if (progressBar.style.width === '0%') progressBar.style.width = '100%';
+                                            } else if (status.status === 'success') {
+                                                clearInterval(syncPollInterval);
+                                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                                progressBar.classList.add('bg-success');
+                                                progressBar.style.width = '100%';
+                                                statusText.textContent = '所有站点同步完成！';
+                                                statusText.classList.add('text-success');
+                                                closeBtn.disabled = false;
+                                                closeBtn.textContent = '完成并刷新';
+                                                closeBtn.onclick = () => location.reload();
+                                            } else if (status.status === 'error') {
+                                                clearInterval(syncPollInterval);
+                                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                                progressBar.classList.add('bg-danger');
+                                                progressBar.style.width = '100%';
+                                                statusText.textContent = '同步出错';
+                                                statusText.classList.add('text-danger');
+                                                closeBtn.disabled = false;
+                                            }
+                                        });
+                                }, 1000);
+                            } else {
+                                statusText.textContent = '启动失败: ' + result.error;
+                                statusText.classList.add('text-danger');
+                                closeBtn.disabled = false;
+                            }
+                        })
+                        .catch(err => {
+                            statusText.textContent = '请求错误: ' + err.message;
+                            statusText.classList.add('text-danger');
+                            closeBtn.disabled = false;
+                        });
+                });
+            }
+        });
+
         function showOrderDetail(orderId) {
             var modal = new bootstrap.Modal(document.getElementById('orderDetailModal'));
             document.getElementById('modalOrderNumber').textContent = orderId;
