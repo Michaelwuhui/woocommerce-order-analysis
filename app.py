@@ -935,8 +935,8 @@ def dashboard():
                     MAX(date_created) as last_order_date,
                     MIN(date_created) as first_order_date
                 FROM orders 
-                WHERE billing LIKE ?
-            ''', (f'%"{email}"%',)).fetchone()
+                WHERE json_extract(billing, '$.email') = ?
+            ''', (email,)).fetchone()
             
             total_orders = stats_row['total_orders'] or 0
             successful_orders = stats_row['successful_orders'] or 0
@@ -1358,8 +1358,8 @@ def orders():
                     MAX(date_created) as last_order_date,
                     MIN(date_created) as first_order_date
                 FROM orders 
-                WHERE billing LIKE ?
-            ''', (f'%"{email}"%',)).fetchone()
+                WHERE json_extract(billing, '$.email') = ?
+            ''', (email,)).fetchone()
             
             total_orders = stats['total_orders'] or 0
             successful_orders = stats['successful_orders'] or 0
@@ -2675,8 +2675,8 @@ def cancelled_analysis():
     if customer_emails:
         for email in customer_emails:
             count = conn.execute('''
-                SELECT COUNT(*) as cnt FROM orders WHERE billing LIKE ?
-            ''', (f'%"{email}"%',)).fetchone()
+                SELECT COUNT(*) as cnt FROM orders WHERE json_extract(billing, '$.email') = ?
+            ''', (email,)).fetchone()
             customer_order_counts[email] = count['cnt'] if count else 0
     
     for order in orders_data:
@@ -3156,16 +3156,16 @@ def get_order_details(order_id):
         customer_stats = conn.execute('''
             SELECT COUNT(*) as count, SUM(total) as total
             FROM orders 
-            WHERE billing LIKE ? AND status IN ('completed', 'on-hold')
-        ''', (f'%"{email}"%',)).fetchone()
+            WHERE json_extract(billing, '$.email') = ? AND status IN ('completed', 'on-hold')
+        ''', (email,)).fetchone()
         
         # 按状态分类统计所有订单
         status_stats = conn.execute('''
             SELECT status, COUNT(*) as count, SUM(total) as total
             FROM orders 
-            WHERE billing LIKE ?
+            WHERE json_extract(billing, '$.email') = ?
             GROUP BY status
-        ''', (f'%"{email}"%',)).fetchall()
+        ''', (email,)).fetchall()
         
         status_breakdown = {}
         for row in status_stats:
@@ -3225,9 +3225,9 @@ def get_customer_details(email):
     orders = conn.execute('''
         SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing
         FROM orders
-        WHERE billing LIKE ? AND status NOT IN ('checkout-draft', 'trash')
+        WHERE json_extract(billing, '$.email') = ? AND status NOT IN ('checkout-draft', 'trash')
         ORDER BY date_created DESC
-    ''', (f'%"{email}"%',)).fetchall()
+    ''', (email,)).fetchall()
     
     conn.close()
     
