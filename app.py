@@ -2864,6 +2864,7 @@ def cancelled_analysis():
         country_filter=country_filter,
         sources=all_sources, # pass all available sources for filter
         all_managers=all_managers,
+        site_managers=site_managers,
         all_countries=all_countries,
         quick_date=quick_date,
         available_months=available_months,
@@ -8214,7 +8215,7 @@ def print_shipping_list():
                     'customer_email': order.get('customer_email', ''),
                     'customer_address': order['customer_address'],
                     'customer_address_2': order.get('customer_address_2', ''),
-                    'customer_inpost_id': order.get('customer_inpost_id', ''),
+                    'customer_inpost_id': order.get('customer_inpost_id') or ('送货上门: ' + order['customer_address'] if 'inpost' in (order.get('shipping_method') or '').lower() else ''),
                     'customer_social': order.get('customer_social', ''),
                     'shipping_method': order.get('shipping_method', ''),
                     'total': f"{order['total']:.2f} {order['currency']}",
@@ -8257,7 +8258,7 @@ def print_pending_list():
             'customer_email': order.get('customer_email', ''),
             'customer_address': order['customer_address'],
             'customer_address_2': order.get('customer_address_2', ''),
-            'customer_inpost_id': order.get('customer_inpost_id', ''),
+            'customer_inpost_id': order.get('customer_inpost_id') or ('送货上门: ' + order['customer_address'] if 'inpost' in (order.get('shipping_method') or '').lower() else ''),
             'customer_social': order.get('customer_social', ''),
             'shipping_method': order.get('shipping_method', ''),
             'total': f"{order['total']:.2f} {order['currency']}",
@@ -8267,6 +8268,134 @@ def print_pending_list():
     
     today = datetime.now().strftime('%Y-%m-%d')
     return jsonify({'date': '截止 ' + today, 'orders': result, 'count': len(result)})
+
+
+@app.route('/api/shipping/export/list')
+@login_required
+@shipper_required
+def export_shipping_list():
+    """Export last 24 hours pending orders to CSV"""
+    import csv
+    import io
+    from flask import make_response
+    from datetime import datetime, timedelta
+    
+    with app.test_request_context('/api/shipping/pending'):
+        response = get_pending_orders()
+        all_orders = response.get_json()
+    
+    now = datetime.now()
+    cutoff = now - timedelta(hours=24)
+    
+    si = io.StringIO()
+    cw = csv.writer(si)
+    si.write('\ufeff')
+    cw.writerow(['序号', '订单信息', '来源', '客户姓名', '电话', '邮箱', '配送方式', 'InPost ID/取货点', '收货地址', '商品明细', '运费', '总金额'])
+    
+    count = 1
+    for order in all_orders:
+        try:
+            order_date = datetime.fromisoformat(order['date_created'].replace('Z', '+00:00'))
+            if order_date >= cutoff:
+                products_str = " | ".join([f"{p['name']} x{p['quantity']}" for p in order['products']])
+                method = (order.get('shipping_method') or '').lower()
+                isInPost = order.get('customer_inpost_id') or 'inpost' in method or 'paczkomat' in method
+                isDPD = 'dpd' in method
+                shipping_method = 'InPost' if isInPost else ('DPD' if isDPD else (order.get('shipping_method') or 'Standard'))
+                
+                inpost_details = order.get('customer_inpost_id', '')
+                if not inpost_details and order.get('customer_address_2'):
+                     inpost_details = order.get('customer_address_2')
+                # Fallback to customer address if it's an InPost method but has no ID (typically courier/home delivery)
+                if not inpost_details and 'inpost' in method:
+                     inpost_details = "送货上门: " + order.get('customer_address', '')
+                     
+                phone_social = " ".join(filter(None, [order.get('customer_phone', ''), order.get('customer_social', '')]))
+
+                cw.writerow([
+                    count,
+                    f"#{order['number']}",
+                    order['source'].replace('https://www.', '').replace('https://', ''),
+                    order['customer_name'],
+                    phone_social,
+                    order.get('customer_email', ''),
+                    shipping_method,
+                    inpost_details,
+                    order['customer_address'],
+                    products_str,
+                    f"{order.get('shipping_total', 0)}",
+                    f"{order['total']} {order['currency']}"
+                ])
+                count += 1
+        except Exception:
+             continue
+             
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = f"attachment; filename=shipping_today_{now.strftime('%Y%m%d')}.csv"
+    output.headers["Content-type"] = "text/csv"
+    return output
+
+
+@app.route('/api/shipping/export/pending')
+@login_required
+@shipper_required
+def export_pending_list():
+    """Export all pending orders to CSV"""
+    import csv
+    import io
+    from flask import make_response
+    from datetime import datetime
+    
+    with app.test_request_context('/api/shipping/pending'):
+        response = get_pending_orders()
+        orders_data = response.get_json()
+        
+    si = io.StringIO()
+    cw = csv.writer(si)
+    si.write('\ufeff')
+    cw.writerow(['序号', '订单信息', '来源', '客户姓名', '电话', '邮箱', '配送方式', 'InPost ID/取货点', '收货地址', '商品明细', '运费', '总金额'])
+    
+    count = 1
+    for order in orders_data:
+        try:
+            products_str = " | ".join([f"{p['name']} x{p['quantity']}" for p in order['products']])
+            method = (order.get('shipping_method') or '').lower()
+            isInPost = order.get('customer_inpost_id') or 'inpost' in method or 'paczkomat' in method
+            isDPD = 'dpd' in method
+            shipping_method = 'InPost' if isInPost else ('DPD' if isDPD else (order.get('shipping_method') or 'Standard'))
+            
+            inpost_details = order.get('customer_inpost_id', '')
+            if not inpost_details and order.get('customer_address_2'):
+                 inpost_details = order.get('customer_address_2')
+            # Fallback to customer address if it's an InPost method but has no ID
+            if not inpost_details and 'inpost' in method:
+                 inpost_details = "送货上门: " + order.get('customer_address', '')
+
+            phone_social = " ".join(filter(None, [order.get('customer_phone', ''), order.get('customer_social', '')]))
+
+            cw.writerow([
+                count,
+                f"#{order['number']}",
+                order['source'].replace('https://www.', '').replace('https://', ''),
+                order['customer_name'],
+                phone_social,
+                order.get('customer_email', ''),
+                shipping_method,
+                inpost_details,
+                order['customer_address'],
+                products_str,
+                f"{order.get('shipping_total', 0)}",
+                f"{order['total']} {order['currency']}"
+            ])
+            count += 1
+        except Exception:
+            continue
+        
+    now = datetime.now()
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = f"attachment; filename=shipping_pending_{now.strftime('%Y%m%d')}.csv"
+    output.headers["Content-type"] = "text/csv"
+    return output
 
 
 def process_shipped_order(order, conn, carriers, ast_provider_mapping):
@@ -8629,7 +8758,7 @@ def fetch_51la_traffic(mask_id, start_day, end_day):
     headers = {'Content-Type': 'application/json'}
     
     try:
-        response = requests.post(LA_API_CONFIG['api_url'], json=payload, headers=headers, timeout=30)
+        response = requests.post(LA_API_CONFIG['api_url'], json=payload, headers=headers, timeout=5)
         result = response.json()
         
         if result.get('success') and result.get('code') == '0000':

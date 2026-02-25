@@ -13,8 +13,14 @@
             <button class="btn btn-outline-info" id="printListBtn">
                 <i class="bi bi-printer me-1"></i> 打印今日清单
             </button>
+            <button class="btn btn-outline-success" id="exportListBtn">
+                <i class="bi bi-file-earmark-excel me-1"></i> 导出今日
+            </button>
             <button class="btn btn-outline-warning" id="printPendingBtn">
                 <i class="bi bi-printer me-1"></i> 打印未发货清单
+            </button>
+            <button class="btn btn-outline-success" id="exportPendingBtn">
+                <i class="bi bi-file-earmark-excel me-1"></i> 导出未发货
             </button>
             <button class="btn btn-outline-light" onclick="loadOrders()">
                 <i class="bi bi-arrow-repeat me-1"></i> 刷新
@@ -377,6 +383,14 @@
             // Print list button
             document.getElementById('printListBtn').addEventListener('click', printTodayList);
             document.getElementById('printPendingBtn').addEventListener('click', printPendingList);
+
+            // Export buttons
+            document.getElementById('exportListBtn').addEventListener('click', () => {
+                window.location.href = '/api/shipping/export/list';
+            });
+            document.getElementById('exportPendingBtn').addEventListener('click', () => {
+                window.location.href = '/api/shipping/export/pending';
+            });
         });
 
         function loadOrders() {
@@ -1067,6 +1081,48 @@
 
         @media print {
 
+            body,
+            html {
+                background: transparent !important;
+                background-color: transparent !important;
+            }
+
+            /* Hide the main UI so its height doesn't cause blank pages */
+            .container-fluid {
+                display: none !important;
+            }
+
+            body.modal-open {
+                visibility: visible !important;
+                overflow: visible !important;
+                height: auto !important;
+            }
+
+            body.modal-open .modal {
+                position: absolute;
+                left: 0;
+                top: 0;
+                margin: 0;
+                padding: 0;
+                overflow: visible !important;
+                height: auto !important;
+                background: transparent !important;
+            }
+
+            #printLabelModal {
+                display: block !important;
+                visibility: visible !important;
+            }
+
+            .modal-backdrop {
+                display: none !important;
+            }
+
+            /* Override Bootstrap backgrounds for print */
+            .bg-dark {
+                background-color: transparent !important;
+            }
+
             .modal-header,
             .modal-footer,
             .navbar,
@@ -1078,11 +1134,32 @@
             .modal-dialog {
                 max-width: 100%;
                 margin: 0;
+                padding: 0;
             }
 
             .modal-content {
                 border: none !important;
-                background: white !important;
+                background: transparent !important;
+                box-shadow: none !important;
+            }
+
+            /* Ensure tables break cleanly */
+            table {
+                page-break-inside: auto;
+                background-color: transparent !important;
+            }
+
+            tr {
+                page-break-inside: avoid;
+                page-break-after: auto;
+            }
+
+            thead {
+                display: table-header-group;
+            }
+
+            tfoot {
+                display: table-footer-group;
             }
         }
 
