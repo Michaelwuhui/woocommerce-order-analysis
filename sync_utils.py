@@ -1,8 +1,8 @@
 
 import json
 import time
-import random
 import sqlite3
+import threading
 from datetime import datetime
 from woocommerce import API
 
@@ -12,6 +12,27 @@ DB_FILE = 'woocommerce_orders.db'
 # Proxy configuration (optional)
 PROXY_CONFIG = {}
 
+# 线程局部存储，用于数据库连接复用
+_thread_local = threading.local()
+
+def get_thread_db_connection():
+    """获取当前线程的数据库连接（复用，启用 WAL 模式支持并发）"""
+    if not hasattr(_thread_local, 'connection') or _thread_local.connection is None:
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        _thread_local.connection = conn
+    return _thread_local.connection
+
+def close_thread_db_connection():
+    """关闭当前线程的数据库连接"""
+    if hasattr(_thread_local, 'connection') and _thread_local.connection is not None:
+        try:
+            _thread_local.connection.close()
+        except:
+            pass
+        _thread_local.connection = None
+
 def create_robust_wcapi(url, consumer_key, consumer_secret, proxy_config=None):
     """Create robust WooCommerce API client"""
     try:
@@ -20,7 +41,7 @@ def create_robust_wcapi(url, consumer_key, consumer_secret, proxy_config=None):
             consumer_key=consumer_key,
             consumer_secret=consumer_secret,
             version="wc/v3",
-            timeout=30
+            timeout=60
         )
         return wcapi
     except Exception as e:
@@ -28,7 +49,7 @@ def create_robust_wcapi(url, consumer_key, consumer_secret, proxy_config=None):
         return None
 
 def create_database_connection():
-    """Create SQLite database connection"""
+    """Create SQLite database connection (兼容旧接口，新代码建议使用 get_thread_db_connection)"""
     try:
         connection = sqlite3.connect(DB_FILE)
         return connection
@@ -72,14 +93,16 @@ def get_last_modified_date_from_db(site_url):
         if connection:
             connection.close()
 
-def save_orders_to_db(orders_data):
+def save_orders_to_db(orders_data, connection=None):
     """Save orders to SQLite database"""
     if not orders_data:
         return
     
-    connection = create_database_connection()
-    if not connection:
-        return
+    own_connection = connection is None
+    if own_connection:
+        connection = create_database_connection()
+        if not connection:
+            return
     
     try:
         cursor = connection.cursor()
@@ -143,14 +166,14 @@ def save_orders_to_db(orders_data):
     except Exception as e:
         print(f"Error saving orders: {e}")
     finally:
-        if connection:
+        if own_connection and connection:
             connection.close()
 
-def fetch_orders_incrementally(wcapi, site_url, last_order_date=None, progress_callback=None):
+def fetch_orders_incrementally(wcapi, site_url, last_order_date=None, progress_callback=None, connection=None):
     """Fetch orders incrementally"""
     orders = []
     page = 1
-    per_page = 25
+    per_page = 100
     max_retries = 3
     retry_count = 0
 
@@ -167,7 +190,6 @@ def fetch_orders_incrementally(wcapi, site_url, last_order_date=None, progress_c
     while True:
         try:
             if progress_callback: progress_callback(f"Fetching page {page}...")
-            time.sleep(random.uniform(0.5, 1)) 
             response = wcapi.get("orders", params=params)
 
             if response.status_code != 200:
@@ -188,7 +210,7 @@ def fetch_orders_incrementally(wcapi, site_url, last_order_date=None, progress_c
             for order in data:
                 order['source'] = site_url
 
-            save_orders_to_db(data)
+            save_orders_to_db(data, connection=connection)
             orders.extend(data)
             
             if progress_callback: progress_callback(f"Saved {len(data)} orders from page {page}.")
@@ -208,11 +230,11 @@ def fetch_orders_incrementally(wcapi, site_url, last_order_date=None, progress_c
 
     return orders
 
-def fetch_orders_modified_after(wcapi, site_url, modified_after=None, progress_callback=None):
+def fetch_orders_modified_after(wcapi, site_url, modified_after=None, progress_callback=None, connection=None):
     """Fetch modified orders"""
     orders = []
     page = 1
-    per_page = 25
+    per_page = 100
     max_retries = 3
     retry_count = 0
     
@@ -229,7 +251,6 @@ def fetch_orders_modified_after(wcapi, site_url, modified_after=None, progress_c
     while True:
         try:
             if progress_callback: progress_callback(f"Fetching updates page {page}...")
-            time.sleep(random.uniform(0.5, 1))
             response = wcapi.get("orders", params=params)
             
             if response.status_code != 200:
@@ -247,7 +268,7 @@ def fetch_orders_modified_after(wcapi, site_url, modified_after=None, progress_c
             for order in data:
                 order['source'] = site_url
                 
-            save_orders_to_db(data)
+            save_orders_to_db(data, connection=connection)
             orders.extend(data)
             
             if progress_callback: progress_callback(f"Updated {len(data)} orders from page {page}.")
@@ -280,6 +301,9 @@ def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_d
     if not wcapi:
         return {"status": "error", "message": "Failed to create API client"}
     
+    # 使用线程局部数据库连接，整个同步过程复用
+    conn = get_thread_db_connection()
+    
     try:
         # Calculate time window for modified_after
         modified_after = None
@@ -307,10 +331,10 @@ def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_d
                     progress_callback(f"Fetching new orders after {last_order_date}...")
                 else:
                     progress_callback("First time sync (full history)...")
-            new_orders = fetch_orders_incrementally(wcapi, url, last_order_date, progress_callback)
+            new_orders = fetch_orders_incrementally(wcapi, url, last_order_date, progress_callback, connection=conn)
         
         # 2. Fetch updated orders (within time window)
-        updated_orders = fetch_orders_modified_after(wcapi, url, modified_after, progress_callback)
+        updated_orders = fetch_orders_modified_after(wcapi, url, modified_after, progress_callback, connection=conn)
         
         msg = f"Sync complete. New: {len(new_orders)}, Updated: {len(updated_orders)}"
         if progress_callback: progress_callback(msg)
@@ -323,4 +347,6 @@ def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_d
     except Exception as e:
         if progress_callback: progress_callback(f"Critical Error: {str(e)}")
         return {"status": "error", "message": str(e)}
+    finally:
+        close_thread_db_connection()
 

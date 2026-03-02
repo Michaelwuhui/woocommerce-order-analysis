@@ -1335,7 +1335,32 @@ def orders():
             WHERE email IN ({placeholders})
         ''', customer_emails).fetchall()
         
-        # 2. Calculate attributes for each customer
+        # 2. Pre-calculate customer stats for all emails to avoid N+1 query locks
+        email_stats = {}
+        emails_list = list(customer_emails)
+        placeholders_stats = ', '.join(['?' for _ in emails_list])
+        
+        try:
+            stats_results = conn.execute(f'''
+                SELECT 
+                    json_extract(billing, '$.email') as current_email,
+                    COUNT(*) as total_orders,
+                    SUM(CASE WHEN status IN ('completed', 'on-hold') THEN 1 ELSE 0 END) as successful_orders,
+                    SUM(CASE WHEN status IN ('completed', 'on-hold') THEN total ELSE 0 END) as total_spending,
+                    MAX(date_created) as last_order_date,
+                    MIN(date_created) as first_order_date
+                FROM orders 
+                WHERE json_extract(billing, '$.email') IN ({placeholders_stats})
+                GROUP BY current_email
+            ''', tuple(emails_list)).fetchall()
+            
+            for r in stats_results:
+                email_stats[r['current_email']] = dict(r)
+        except Exception as e:
+            # Fallback if there is any issue with the bulk query
+            pass
+
+        # 3. Calculate attributes for each customer
         for email in customer_emails:
             if email not in customer_attributes:
                 customer_attributes[email] = {}
@@ -1347,23 +1372,12 @@ def orders():
                     manual_tier = row['quality_tier']
                     break
             
-            # Get customer stats (order count and total spending)
-            # Note: This is a bit expensive inside a loop, but for 20 items it's acceptable.
-            # Optimized query to get count and total in one go
-            stats = conn.execute('''
-                SELECT 
-                    COUNT(*) as total_orders,
-                    SUM(CASE WHEN status IN ('completed', 'on-hold') THEN 1 ELSE 0 END) as successful_orders,
-                    SUM(CASE WHEN status IN ('completed', 'on-hold') THEN total ELSE 0 END) as total_spending,
-                    MAX(date_created) as last_order_date,
-                    MIN(date_created) as first_order_date
-                FROM orders 
-                WHERE json_extract(billing, '$.email') = ?
-            ''', (email,)).fetchone()
+            # Get customer stats from pre-calculated dictionary
+            stats = email_stats.get(email, {})
             
-            total_orders = stats['total_orders'] or 0
-            successful_orders = stats['successful_orders'] or 0
-            total_spending = stats['total_spending'] or 0
+            total_orders = stats.get('total_orders') or 0
+            successful_orders = stats.get('successful_orders') or 0
+            total_spending = stats.get('total_spending') or 0
             
             # Store order count for display
             customer_attributes[email]['order_count'] = total_orders
@@ -2673,11 +2687,24 @@ def cancelled_analysis():
     # Get order counts for all customers
     customer_order_counts = {}
     if customer_emails:
-        for email in customer_emails:
-            count = conn.execute('''
-                SELECT COUNT(*) as cnt FROM orders WHERE json_extract(billing, '$.email') = ?
-            ''', (email,)).fetchone()
-            customer_order_counts[email] = count['cnt'] if count else 0
+        emails_list = list(customer_emails)
+        placeholders_stats = ', '.join(['?' for _ in emails_list])
+        try:
+            counts = conn.execute(f'''
+                SELECT json_extract(billing, '$.email') as email, COUNT(*) as cnt 
+                FROM orders 
+                WHERE json_extract(billing, '$.email') IN ({placeholders_stats})
+                GROUP BY email
+            ''', tuple(emails_list)).fetchall()
+            for r in counts:
+                customer_order_counts[r['email']] = r['cnt']
+        except Exception as e:
+            pass
+        
+        # Ensure all existing emails have some default value if not returned
+        for email in emails_list:
+            if email not in customer_order_counts:
+                customer_order_counts[email] = 0
     
     for order in orders_data:
         od = dict(order)
