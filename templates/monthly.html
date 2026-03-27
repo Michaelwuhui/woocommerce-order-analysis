@@ -124,12 +124,25 @@
                                 "{:,}".format(monthly_aggregates[row.month].total_orders) }}</td>
                             <td class="text-end fw-bold align-middle text-light">{{
                                 "{:,}".format(monthly_aggregates[row.month].total_products) }}</td>
-                            <td class="text-end"></td>
+                            <td class="text-end fw-bold align-middle text-light">
+                                {% for cur, amt in monthly_aggregates[row.month].currency_amounts.items() %}
+                                <div>{{ "{:,.2f}".format(amt.total_amount) }} <span class="badge bg-secondary" style="font-size:0.7em;">{{ cur }}</span></div>
+                                {% endfor %}
+                            </td>
                             <td class="text-end text-success fw-bold align-middle border-start">{{
                                 "{:,}".format(monthly_aggregates[row.month].success_orders) }}</td>
                             <td class="text-end text-info fw-bold align-middle">{{
                                 "{:,}".format(monthly_aggregates[row.month].success_products) }}</td>
-                            <td colspan="2"></td>
+                            <td class="text-end text-success fw-bold align-middle">
+                                {% for cur, amt in monthly_aggregates[row.month].currency_amounts.items() %}
+                                <div>{{ "{:,.2f}".format(amt.success_amount) }} <span class="badge bg-secondary" style="font-size:0.7em;">{{ cur }}</span></div>
+                                {% endfor %}
+                            </td>
+                            <td class="text-end text-success fw-bold align-middle">
+                                {% for cur, amt in monthly_aggregates[row.month].currency_amounts.items() %}
+                                <div>{{ "{:,.2f}".format(amt.success_net_amount) }} <span class="badge bg-secondary" style="font-size:0.7em;">{{ cur }}</span></div>
+                                {% endfor %}
+                            </td>
                             <td class="text-end text-danger fw-bold align-middle border-start">{{
                                 "{:,}".format(monthly_aggregates[row.month].failed_orders) }}</td>
                             <td class="text-end text-danger fw-bold align-middle">{{

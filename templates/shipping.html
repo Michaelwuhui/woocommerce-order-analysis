@@ -114,12 +114,14 @@
                                     <th class="text-end">总数量</th>
                                     <th class="text-end">运费</th>
                                     <th class="text-end">订单金额</th>
+                                    <th>最新备注</th>
+                                    <th>备注</th>
                                     <th class="text-end pe-3">操作</th>
                                 </tr>
                             </thead>
                             <tbody id="pendingOrdersBody">
                                 <tr>
-                                    <td colspan="7" class="text-center py-4 text-muted">加载中...</td>
+                                    <td colspan="9" class="text-center py-4 text-muted">加载中...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -143,6 +145,7 @@
                                     <th class="text-end">运费</th>
                                     <th class="text-end">订单金额</th>
                                     <th class="text-center">运单信息</th>
+                                    <th>最新备注</th>
                                     <th class="text-end pe-3">操作</th>
                                 </tr>
                             </thead>
@@ -234,6 +237,14 @@
                 <div class="mb-3">
                     <label class="form-label text-white-50">订单号: <span id="noteOrderNumber"
                             class="text-white"></span></label>
+                </div>
+                <!-- History Notes -->
+                <div class="mb-3">
+                    <label class="form-label text-white-50">历史备注</label>
+                    <div id="noteHistoryList" class="bg-dark p-2 rounded border border-secondary border-opacity-25"
+                        style="max-height: 200px; overflow-y: auto;">
+                        <div class="text-center text-muted small py-2">加载中...</div>
+                    </div>
                 </div>
                 <div class="mb-3">
                     <label class="form-label text-white-50">备注内容 *</label>
@@ -488,6 +499,17 @@
                             <div class="text-muted small">${o.shipped_at || '-'}</div>
                         ` : '<span class="text-muted small">-</span>'}
                     </td>
+                    <td>
+                        ${o.latest_note ? `
+                            <div class="d-flex align-items-start">
+                                <span class="badge bg-warning text-dark me-2 mt-1" title="最新备注"><i class="bi bi-chat-text-fill"></i></span>
+                                <div class="small" style="max-width: 15vw; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis;" title="${o.latest_note.replace(/"/g, '&quot;')}">
+                                    <span class="text-white">${o.latest_note}</span>
+                                    ${o.latest_note_author ? `<div class="text-muted" style="font-size:0.8em">${o.latest_note_author}</div>` : ''}
+                                </div>
+                            </div>
+                        ` : '<span class="text-muted small">-</span>'}
+                    </td>
                     <td class="text-end pe-3 text-nowrap">
                         <a href="javascript:void(0)" class="text-secondary me-3 text-decoration-none" onclick="openNoteModal(${o.id}, '${o.number}')" title="备注">
                             <i class="bi bi-chat-left-text"></i>
@@ -545,6 +567,17 @@
                             <div class="text-muted small">${o.shipped_at || '-'}</div>
                         ` : '<span class="text-muted small">-</span>') :
                             '<span class="text-warning small"><i class="bi bi-exclamation-triangle me-1"></i>无追踪号</span>'}
+                    </td>
+                    <td>
+                        ${o.latest_note ? `
+                            <div class="d-flex align-items-start">
+                                <span class="badge bg-warning text-dark me-2 mt-1" title="最新备注"><i class="bi bi-chat-text-fill"></i></span>
+                                <div class="small" style="max-width: 15vw; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis;" title="${o.latest_note.replace(/"/g, '&quot;')}">
+                                    <span class="text-white">${o.latest_note}</span>
+                                    ${o.latest_note_author ? `<div class="text-muted" style="font-size:0.8em">${o.latest_note_author}</div>` : ''}
+                                </div>
+                            </div>
+                        ` : '<span class="text-muted small">-</span>'}
                     </td>
                     <td class="text-end pe-3 text-nowrap">
                         <a href="javascript:void(0)" class="text-secondary text-decoration-none" onclick="openNoteModal(${o.id}, '${o.number}')" title="备注">
@@ -655,7 +688,39 @@
             document.getElementById('noteOrderNumber').textContent = '#' + orderNumber;
             document.getElementById('noteContent').value = '';
             document.getElementById('noteNotifyCustomer').checked = false;
+
+            const historyContainer = document.getElementById('noteHistoryList');
+            historyContainer.innerHTML = '<div class="text-center text-muted small py-2"><span class="spinner-border spinner-border-sm me-1"></span>加载中...</div>';
+
             bootstrap.Modal.getOrCreateInstance(document.getElementById('noteModal')).show();
+
+            // Fetch history notes from local DB
+            fetch(`/api/order/${orderId}/notes`)
+                .then(res => res.json())
+                .then(notes => {
+                    if (notes.length === 0) {
+                        historyContainer.innerHTML = '<div class="text-center text-muted small py-2">暂无历史备注</div>';
+                        return;
+                    }
+
+                    historyContainer.innerHTML = notes.map(note => {
+                        const dateStr = note.date_created ? note.date_created.replace('T', ' ').substring(0, 16) : '';
+                        const badgeHtml = note.customer_note ? '<span class="badge bg-warning text-dark ms-2" style="font-size: 0.7em;">发给客户</span>' : '';
+                        const authorHtml = note.author ? `<span class="badge bg-secondary bg-opacity-25 text-light ms-2" style="font-size: 0.7em;"><i class="bi bi-person me-1"></i>${note.author}</span>` : '';
+
+                        return `
+                            <div class="mb-2 pb-2 border-bottom border-secondary border-opacity-25 last-border-0">
+                                <div class="d-flex justify-content-between mb-1">
+                                    <div><small class="text-muted"><i class="bi bi-clock me-1"></i>${dateStr}</small>${authorHtml}${badgeHtml}</div>
+                                </div>
+                                <div class="small text-light" style="word-break: break-word;">${note.note}</div>
+                            </div>
+                        `;
+                    }).join('');
+                })
+                .catch(err => {
+                    historyContainer.innerHTML = '<div class="text-danger small py-2">加载失败</div>';
+                });
         }
 
         function addNote() {
@@ -668,6 +733,11 @@
                 return;
             }
 
+            const btn = document.getElementById('confirmNoteBtn');
+            const originalText = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>保存中...';
+
             fetch(`/api/order/${orderId}/note`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -675,12 +745,21 @@
             })
                 .then(res => res.json())
                 .then(data => {
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+
                     if (data.success) {
                         bootstrap.Modal.getInstance(document.getElementById('noteModal')).hide();
                         showToast(data.message, 'success');
+                        loadOrders(); // 刷新列表以显示最新备注
                     } else {
                         alert('添加备注失败: ' + (data.error || '未知错误'));
                     }
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+                    alert('请求失败: ' + err);
                 });
         }
 

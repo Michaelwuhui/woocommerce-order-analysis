@@ -1,8 +1,8 @@
-
 import json
 import time
 import sqlite3
 import threading
+import concurrent.futures
 from datetime import datetime
 from woocommerce import API
 
@@ -288,6 +288,94 @@ def fetch_orders_modified_after(wcapi, site_url, modified_after=None, progress_c
                 
     return orders
 
+def sync_order_notes(wcapi, site_url, connection=None):
+    """Fetch and sync order notes for active orders"""
+    if not connection:
+        return
+        
+    try:
+        cursor = connection.cursor()
+        
+        # Get active orders (processing, on-hold) to fetch notes for
+        cursor.execute('''
+            SELECT number 
+            FROM orders 
+            WHERE source = ? AND status IN ('processing', 'on-hold')
+        ''', (site_url,))
+        
+        active_orders = [row[0] for row in cursor.fetchall()]
+        
+        if not active_orders:
+            return
+            
+        def fetch_notes_for_order(order_number):
+            try:
+                response = wcapi.get(f"orders/{order_number}/notes")
+                if response.status_code == 200:
+                    notes_data = response.json()
+                    # Add order number to each note for DB insertion
+                    for note in notes_data:
+                        note['order_number'] = order_number
+                    return notes_data
+            except Exception as e:
+                print(f"Error fetching notes for order {order_number}: {e}")
+            return []
+
+        all_notes = []
+        # Use ThreadPoolExecutor to fetch notes concurrently
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # Map order numbers to fetch futures
+            future_to_order = {executor.submit(fetch_notes_for_order, onum): onum for onum in active_orders}
+            
+            for future in concurrent.futures.as_completed(future_to_order):
+                order_number = future_to_order[future]
+                try:
+                    notes = future.result()
+                    if notes:
+                        all_notes.extend(notes)
+                except Exception as exc:
+                    print(f'{order_number} generated an exception: {exc}')
+
+        if all_notes:
+            # Insert notes into database
+            insert_query = """
+            INSERT OR REPLACE INTO order_notes (
+                id, order_id, note, date_created, customer_note, author, added_by_user
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """
+            
+            processed_notes = []
+            for note in all_notes:
+                # To match with order_id in our local orders table (which uses WooCommerce ID usually mapped to number here, 
+                # but to be completely safe we find the actual local order ID based on the order number)
+                # For this application, order 'number' and WooCommerce 'id' are often identical or we map them.
+                # Find the local order ID for this note
+                cursor.execute('SELECT id FROM orders WHERE number = ? AND source = ?', (note['order_number'], site_url))
+                order_row = cursor.fetchone()
+                
+                if order_row:
+                    local_order_id = order_row[0]
+                    # We store 1 if added_by_user is True, else 0
+                    added_by_user = 1 if note.get('added_by_user', False) else 0
+                    customer_note = 1 if note.get('customer_note', False) else 0
+                    
+                    processed_notes.append((
+                        note.get('id'),
+                        local_order_id,
+                        note.get('note', ''),
+                        note.get('date_created', ''),
+                        customer_note,
+                        note.get('author', ''),
+                        added_by_user
+                    ))
+            
+            if processed_notes:
+                cursor.executemany(insert_query, processed_notes)
+                connection.commit()
+                
+    except Exception as e:
+        print(f"Error syncing order notes: {e}")
+
 def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_days=7):
     """Sync a single site
     
@@ -335,6 +423,10 @@ def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_d
         
         # 2. Fetch updated orders (within time window)
         updated_orders = fetch_orders_modified_after(wcapi, url, modified_after, progress_callback, connection=conn)
+        
+        # 3. Sync order notes for active orders
+        if progress_callback: progress_callback("Syncing order notes...")
+        sync_order_notes(wcapi, url, connection=conn)
         
         msg = f"Sync complete. New: {len(new_orders)}, Updated: {len(updated_orders)}"
         if progress_callback: progress_callback(msg)

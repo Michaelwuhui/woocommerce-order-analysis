@@ -1655,7 +1655,7 @@ def monthly():
     for row in rows:
         m = row['month']
         if m not in monthly_aggregates:
-            monthly_aggregates[m] = {'success_net_amount_cny': 0, 'success_orders': 0, 'success_products': 0, 'failed_orders': 0, 'cancelled_orders': 0, 'total_orders': 0, 'total_products': 0}
+            monthly_aggregates[m] = {'success_net_amount_cny': 0, 'success_orders': 0, 'success_products': 0, 'failed_orders': 0, 'cancelled_orders': 0, 'total_orders': 0, 'total_products': 0, 'currency_amounts': {}}
         monthly_aggregates[m]['success_net_amount_cny'] += (row.get('success_net_amount_cny') or 0)
         monthly_aggregates[m]['success_orders'] += row['success_orders']
         monthly_aggregates[m]['success_products'] += row['success_products']
@@ -1663,6 +1663,13 @@ def monthly():
         monthly_aggregates[m]['cancelled_orders'] += row['cancelled_orders']
         monthly_aggregates[m]['total_orders'] += row['total_orders']
         monthly_aggregates[m]['total_products'] += row['total_products']
+        # Aggregate amounts by currency
+        currency = row.get('currency', 'PLN')
+        if currency not in monthly_aggregates[m]['currency_amounts']:
+            monthly_aggregates[m]['currency_amounts'][currency] = {'total_amount': 0, 'success_amount': 0, 'success_net_amount': 0}
+        monthly_aggregates[m]['currency_amounts'][currency]['total_amount'] += row.get('total_amount', 0)
+        monthly_aggregates[m]['currency_amounts'][currency]['success_amount'] += row.get('success_amount', 0)
+        monthly_aggregates[m]['currency_amounts'][currency]['success_net_amount'] += row.get('success_net_amount', 0)
         
     return render_template('monthly.html', monthly_stats=rows, monthly_aggregates=monthly_aggregates, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, country_filter=country_filter, all_managers=all_managers, all_countries=all_countries, sort_by=sort_by, site_managers=site_managers, start_month=start_month, end_month=end_month)
 
@@ -7337,13 +7344,20 @@ def get_pending_orders():
     manager_filter = request.args.get('manager', '')
     country_filter = request.args.get('country', '')
     
-    # Build query
     query = '''
         SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, 
                o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_total, o.shipping_lines,
-               s.manager
+               s.manager,
+               n.note as latest_note, n.date_created as latest_note_date, n.author as latest_note_author
         FROM orders o
         LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN (
+            SELECT order_id, note, date_created, author
+            FROM order_notes
+            WHERE customer_note = 0
+            GROUP BY order_id
+            HAVING date_created = MAX(date_created)
+        ) n ON o.id = n.order_id
         WHERE o.status IN ('processing', 'offline')
     '''
     params = []
@@ -7442,7 +7456,10 @@ def get_pending_orders():
             'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (line_items or [])],
             'shipping_total': float(order['shipping_total'] or 0),
             'shipping_method': shipping_method,
-            'product_count': sum(item.get('quantity', 1) for item in (line_items or []))
+            'product_count': sum(item.get('quantity', 1) for item in (line_items or [])),
+            'latest_note': order['latest_note'] or '',
+            'latest_note_date': order['latest_note_date'] or '',
+            'latest_note_author': order['latest_note_author'] or ''
         })
     
     return jsonify(result)
@@ -7463,10 +7480,18 @@ def get_shipped_orders():
         SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, o.date_modified,
                o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_lines, o.shipping_total,
                s.manager,
-               sl.tracking_number, sl.carrier_slug, sl.shipped_at
+               sl.tracking_number, sl.carrier_slug, sl.shipped_at,
+               n.note as latest_note, n.date_created as latest_note_date, n.author as latest_note_author
         FROM orders o
         LEFT JOIN sites s ON o.source = s.url
         LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        LEFT JOIN (
+            SELECT order_id, note, date_created, author
+            FROM order_notes
+            WHERE customer_note = 0
+            GROUP BY order_id
+            HAVING date_created = MAX(date_created)
+        ) n ON o.id = n.order_id
         WHERE o.status = 'on-hold'
     '''
     params = []
@@ -7604,7 +7629,7 @@ def ship_order():
     api_tracking_success = False
     if shipping_mode == 'api':
         # Use URL params for auth to avoid WordPress Basic Auth interception
-        tracking_api_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['number']}/tracking?consumer_key={site['consumer_key']}&consumer_secret={site['consumer_secret']}"
+        tracking_api_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['id']}/tracking?consumer_key={site['consumer_key']}&consumer_secret={site['consumer_secret']}"
         
         print(f"[DEBUG] API Mode - URL: {site['url']}/wp-json/woo-tracking/v1/orders/{order['number']}/tracking")
         print(f"[DEBUG] API Mode - Order Number: {order['number']}, Tracking: {tracking_number}")
@@ -7663,7 +7688,7 @@ def ship_order():
     if used_mode == 'note' or (shipping_mode == 'api' and not api_tracking_success):
         # Add order note with tracking information
         try:
-            note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+            note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes"
             
             if tracking_url:
                 note_content = f"Order has been shipped via {carrier_name}. Tracking Number: <a href='{tracking_url}'>{tracking_number}</a>"
@@ -7723,7 +7748,7 @@ def ship_order():
     
     # Only update status if API mode didn't already do it
     if order['status'] != 'on-hold' and not api_tracking_success:
-        status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
+        status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}"
         # Retry logic for status update
         max_retries = 3
         
@@ -7939,7 +7964,7 @@ def complete_order(order_id):
     
     try:
         # Update order status via WooCommerce API
-        url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
+        url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}"
         resp = req.put(
             url,
             json={'status': 'completed'},
@@ -7974,6 +7999,22 @@ def get_carriers():
     return jsonify([dict(c) for c in carriers])
 
 
+@app.route('/api/order/<int:order_id>/notes', methods=['GET'])
+@login_required
+def get_order_notes(order_id):
+    """Get all notes for an order from local database"""
+    conn = get_db_connection()
+    notes = conn.execute('''
+        SELECT id, note, date_created, customer_note, author, added_by_user
+        FROM order_notes
+        WHERE order_id = ?
+        ORDER BY date_created DESC
+    ''', (order_id,)).fetchall()
+    conn.close()
+    
+    return jsonify([dict(n) for n in notes])
+
+
 @app.route('/api/order/<int:order_id>/note', methods=['POST'])
 @login_required
 @shipper_required
@@ -8001,7 +8042,7 @@ def add_order_note(order_id):
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
     
     try:
-        url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+        url = f"{site['url']}/wp-json/wc/v3/orders/{order_id}/notes"
         
         # Headers to simulate official WooCommerce API client to bypass WAF
         headers = {
@@ -8020,6 +8061,31 @@ def add_order_note(order_id):
         
         if resp.status_code not in [200, 201]:
             raise Exception(f"API错误: {resp.text}")
+            
+        # Parse response to get the note ID and details, save to local DB
+        try:
+            note_data = resp.json()
+            if note_data and 'id' in note_data:
+                from datetime import datetime
+                conn = get_db_connection()
+                conn.execute('''
+                    INSERT OR REPLACE INTO order_notes (
+                        id, order_id, note, date_created, customer_note, author, added_by_user
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    note_data.get('id'),
+                    order_id,
+                    note_data.get('note', note),
+                    note_data.get('date_created', datetime.now().isoformat()),
+                    1 if notify_customer else 0,
+                    note_data.get('author', current_user.username if current_user.is_authenticated else ''),
+                    1 # Manually added
+                ))
+                conn.commit()
+                conn.close()
+        except Exception as db_err:
+            app.logger.error(f"Failed to save note to local DB: {db_err}")
+            pass # Non-fatal, will be synced later
         
         return jsonify({'success': True, 'message': '备注已添加' + ('，已通知客户' if notify_customer else '')})
         
