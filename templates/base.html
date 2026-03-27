@@ -168,12 +168,22 @@
                         </a>
                     </li>
                     {% endif %}
+                    {% if current_user.can_view_sales_board() %}
                     <li class="nav-item">
-                        <a class="nav-link {{ 'active' if request.endpoint == 'settings' else '' }}"
+                        <a class="nav-link {{ 'active' if request.endpoint == 'sales_board' else '' }}"
+                            href="{{ url_for('sales_board') }}">
+                            <i class="bi bi-kanban me-1"></i>销售看板
+                        </a>
+                    </li>
+                    {% endif %}
+                    {% if current_user.can_manage_users() %}
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint in ['settings','users_page'] else '' }}"
                             href="{{ url_for('settings') }}">
                             <i class="bi bi-gear me-1"></i>系统设置
                         </a>
                     </li>
+                    {% endif %}
                 </ul>
                 <ul class="navbar-nav">
                     <!-- Display Mode Toggle -->

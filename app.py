@@ -79,6 +79,29 @@ class User(UserMixin):
             # Column might not exist yet if migration failed or legacy db
             return False
 
+    def can_view_sales_board(self):
+        """Check if user has sales board viewing permission (all roles must be explicitly granted)"""
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_view_sales_board FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return user and user['can_view_sales_board'] == 1
+        except:
+            return False
+
+    def can_manage_users(self):
+        """Check if user can manage other users and permissions (super admin privilege)"""
+        # 'admin' username always has this right as a safety net
+        if self.username == 'admin':
+            return True
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_manage_users FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return user and user['can_manage_users'] == 1
+        except:
+            return False
+
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -428,6 +451,38 @@ def admin_required(f):
     </div>
 </body>
 </html>
+            '''), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def user_manager_required(f):
+    """Decorator: only users with can_manage_users privilege can access user management"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login'))
+        if not current_user.is_admin() or not current_user.can_manage_users():
+            return render_template_string('''
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="UTF-8"><title>权限不足</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+<style>
+body{background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
+.box{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:48px;text-align:center;max-width:440px;}
+.icon{font-size:56px;color:#f59e0b;margin-bottom:20px;}
+h1{font-size:22px;font-weight:600;margin-bottom:12px;}
+p{color:#94a3b8;margin-bottom:24px;}
+a{background:#3b82f6;color:#fff;padding:10px 24px;border-radius:8px;text-decoration:none;}
+</style></head>
+<body><div class="box">
+<div class="icon"><i class="bi bi-shield-exclamation"></i></div>
+<h1>权限不足</h1>
+<p>用户管理功能需要超级管理员授权，请联系 admin 获取权限。</p>
+<a href="/"><i class="bi bi-house"></i> 返回首页</a>
+</div></body></html>
             '''), 403
         return f(*args, **kwargs)
     return decorated_function
@@ -3942,6 +3997,69 @@ def parse_product_name(name, brands_cache=None):
     return result
 
 
+def init_sales_board_tables():
+    """Initialize sales board related tables"""
+    conn = get_db_connection()
+
+    # Add can_view_sales_board column to users table
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_view_sales_board INTEGER DEFAULT 0')
+        conn.commit()
+    except:
+        pass  # Column already exists
+
+    # Add can_manage_users column — super admin privilege
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_manage_users INTEGER DEFAULT 0')
+        conn.commit()
+    except:
+        pass  # Column already exists
+
+    # Ensure the 'admin' username always has can_manage_users = 1
+    try:
+        conn.execute("UPDATE users SET can_manage_users = 1 WHERE username = 'admin'")
+        conn.commit()
+    except:
+        pass
+
+    # Sales targets table - monthly targets per manager
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sales_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year_month TEXT NOT NULL,
+            manager TEXT NOT NULL,
+            monthly_target REAL DEFAULT 0,
+            weekly_targets TEXT DEFAULT '{}',
+            base_salary REAL DEFAULT 7000,
+            commission_rate REAL DEFAULT 0.05,
+            notes TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(year_month, manager)
+        )
+    ''')
+
+    # No-commission brands table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS no_commission_brands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            brand_name TEXT NOT NULL UNIQUE,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # Insert default no-commission brands
+    default_brands = ['L8', 'Esin', 'UR1']
+    for brand in default_brands:
+        try:
+            conn.execute('INSERT OR IGNORE INTO no_commission_brands (brand_name) VALUES (?)', (brand,))
+        except:
+            pass
+
+    conn.commit()
+    conn.close()
+
+
 # Initialize tables on startup
 with app.app_context():
     init_sites_table()
@@ -3951,6 +4069,7 @@ with app.app_context():
     init_shipping_tables()
     init_product_tables()
     init_user_preferences_table()
+    init_sales_board_tables()
 
 @app.route('/settings')
 @login_required
@@ -5783,30 +5902,32 @@ def remove_clean_cron():
 
 @app.route('/users')
 @login_required
-@admin_required
+@user_manager_required
 def users_page():
     """User management page"""
-    return render_template('users.html')
+    return render_template('users.html', is_super_admin=(current_user.username == 'admin'))
 
 
 @app.route('/api/users')
 @login_required
-@admin_required
+@user_manager_required
 def get_users():
     """Get all users"""
     conn = get_db_connection()
     try:
-        users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, created_at FROM users').fetchall()
+        users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, created_at FROM users').fetchall()
     except sqlite3.OperationalError:
-        # Fallback if column doesn't exist yet
-        users = conn.execute('SELECT id, username, name, role, can_ship, 0 as can_view_report, created_at FROM users').fetchall()
+        try:
+            users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, 0 as can_manage_users, created_at FROM users').fetchall()
+        except sqlite3.OperationalError:
+            users = conn.execute('SELECT id, username, name, role, can_ship, 0 as can_view_report, 0 as can_view_sales_board, 0 as can_manage_users, created_at FROM users').fetchall()
     conn.close()
     return jsonify([dict(row) for row in users])
 
 
 @app.route('/api/users', methods=['POST'])
 @login_required
-@admin_required
+@user_manager_required
 def add_user():
     """Add a new user"""
     data = request.json
@@ -5814,13 +5935,13 @@ def add_user():
     password = data.get('password', '')
     name = data.get('name', '').strip()
     role = data.get('role', 'user')
-    
+
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
-    
+
     if role not in ['admin', 'user']:
         role = 'user'
-    
+
     conn = get_db_connection()
     try:
         conn.execute('''
@@ -5837,7 +5958,7 @@ def add_user():
 
 @app.route('/api/users/<int:user_id>', methods=['PUT'])
 @login_required
-@admin_required
+@user_manager_required
 def update_user(user_id):
     """Update a user"""
     data = request.json
@@ -5846,18 +5967,30 @@ def update_user(user_id):
     password = data.get('password', '')
     can_ship = data.get('can_ship', 0)
     can_view_report = data.get('can_view_report', 0)
-    
+    can_view_sales_board = data.get('can_view_sales_board', 0)
+
     if role not in ['admin', 'user', 'viewer']:
         role = 'user'
-    
+
     conn = get_db_connection()
     try:
-        if password:
-            conn.execute('UPDATE users SET name = ?, role = ?, can_ship = ?, can_view_report = ?, password_hash = ? WHERE id = ?',
-                        (name, role, can_ship, can_view_report, generate_password_hash(password), user_id))
+        # Only the 'admin' superuser can grant/revoke can_manage_users
+        if current_user.username == 'admin':
+            can_manage_users_val = 1 if data.get('can_manage_users') else 0
+            if password:
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, generate_password_hash(password), user_id))
+            else:
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, user_id))
         else:
-            conn.execute('UPDATE users SET name = ?, role = ?, can_ship = ?, can_view_report = ? WHERE id = ?',
-                        (name, role, can_ship, can_view_report, user_id))
+            # Non-superadmin: cannot change can_manage_users
+            if password:
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_view_sales_board, generate_password_hash(password), user_id))
+            else:
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_view_sales_board, user_id))
         conn.commit()
         return jsonify({'success': True})
     finally:
@@ -5866,13 +5999,13 @@ def update_user(user_id):
 
 @app.route('/api/users/<int:user_id>', methods=['DELETE'])
 @login_required
-@admin_required
+@user_manager_required
 def delete_user(user_id):
     """Delete a user"""
     # Prevent deleting yourself
     if str(user_id) == str(current_user.id):
         return jsonify({'error': 'Cannot delete yourself'}), 400
-    
+
     conn = get_db_connection()
     try:
         conn.execute('DELETE FROM user_site_permissions WHERE user_id = ?', (user_id,))
@@ -5911,7 +6044,7 @@ def change_own_password():
 
 @app.route('/api/users/<int:user_id>/permissions')
 @login_required
-@admin_required
+@user_manager_required
 def get_user_permissions(user_id):
     """Get user's site permissions"""
     conn = get_db_connection()
@@ -5929,7 +6062,7 @@ def get_user_permissions(user_id):
 
 @app.route('/api/users/<int:user_id>/permissions', methods=['PUT'])
 @login_required
-@admin_required
+@user_manager_required
 def update_user_permissions(user_id):
     """Update user's site permissions"""
     data = request.json
@@ -9292,6 +9425,417 @@ def report_cache_sync():
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+## ==================== Sales Board (销售看板) ====================
+
+def sales_board_required(f):
+    """Decorator to require sales board viewing permission"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login'))
+        if not current_user.can_view_sales_board():
+            return render_template_string('''
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="UTF-8"><title>访问受限</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#1a1a2e;color:#e0e0e0;}</style>
+</head><body><div class="text-center"><h1 class="display-1">🔒</h1><h3>无权访问销售看板</h3><p class="text-muted">请联系管理员开通权限</p><a href="/" class="btn btn-primary mt-3">返回首页</a></div></body></html>
+'''), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+@app.route('/sales-board')
+@login_required
+@sales_board_required
+def sales_board():
+    """Sales board dashboard"""
+    import datetime
+    from collections import defaultdict
+
+    selected_month = request.args.get('month', '')
+    if not selected_month:
+        today = datetime.date.today()
+        selected_month = today.strftime('%Y-%m')
+
+    # Get previous month for growth calculation
+    ym_parts = selected_month.split('-')
+    sel_year, sel_mon = int(ym_parts[0]), int(ym_parts[1])
+    if sel_mon == 1:
+        prev_month = f"{sel_year - 1}-12"
+    else:
+        prev_month = f"{sel_year}-{sel_mon - 1:02d}"
+
+    conn = get_db_connection()
+
+    # Get all managers and their sites
+    sites = conn.execute('SELECT url, manager FROM sites WHERE manager IS NOT NULL AND manager != ""').fetchall()
+    manager_sites = defaultdict(list)
+    for s in sites:
+        manager_sites[s['manager']].append(s['url'])
+
+    managers = sorted(manager_sites.keys())
+
+    # Get sales targets for selected month
+    targets = {}
+    target_rows = conn.execute('SELECT * FROM sales_targets WHERE year_month = ?', (selected_month,)).fetchall()
+    for t in target_rows:
+        targets[t['manager']] = dict(t)
+
+    # Get no-commission brand names
+    no_comm_rows = conn.execute('SELECT brand_name FROM no_commission_brands').fetchall()
+    no_commission_brands_display = [r['brand_name'] for r in no_comm_rows]
+    no_commission_brands = [b.upper() for b in no_commission_brands_display]
+
+    # Get brands cache for product name parsing
+    brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+    brands_cache = []
+    for row in brands_rows:
+        brand_name = row['name']
+        try:
+            aliases = json.loads(row['aliases']) if row['aliases'] else []
+        except:
+            aliases = []
+        brands_cache.append({
+            'id': row['id'],
+            'name': brand_name,
+            'aliases': aliases,
+            'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
+        })
+
+    # Calculate current week range (Monday to Sunday)
+    today = datetime.date.today()
+    week_start = today - datetime.timedelta(days=today.weekday())
+    week_end = week_start + datetime.timedelta(days=6)
+    # Determine which week number in the month (1-based)
+    current_week_num = (today.day - 1) // 7 + 1
+
+    # Build manager performance data
+    board_data = []
+    for manager in managers:
+        site_urls = manager_sites[manager]
+        placeholders = ', '.join(['?' for _ in site_urls])
+
+        # Current month successful orders
+        month_orders = conn.execute(f'''
+            SELECT id, total, shipping_total, currency, line_items, source, date_created
+            FROM orders
+            WHERE source IN ({placeholders})
+            AND strftime('%Y-%m', date_created) = ?
+            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat')
+        ''', site_urls + [selected_month]).fetchall()
+
+        # Previous month successful orders (for growth)
+        prev_orders = conn.execute(f'''
+            SELECT total, shipping_total, currency, line_items
+            FROM orders
+            WHERE source IN ({placeholders})
+            AND strftime('%Y-%m', date_created) = ?
+            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat')
+        ''', site_urls + [prev_month]).fetchall()
+
+        # Current week orders
+        week_orders = conn.execute(f'''
+            SELECT total, shipping_total, currency, line_items, source
+            FROM orders
+            WHERE source IN ({placeholders})
+            AND date(date_created) >= ? AND date(date_created) <= ?
+            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat')
+        ''', site_urls + [week_start.isoformat(), week_end.isoformat()]).fetchall()
+
+        # Calculate month amounts by currency and total products
+        month_currency_amounts = defaultdict(lambda: {'net_amount': 0, 'amount': 0})
+        month_total_products = 0
+        month_net_cny = 0
+        month_commission_base_cny = 0  # Sales eligible for commission (in CNY)
+
+        for order in month_orders:
+            currency = order['currency'] or 'PLN'
+            total = float(order['total'] or 0)
+            shipping = float(order['shipping_total'] or 0)
+            net = total - shipping
+            month_currency_amounts[currency]['amount'] += total
+            month_currency_amounts[currency]['net_amount'] += net
+
+            # Products count
+            items = parse_json_field(order['line_items'])
+            if isinstance(items, list):
+                for item in items:
+                    qty = item.get('quantity', 0)
+                    month_total_products += qty
+
+                    # Check if product brand is excluded from commission
+                    product_name = item.get('name', '').upper()
+                    is_excluded = False
+                    for nc_brand in no_commission_brands:
+                        if nc_brand in product_name:
+                            is_excluded = True
+                            break
+                    # Also check against brands_cache for better matching
+                    if not is_excluded:
+                        parsed = parse_product_name(item.get('name', ''), brands_cache)
+                        if parsed.get('brand') and parsed['brand'].upper() in no_commission_brands:
+                            is_excluded = True
+
+                    if not is_excluded:
+                        item_total = float(item.get('total', 0))
+                        rate, _ = get_cny_rate(currency, selected_month)
+                        if rate:
+                            month_commission_base_cny += item_total * rate
+
+            # CNY conversion for net amount
+            rate, _ = get_cny_rate(currency, selected_month)
+            if rate:
+                month_net_cny += net * rate
+
+        # Previous month CNY
+        prev_net_cny = 0
+        for order in prev_orders:
+            currency = order['currency'] or 'PLN'
+            total = float(order['total'] or 0)
+            shipping = float(order['shipping_total'] or 0)
+            net = total - shipping
+            rate, _ = get_cny_rate(currency, prev_month)
+            if rate:
+                prev_net_cny += net * rate
+
+        # Current week amounts by currency
+        week_currency_amounts = defaultdict(lambda: {'net_amount': 0})
+        week_net_cny = 0
+        week_total_products = 0
+        for order in week_orders:
+            currency = order['currency'] or 'PLN'
+            total = float(order['total'] or 0)
+            shipping = float(order['shipping_total'] or 0)
+            net = total - shipping
+            week_currency_amounts[currency]['net_amount'] += net
+            items = parse_json_field(order['line_items'])
+            if isinstance(items, list):
+                week_total_products += sum(i.get('quantity', 0) for i in items)
+            rate, _ = get_cny_rate(currency, selected_month)
+            if rate:
+                week_net_cny += net * rate
+
+        # Get target info
+        target = targets.get(manager, {})
+        _mt = target.get('monthly_target'); monthly_target = _mt if _mt is not None else 0
+        _bs = target.get('base_salary');   base_salary   = _bs if _bs is not None else 7000
+        _cr = target.get('commission_rate'); commission_rate = _cr if _cr is not None else 0.05
+        weekly_targets_json = target.get('weekly_targets', '{}') or '{}'
+        try:
+            weekly_targets = json.loads(weekly_targets_json)
+        except:
+            weekly_targets = {}
+        weekly_target = weekly_targets.get(f'w{current_week_num}', 0) or 0
+
+        # Achievement rates
+        month_achievement = (month_net_cny / monthly_target * 100) if monthly_target > 0 else 0
+        week_achievement = (week_net_cny / weekly_target * 100) if weekly_target > 0 else 0
+
+        # Growth rate
+        if prev_net_cny > 0:
+            growth_rate = (month_net_cny - prev_net_cny) / prev_net_cny * 100
+        else:
+            growth_rate = 100 if month_net_cny > 0 else 0
+
+        # Salary calculation
+        growth_met = growth_rate >= 20
+        units_met = month_total_products >= 500
+        salary_protected = growth_met or units_met
+        salary_deduction = 0 if salary_protected else round(base_salary * 0.2, 2)
+        actual_salary = base_salary - salary_deduction
+
+        # Commission
+        commission = round(month_commission_base_cny * commission_rate, 2)
+
+        # Total income
+        total_income = round(actual_salary + commission, 2)
+
+        board_data.append({
+            'manager': manager,
+            'sites': [u.replace('https://www.', '').replace('https://', '') for u in site_urls],
+            'sites_raw': site_urls,
+            'monthly_target': monthly_target,
+            'weekly_target': weekly_target,
+            'weekly_targets': weekly_targets,
+            'current_week_num': current_week_num,
+            'month_currency_amounts': dict(month_currency_amounts),
+            'week_currency_amounts': dict(week_currency_amounts),
+            'month_net_cny': round(month_net_cny, 2),
+            'week_net_cny': round(week_net_cny, 2),
+            'month_total_products': month_total_products,
+            'week_total_products': week_total_products,
+            'month_achievement': round(month_achievement, 1),
+            'week_achievement': round(week_achievement, 1),
+            'prev_net_cny': round(prev_net_cny, 2),
+            'growth_rate': round(growth_rate, 1),
+            'growth_met': growth_met,
+            'units_met': units_met,
+            'salary_protected': salary_protected,
+            'base_salary': base_salary,
+            'salary_deduction': salary_deduction,
+            'actual_salary': actual_salary,
+            'commission_rate': commission_rate,
+            'commission_base_cny': round(month_commission_base_cny, 2),
+            'commission': commission,
+            'total_income': total_income,
+            'notes': target.get('notes', ''),
+        })
+
+    conn.close()
+
+    # Team totals
+    team_totals = {
+        'monthly_target': sum(d['monthly_target'] for d in board_data),
+        'month_net_cny': sum(d['month_net_cny'] for d in board_data),
+        'prev_net_cny': sum(d['prev_net_cny'] for d in board_data),
+        'week_net_cny': sum(d['week_net_cny'] for d in board_data),
+        'month_total_products': sum(d['month_total_products'] for d in board_data),
+        'total_commission': sum(d['commission'] for d in board_data),
+        'total_income': sum(d['total_income'] for d in board_data),
+    }
+    if team_totals['monthly_target'] > 0:
+        team_totals['month_achievement'] = round(team_totals['month_net_cny'] / team_totals['monthly_target'] * 100, 1)
+    else:
+        team_totals['month_achievement'] = 0
+
+    return render_template('sales_board.html',
+                           board_data=board_data,
+                           team_totals=team_totals,
+                           selected_month=selected_month,
+                           prev_month=prev_month,
+                           current_week_num=current_week_num,
+                           no_commission_brands=no_commission_brands_display)
+
+
+@app.route('/api/sales-targets', methods=['GET'])
+@login_required
+@sales_board_required
+def get_sales_targets():
+    """Get sales targets for a month"""
+    year_month = request.args.get('month', '')
+    conn = get_db_connection()
+    if year_month:
+        rows = conn.execute('SELECT * FROM sales_targets WHERE year_month = ?', (year_month,)).fetchall()
+    else:
+        rows = conn.execute('SELECT * FROM sales_targets ORDER BY year_month DESC').fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/sales-targets', methods=['POST'])
+@login_required
+@admin_required
+def save_sales_target():
+    """Create or update a sales target"""
+    data = request.json
+    year_month = data.get('year_month', '').strip()
+    manager = data.get('manager', '').strip()
+    monthly_target = data.get('monthly_target', 0)
+    weekly_targets = data.get('weekly_targets', {})
+    base_salary = data.get('base_salary', 7000)
+    commission_rate = data.get('commission_rate', 0.05)
+    notes = data.get('notes', '')
+
+    if not year_month or not manager:
+        return jsonify({'error': '月份和负责人为必填项'}), 400
+
+    conn = get_db_connection()
+    try:
+        conn.execute('''
+            INSERT INTO sales_targets (year_month, manager, monthly_target, weekly_targets, base_salary, commission_rate, notes, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(year_month, manager) DO UPDATE SET
+                monthly_target = excluded.monthly_target,
+                weekly_targets = excluded.weekly_targets,
+                base_salary = excluded.base_salary,
+                commission_rate = excluded.commission_rate,
+                notes = excluded.notes,
+                updated_at = datetime('now')
+        ''', (year_month, manager, monthly_target, json.dumps(weekly_targets), base_salary, commission_rate, notes))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-targets/batch', methods=['POST'])
+@login_required
+@admin_required
+def batch_save_sales_targets():
+    """Batch save sales targets for all managers in a month"""
+    data = request.json
+    targets = data.get('targets', [])
+    if not targets:
+        return jsonify({'error': '无数据'}), 400
+
+    conn = get_db_connection()
+    try:
+        for t in targets:
+            year_month = t.get('year_month', '').strip()
+            manager = t.get('manager', '').strip()
+            if not year_month or not manager:
+                continue
+            conn.execute('''
+                INSERT INTO sales_targets (year_month, manager, monthly_target, weekly_targets, base_salary, commission_rate, notes, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(year_month, manager) DO UPDATE SET
+                    monthly_target = excluded.monthly_target,
+                    weekly_targets = excluded.weekly_targets,
+                    base_salary = excluded.base_salary,
+                    commission_rate = excluded.commission_rate,
+                    notes = excluded.notes,
+                    updated_at = datetime('now')
+            ''', (year_month, manager,
+                  t.get('monthly_target', 0),
+                  json.dumps(t.get('weekly_targets', {})),
+                  t.get('base_salary', 7000),
+                  t.get('commission_rate', 0.05),
+                  t.get('notes', '')))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/no-commission-brands', methods=['GET'])
+@login_required
+@sales_board_required
+def get_no_commission_brands():
+    """Get list of no-commission brands"""
+    conn = get_db_connection()
+    rows = conn.execute('SELECT * FROM no_commission_brands ORDER BY brand_name').fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/no-commission-brands', methods=['POST'])
+@login_required
+@admin_required
+def update_no_commission_brands():
+    """Update no-commission brands list"""
+    data = request.json
+    brands = data.get('brands', [])
+    conn = get_db_connection()
+    try:
+        conn.execute('DELETE FROM no_commission_brands')
+        for brand in brands:
+            brand = brand.strip()
+            if brand:
+                conn.execute('INSERT INTO no_commission_brands (brand_name) VALUES (?)', (brand,))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
 
 
 if __name__ == '__main__':

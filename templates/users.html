@@ -163,7 +163,21 @@
                                 <i class="bi bi-file-earmark-bar-graph me-1"></i>查看报告权限
                             </label>
                         </div>
-                        <small class="text-muted">允许该用户访问发货管理和数据报告功能</small>
+                        <div class="form-check mt-2">
+                            <input class="form-check-input" type="checkbox" id="editCanViewSalesBoard">
+                            <label class="form-check-label text-white-50" for="editCanViewSalesBoard">
+                                <i class="bi bi-kanban me-1"></i>销售看板权限
+                            </label>
+                        </div>
+                        {% if is_super_admin %}
+                        <div class="form-check mt-2" id="wrapCanManageUsers">
+                            <input class="form-check-input" type="checkbox" id="editCanManageUsers">
+                            <label class="form-check-label text-warning" for="editCanManageUsers">
+                                <i class="bi bi-shield-fill-check me-1"></i>用户管理权限 <small class="text-muted">（可管理用户和权限）</small>
+                            </label>
+                        </div>
+                        {% endif %}
+                        <small class="text-muted">允许该用户访问发货管理、数据报告和销售看板功能</small>
                     </div>
                 </div>
                 <div class="modal-footer border-top border-secondary border-opacity-25">
@@ -237,7 +251,7 @@
             } else if (btn.classList.contains('btn-edit')) {
                 const user = window._usersData && window._usersData[userId];
                 if (user) {
-                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0);
+                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0);
                 }
             } else if (btn.classList.contains('btn-delete')) {
                 deleteUser(userId);
@@ -315,13 +329,16 @@
         });
 
         // Edit User
-        window.openEditUser = function (id, username, name, role, can_ship, can_view_report) {
+        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users) {
             document.getElementById('editUserId').value = id;
             document.getElementById('editUsername').value = username;
             document.getElementById('editName').value = name;
             document.getElementById('editRole').value = role;
             document.getElementById('editCanShip').checked = can_ship == 1;
             document.getElementById('editCanViewReport').checked = can_view_report == 1;
+            document.getElementById('editCanViewSalesBoard').checked = can_view_sales_board == 1;
+            var cmEl = document.getElementById('editCanManageUsers');
+            if (cmEl) cmEl.checked = can_manage_users == 1;
             document.getElementById('editPassword').value = '';
             bootstrap.Modal.getOrCreateInstance(document.getElementById('editUserModal')).show();
         };
@@ -337,7 +354,9 @@
                     role: document.getElementById('editRole').value,
                     password: document.getElementById('editPassword').value,
                     can_ship: document.getElementById('editCanShip').checked ? 1 : 0,
-                    can_view_report: document.getElementById('editCanViewReport').checked ? 1 : 0
+                    can_view_report: document.getElementById('editCanViewReport').checked ? 1 : 0,
+                    can_view_sales_board: document.getElementById('editCanViewSalesBoard').checked ? 1 : 0,
+                    can_manage_users: (document.getElementById('editCanManageUsers') || {}).checked ? 1 : 0
                 })
             })
                 .then(res => res.json())

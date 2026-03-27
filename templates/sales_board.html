@@ -1,0 +1,654 @@
+{% extends "base.html" %}
+
+{% block title %}销售看板 - 苍赋管理系统{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+    <!-- Header -->
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h5 class="text-light mb-0">
+            <i class="bi bi-kanban me-2"></i>销售看板
+            <span class="text-muted ms-2 fs-6">{{ selected_month }}</span>
+        </h5>
+        <div class="d-flex align-items-center gap-3">
+            <div class="d-flex align-items-center gap-2">
+                <span class="text-secondary"><i class="bi bi-calendar-range me-1"></i>月份：</span>
+                <input type="text" class="form-control form-control-sm bg-dark text-white border-secondary border-opacity-25 flatpickr-month"
+                    style="width: 140px;" value="{{ selected_month }}" onchange="updateMonth(this.value)">
+            </div>
+            {% if current_user.is_admin() %}
+            <button class="btn btn-sm btn-outline-warning" onclick="openTargetSettings()">
+                <i class="bi bi-gear me-1"></i>设置目标
+            </button>
+            <button class="btn btn-sm btn-outline-info" onclick="openBrandSettings()">
+                <i class="bi bi-tag me-1"></i>免提成品牌
+            </button>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Summary Cards -->
+    <div class="row g-3 mb-4">
+        <div class="col">
+            <div class="card data-card">
+                <div class="card-body py-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-white-50 small">团队月目标</div>
+                            <div class="text-warning fw-bold fs-5">¥{{ "{:,.0f}".format(team_totals.monthly_target) }}</div>
+                        </div>
+                        <i class="bi bi-bullseye text-warning fs-3 opacity-50"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card data-card">
+                <div class="card-body py-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-white-50 small">上月销售(¥) <span class="opacity-50" style="font-size:0.75rem;">{{ prev_month }}</span></div>
+                            <div class="text-white fw-bold fs-5">¥{{ "{:,.0f}".format(team_totals.prev_net_cny) }}</div>
+                        </div>
+                        <i class="bi bi-calendar-minus text-secondary fs-3 opacity-50"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card data-card">
+                <div class="card-body py-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-white-50 small">团队月实际(¥)</div>
+                            <div class="text-success fw-bold fs-5">¥{{ "{:,.0f}".format(team_totals.month_net_cny) }}</div>
+                        </div>
+                        <i class="bi bi-cash-stack text-success fs-3 opacity-50"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card data-card">
+                <div class="card-body py-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-white-50 small">团队达成率</div>
+                            <div class="fw-bold fs-5 {% if team_totals.month_achievement >= 100 %}text-success{% elif team_totals.month_achievement >= 70 %}text-warning{% else %}text-danger{% endif %}">
+                                {{ team_totals.month_achievement }}%
+                            </div>
+                        </div>
+                        <i class="bi bi-graph-up-arrow text-info fs-3 opacity-50"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card data-card">
+                <div class="card-body py-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-white-50 small">团队总产品数</div>
+                            <div class="text-info fw-bold fs-5">{{ "{:,}".format(team_totals.month_total_products) }} 支</div>
+                        </div>
+                        <i class="bi bi-box-seam text-info fs-3 opacity-50"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Table -->
+    <div class="card data-card">
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-dark table-hover mb-0 sales-board-table" style="font-size: 0.88rem;">
+                    <thead>
+                        <tr>
+                            <th rowspan="2" class="align-middle text-center grp-start" style="min-width:70px;">姓名</th>
+                            <th rowspan="2" class="align-middle" style="min-width:130px;">网站</th>
+                            <th colspan="3" class="text-center grp-start">本月</th>
+                            <th colspan="2" class="text-center grp-start">第{{ current_week_num }}周</th>
+                            <th rowspan="2" class="align-middle text-center grp-start" style="min-width:60px;">产品数</th>
+                            <th colspan="3" class="text-center grp-start">业绩考核</th>
+                            <th colspan="4" class="text-center grp-start">薪资计算</th>
+                        </tr>
+                        <tr>
+                            <th class="text-end grp-start" style="min-width:80px;">目标</th>
+                            <th class="text-end" style="min-width:110px;">实际(¥)</th>
+                            <th class="text-center" style="min-width:65px;">达成率</th>
+                            <th class="text-end grp-start" style="min-width:80px;">目标</th>
+                            <th class="text-end" style="min-width:100px;">实际(¥)</th>
+                            <th class="text-end grp-start" style="min-width:90px;">上月(¥)</th>
+                            <th class="text-center" style="min-width:65px;">环比</th>
+                            <th class="text-center" style="min-width:55px;">达标</th>
+                            <th class="text-end grp-start" style="min-width:65px;">底薪</th>
+                            <th class="text-end" style="min-width:65px;">扣除</th>
+                            <th class="text-end" style="min-width:75px;">提成</th>
+                            <th class="text-end" style="min-width:80px;">预计薪资</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for d in board_data %}
+                        <tr>
+                            <td class="text-center fw-bold text-white grp-start">{{ d.manager }}</td>
+                            <td>
+                                {% for site in d.sites %}
+                                <span class="badge bg-secondary bg-opacity-75 me-1 mb-1" style="font-size:0.75em;">{{ site }}</span>
+                                {% endfor %}
+                            </td>
+                            <!-- 本月目标 -->
+                            <td class="text-end grp-start">
+                                {% if d.monthly_target > 0 %}
+                                <span class="text-warning">¥{{ "{:,.0f}".format(d.monthly_target) }}</span>
+                                {% else %}
+                                <span class="text-white-50">-</span>
+                                {% endif %}
+                            </td>
+                            <!-- 本月实际 -->
+                            <td class="text-end">
+                                <div class="text-success fw-bold">¥{{ "{:,.2f}".format(d.month_net_cny) }}</div>
+                                {% for cur, amt in d.month_currency_amounts.items() %}
+                                <div class="text-white-50" style="font-size:0.78em;">{{ "{:,.2f}".format(amt.net_amount) }} <span class="badge bg-secondary" style="font-size:0.8em;">{{ cur }}</span></div>
+                                {% endfor %}
+                            </td>
+                            <!-- 月达成率 -->
+                            <td class="text-center">
+                                {% if d.monthly_target > 0 %}
+                                <span class="badge {% if d.month_achievement >= 100 %}bg-success{% elif d.month_achievement >= 70 %}bg-warning text-dark{% else %}bg-danger{% endif %}" style="font-size:0.85em;">
+                                    {{ d.month_achievement }}%
+                                </span>
+                                {% else %}<span class="text-white-50">-</span>{% endif %}
+                            </td>
+                            <!-- 本周目标 -->
+                            <td class="text-end grp-start">
+                                {% if d.weekly_target > 0 %}
+                                <span class="text-warning">¥{{ "{:,.0f}".format(d.weekly_target) }}</span>
+                                {% else %}<span class="text-white-50">-</span>{% endif %}
+                            </td>
+                            <!-- 本周实际 -->
+                            <td class="text-end">
+                                <div class="text-info">¥{{ "{:,.2f}".format(d.week_net_cny) }}</div>
+                            </td>
+                            <!-- 产品数 -->
+                            <td class="text-center grp-start">
+                                <span class="{% if d.month_total_products >= 500 %}text-success fw-bold{% else %}text-white{% endif %}">
+                                    {{ "{:,}".format(d.month_total_products) }}
+                                </span>
+                                {% if d.month_total_products >= 500 %}
+                                <i class="bi bi-check-circle-fill text-success ms-1" style="font-size:0.7em;" title="满500支"></i>
+                                {% endif %}
+                            </td>
+                            <!-- 上月 -->
+                            <td class="text-end grp-start text-white">
+                                ¥{{ "{:,.2f}".format(d.prev_net_cny) }}
+                            </td>
+                            <!-- 环比增长 -->
+                            <td class="text-center">
+                                <span class="fw-bold {% if d.growth_rate >= 20 %}text-success{% elif d.growth_rate >= 0 %}text-warning{% else %}text-danger{% endif %}">
+                                    {% if d.growth_rate > 0 %}+{% endif %}{{ d.growth_rate }}%
+                                </span>
+                            </td>
+                            <!-- 达标 -->
+                            <td class="text-center">
+                                {% if d.salary_protected %}
+                                <span class="badge bg-success"><i class="bi bi-check-lg"></i></span>
+                                {% else %}
+                                <span class="badge bg-danger"><i class="bi bi-x-lg"></i></span>
+                                {% endif %}
+                                <div style="font-size:0.68em;" class="text-white-50 mt-1">
+                                    {% if d.growth_met %}增长达标{% endif %}
+                                    {% if d.units_met %}{% if d.growth_met %}/{% endif %}销量达标{% endif %}
+                                    {% if not d.salary_protected %}未达标{% endif %}
+                                </div>
+                            </td>
+                            <!-- 底薪 -->
+                            <td class="text-end grp-start text-white">
+                                ¥{{ "{:,.0f}".format(d.base_salary) }}
+                            </td>
+                            <!-- 扣除 -->
+                            <td class="text-end">
+                                {% if d.salary_deduction > 0 %}
+                                <span class="text-danger fw-bold">-¥{{ "{:,.0f}".format(d.salary_deduction) }}</span>
+                                {% else %}
+                                <span class="text-success">0</span>
+                                {% endif %}
+                            </td>
+                            <!-- 提成 -->
+                            <td class="text-end">
+                                <span class="text-info fw-bold">¥{{ "{:,.2f}".format(d.commission) }}</span>
+                                <div class="text-white-50" style="font-size:0.68em;">
+                                    基数¥{{ "{:,.0f}".format(d.commission_base_cny) }} × {{ (d.commission_rate * 100)|int }}%
+                                </div>
+                            </td>
+                            <!-- 预计薪资 -->
+                            <td class="text-end">
+                                <span class="text-warning fw-bold fs-6">¥{{ "{:,.2f}".format(d.total_income) }}</span>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="15" class="text-center py-5 text-white-50">
+                                <i class="bi bi-inbox display-4"></i>
+                                <p class="mt-3">暂无数据，请先在系统设置中配置站点负责人</p>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                    {% if board_data %}
+                    <tfoot>
+                        <tr style="background: rgba(255,255,255,0.07);">
+                            <td class="text-center fw-bold text-white grp-start" colspan="2">
+                                <span class="badge bg-primary bg-opacity-75 fs-6">团队合计</span>
+                            </td>
+                            <td class="text-end grp-start text-warning fw-bold">¥{{ "{:,.0f}".format(team_totals.monthly_target) }}</td>
+                            <td class="text-end text-success fw-bold">¥{{ "{:,.2f}".format(team_totals.month_net_cny) }}</td>
+                            <td class="text-center">
+                                <span class="badge {% if team_totals.month_achievement >= 100 %}bg-success{% elif team_totals.month_achievement >= 70 %}bg-warning text-dark{% else %}bg-danger{% endif %}">
+                                    {{ team_totals.month_achievement }}%
+                                </span>
+                            </td>
+                            <td class="grp-start"></td>
+                            <td class="text-end text-info fw-bold">¥{{ "{:,.2f}".format(team_totals.week_net_cny) }}</td>
+                            <td class="text-center grp-start text-info fw-bold">{{ "{:,}".format(team_totals.month_total_products) }}</td>
+                            <td class="grp-start" colspan="3"></td>
+                            <td class="grp-start" colspan="2"></td>
+                            <td class="text-end text-info fw-bold">¥{{ "{:,.2f}".format(team_totals.total_commission) }}</td>
+                            <td class="text-end text-warning fw-bold fs-6">¥{{ "{:,.2f}".format(team_totals.total_income) }}</td>
+                        </tr>
+                    </tfoot>
+                    {% endif %}
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Rules Card -->
+    <div class="card data-card mt-4">
+        <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25">
+            <h6 class="text-white mb-0"><i class="bi bi-info-circle me-2"></i>业绩规则说明</h6>
+        </div>
+        <div class="card-body">
+            <div class="row text-white-50" style="font-size: 0.88rem;">
+                <div class="col-md-4">
+                    <p class="mb-2"><i class="bi bi-check-circle text-success me-1"></i><strong class="text-white">底薪保护条件（满足其一即可）：</strong></p>
+                    <ul class="mb-0 ps-3">
+                        <li>环比增长 ≥ 20%</li>
+                        <li>当月销售 ≥ 500 支</li>
+                    </ul>
+                </div>
+                <div class="col-md-4">
+                    <p class="mb-2"><i class="bi bi-dash-circle text-danger me-1"></i><strong class="text-white">未达标扣除：</strong></p>
+                    <ul class="mb-0 ps-3">
+                        <li>扣除底薪的 20%</li>
+                    </ul>
+                </div>
+                <div class="col-md-4">
+                    <p class="mb-2"><i class="bi bi-currency-exchange text-info me-1"></i><strong class="text-white">提成规则：</strong></p>
+                    <ul class="mb-0 ps-3">
+                        <li>成功订单销售额 × 5%</li>
+                        <li>排除品牌：{{ no_commission_brands | join(', ') }}</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Target Settings Modal -->
+{% if current_user.is_admin() %}
+<div class="modal fade" id="targetModal" tabindex="-1">
+    <div class="modal-dialog" id="targetModalDialog" style="max-width:95vw; width:95vw; margin:1.5rem auto;">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25"
+             id="targetModalContent"
+             style="resize:both; overflow:auto; min-width:600px; min-height:300px; max-width:100%; max-height:90vh;">
+            <div class="modal-header border-bottom border-secondary border-opacity-25"
+                 id="targetModalHeader"
+                 style="cursor:move; user-select:none;">
+                <h5 class="modal-title text-white"><i class="bi bi-bullseye me-2"></i>设置销售目标 - {{ selected_month }}</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; max-height:calc(90vh - 140px);">
+                <div class="d-flex align-items-center justify-content-between mb-3">
+                    <p class="text-white-50 small mb-0">
+                        <i class="bi bi-info-circle me-1"></i>
+                        「上月销售」为系统自动计算的 <strong class="text-white">{{ prev_month }}</strong> 实际净销售额(¥)
+                    </p>
+                    <button type="button" class="btn btn-sm btn-outline-success" onclick="autoFillAll()">
+                        <i class="bi bi-magic me-1"></i>一键自动填充全部目标(上月×120%)
+                    </button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-dark table-sm mb-0" id="targetTable">
+                        <thead>
+                            <tr>
+                                <th style="min-width:70px;">负责人</th>
+                                <th style="min-width:110px;">上月销售(¥)</th>
+                                <th style="min-width:130px;">月目标(¥)</th>
+                                <th style="min-width:100px;">W1目标</th>
+                                <th style="min-width:100px;">W2目标</th>
+                                <th style="min-width:100px;">W3目标</th>
+                                <th style="min-width:100px;">W4目标</th>
+                                <th style="min-width:100px;">W5目标</th>
+                                <th style="min-width:100px;">底薪</th>
+                                <th style="min-width:100px;">提成比例(%)</th>
+                                <th style="min-width:120px;">备注</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for d in board_data %}
+                            <tr data-manager="{{ d.manager }}" data-prev-cny="{{ d.prev_net_cny }}">
+                                <td class="text-white fw-bold align-middle">{{ d.manager }}</td>
+                                <td class="align-middle">
+                                    <div class="text-info fw-bold">¥{{ "{:,.0f}".format(d.prev_net_cny) }}</div>
+                                    <button type="button" class="btn btn-outline-success mt-1 px-2 py-0"
+                                        style="font-size:0.72em; white-space:nowrap;"
+                                        onclick="autoFillRow(this)">
+                                        <i class="bi bi-magic me-1"></i>×120%→目标
+                                    </button>
+                                </td>
+                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-monthly" value="{{ d.monthly_target|int }}" step="1" style="width:100%;"></td>
+                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w1" value="{{ d.weekly_targets.get('w1', 0)|int }}" step="1" style="width:100%;"></td>
+                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w2" value="{{ d.weekly_targets.get('w2', 0)|int }}" step="1" style="width:100%;"></td>
+                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w3" value="{{ d.weekly_targets.get('w3', 0)|int }}" step="1" style="width:100%;"></td>
+                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w4" value="{{ d.weekly_targets.get('w4', 0)|int }}" step="1" style="width:100%;"></td>
+                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w5" value="{{ d.weekly_targets.get('w5', 0)|int }}" step="1" style="width:100%;"></td>
+                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-salary" value="{{ d.base_salary|int }}" step="100" style="width:100%;"></td>
+                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-commission" value="{{ (d.commission_rate * 100)|round(1) }}" step="0.5" min="0" max="100" style="width:100%;"></td>
+                                <td><input type="text" class="form-control form-control-sm bg-dark text-white border-secondary target-notes" value="{{ d.notes }}" style="width:100%;"></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" onclick="saveTargets()">
+                    <i class="bi bi-check-lg me-1"></i>保存全部
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Brand Settings Modal -->
+<div class="modal fade" id="brandModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-tag me-2"></i>免提成品牌设置</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-white-50 small">以下品牌的产品销售不计入提成（每行一个品牌名）：</p>
+                <textarea class="form-control bg-dark text-white border-secondary" id="brandList" rows="8" placeholder="L8&#10;Esin&#10;UR1">{{ no_commission_brands | join('\n') }}</textarea>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" onclick="saveBrands()">
+                    <i class="bi bi-check-lg me-1"></i>保存
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<style>
+.sales-board-table th, .sales-board-table td {
+    border-color: rgba(255, 255, 255, 0.1) !important;
+    vertical-align: middle;
+}
+.sales-board-table .grp-start {
+    border-left: 2px solid rgba(255, 255, 255, 0.25) !important;
+}
+.sales-board-table thead th {
+    color: #e0e0e0;
+    font-weight: 600;
+    background: rgba(255,255,255,0.05);
+}
+</style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/dark.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/plugins/monthSelect/style.css">
+<script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+<script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/zh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/plugins/monthSelect/index.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    flatpickr(".flatpickr-month", {
+        plugins: [
+            new monthSelectPlugin({
+                shorthand: true,
+                dateFormat: "Y-m",
+                altFormat: "Y年m月",
+                theme: "dark"
+            })
+        ],
+        locale: "zh",
+        theme: "dark",
+        disableMobile: true,
+        allowInput: true
+    });
+});
+
+function updateMonth(value) {
+    if (value) {
+        window.location.href = '/sales-board?month=' + encodeURIComponent(value);
+    }
+}
+
+function showToast(msg, type) {
+    var cls = type === 'error' ? 'bg-danger' : 'bg-success';
+    document.body.insertAdjacentHTML('beforeend',
+        '<div class="toast-container position-fixed top-0 end-0 p-3" style="z-index:9999;">' +
+        '<div class="toast show ' + cls + ' text-white" role="alert"><div class="toast-body">' + msg + '</div></div></div>');
+    setTimeout(function() {
+        var el = document.querySelector('.toast-container');
+        if (el) el.remove();
+    }, 3000);
+}
+
+{% if current_user.is_admin() %}
+function openTargetSettings() {
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('targetModal')).show();
+}
+
+function openBrandSettings() {
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('brandModal')).show();
+}
+
+function autoFillRow(btn) {
+    var row = btn.closest('tr');
+    var prevCny = parseFloat(row.dataset.prevCny) || 0;
+    var newTarget = Math.round(prevCny * 1.2);
+    row.querySelector('.target-monthly').value = newTarget;
+    // 均分到4周
+    var weekVal = Math.round(newTarget / 4);
+    ['w1','w2','w3','w4'].forEach(function(w) {
+        row.querySelector('.target-' + w).value = weekVal;
+    });
+    row.querySelector('.target-w5').value = 0;
+    // 高亮提示
+    var inp = row.querySelector('.target-monthly');
+    inp.classList.add('border-success');
+    setTimeout(function() { inp.classList.remove('border-success'); }, 1500);
+}
+
+function autoFillAll() {
+    document.querySelectorAll('#targetTable tbody tr').forEach(function(row) {
+        var prevCny = parseFloat(row.dataset.prevCny) || 0;
+        if (prevCny <= 0) return;
+        var newTarget = Math.round(prevCny * 1.2);
+        row.querySelector('.target-monthly').value = newTarget;
+        var weekVal = Math.round(newTarget / 4);
+        ['w1','w2','w3','w4'].forEach(function(w) {
+            row.querySelector('.target-' + w).value = weekVal;
+        });
+        row.querySelector('.target-w5').value = 0;
+    });
+    showToast('已自动填充所有目标（上月×120%）', 'success');
+}
+
+function saveTargets() {
+    var rows = document.querySelectorAll('#targetTable tbody tr');
+    var targets = [];
+    rows.forEach(function(row) {
+        var manager = row.dataset.manager;
+        targets.push({
+            year_month: '{{ selected_month }}',
+            manager: manager,
+            monthly_target: parseFloat(row.querySelector('.target-monthly').value) || 0,
+            weekly_targets: {
+                w1: parseFloat(row.querySelector('.target-w1').value) || 0,
+                w2: parseFloat(row.querySelector('.target-w2').value) || 0,
+                w3: parseFloat(row.querySelector('.target-w3').value) || 0,
+                w4: parseFloat(row.querySelector('.target-w4').value) || 0,
+                w5: parseFloat(row.querySelector('.target-w5').value) || 0
+            },
+            base_salary: (function(v){ var n = parseFloat(v); return isNaN(n) ? 7000 : n; })(row.querySelector('.target-salary').value),
+            commission_rate: (function(v){ var n = parseFloat(v); return isNaN(n) ? 5 : n; })(row.querySelector('.target-commission').value) / 100,
+            notes: row.querySelector('.target-notes').value || ''
+        });
+    });
+
+    fetch('/api/sales-targets/batch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({targets: targets})
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        if (data.success) {
+            showToast('目标已保存', 'success');
+            setTimeout(function() { location.reload(); }, 1000);
+        } else {
+            showToast('保存失败: ' + (data.error || '未知错误'), 'error');
+        }
+    });
+}
+
+function saveBrands() {
+    var text = document.getElementById('brandList').value;
+    var brands = text.split('\n').map(function(s) { return s.trim(); }).filter(function(s) { return s; });
+
+    fetch('/api/no-commission-brands', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({brands: brands})
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        if (data.success) {
+            showToast('品牌列表已保存', 'success');
+            setTimeout(function() { location.reload(); }, 1000);
+        } else {
+            showToast('保存失败: ' + (data.error || '未知错误'), 'error');
+        }
+    });
+}
+{% endif %}
+
+// Draggable + persistent modal
+(function() {
+    var STORAGE_KEY = 'salesboard_target_modal_pos';
+    var modal = document.getElementById('targetModal');
+    if (!modal) return;
+
+    function saveState(dialog, content) {
+        var state = {
+            left: dialog.style.left,
+            top: dialog.style.top,
+            width: content.style.width,
+            height: content.style.height
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    }
+
+    var DEFAULT_W = Math.round(window.innerWidth * 0.92);
+    var DEFAULT_H = Math.round(window.innerHeight * 0.82);
+    var MIN_W = 800, MIN_H = 400;
+
+    function applyState(dialog, content) {
+        var raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return false;
+        try {
+            var state = JSON.parse(raw);
+            var w = Math.max(MIN_W, Math.min(window.innerWidth,  parseInt(state.width)  || DEFAULT_W));
+            var h = Math.max(MIN_H, Math.min(window.innerHeight, parseInt(state.height) || DEFAULT_H));
+            var left = Math.max(0, Math.min(window.innerWidth  - w, parseInt(state.left) || 0));
+            var top  = Math.max(0, Math.min(window.innerHeight - h, parseInt(state.top)  || 0));
+            dialog.style.position = 'fixed';
+            dialog.style.margin   = '0';
+            dialog.style.left     = left + 'px';
+            dialog.style.top      = top  + 'px';
+            content.style.width   = w + 'px';
+            content.style.height  = h + 'px';
+            return true;
+        } catch(e) { return false; }
+    }
+
+    modal.addEventListener('shown.bs.modal', function() {
+        var header  = document.getElementById('targetModalHeader');
+        var dialog  = document.getElementById('targetModalDialog');
+        var content = document.getElementById('targetModalContent');
+        if (!header || !dialog || !content) return;
+
+        // Restore saved position, or center with default size if first time
+        if (!applyState(dialog, content)) {
+            content.style.width  = DEFAULT_W + 'px';
+            content.style.height = DEFAULT_H + 'px';
+            var left = Math.round((window.innerWidth  - DEFAULT_W) / 2);
+            var top  = Math.round((window.innerHeight - DEFAULT_H) / 2);
+            dialog.style.position = 'fixed';
+            dialog.style.margin   = '0';
+            dialog.style.left     = Math.max(0, left) + 'px';
+            dialog.style.top      = Math.max(0, top)  + 'px';
+        }
+
+        // Watch for resize changes (right-corner drag)
+        var resizeObserver = new ResizeObserver(function() {
+            content.style.width  = content.offsetWidth  + 'px';
+            content.style.height = content.offsetHeight + 'px';
+            saveState(dialog, content);
+        });
+        resizeObserver.observe(content);
+        modal._resizeObserver = resizeObserver;
+
+        // Drag by header
+        var startX, startY, startLeft, startTop;
+        function onMove(e) {
+            var newLeft = Math.max(0, Math.min(window.innerWidth  - 100, startLeft + e.clientX - startX));
+            var newTop  = Math.max(0, Math.min(window.innerHeight -  60, startTop  + e.clientY - startY));
+            dialog.style.left = newLeft + 'px';
+            dialog.style.top  = newTop  + 'px';
+        }
+        function onUp() {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup',   onUp);
+            saveState(dialog, content);
+        }
+        header.addEventListener('mousedown', function(e) {
+            if (e.target.closest('button')) return;
+            startX    = e.clientX;
+            startY    = e.clientY;
+            startLeft = parseInt(dialog.style.left) || 0;
+            startTop  = parseInt(dialog.style.top)  || 0;
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup',   onUp);
+            e.preventDefault();
+        });
+    });
+
+    modal.addEventListener('hidden.bs.modal', function() {
+        if (modal._resizeObserver) {
+            modal._resizeObserver.disconnect();
+            modal._resizeObserver = null;
+        }
+    });
+})();
+</script>
+{% endblock %}
