@@ -23,6 +23,9 @@
             <button class="btn btn-sm btn-outline-info" onclick="openBrandSettings()">
                 <i class="bi bi-tag me-1"></i>免提成品牌
             </button>
+            <button class="btn btn-sm btn-outline-success" onclick="openGroupSettings()">
+                <i class="bi bi-people me-1"></i>小组管理
+            </button>
             {% endif %}
         </div>
     </div>
@@ -228,7 +231,16 @@
                             </td>
                             <!-- 预计薪资 -->
                             <td class="text-end">
+                                {% set group_bonus = leader_bonus_map.get(d.manager, 0) %}
+                                {% if group_bonus > 0 %}
+                                <span class="text-warning fw-bold fs-6">¥{{ "{:,.2f}".format(d.total_income + group_bonus) }}</span>
+                                <div class="text-info" style="font-size:0.68em;">
+                                    个人 ¥{{ "{:,.2f}".format(d.total_income) }}
+                                    +带团 ¥{{ "{:,.2f}".format(group_bonus) }}
+                                </div>
+                                {% else %}
                                 <span class="text-warning fw-bold fs-6">¥{{ "{:,.2f}".format(d.total_income) }}</span>
+                                {% endif %}
                             </td>
                         </tr>
                         {% else %}
@@ -240,6 +252,50 @@
                         </tr>
                         {% endfor %}
                     </tbody>
+                    {% if group_summaries %}
+                    <tbody>
+                        {% for g in group_summaries %}
+                        <tr style="background: rgba(13, 202, 240, 0.08); border-top: 2px solid rgba(13, 202, 240, 0.3);">
+                            <td class="text-center fw-bold grp-start" colspan="2">
+                                <span class="badge bg-info bg-opacity-75 fs-6">
+                                    <i class="bi bi-people-fill me-1"></i>{{ g.name }}
+                                </span>
+                                <div class="text-white-50 mt-1" style="font-size:0.72em;">
+                                    组长: {{ g.leader_manager }} |
+                                    带团奖金: <span class="text-warning fw-bold">¥{{ "{:,.2f}".format(g.leader_bonus) }}</span>
+                                    <span class="text-info">({{ (g.bonus_rate * 100)|round(1) }}%)</span>
+                                </div>
+                            </td>
+                            <td class="text-end grp-start text-warning fw-bold">
+                                {% if g.monthly_target > 0 %}¥{{ "{:,.0f}".format(g.monthly_target) }}{% else %}-{% endif %}
+                            </td>
+                            <td class="text-end text-success fw-bold">¥{{ "{:,.2f}".format(g.month_net_cny) }}</td>
+                            <td class="text-center">
+                                {% if g.monthly_target > 0 %}
+                                <span class="badge {% if g.month_achievement >= 100 %}bg-success{% elif g.month_achievement >= 70 %}bg-warning text-dark{% else %}bg-danger{% endif %}">
+                                    {{ g.month_achievement }}%
+                                </span>
+                                {% else %}-{% endif %}
+                            </td>
+                            {% if is_current_month %}
+                            <td class="grp-start"></td>
+                            <td class="text-end text-info fw-bold">¥{{ "{:,.2f}".format(g.week_net_cny) }}</td>
+                            {% endif %}
+                            <td class="text-center grp-start text-info fw-bold">{{ "{:,}".format(g.month_total_products) }}</td>
+                            <td class="text-end grp-start text-white">¥{{ "{:,.2f}".format(g.prev_net_cny) }}</td>
+                            <td colspan="2"></td>
+                            <td class="grp-start" colspan="2"></td>
+                            <td class="text-end">
+                                <span class="text-warning fw-bold">¥{{ "{:,.2f}".format(g.leader_bonus) }}</span>
+                                <div class="text-white-50" style="font-size:0.68em;">
+                                    成员基数¥{{ "{:,.0f}".format(g.bonus_base_cny) }} × {{ (g.bonus_rate * 100)|round(1) }}%
+                                </div>
+                            </td>
+                            <td></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                    {% endif %}
                     {% if board_data %}
                     <tfoot>
                         <tr style="background: rgba(255,255,255,0.07);">
@@ -388,12 +444,75 @@
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
-                <p class="text-white-50 small">以下品牌的产品销售不计入提成（每行一个品牌名）：</p>
-                <textarea class="form-control bg-dark text-white border-secondary" id="brandList" rows="8" placeholder="L8&#10;Esin&#10;UR1">{{ no_commission_brands | join('\n') }}</textarea>
+                <p class="text-white-50 small mb-3">勾选不计入提成的品牌：</p>
+                <div class="row g-2">
+                    {% for brand in all_brands_list %}
+                    <div class="col-6">
+                        <div class="form-check">
+                            <input class="form-check-input brand-checkbox" type="checkbox"
+                                   value="{{ brand }}" id="brand_{{ loop.index }}"
+                                   {% if brand in no_commission_brands %}checked{% endif %}>
+                            <label class="form-check-label text-white" for="brand_{{ loop.index }}">
+                                {{ brand }}
+                            </label>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
             </div>
             <div class="modal-footer border-top border-secondary border-opacity-25">
                 <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
                 <button type="button" class="btn btn-primary" onclick="saveBrands()">
+                    <i class="bi bi-check-lg me-1"></i>保存
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+<!-- Group Settings Modal -->
+<div class="modal fade" id="groupModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-people-fill me-2"></i>小组管理</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="groupId" value="">
+                <div class="mb-3">
+                    <label class="form-label text-white-50">小组名称</label>
+                    <input type="text" class="form-control bg-dark text-white border-secondary" id="groupName" placeholder="例如：A组">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">组长</label>
+                    <select class="form-select bg-dark text-white border-secondary" id="groupLeader">
+                        {% for m in managers %}
+                        <option value="{{ m }}">{{ m }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">带团奖金比例(%)</label>
+                    <input type="number" class="form-control bg-dark text-white border-secondary" id="groupBonusRate" value="2" step="0.5" min="0" max="100">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">组员（勾选加入小组的成员，不含组长）</label>
+                    <div id="groupMembersList">
+                        {% for m in managers %}
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" value="{{ m }}" id="gm_{{ loop.index }}">
+                            <label class="form-check-label text-white" for="gm_{{ loop.index }}">{{ m }}</label>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-danger" id="deleteGroupBtn" style="display:none;" onclick="deleteGroup()">
+                    <i class="bi bi-trash me-1"></i>删除小组
+                </button>
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" onclick="saveGroup()">
                     <i class="bi bi-check-lg me-1"></i>保存
                 </button>
             </div>
@@ -539,8 +658,7 @@ function saveTargets() {
 }
 
 function saveBrands() {
-    var text = document.getElementById('brandList').value;
-    var brands = text.split('\n').map(function(s) { return s.trim(); }).filter(function(s) { return s; });
+    var brands = Array.from(document.querySelectorAll('.brand-checkbox:checked')).map(function(cb) { return cb.value; });
 
     fetch('/api/no-commission-brands', {
         method: 'POST',
@@ -554,6 +672,98 @@ function saveBrands() {
             setTimeout(function() { location.reload(); }, 1000);
         } else {
             showToast('保存失败: ' + (data.error || '未知错误'), 'error');
+        }
+    });
+}
+
+function openGroupSettings() {
+    // Fetch existing groups
+    fetch('/api/sales-groups')
+    .then(function(res) { return res.json(); })
+    .then(function(groups) {
+        var idInput = document.getElementById('groupId');
+        var nameInput = document.getElementById('groupName');
+        var leaderSelect = document.getElementById('groupLeader');
+        var rateInput = document.getElementById('groupBonusRate');
+        var deleteBtn = document.getElementById('deleteGroupBtn');
+        var checkboxes = document.querySelectorAll('#groupMembersList input[type="checkbox"]');
+
+        // Reset form
+        idInput.value = '';
+        nameInput.value = '';
+        rateInput.value = '2';
+        deleteBtn.style.display = 'none';
+        checkboxes.forEach(function(cb) { cb.checked = false; });
+
+        // If group exists, populate form (use first group)
+        if (groups.length > 0) {
+            var g = groups[0];
+            idInput.value = g.id;
+            nameInput.value = g.name;
+            leaderSelect.value = g.leader_manager;
+            rateInput.value = (g.bonus_rate * 100).toFixed(1);
+            deleteBtn.style.display = '';
+            checkboxes.forEach(function(cb) {
+                if (g.members.indexOf(cb.value) !== -1) {
+                    cb.checked = true;
+                }
+            });
+        }
+
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('groupModal')).show();
+    });
+}
+
+function saveGroup() {
+    var idVal = document.getElementById('groupId').value;
+    var name = document.getElementById('groupName').value.trim();
+    var leader = document.getElementById('groupLeader').value;
+    var rate = parseFloat(document.getElementById('groupBonusRate').value) || 2;
+    var members = [];
+    document.querySelectorAll('#groupMembersList input[type="checkbox"]:checked').forEach(function(cb) {
+        members.push(cb.value);
+    });
+
+    if (!name) { showToast('请输入小组名称', 'error'); return; }
+    if (members.length === 0) { showToast('请至少选择一个组员', 'error'); return; }
+
+    var payload = {
+        name: name,
+        leader_manager: leader,
+        bonus_rate: rate / 100,
+        members: members
+    };
+    if (idVal) payload.id = parseInt(idVal);
+
+    fetch('/api/sales-groups', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        if (data.success) {
+            showToast('小组已保存', 'success');
+            setTimeout(function() { location.reload(); }, 1000);
+        } else {
+            showToast('保存失败: ' + (data.error || '未知错误'), 'error');
+        }
+    });
+}
+
+function deleteGroup() {
+    var idVal = document.getElementById('groupId').value;
+    if (!idVal) return;
+    if (!confirm('确定要删除此小组吗？')) return;
+
+    fetch('/api/sales-groups/' + idVal, { method: 'DELETE' })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        if (data.success) {
+            showToast('小组已删除', 'success');
+            setTimeout(function() { location.reload(); }, 1000);
+        } else {
+            showToast('删除失败: ' + (data.error || '未知错误'), 'error');
         }
     });
 }

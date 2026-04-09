@@ -176,7 +176,7 @@
                 <canvas id="trendChart"></canvas>
             </div>
             <div class="text-center mt-3">
-                <small class="text-muted"><i class="bi bi-info-circle me-1"></i>图表显示筛选范围内所有选中站点的<span
+                <small style="color:#ffffff !important;"><i class="bi bi-info-circle me-1"></i>图表显示筛选范围内所有选中站点的<span
                         id="chartGranularityInfo">月度</span>汇总数据</small>
             </div>
         </div>
@@ -965,6 +965,16 @@
         const hasData = datasets.some(ds => ds.data.some(v => v > 0));
         if (!hasData) return;
 
+        // Custom positioner: keep tooltip inside canvas by shifting Y upward if needed
+        Chart.Tooltip.positioners.clampedY = function(elements, eventPosition) {
+            const pos = Chart.Tooltip.positioners.average.call(this, elements, eventPosition);
+            if (!pos) return false;
+            const tooltipHeight = this.height || 0;
+            const canvasHeight = this.chart.canvas.height;
+            const y = Math.max(5, Math.min(pos.y, canvasHeight - tooltipHeight - 5));
+            return { x: pos.x, y: y };
+        };
+
         trendChart = new Chart(ctx, {
             type: 'bar', // Default type
             data: {
@@ -988,12 +998,16 @@
                         }
                     },
                     tooltip: {
+                        position: 'clampedY',
                         backgroundColor: 'rgba(15, 23, 42, 0.95)',
                         titleColor: '#e2e8f0',
                         bodyColor: '#cbd5e1',
                         borderColor: 'rgba(148, 163, 184, 0.2)',
                         borderWidth: 1,
                         padding: 12,
+                        filter: function (item) {
+                            return item.raw > 0;
+                        },
                         itemSort: function (a, b) {
                             return a.datasetIndex - b.datasetIndex;
                         },

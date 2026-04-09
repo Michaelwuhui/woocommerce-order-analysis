@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 from functools import wraps
 
-from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session, send_file
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session, send_file, make_response
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
@@ -4060,6 +4060,38 @@ def init_sales_board_tables():
     conn.close()
 
 
+def init_sales_groups_tables():
+    """Initialize sales groups related tables"""
+    conn = get_db_connection()
+
+    # Sales groups table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sales_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            leader_manager TEXT NOT NULL,
+            bonus_rate REAL DEFAULT 0.02,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # Sales group members table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sales_group_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            manager TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (group_id) REFERENCES sales_groups(id) ON DELETE CASCADE,
+            UNIQUE(group_id, manager)
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+
+
 # Initialize tables on startup
 with app.app_context():
     init_sites_table()
@@ -4070,6 +4102,7 @@ with app.app_context():
     init_product_tables()
     init_user_preferences_table()
     init_sales_board_tables()
+    init_sales_groups_tables()
 
 @app.route('/settings')
 @login_required
@@ -5922,7 +5955,15 @@ def get_users():
         except sqlite3.OperationalError:
             users = conn.execute('SELECT id, username, name, role, can_ship, 0 as can_view_report, 0 as can_view_sales_board, 0 as can_manage_users, created_at FROM users').fetchall()
     conn.close()
-    return jsonify([dict(row) for row in users])
+    is_super_admin = (current_user.username == 'admin')
+    result = []
+    for row in users:
+        u = dict(row)
+        # Mark users that the current operator cannot modify
+        u['is_super_admin'] = (u['username'] == 'admin')
+        u['is_protected'] = u['is_super_admin'] or (u['role'] == 'admin' and not is_super_admin)
+        result.append(u)
+    return jsonify(result)
 
 
 @app.route('/api/users', methods=['POST'])
@@ -5939,8 +5980,12 @@ def add_user():
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
 
-    if role not in ['admin', 'user']:
+    if role not in ['admin', 'user', 'viewer']:
         role = 'user'
+
+    # Only super admin can create admin-role users
+    if role == 'admin' and current_user.username != 'admin':
+        return jsonify({'error': '无权创建管理员账户，请联系超级管理员'}), 403
 
     conn = get_db_connection()
     try:
@@ -5974,8 +6019,33 @@ def update_user(user_id):
 
     conn = get_db_connection()
     try:
+        # Look up the target user to enforce hierarchy
+        target_user = conn.execute('SELECT username, role FROM users WHERE id = ?', (user_id,)).fetchone()
+        if not target_user:
+            return jsonify({'error': '用户不存在'}), 404
+
+        is_super_admin = (current_user.username == 'admin')
+        target_is_super_admin = (target_user['username'] == 'admin')
+        target_is_admin = (target_user['role'] == 'admin')
+
+        # Rule 1: Super admin account can ONLY be modified by itself
+        if target_is_super_admin and not is_super_admin:
+            return jsonify({'error': '无权修改超级管理员账户'}), 403
+
+        # Rule 2: Non-super-admin cannot modify admin-role users
+        if target_is_admin and not is_super_admin:
+            return jsonify({'error': '无权修改管理员账户，请联系超级管理员'}), 403
+
+        # Rule 3: Non-super-admin cannot promote users to admin role
+        if role == 'admin' and not is_super_admin:
+            return jsonify({'error': '无权设置管理员角色，请联系超级管理员'}), 403
+
+        # Rule 4: Super admin's role cannot be downgraded
+        if target_is_super_admin and role != 'admin':
+            return jsonify({'error': '超级管理员角色不可更改'}), 403
+
         # Only the 'admin' superuser can grant/revoke can_manage_users
-        if current_user.username == 'admin':
+        if is_super_admin:
             can_manage_users_val = 1 if data.get('can_manage_users') else 0
             if password:
                 conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, password_hash=? WHERE id=?',
@@ -5984,13 +6054,13 @@ def update_user(user_id):
                 conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=? WHERE id=?',
                             (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, user_id))
         else:
-            # Non-superadmin: cannot change can_manage_users
+            # Non-superadmin: cannot change can_manage_users, can_view_sales_board, or set role to admin
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_view_sales_board, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_view_sales_board, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, user_id))
         conn.commit()
         return jsonify({'success': True})
     finally:
@@ -6004,10 +6074,22 @@ def delete_user(user_id):
     """Delete a user"""
     # Prevent deleting yourself
     if str(user_id) == str(current_user.id):
-        return jsonify({'error': 'Cannot delete yourself'}), 400
+        return jsonify({'error': '不能删除自己的账户'}), 400
 
     conn = get_db_connection()
     try:
+        target_user = conn.execute('SELECT username, role FROM users WHERE id = ?', (user_id,)).fetchone()
+        if not target_user:
+            return jsonify({'error': '用户不存在'}), 404
+
+        # Super admin account can never be deleted
+        if target_user['username'] == 'admin':
+            return jsonify({'error': '超级管理员账户不可删除'}), 403
+
+        # Non-super-admin cannot delete admin-role users
+        if target_user['role'] == 'admin' and current_user.username != 'admin':
+            return jsonify({'error': '无权删除管理员账户，请联系超级管理员'}), 403
+
         conn.execute('DELETE FROM user_site_permissions WHERE user_id = ?', (user_id,))
         conn.execute('DELETE FROM users WHERE id = ?', (user_id,))
         conn.commit()
@@ -9196,7 +9278,10 @@ def report():
     all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
     all_countries = [c['country'] for c in all_countries]
     conn.close()
-    return render_template('report.html', all_countries=all_countries)
+    resp = make_response(render_template('report.html', all_countries=all_countries))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    return resp
 
 
 @app.route('/api/report/data')
@@ -9490,6 +9575,10 @@ def sales_board():
     no_commission_brands_display = [r['brand_name'] for r in no_comm_rows]
     no_commission_brands = [b.upper() for b in no_commission_brands_display]
 
+    # Get all available brands for the checkbox picker
+    all_brands_rows = conn.execute('SELECT name FROM brands ORDER BY name').fetchall()
+    all_brands_list = [r['name'] for r in all_brands_rows]
+
     # Get brands cache for product name parsing
     brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
     brands_cache = []
@@ -9685,9 +9774,57 @@ def sales_board():
             'notes': target.get('notes', ''),
         })
 
+    # Group summaries
+    group_summaries = []
+    groups_raw = conn.execute('SELECT * FROM sales_groups ORDER BY id').fetchall()
+    for group in groups_raw:
+        members_rows = conn.execute(
+            'SELECT manager FROM sales_group_members WHERE group_id = ?',
+            (group['id'],)
+        ).fetchall()
+        member_names = [r['manager'] for r in members_rows]
+        leader = group['leader_manager']
+
+        # All member data (including leader) for group display totals
+        member_data = [d for d in board_data if d['manager'] in member_names]
+        # Exclude leader for bonus calculation
+        non_leader_data = [d for d in member_data if d['manager'] != leader]
+
+        group_month_net_cny = sum(d['month_net_cny'] for d in member_data)
+        group_prev_net_cny = sum(d['prev_net_cny'] for d in member_data)
+        group_week_net_cny = sum(d['week_net_cny'] for d in member_data)
+        group_products = sum(d['month_total_products'] for d in member_data)
+        group_monthly_target = sum(d['monthly_target'] for d in member_data)
+        group_commission = sum(d['commission'] for d in member_data)
+        group_total_income = sum(d['total_income'] for d in member_data)
+
+        # Bonus base = commission base of non-leader members only
+        bonus_base_cny = sum(d['commission_base_cny'] for d in non_leader_data)
+        bonus_rate = group['bonus_rate'] or 0.02
+        leader_bonus = round(bonus_base_cny * bonus_rate, 2)
+
+        group_summaries.append({
+            'id': group['id'],
+            'name': group['name'],
+            'leader_manager': leader,
+            'bonus_rate': bonus_rate,
+            'members': member_names,
+            'month_net_cny': round(group_month_net_cny, 2),
+            'bonus_base_cny': round(bonus_base_cny, 2),
+            'prev_net_cny': round(group_prev_net_cny, 2),
+            'week_net_cny': round(group_week_net_cny, 2),
+            'month_total_products': group_products,
+            'monthly_target': group_monthly_target,
+            'month_achievement': round(group_month_net_cny / group_monthly_target * 100, 1) if group_monthly_target > 0 else 0,
+            'leader_bonus': leader_bonus,
+            'total_commission': round(group_commission, 2),
+            'total_income': round(group_total_income, 2),
+        })
+
     conn.close()
 
-    # Team totals
+    # Team totals (include leader bonuses so the total matches the sum of displayed rows)
+    total_leader_bonuses = sum(g['leader_bonus'] for g in group_summaries)
     team_totals = {
         'monthly_target': sum(d['monthly_target'] for d in board_data),
         'month_net_cny': sum(d['month_net_cny'] for d in board_data),
@@ -9695,7 +9832,7 @@ def sales_board():
         'week_net_cny': sum(d['week_net_cny'] for d in board_data),
         'month_total_products': sum(d['month_total_products'] for d in board_data),
         'total_commission': sum(d['commission'] for d in board_data),
-        'total_income': sum(d['total_income'] for d in board_data),
+        'total_income': round(sum(d['total_income'] for d in board_data) + total_leader_bonuses, 2),
     }
     if team_totals['monthly_target'] > 0:
         team_totals['month_achievement'] = round(team_totals['month_net_cny'] / team_totals['monthly_target'] * 100, 1)
@@ -9704,14 +9841,21 @@ def sales_board():
 
     is_current_month = (selected_month == datetime.date.today().strftime('%Y-%m'))
 
+    # Build leader bonus map: {leader_manager: leader_bonus}
+    leader_bonus_map = {g['leader_manager']: g['leader_bonus'] for g in group_summaries}
+
     return render_template('sales_board.html',
                            board_data=board_data,
                            team_totals=team_totals,
+                           group_summaries=group_summaries,
+                           leader_bonus_map=leader_bonus_map,
+                           managers=managers,
                            selected_month=selected_month,
                            prev_month=prev_month,
                            current_week_num=current_week_num,
                            is_current_month=is_current_month,
-                           no_commission_brands=no_commission_brands_display)
+                           no_commission_brands=no_commission_brands_display,
+                           all_brands_list=all_brands_list)
 
 
 @app.route('/api/sales-targets', methods=['GET'])
@@ -9833,6 +9977,90 @@ def update_no_commission_brands():
             brand = brand.strip()
             if brand:
                 conn.execute('INSERT INTO no_commission_brands (brand_name) VALUES (?)', (brand,))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-groups', methods=['GET'])
+@login_required
+@sales_board_required
+def get_sales_groups():
+    """Get all sales groups with members"""
+    conn = get_db_connection()
+    groups = conn.execute('SELECT * FROM sales_groups ORDER BY id').fetchall()
+    result = []
+    for g in groups:
+        members = conn.execute(
+            'SELECT manager FROM sales_group_members WHERE group_id = ? ORDER BY manager',
+            (g['id'],)
+        ).fetchall()
+        result.append({
+            'id': g['id'],
+            'name': g['name'],
+            'leader_manager': g['leader_manager'],
+            'bonus_rate': g['bonus_rate'],
+            'members': [m['manager'] for m in members]
+        })
+    conn.close()
+    return jsonify(result)
+
+
+@app.route('/api/sales-groups', methods=['POST'])
+@login_required
+@admin_required
+def save_sales_group():
+    """Create or update a sales group"""
+    data = request.json
+    group_id = data.get('id')
+    name = (data.get('name') or '').strip()
+    leader_manager = (data.get('leader_manager') or '').strip()
+    bonus_rate = data.get('bonus_rate', 0.02)
+    members = data.get('members', [])
+
+    if not name or not leader_manager:
+        return jsonify({'error': '小组名称和组长为必填项'}), 400
+
+    conn = get_db_connection()
+    try:
+        if group_id:
+            conn.execute('''
+                UPDATE sales_groups SET name = ?, leader_manager = ?, bonus_rate = ?, updated_at = datetime('now')
+                WHERE id = ?
+            ''', (name, leader_manager, bonus_rate, group_id))
+        else:
+            cursor = conn.execute('''
+                INSERT INTO sales_groups (name, leader_manager, bonus_rate) VALUES (?, ?, ?)
+            ''', (name, leader_manager, bonus_rate))
+            group_id = cursor.lastrowid
+
+        # Update members: delete all then reinsert
+        conn.execute('DELETE FROM sales_group_members WHERE group_id = ?', (group_id,))
+        for m in members:
+            m = m.strip()
+            if m:
+                conn.execute('INSERT INTO sales_group_members (group_id, manager) VALUES (?, ?)', (group_id, m))
+
+        conn.commit()
+        return jsonify({'success': True, 'id': group_id})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-groups/<int:group_id>', methods=['DELETE'])
+@login_required
+@admin_required
+def delete_sales_group(group_id):
+    """Delete a sales group"""
+    conn = get_db_connection()
+    try:
+        conn.execute('DELETE FROM sales_group_members WHERE group_id = ?', (group_id,))
+        conn.execute('DELETE FROM sales_groups WHERE id = ?', (group_id,))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
