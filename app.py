@@ -9702,12 +9702,15 @@ def sales_board():
     else:
         team_totals['month_achievement'] = 0
 
+    is_current_month = (selected_month == datetime.date.today().strftime('%Y-%m'))
+
     return render_template('sales_board.html',
                            board_data=board_data,
                            team_totals=team_totals,
                            selected_month=selected_month,
                            prev_month=prev_month,
                            current_week_num=current_week_num,
+                           is_current_month=is_current_month,
                            no_commission_brands=no_commission_brands_display)
 
 
