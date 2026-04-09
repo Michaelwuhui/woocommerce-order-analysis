@@ -174,6 +174,18 @@
                                 <i class="bi bi-kanban me-1"></i>销售看板权限
                             </label>
                         </div>
+                        <div class="form-check mt-2">
+                            <input class="form-check-input" type="checkbox" id="editCanViewReconciliation">
+                            <label class="form-check-label text-white-50" for="editCanViewReconciliation">
+                                <i class="bi bi-cash-coin me-1"></i>合伙人对账 · 查看 <small class="text-muted">（可访问对账页面；合伙人成员默认只勾这一项）</small>
+                            </label>
+                        </div>
+                        <div class="form-check mt-1 ms-4">
+                            <input class="form-check-input" type="checkbox" id="editCanEditReconciliation">
+                            <label class="form-check-label text-white-50" for="editCanEditReconciliation">
+                                <i class="bi bi-pencil-square me-1"></i>合伙人对账 · 编辑 <small class="text-muted">（可生成对账单、录入收款、改合伙人设置。内部财务/admin 需勾上）</small>
+                            </label>
+                        </div>
                         <div class="form-check mt-2" id="wrapCanManageUsers">
                             <input class="form-check-input" type="checkbox" id="editCanManageUsers">
                             <label class="form-check-label text-warning" for="editCanManageUsers">
@@ -255,7 +267,7 @@
             } else if (btn.classList.contains('btn-edit')) {
                 const user = window._usersData && window._usersData[userId];
                 if (user) {
-                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0);
+                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0);
                 }
             } else if (btn.classList.contains('btn-delete')) {
                 deleteUser(userId);
@@ -352,7 +364,7 @@
         });
 
         // Edit User
-        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users) {
+        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation) {
             document.getElementById('editUserId').value = id;
             document.getElementById('editUsername').value = username;
             document.getElementById('editName').value = name;
@@ -361,11 +373,39 @@
             document.getElementById('editCanViewReport').checked = can_view_report == 1;
             var sbEl = document.getElementById('editCanViewSalesBoard');
             if (sbEl) sbEl.checked = can_view_sales_board == 1;
+            var rcEl = document.getElementById('editCanViewReconciliation');
+            if (rcEl) rcEl.checked = can_view_reconciliation == 1;
+            var recEl = document.getElementById('editCanEditReconciliation');
+            if (recEl) recEl.checked = can_edit_reconciliation == 1;
             var cmEl = document.getElementById('editCanManageUsers');
             if (cmEl) cmEl.checked = can_manage_users == 1;
             document.getElementById('editPassword').value = '';
+            // Enforce: edit implies view. If view is unchecked, disable edit.
+            updateReconEditState();
             bootstrap.Modal.getOrCreateInstance(document.getElementById('editUserModal')).show();
         };
+
+        // Keep "edit reconciliation" gated by "view reconciliation"
+        function updateReconEditState() {
+            var vEl = document.getElementById('editCanViewReconciliation');
+            var eEl = document.getElementById('editCanEditReconciliation');
+            if (!vEl || !eEl) return;
+            if (!vEl.checked) {
+                eEl.checked = false;
+                eEl.disabled = true;
+            } else {
+                eEl.disabled = false;
+            }
+        }
+        (function wireReconPerms() {
+            var vEl = document.getElementById('editCanViewReconciliation');
+            var eEl = document.getElementById('editCanEditReconciliation');
+            if (vEl) vEl.addEventListener('change', updateReconEditState);
+            if (eEl) eEl.addEventListener('change', function () {
+                // If enabling edit, auto-enable view
+                if (eEl.checked && vEl && !vEl.checked) vEl.checked = true;
+            });
+        })();
 
         document.getElementById('editUserForm').addEventListener('submit', function (e) {
             e.preventDefault();
@@ -380,6 +420,8 @@
                     can_ship: document.getElementById('editCanShip').checked ? 1 : 0,
                     can_view_report: document.getElementById('editCanViewReport').checked ? 1 : 0,
                     can_view_sales_board: (document.getElementById('editCanViewSalesBoard') || {}).checked ? 1 : 0,
+                    can_view_reconciliation: (document.getElementById('editCanViewReconciliation') || {}).checked ? 1 : 0,
+                    can_edit_reconciliation: (document.getElementById('editCanEditReconciliation') || {}).checked ? 1 : 0,
                     can_manage_users: (document.getElementById('editCanManageUsers') || {}).checked ? 1 : 0
                 })
             })

@@ -176,6 +176,14 @@
                         </a>
                     </li>
                     {% endif %}
+                    {% if current_user.can_view_reconciliation() %}
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint == 'partner_reconciliation_page' else '' }}"
+                            href="{{ url_for('partner_reconciliation_page') }}">
+                            <i class="bi bi-cash-coin me-1"></i>合伙人对账
+                        </a>
+                    </li>
+                    {% endif %}
                     {% if current_user.can_manage_users() %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint in ['settings','users_page'] else '' }}"

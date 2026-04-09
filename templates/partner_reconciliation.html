@@ -1,0 +1,1338 @@
+{% extends "base.html" %}
+
+{% block title %}合伙人对账 - 苍赋管理系统{% endblock %}
+
+{% block content %}
+<style>
+/* ========== Partner Reconciliation Page Custom Styles ========== */
+/* Dark-themed nav tabs */
+#recTabs.nav-tabs {
+    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+}
+#recTabs .nav-link {
+    color: rgba(226, 232, 240, 0.65);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px 8px 0 0;
+    padding: 10px 18px;
+    font-weight: 500;
+    transition: all 0.15s ease;
+}
+#recTabs .nav-link:hover {
+    color: #fff;
+    background: rgba(59, 130, 246, 0.1);
+    border-color: transparent;
+}
+#recTabs .nav-link.active {
+    color: #fff !important;
+    background: #1e293b !important;
+    border-color: rgba(148, 163, 184, 0.25) rgba(148, 163, 184, 0.25) #1e293b !important;
+}
+#recTabs .nav-link i { opacity: 0.85; }
+
+/* CNY subtext — visible on both plain and gradient backgrounds */
+.cny-sub {
+    font-size: 12px;
+    font-weight: 400;
+    color: rgba(186, 230, 253, 0.85);
+    margin-top: 2px;
+    letter-spacing: 0.3px;
+}
+/* CNY on gradient overview cards — brighter */
+.card[style*="gradient"] .cny-sub {
+    color: rgba(255, 255, 255, 0.8);
+}
+
+/* Chinese month/year selectors styled like form-select-sm */
+.ym-picker {
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+}
+.ym-picker select {
+    background-color: #0f172a !important;
+    color: #e2e8f0 !important;
+    border: 1px solid #334155 !important;
+    border-radius: 6px;
+    padding: 4px 26px 4px 10px;
+    font-size: 13px;
+    cursor: pointer;
+}
+.ym-picker select:focus {
+    outline: none;
+    border-color: #3b82f6 !important;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+.ym-picker select option {
+    background-color: #1e293b;
+    color: #e2e8f0;
+}
+
+/* Rate badge in preview header */
+.rate-badge-inline {
+    font-size: 12px;
+    color: rgba(226, 232, 240, 0.75);
+}
+
+/* Overview main value container — supports single large line or multi-currency stacked lines */
+.ov-main-value {
+    color: #fff;
+    line-height: 1.3;
+}
+.ov-main-value.single {
+    font-size: 1.75rem;
+    font-weight: 500;
+}
+.ov-main-value.multi .ov-line {
+    font-size: 1.15rem;
+    font-weight: 500;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 2px 0;
+}
+.ov-main-value.multi .ov-line + .ov-line {
+    border-top: 1px dashed rgba(255,255,255,0.15);
+    margin-top: 2px;
+    padding-top: 4px;
+}
+.ov-main-value.multi .ov-line .ov-curr {
+    font-size: 11px;
+    color: rgba(255,255,255,0.65);
+    margin-left: 8px;
+    font-weight: 400;
+}
+</style>
+
+<div class="container-fluid py-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h1 class="h3 text-white mb-1"><i class="bi bi-cash-coin me-2"></i>合伙人对账</h1>
+            <p class="text-white-50 mb-0">核对合伙人净销售额及打款记录</p>
+        </div>
+        <div class="d-flex gap-2 align-items-center">
+            <label class="text-white-50 small mb-0">当前合伙人：</label>
+            <select id="partnerSelector" class="form-select form-select-sm bg-dark text-white border-secondary" style="width:220px;"></select>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <ul class="nav nav-tabs mb-3" id="recTabs" role="tablist">
+        <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-overview" type="button"><i class="bi bi-speedometer2 me-1"></i>概览</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-statements" type="button"><i class="bi bi-file-earmark-text me-1"></i>对账单</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-receipts" type="button"><i class="bi bi-receipt me-1"></i>收款记录</button></li>
+        {% if is_recon_admin %}
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-settings" type="button"><i class="bi bi-gear me-1"></i>合伙人设置</button></li>
+        {% endif %}
+    </ul>
+
+    <div class="tab-content">
+        <!-- ========== OVERVIEW TAB ========== -->
+        <div class="tab-pane fade show active" id="tab-overview">
+            <div class="row g-3 mb-4">
+                <div class="col-md-4">
+                    <div class="card data-card border-0" style="background:linear-gradient(135deg,#1e3a8a,#1e40af);">
+                        <div class="card-body">
+                            <div class="text-white-50 small mb-1"><i class="bi bi-arrow-down-circle me-1"></i>累计应收</div>
+                            <div class="ov-main-value" id="ovTotalReceivable">—</div>
+                            <div class="cny-sub" id="ovTotalReceivableSub"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card data-card border-0" style="background:linear-gradient(135deg,#065f46,#047857);">
+                        <div class="card-body">
+                            <div class="text-white-50 small mb-1"><i class="bi bi-check-circle me-1"></i>累计已收</div>
+                            <div class="ov-main-value" id="ovTotalReceived">—</div>
+                            <div class="cny-sub" id="ovTotalReceivedSub"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card data-card border-0" style="background:linear-gradient(135deg,#92400e,#b45309);">
+                        <div class="card-body">
+                            <div class="text-white-50 small mb-1"><i class="bi bi-exclamation-circle me-1"></i>未收余额</div>
+                            <div class="ov-main-value" id="ovOutstanding">—</div>
+                            <div class="cny-sub" id="ovOutstandingSub"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Current month live preview -->
+            <div class="card data-card mb-4">
+                <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <h5 class="text-white mb-0"><i class="bi bi-calendar-month me-2"></i>本月实时预估</h5>
+                    <div class="d-flex gap-2 align-items-center flex-wrap">
+                        <span class="rate-badge-inline me-2" id="pvRateBadge"></span>
+                        <div class="ym-picker">
+                            <select id="previewYear"></select>
+                            <select id="previewMonth"></select>
+                        </div>
+                        <button class="btn btn-sm btn-outline-primary" id="btnRefreshPreview"><i class="bi bi-arrow-clockwise"></i></button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="row text-center g-3" id="previewBox">
+                        <div class="col-md-2"><div class="text-white-50 small">成功订单数</div><div class="h5 text-white mt-1" id="pvOrders">—</div></div>
+                        <div class="col-md-2"><div class="text-white-50 small">总销售额</div><div class="h5 text-white mt-1" id="pvGross">—</div></div>
+                        <div class="col-md-2"><div class="text-white-50 small">净销售额</div><div class="h5 text-info mt-1" id="pvNet">—</div></div>
+                        <div class="col-md-2"><div class="text-white-50 small">产品成本 (50%)</div><div class="h5 text-warning mt-1" id="pvCost">—</div></div>
+                        <div class="col-md-2"><div class="text-white-50 small">合伙人利润 (25%)</div><div class="h5 text-warning mt-1" id="pvPartnerProfit">—</div></div>
+                        <div class="col-md-2"><div class="text-white-50 small">我方应收 (25%)</div><div class="h5 text-success mt-1" id="pvOurRecv">—</div></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Per partner summary -->
+            <div class="card data-card">
+                <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25">
+                    <h5 class="text-white mb-0"><i class="bi bi-people me-2"></i>各合伙人汇总</h5>
+                </div>
+                <div class="card-body p-0">
+                    <table class="table table-dark table-hover mb-0" style="--bs-table-bg:transparent;">
+                        <thead><tr><th class="ps-4">合伙人</th><th class="text-end">累计应收</th><th class="text-end">累计已收</th><th class="text-end pe-4">未收余额</th></tr></thead>
+                        <tbody id="partnerSummaryBody"><tr><td colspan="4" class="text-center text-muted py-4">加载中...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========== STATEMENTS TAB ========== -->
+        <div class="tab-pane fade" id="tab-statements">
+            <div class="card data-card">
+                <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 d-flex justify-content-between align-items-center">
+                    <h5 class="text-white mb-0">对账单列表</h5>
+                    {% if is_recon_admin %}
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-sm btn-outline-warning" data-bs-toggle="modal" data-bs-target="#manualStmtModal"><i class="bi bi-pencil me-1"></i>手工录入</button>
+                        <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#genStmtModal"><i class="bi bi-plus-lg me-1"></i>生成对账单</button>
+                    </div>
+                    {% endif %}
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-dark table-hover mb-0" style="--bs-table-bg:transparent;">
+                            <thead>
+                                <tr>
+                                    <th class="ps-4">期间</th>
+                                    <th>合伙人</th>
+                                    <th class="text-end">订单数</th>
+                                    <th class="text-end">净销售</th>
+                                    <th class="text-end">我方应收</th>
+                                    <th class="text-end">已收</th>
+                                    <th class="text-end">未收</th>
+                                    <th>汇率</th>
+                                    <th>状态</th>
+                                    <th class="text-end pe-4">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="statementsBody"><tr><td colspan="10" class="text-center text-muted py-4">加载中...</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========== RECEIPTS TAB ========== -->
+        <div class="tab-pane fade" id="tab-receipts">
+            <div class="card data-card">
+                <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 d-flex justify-content-between align-items-center">
+                    <h5 class="text-white mb-0">收款记录（从合伙人处收到的款项）</h5>
+                    {% if is_recon_admin %}
+                    <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#addReceiptModal"><i class="bi bi-plus-lg me-1"></i>新增收款</button>
+                    {% endif %}
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-dark table-hover mb-0" style="--bs-table-bg:transparent;">
+                            <thead>
+                                <tr>
+                                    <th class="ps-4">收款日期</th>
+                                    <th>合伙人</th>
+                                    <th>关联对账单</th>
+                                    <th class="text-end">金额</th>
+                                    <th class="text-end">汇率</th>
+                                    <th class="text-end">金额 (CNY)</th>
+                                    <th>方式</th>
+                                    <th>单号</th>
+                                    <th>备注</th>
+                                    <th class="text-end pe-4">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="receiptsBody"><tr><td colspan="10" class="text-center text-muted py-4">加载中...</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        {% if is_recon_admin %}
+        <!-- ========== SETTINGS TAB ========== -->
+        <div class="tab-pane fade" id="tab-settings">
+            <div class="card data-card mb-3">
+                <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 d-flex justify-content-between align-items-center">
+                    <h5 class="text-white mb-0">合伙人配置</h5>
+                    {% if is_recon_admin %}
+                    <button class="btn btn-sm btn-primary" id="btnOpenNewPartner"><i class="bi bi-plus-lg me-1"></i>新增合伙人</button>
+                    {% endif %}
+                </div>
+                <div class="card-body">
+                    <div id="partnersSettingsBox">加载中...</div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- ============= MODALS ============= -->
+
+<!-- Generate Statement Modal -->
+<div class="modal fade" id="genStmtModal" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content bg-dark border border-secondary">
+        <div class="modal-header border-bottom border-secondary"><h5 class="modal-title text-white">生成月度对账单</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">
+            <div class="mb-3"><label class="form-label text-white-50">合伙人</label><select id="genPartner" class="form-select bg-dark text-white border-secondary"></select></div>
+            <div class="row g-2">
+                <div class="col-6"><label class="form-label text-white-50">年份</label><select id="genYear" class="form-select bg-dark text-white border-secondary"></select></div>
+                <div class="col-6"><label class="form-label text-white-50">月份</label><select id="genMonth" class="form-select bg-dark text-white border-secondary"></select></div>
+            </div>
+            <div class="alert alert-info mt-3 small mb-0"><i class="bi bi-info-circle me-1"></i>系统会自动从订单数据中聚合该月该合伙人绑定站点的 PLN 净销售额，按分成比例计算。</div>
+        </div>
+        <div class="modal-footer border-top border-secondary"><button class="btn btn-outline-light" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="btnGenStmt">生成</button></div>
+    </div></div>
+</div>
+
+<!-- Manual Statement Modal -->
+<div class="modal fade" id="manualStmtModal" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content bg-dark border border-secondary">
+        <div class="modal-header border-bottom border-secondary"><h5 class="modal-title text-white">手工录入历史对账单</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">
+            <div class="alert alert-warning small"><i class="bi bi-exclamation-triangle me-1"></i>用于录入 2026 年之前的历史数据。直接填写净销售额，系统按比例自动计算分成。</div>
+            <div class="mb-3"><label class="form-label text-white-50">合伙人</label><select id="manPartner" class="form-select bg-dark text-white border-secondary"></select></div>
+            <div class="row g-2 mb-3">
+                <div class="col-6"><label class="form-label text-white-50">年份</label><select id="manYear" class="form-select bg-dark text-white border-secondary"></select></div>
+                <div class="col-6"><label class="form-label text-white-50">月份</label><select id="manMonth" class="form-select bg-dark text-white border-secondary"></select></div>
+            </div>
+            <div class="mb-3"><label class="form-label text-white-50">订单数</label><input type="number" id="manOrders" class="form-control bg-dark text-white border-secondary" value="0"></div>
+            <div class="mb-3"><label class="form-label text-white-50">总销售额 (<span class="man-curr-label">PLN</span>)</label><input type="number" step="0.01" id="manGross" class="form-control bg-dark text-white border-secondary" value="0"></div>
+            <div class="mb-3"><label class="form-label text-white-50">净销售额 (<span class="man-curr-label">PLN</span>) *</label><input type="number" step="0.01" id="manNet" class="form-control bg-dark text-white border-secondary" value="0" required></div>
+            <div class="mb-3"><label class="form-label text-white-50">备注</label><input type="text" id="manNotes" class="form-control bg-dark text-white border-secondary" value="手工录入历史数据"></div>
+        </div>
+        <div class="modal-footer border-top border-secondary"><button class="btn btn-outline-light" data-bs-dismiss="modal">取消</button><button class="btn btn-warning" id="btnManStmt">保存</button></div>
+    </div></div>
+</div>
+
+<!-- Statement Detail Modal -->
+<div class="modal fade" id="stmtDetailModal" tabindex="-1">
+    <div class="modal-dialog modal-lg"><div class="modal-content bg-dark border border-secondary">
+        <div class="modal-header border-bottom border-secondary"><h5 class="modal-title text-white">对账单详情</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body" id="stmtDetailBody"></div>
+        <div class="modal-footer border-top border-secondary" id="stmtDetailFooter"></div>
+    </div></div>
+</div>
+
+<!-- Add Receipt Modal -->
+<div class="modal fade" id="addReceiptModal" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content bg-dark border border-secondary">
+        <div class="modal-header border-bottom border-secondary"><h5 class="modal-title text-white" id="receiptModalTitle">新增收款记录</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">
+            <input type="hidden" id="rcptId">
+            <div class="mb-3"><label class="form-label text-white-50">合伙人</label><select id="rcptPartner" class="form-select bg-dark text-white border-secondary"></select></div>
+            <div class="mb-3"><label class="form-label text-white-50">关联对账单（可选）</label><select id="rcptStatement" class="form-select bg-dark text-white border-secondary"><option value="">-- 不关联 --</option></select></div>
+            <div class="row g-2 mb-3">
+                <div class="col-6"><label class="form-label text-white-50">收款日期 *</label><input type="date" id="rcptDate" class="form-control bg-dark text-white border-secondary"></div>
+                <div class="col-6"><label class="form-label text-white-50">金额 (<span class="rcpt-curr-label">PLN</span>) *</label><input type="number" step="0.01" id="rcptAmount" class="form-control bg-dark text-white border-secondary"></div>
+            </div>
+            <div class="row g-2 mb-3">
+                <div class="col-6"><label class="form-label text-white-50">汇率 <span class="rcpt-curr-label">PLN</span>→CNY <small class="text-muted" id="rcptRateHint"></small></label><input type="number" step="0.0001" id="rcptRate" class="form-control bg-dark text-white border-secondary" placeholder="自动读取系统汇率"></div>
+                <div class="col-6"><label class="form-label text-white-50">金额 (CNY)</label><input type="text" id="rcptCny" class="form-control bg-dark text-muted border-secondary" readonly></div>
+            </div>
+            <div class="row g-2 mb-3">
+                <div class="col-6"><label class="form-label text-white-50">收款方式</label><select id="rcptMethod" class="form-select bg-dark text-white border-secondary"><option value="">-- 选择 --</option><option>银行转账</option><option>Wise</option><option>USDT</option><option>支付宝</option><option>微信</option><option>其他</option></select></div>
+                <div class="col-6"><label class="form-label text-white-50">单号/参考号</label><input type="text" id="rcptRef" class="form-control bg-dark text-white border-secondary"></div>
+            </div>
+            <div class="mb-3"><label class="form-label text-white-50">凭证链接</label><input type="text" id="rcptUrl" class="form-control bg-dark text-white border-secondary" placeholder="截图地址或文件路径"></div>
+            <div class="mb-3"><label class="form-label text-white-50">备注</label><textarea id="rcptNotes" class="form-control bg-dark text-white border-secondary" rows="2"></textarea></div>
+        </div>
+        <div class="modal-footer border-top border-secondary"><button class="btn btn-outline-light" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="btnSaveReceipt">保存</button></div>
+    </div></div>
+</div>
+
+<!-- Add/Edit Partner Modal (available to all reconciliation admins) -->
+{% if is_recon_admin %}
+<div class="modal fade" id="addPartnerModal" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content bg-dark border border-secondary">
+        <div class="modal-header border-bottom border-secondary">
+            <h5 class="modal-title text-white" id="partnerModalTitle">新增合伙人</h5>
+            <button class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+            <input type="hidden" id="editPartnerId" value="">
+            <div class="row g-2 mb-3">
+                <div class="col-8"><label class="form-label text-white-50">名称 *</label><input type="text" id="newPartnerName" class="form-control bg-dark text-white border-secondary"></div>
+                <div class="col-4">
+                    <label class="form-label text-white-50">结算货币 *</label>
+                    <select id="newPartnerCurrency" class="form-select bg-dark text-white border-secondary">
+                        <option value="PLN">PLN · 波兰兹罗提</option>
+                        <option value="AUD">AUD · 澳元</option>
+                        <option value="AED">AED · 迪拉姆</option>
+                        <option value="USD">USD · 美元</option>
+                        <option value="EUR">EUR · 欧元</option>
+                        <option value="GBP">GBP · 英镑</option>
+                        <option value="CNY">CNY · 人民币</option>
+                    </select>
+                </div>
+            </div>
+            <div class="mb-3"><label class="form-label text-white-50">代号</label><input type="text" id="newPartnerCode" class="form-control bg-dark text-white border-secondary" placeholder="英文短名，创建后不可修改"></div>
+            <div class="mb-3"><label class="form-label text-white-50">描述</label><textarea id="newPartnerDesc" class="form-control bg-dark text-white border-secondary" rows="2"></textarea></div>
+            <div class="row g-2 mb-3">
+                <div class="col-4"><label class="form-label text-white-50">成本占比</label><input type="number" step="0.01" id="newPartnerCost" class="form-control bg-dark text-white border-secondary" value="0.50"></div>
+                <div class="col-4"><label class="form-label text-white-50">对方利润</label><input type="number" step="0.01" id="newPartnerPP" class="form-control bg-dark text-white border-secondary" value="0.25"></div>
+                <div class="col-4"><label class="form-label text-white-50">我方利润</label><input type="number" step="0.01" id="newPartnerOP" class="form-control bg-dark text-white border-secondary" value="0.25"></div>
+            </div>
+            <div class="small text-muted"><i class="bi bi-info-circle me-1"></i>三项占比之和应等于 1.00。订单将按选定货币过滤，请确保绑定的站点使用该货币。</div>
+        </div>
+        <div class="modal-footer border-top border-secondary">
+            <button class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+            <button class="btn btn-primary" id="btnSavePartner">保存</button>
+        </div>
+    </div></div>
+</div>
+{% endif %}
+
+<script>
+// Template version: v2 (2026-04-09) — if you don't see this in console, hard-refresh!
+console.log('[partner_reconciliation] template loaded v2');
+const IS_RECON_ADMIN = {{ 'true' if is_recon_admin else 'false' }};
+const IS_SUPER_ADMIN = {{ 'true' if is_super_admin else 'false' }};
+console.log('[partner_reconciliation] IS_RECON_ADMIN=', IS_RECON_ADMIN, 'IS_SUPER_ADMIN=', IS_SUPER_ADMIN);
+let partnersCache = [];
+let statementsCache = [];
+
+document.addEventListener('DOMContentLoaded', function() {
+    // Init Chinese year/month picker
+    const now = new Date();
+    const curYear = now.getFullYear();
+    const curMonth = now.getMonth() + 1;
+    const CN_MONTHS = ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'];
+
+    // Populate year selects (last 3 years + next year)
+    function fillYearSelect(selectId, selected) {
+        const el = document.getElementById(selectId);
+        if (!el) return;
+        let html = '';
+        for (let y = curYear + 1; y >= curYear - 3; y--) {
+            html += `<option value="${y}" ${y==selected?'selected':''}>${y}年</option>`;
+        }
+        el.innerHTML = html;
+    }
+    function fillMonthSelect(selectId, selected) {
+        const el = document.getElementById(selectId);
+        if (!el) return;
+        el.innerHTML = CN_MONTHS.map((m,i) => `<option value="${i+1}" ${(i+1)==selected?'selected':''}>${m}</option>`).join('');
+    }
+
+    fillYearSelect('previewYear', curYear);
+    fillMonthSelect('previewMonth', curMonth);
+    fillYearSelect('genYear', curYear);
+    fillMonthSelect('genMonth', curMonth);
+    fillYearSelect('manYear', curYear - 1);
+    fillMonthSelect('manMonth', 1);
+
+    loadPartners().then(() => {
+        loadOverview();
+        loadStatements();
+        loadReceipts();
+        if (IS_RECON_ADMIN) loadPartnerSettings();
+        refreshPreview();
+    });
+
+    document.getElementById('partnerSelector').addEventListener('change', () => {
+        loadOverview();
+        loadStatements();
+        loadReceipts();
+        refreshPreview();
+    });
+    document.getElementById('previewYear').addEventListener('change', refreshPreview);
+    document.getElementById('previewMonth').addEventListener('change', refreshPreview);
+    document.getElementById('btnRefreshPreview').addEventListener('click', refreshPreview);
+
+    // Modal wiring
+    const btnGen = document.getElementById('btnGenStmt');
+    if (btnGen) btnGen.addEventListener('click', generateStatement);
+    const btnMan = document.getElementById('btnManStmt');
+    if (btnMan) btnMan.addEventListener('click', manualStatement);
+    document.getElementById('btnSaveReceipt').addEventListener('click', saveReceipt);
+
+    // Auto calc CNY amount in receipt modal
+    const rcptAmt = document.getElementById('rcptAmount');
+    const rcptRate = document.getElementById('rcptRate');
+    const updateCny = () => {
+        const a = parseFloat(rcptAmt.value) || 0;
+        const r = parseFloat(rcptRate.value) || 0;
+        document.getElementById('rcptCny').value = (a * r).toFixed(2);
+    };
+    rcptAmt.addEventListener('input', updateCny);
+    rcptRate.addEventListener('input', updateCny);
+
+    // Partner modal save button (new or edit)
+    const btnSavePartner = document.getElementById('btnSavePartner');
+    if (btnSavePartner) btnSavePartner.addEventListener('click', savePartner);
+
+    // "新增合伙人" button: reset modal to new-mode then open
+    const btnOpenNewPartner = document.getElementById('btnOpenNewPartner');
+    if (btnOpenNewPartner) btnOpenNewPartner.addEventListener('click', () => {
+        resetPartnerModal();
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('addPartnerModal')).show();
+    });
+});
+
+// ========== API helpers ==========
+async function api(url, opts={}) {
+    const res = await fetch(url, {
+        headers: {'Content-Type':'application/json'},
+        ...opts
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({error:'请求失败'}));
+        throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    return res.json();
+}
+
+function fmt(n) { return (n||0).toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+
+// Render a dual-currency value: native currency (big) + CNY (small blue-tinted below)
+function dual(local, cny, currency) {
+    const curr = currency || 'PLN';
+    const p = `${fmt(local)} ${curr}`;
+    if (cny == null || cny === undefined) return p;
+    if (curr === 'CNY') return p;  // avoid ≈ xxx CNY when already CNY
+    return `${p}<div class="cny-sub">≈ ${fmt(cny)} CNY</div>`;
+}
+
+// Inline dual (single line) for compact tables
+function dualInline(local, cny, currency) {
+    const curr = currency || 'PLN';
+    if (cny == null || cny === undefined) return `${fmt(local)} ${curr}`;
+    if (curr === 'CNY') return `${fmt(local)} ${curr}`;
+    return `${fmt(local)} ${curr}<span class="cny-sub ms-1">/${fmt(cny)}</span>`;
+}
+
+// Find partner currency by id (fallback to PLN)
+function partnerCurrency(partnerId) {
+    if (!partnerId) return null;
+    const p = partnersCache.find(x => x.id === parseInt(partnerId));
+    return p ? (p.currency || 'PLN') : 'PLN';
+}
+
+// Translate backend rate_source marker into friendly Chinese text
+function rateSourceText(src) {
+    if (!src) return '';
+    if (src === 'saved') return '生成时快照';
+    if (src === 'none') return '系统未配置';
+    // Format: system(2025-12)
+    const m = src.match(/^system\(([\d-]+)\)$/);
+    if (m) return `取自系统 ${m[1]}`;
+    return src;
+}
+
+// ========== Load partners ==========
+async function loadPartners() {
+    try {
+        partnersCache = await api('/api/partners');
+        console.log('[loadPartners] got', partnersCache.length, 'partners', partnersCache);
+        const sel = document.getElementById('partnerSelector');
+        sel.innerHTML = '<option value="">全部合伙人</option>' + partnersCache.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+        // populate modal selects
+        ['genPartner','manPartner','rcptPartner'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.innerHTML = partnersCache.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+        });
+    } catch (e) {
+        console.error('[loadPartners] failed:', e);
+        showToast('加载合伙人列表失败: ' + e.message, 'danger');
+    }
+}
+
+// ========== Overview ==========
+// Render an overview card's main-value block.
+// mode: 'single'  → one big line with amount + currency
+//       'multi'   → list of currencies, each as one line
+function renderOvValue(el, mode, entries) {
+    if (mode === 'single') {
+        const { amount, currency } = entries;
+        el.className = 'ov-main-value single';
+        el.innerHTML = `${fmt(amount)} <small style="font-size:0.6em;opacity:0.7;">${currency}</small>`;
+    } else {
+        el.className = 'ov-main-value multi';
+        if (!entries.length) {
+            el.innerHTML = `<div class="ov-line"><span>0.00</span><span class="ov-curr">—</span></div>`;
+            return;
+        }
+        el.innerHTML = entries.map(e =>
+            `<div class="ov-line"><span>${fmt(e.amount)}</span><span class="ov-curr">${e.currency}</span></div>`
+        ).join('');
+    }
+}
+
+async function loadOverview() {
+    try {
+        const data = await api('/api/reconciliation/overview');
+        const selectedPartnerId = document.getElementById('partnerSelector').value;
+
+        const elReceivable = document.getElementById('ovTotalReceivable');
+        const elReceived = document.getElementById('ovTotalReceived');
+        const elOutstanding = document.getElementById('ovOutstanding');
+        const subReceivable = document.getElementById('ovTotalReceivableSub');
+        const subReceived = document.getElementById('ovTotalReceivedSub');
+        const subOutstanding = document.getElementById('ovOutstandingSub');
+
+        if (selectedPartnerId) {
+            // === Specific partner mode: single big value in native currency ===
+            const p = data.partners.find(x => x.id == parseInt(selectedPartnerId));
+            if (p) {
+                const curr = p.currency || 'PLN';
+                renderOvValue(elReceivable, 'single', {amount: p.total_receivable_pln, currency: curr});
+                renderOvValue(elReceived, 'single', {amount: p.total_received_pln, currency: curr});
+                renderOvValue(elOutstanding, 'single', {amount: p.outstanding_pln, currency: curr});
+                if (curr !== 'CNY') {
+                    subReceivable.innerHTML = `≈ ${fmt(p.total_receivable_cny)} CNY`;
+                    subReceived.innerHTML = `≈ ${fmt(p.total_received_cny)} CNY`;
+                    subOutstanding.innerHTML = `≈ ${fmt(p.outstanding_cny)} CNY`;
+                } else {
+                    subReceivable.innerHTML = '';
+                    subReceived.innerHTML = '';
+                    subOutstanding.innerHTML = '';
+                }
+            }
+        } else {
+            // === All-partners mode: list each currency separately ===
+            const byCurrency = {};
+            data.partners.forEach(p => {
+                const c = p.currency || 'PLN';
+                if (!byCurrency[c]) byCurrency[c] = {receivable: 0, received: 0, outstanding: 0};
+                byCurrency[c].receivable += (p.total_receivable_pln || 0);
+                byCurrency[c].received += (p.total_received_pln || 0);
+                byCurrency[c].outstanding += (p.outstanding_pln || 0);
+            });
+
+            // Sort currencies by PLN first, then alphabetically
+            const currencies = Object.keys(byCurrency).sort((a,b) => {
+                if (a === 'PLN') return -1;
+                if (b === 'PLN') return 1;
+                return a.localeCompare(b);
+            });
+
+            const receivableEntries = currencies
+                .filter(c => Math.abs(byCurrency[c].receivable) > 0.001)
+                .map(c => ({amount: byCurrency[c].receivable, currency: c}));
+            const receivedEntries = currencies
+                .filter(c => Math.abs(byCurrency[c].received) > 0.001)
+                .map(c => ({amount: byCurrency[c].received, currency: c}));
+            const outstandingEntries = currencies
+                .filter(c => Math.abs(byCurrency[c].outstanding) > 0.001)
+                .map(c => ({amount: byCurrency[c].outstanding, currency: c}));
+
+            renderOvValue(elReceivable, 'multi', receivableEntries);
+            renderOvValue(elReceived, 'multi', receivedEntries);
+            renderOvValue(elOutstanding, 'multi', outstandingEntries);
+
+            // Sub-line: unified CNY total
+            const hasCnyTotal = data.totals.total_receivable_cny || data.totals.total_received_cny || data.totals.outstanding_cny;
+            if (hasCnyTotal) {
+                subReceivable.innerHTML = `<i class="bi bi-layers me-1"></i>合计 ≈ ${fmt(data.totals.total_receivable_cny)} CNY`;
+                subReceived.innerHTML = `<i class="bi bi-layers me-1"></i>合计 ≈ ${fmt(data.totals.total_received_cny)} CNY`;
+                subOutstanding.innerHTML = `<i class="bi bi-layers me-1"></i>合计 ≈ ${fmt(data.totals.outstanding_cny)} CNY`;
+            } else {
+                subReceivable.innerHTML = '';
+                subReceived.innerHTML = '';
+                subOutstanding.innerHTML = '';
+            }
+        }
+
+        // === Per-partner summary table — always show each partner in native currency ===
+        const tbody = document.getElementById('partnerSummaryBody');
+        if (data.partners.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">暂无合伙人</td></tr>';
+        } else {
+            tbody.innerHTML = data.partners.map(p => `<tr>
+                <td class="ps-4 text-white">${p.name} <span class="badge bg-dark text-muted ms-1" style="font-weight:400;">${p.currency || 'PLN'}</span></td>
+                <td class="text-end text-info">${dual(p.total_receivable_pln, p.total_receivable_cny, p.currency)}</td>
+                <td class="text-end text-success">${dual(p.total_received_pln, p.total_received_cny, p.currency)}</td>
+                <td class="text-end pe-4 ${p.outstanding_pln>0?'text-warning':'text-muted'}">${dual(p.outstanding_pln, p.outstanding_cny, p.currency)}</td>
+            </tr>`).join('');
+        }
+    } catch (e) { console.error(e); }
+}
+
+async function refreshPreview() {
+    const y = document.getElementById('previewYear').value;
+    const m = document.getElementById('previewMonth').value;
+    const partnerId = document.getElementById('partnerSelector').value || (partnersCache[0] && partnersCache[0].id);
+    if (!y || !m || !partnerId) return;
+    try {
+        const data = await api(`/api/reconciliation/statements/preview?partner_id=${partnerId}&year=${y}&month=${parseInt(m)}`);
+        const curr = data.currency || 'PLN';
+        const rateBadge = document.getElementById('pvRateBadge');
+        if (data.effective_rate_cny) {
+            rateBadge.innerHTML = `<i class="bi bi-currency-exchange me-1"></i>系统汇率 1 ${curr} = ${data.effective_rate_cny} CNY · <span class="text-white-50">${rateSourceText(data.rate_source)}</span>`;
+        } else {
+            rateBadge.innerHTML = `<span class="text-warning"><i class="bi bi-exclamation-triangle me-1"></i>系统未配置 ${curr} 汇率 — 请到系统设置中添加</span>`;
+        }
+        document.getElementById('pvOrders').innerHTML = data.total_orders;
+        document.getElementById('pvGross').innerHTML = dual(data.total_gross_pln, data.total_gross_cny, curr);
+        document.getElementById('pvNet').innerHTML = dual(data.total_net_pln, data.total_net_cny, curr);
+        document.getElementById('pvCost').innerHTML = dual(data.cost_amount_pln, data.cost_amount_cny, curr);
+        document.getElementById('pvPartnerProfit').innerHTML = dual(data.partner_profit_pln, data.partner_profit_cny, curr);
+        document.getElementById('pvOurRecv').innerHTML = dual(data.our_receivable_pln, data.our_receivable_cny, curr);
+    } catch (e) { console.error(e); }
+}
+
+// ========== Statements ==========
+async function loadStatements() {
+    try {
+        const partnerId = document.getElementById('partnerSelector').value;
+        const url = partnerId ? `/api/reconciliation/statements?partner_id=${partnerId}` : '/api/reconciliation/statements';
+        statementsCache = await api(url);
+        const tbody = document.getElementById('statementsBody');
+        if (statementsCache.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-4">暂无对账单</td></tr>';
+            return;
+        }
+        // fetch receipts totals per statement asynchronously
+        const partnerMap = {};
+        partnersCache.forEach(p => partnerMap[p.id] = p.name);
+
+        tbody.innerHTML = statementsCache.map(s => {
+            const statusBadge = getStatusBadge(s.status);
+            const manualTag = s.is_manual ? '<span class="badge bg-warning text-dark ms-1">手工</span>' : '';
+            const curr = s.currency || 'PLN';
+            const rateDisplay = s.effective_rate_cny
+                ? `<span class="badge bg-secondary">1 ${curr} = ${s.effective_rate_cny}</span>`
+                : `<span class="text-warning small"><i class="bi bi-exclamation-triangle"></i> 未配置</span>`;
+            return `<tr>
+                <td class="ps-4 text-white">${s.period_year}-${String(s.period_month).padStart(2,'0')}${manualTag}</td>
+                <td class="text-white-50">${partnerMap[s.partner_id] || '-'}</td>
+                <td class="text-end text-white-50">${s.total_orders || 0}</td>
+                <td class="text-end text-info">${dual(s.total_net_pln, s.total_net_cny, curr)}</td>
+                <td class="text-end text-success">${dual(s.our_receivable_pln, s.our_receivable_cny, curr)}</td>
+                <td class="text-end text-muted" id="rcv-${s.id}">—</td>
+                <td class="text-end text-warning" id="out-${s.id}">—</td>
+                <td>${rateDisplay}</td>
+                <td>${statusBadge}</td>
+                <td class="text-end pe-4">
+                    <button class="btn btn-sm btn-outline-info btn-view-stmt" data-id="${s.id}"><i class="bi bi-eye"></i></button>
+                    ${IS_RECON_ADMIN && !['locked','settled'].includes(s.status) ? `<button class="btn btn-sm btn-outline-danger btn-del-stmt" data-id="${s.id}"><i class="bi bi-trash"></i></button>` : ''}
+                </td>
+            </tr>`;
+        }).join('');
+
+        // Bind events
+        tbody.querySelectorAll('.btn-view-stmt').forEach(b => b.addEventListener('click', () => openStatementDetail(parseInt(b.dataset.id))));
+        tbody.querySelectorAll('.btn-del-stmt').forEach(b => b.addEventListener('click', () => deleteStatement(parseInt(b.dataset.id))));
+
+        // Load received amounts per statement
+        statementsCache.forEach(async s => {
+            try {
+                const detail = await api(`/api/reconciliation/statements/${s.id}`);
+                const curr = detail.currency || s.currency || 'PLN';
+                const rcvEl = document.getElementById(`rcv-${s.id}`);
+                const outEl = document.getElementById(`out-${s.id}`);
+                if (rcvEl) rcvEl.innerHTML = `${fmt(detail.total_received_pln)} ${curr}`;
+                if (outEl) {
+                    outEl.innerHTML = `${fmt(detail.outstanding_pln)} ${curr}`;
+                    if (detail.outstanding_pln <= 0.01) outEl.className = 'text-end text-success';
+                }
+            } catch (e) {}
+        });
+    } catch (e) { console.error(e); }
+}
+
+function getStatusBadge(status) {
+    const map = {
+        'draft': '<span class="badge bg-secondary">草稿</span>',
+        'generated': '<span class="badge bg-primary">已生成</span>',
+        'confirmed': '<span class="badge bg-info">合伙人已确认</span>',
+        'locked': '<span class="badge bg-warning text-dark">已锁定</span>',
+        'settled': '<span class="badge bg-success">已结清</span>'
+    };
+    return map[status] || `<span class="badge bg-secondary">${status}</span>`;
+}
+
+async function generateStatement() {
+    const partner_id = parseInt(document.getElementById('genPartner').value);
+    const year = parseInt(document.getElementById('genYear').value);
+    const month = parseInt(document.getElementById('genMonth').value);
+    try {
+        await api('/api/reconciliation/statements/generate', {method:'POST', body: JSON.stringify({partner_id, year, month})});
+        bootstrap.Modal.getInstance(document.getElementById('genStmtModal')).hide();
+        showToast('对账单已生成', 'success');
+        loadStatements();
+        loadOverview();
+    } catch (e) { showToast('生成失败: ' + e.message, 'danger'); }
+}
+
+async function manualStatement() {
+    const payload = {
+        partner_id: parseInt(document.getElementById('manPartner').value),
+        year: parseInt(document.getElementById('manYear').value),
+        month: parseInt(document.getElementById('manMonth').value),
+        total_orders: parseInt(document.getElementById('manOrders').value) || 0,
+        total_gross_pln: parseFloat(document.getElementById('manGross').value) || 0,
+        total_net_pln: parseFloat(document.getElementById('manNet').value) || 0,
+        notes: document.getElementById('manNotes').value
+    };
+    try {
+        await api('/api/reconciliation/statements/manual', {method:'POST', body: JSON.stringify(payload)});
+        bootstrap.Modal.getInstance(document.getElementById('manualStmtModal')).hide();
+        showToast('历史对账单已录入', 'success');
+        loadStatements();
+        loadOverview();
+    } catch (e) { showToast('录入失败: ' + e.message, 'danger'); }
+}
+
+async function deleteStatement(id) {
+    if (!confirm('确定删除这张对账单？相关收款记录会保留但解除关联。')) return;
+    try {
+        await api(`/api/reconciliation/statements/${id}`, {method:'DELETE'});
+        showToast('已删除', 'success');
+        loadStatements();
+        loadOverview();
+    } catch (e) { showToast('删除失败: ' + e.message, 'danger'); }
+}
+
+async function openStatementDetail(id) {
+    try {
+        const s = await api(`/api/reconciliation/statements/${id}`);
+        const body = document.getElementById('stmtDetailBody');
+        const footer = document.getElementById('stmtDetailFooter');
+
+        const curr = s.currency || 'PLN';
+        const rate = s.effective_rate_cny;
+        const rateBlock = rate
+            ? `<div class="d-flex align-items-center gap-2 flex-wrap">
+                   <span class="badge bg-primary fs-6">1 ${curr} = ${rate} CNY</span>
+                   <small class="text-white-50">${rateSourceText(s.rate_source)}</small>
+                   ${IS_RECON_ADMIN && !['locked','settled'].includes(s.status)
+                       ? `<button class="btn btn-sm btn-outline-primary ms-2" id="btnRefreshRate"><i class="bi bi-arrow-clockwise me-1"></i>重新获取系统汇率</button>`
+                       : ''}
+               </div>`
+            : `<div class="alert alert-warning py-2 mb-0 small">
+                   <i class="bi bi-exclamation-triangle me-1"></i>系统未配置 ${s.period_year}-${String(s.period_month).padStart(2,'0')} 的 ${curr} 汇率，
+                   请到 <a href="/settings" class="alert-link">系统设置</a> 添加。
+               </div>`;
+
+        body.innerHTML = `
+            <div class="row g-2 mb-3">
+                <div class="col-md-6"><div class="text-white-50 small">合伙人</div><div class="text-white">${s.partner_name} <span class="badge bg-dark text-muted ms-1" style="font-weight:400;">${curr}</span></div></div>
+                <div class="col-md-6"><div class="text-white-50 small">期间</div><div class="text-white">${s.period_year}-${String(s.period_month).padStart(2,'0')}</div></div>
+            </div>
+            <hr class="border-secondary">
+            <div class="row g-2 mb-3">
+                <div class="col-md-4"><div class="text-white-50 small">订单数</div><div class="text-white h5">${s.total_orders || 0}</div></div>
+                <div class="col-md-4"><div class="text-white-50 small">总销售额</div><div class="text-white h5">${dual(s.total_gross_pln, s.total_gross_cny, curr)}</div></div>
+                <div class="col-md-4"><div class="text-white-50 small">净销售额</div><div class="text-info h5">${dual(s.total_net_pln, s.total_net_cny, curr)}</div></div>
+            </div>
+            <hr class="border-secondary">
+            <div class="row g-2 mb-3">
+                <div class="col-md-4"><div class="text-white-50 small">产品成本 (合伙人留)</div><div class="text-warning">${dual(s.cost_amount_pln, s.cost_amount_cny, curr)}</div></div>
+                <div class="col-md-4"><div class="text-white-50 small">合伙人利润 (合伙人留)</div><div class="text-warning">${dual(s.partner_profit_pln, s.partner_profit_cny, curr)}</div></div>
+                <div class="col-md-4"><div class="text-white-50 small">我方应收</div><div class="text-success h5">${dual(s.our_receivable_pln, s.our_receivable_cny, curr)}</div></div>
+            </div>
+            <hr class="border-secondary">
+            <div class="mb-3">
+                <label class="text-white-50 small d-block mb-1">汇率 ${curr}→CNY（系统设置）</label>
+                ${rateBlock}
+            </div>
+            <div class="mb-3"><div class="text-white-50 small">已收款 / 未收余额</div>
+                <div class="text-white">已收 <span class="text-success">${dual(s.total_received_pln, s.total_received_cny, curr)}</span></div>
+                <div class="text-white">未收 <span class="${s.outstanding_pln>0.01?'text-warning':'text-success'}">${dual(s.outstanding_pln, s.outstanding_cny, curr)}</span></div>
+            </div>
+            <div class="mb-2"><div class="text-white-50 small">状态</div>${getStatusBadge(s.status)}</div>
+            <div class="mb-2"><div class="text-white-50 small">备注</div>
+                ${IS_RECON_ADMIN && !['locked','settled'].includes(s.status) ? `<textarea id="stmtNotes" class="form-control bg-dark text-white border-secondary" rows="2">${s.notes||''}</textarea>` : `<div class="text-white">${s.notes||'-'}</div>`}
+            </div>
+            ${s.receipts && s.receipts.length ? `
+                <hr class="border-secondary"><h6 class="text-white-50">关联的收款记录</h6>
+                <table class="table table-dark table-sm mb-0"><thead><tr><th>日期</th><th>金额(${curr})</th><th>金额(CNY)</th><th>方式</th><th>单号</th></tr></thead>
+                <tbody>${s.receipts.map(r => `<tr><td>${r.receipt_date}</td><td>${fmt(r.amount_pln)}</td><td>${r.amount_cny?fmt(r.amount_cny):'-'}</td><td>${r.payment_method||'-'}</td><td>${r.reference_no||'-'}</td></tr>`).join('')}</tbody></table>
+            ` : ''}
+        `;
+
+        // Footer actions
+        let actions = `<button class="btn btn-outline-light" data-bs-dismiss="modal">关闭</button>`;
+        if (IS_RECON_ADMIN) {
+            if (!['locked','settled'].includes(s.status)) {
+                actions += ` <button class="btn btn-primary" id="btnSaveStmt">保存备注</button>`;
+                actions += ` <button class="btn btn-warning" id="btnLockStmt">锁定</button>`;
+            } else if (s.status === 'locked') {
+                actions += ` <button class="btn btn-success" id="btnSettleStmt">标记已结清</button>`;
+                actions += ` <button class="btn btn-outline-warning" id="btnUnlockStmt">解锁</button>`;
+            }
+        } else {
+            if (s.status === 'generated') {
+                actions += ` <button class="btn btn-info" id="btnConfirmStmt">确认无误</button>`;
+            }
+        }
+        footer.innerHTML = actions;
+
+        // Bind actions
+        const btnSave = document.getElementById('btnSaveStmt');
+        if (btnSave) btnSave.addEventListener('click', () => {
+            const notesEl = document.getElementById('stmtNotes');
+            updateStatement(id, {notes: notesEl ? notesEl.value : ''});
+        });
+        const btnRefreshRate = document.getElementById('btnRefreshRate');
+        if (btnRefreshRate) btnRefreshRate.addEventListener('click', async () => {
+            try {
+                const r = await api(`/api/reconciliation/rate?currency=${curr}&year=${s.period_year}&month=${s.period_month}`);
+                if (!r.rate) {
+                    showToast(`系统未配置该月份 ${curr} 汇率`, 'warning');
+                    return;
+                }
+                await api(`/api/reconciliation/statements/${id}`, {method:'PUT', body: JSON.stringify({exchange_rate_cny: r.rate})});
+                showToast(`汇率已刷新为 ${r.rate}`, 'success');
+                openStatementDetail(id);
+                loadStatements();
+                loadOverview();
+            } catch (e) { showToast('刷新失败: ' + e.message, 'danger'); }
+        });
+        const btnLock = document.getElementById('btnLockStmt');
+        if (btnLock) btnLock.addEventListener('click', () => updateStatement(id, {action:'lock'}));
+        const btnSettle = document.getElementById('btnSettleStmt');
+        if (btnSettle) btnSettle.addEventListener('click', () => updateStatement(id, {action:'settle'}));
+        const btnUnlock = document.getElementById('btnUnlockStmt');
+        if (btnUnlock) btnUnlock.addEventListener('click', () => updateStatement(id, {action:'unlock'}));
+        const btnConfirm = document.getElementById('btnConfirmStmt');
+        if (btnConfirm) btnConfirm.addEventListener('click', () => updateStatement(id, {action:'confirm'}));
+
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('stmtDetailModal')).show();
+    } catch (e) { showToast('加载失败: ' + e.message, 'danger'); }
+}
+
+async function updateStatement(id, payload) {
+    try {
+        await api(`/api/reconciliation/statements/${id}`, {method:'PUT', body: JSON.stringify(payload)});
+        showToast('已更新', 'success');
+        bootstrap.Modal.getInstance(document.getElementById('stmtDetailModal')).hide();
+        loadStatements();
+        loadOverview();
+    } catch (e) { showToast('失败: ' + e.message, 'danger'); }
+}
+
+// ========== Receipts ==========
+async function loadReceipts() {
+    try {
+        const partnerId = document.getElementById('partnerSelector').value;
+        const url = partnerId ? `/api/reconciliation/receipts?partner_id=${partnerId}` : '/api/reconciliation/receipts';
+        const data = await api(url);
+        const tbody = document.getElementById('receiptsBody');
+        if (data.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-4">暂无收款记录</td></tr>';
+            return;
+        }
+        tbody.innerHTML = data.map(r => {
+            const stmtLabel = r.period_year ? `${r.period_year}-${String(r.period_month).padStart(2,'0')}` : '-';
+            const curr = r.currency || 'PLN';
+            return `<tr>
+                <td class="ps-4 text-white">${r.receipt_date}</td>
+                <td class="text-white-50">${r.partner_name}</td>
+                <td class="text-white-50">${stmtLabel}</td>
+                <td class="text-end text-success">${fmt(r.amount_pln)} <small class="text-white-50">${curr}</small></td>
+                <td class="text-end text-white-50">${r.exchange_rate_cny || '-'}</td>
+                <td class="text-end text-white-50">${r.amount_cny ? fmt(r.amount_cny) : '-'}</td>
+                <td class="text-white-50">${r.payment_method || '-'}</td>
+                <td class="text-white-50">${r.reference_no || '-'}</td>
+                <td class="text-white-50" style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.notes||''}">${r.notes || '-'}</td>
+                <td class="text-end pe-4">
+                    ${IS_RECON_ADMIN ? `<button class="btn btn-sm btn-outline-danger btn-del-rcpt" data-id="${r.id}"><i class="bi bi-trash"></i></button>` : ''}
+                </td>
+            </tr>`;
+        }).join('');
+        tbody.querySelectorAll('.btn-del-rcpt').forEach(b => b.addEventListener('click', () => deleteReceipt(parseInt(b.dataset.id))));
+    } catch (e) { console.error(e); }
+}
+
+async function saveReceipt() {
+    const payload = {
+        partner_id: parseInt(document.getElementById('rcptPartner').value),
+        statement_id: document.getElementById('rcptStatement').value || null,
+        receipt_date: document.getElementById('rcptDate').value,
+        amount_pln: parseFloat(document.getElementById('rcptAmount').value) || 0,
+        exchange_rate_cny: parseFloat(document.getElementById('rcptRate').value) || null,
+        payment_method: document.getElementById('rcptMethod').value,
+        reference_no: document.getElementById('rcptRef').value,
+        receipt_url: document.getElementById('rcptUrl').value,
+        notes: document.getElementById('rcptNotes').value
+    };
+    if (!payload.receipt_date || !payload.amount_pln) {
+        showToast('请填写收款日期和金额', 'warning');
+        return;
+    }
+    try {
+        await api('/api/reconciliation/receipts', {method:'POST', body: JSON.stringify(payload)});
+        bootstrap.Modal.getInstance(document.getElementById('addReceiptModal')).hide();
+        showToast('收款已记录', 'success');
+        // Clear form
+        ['rcptDate','rcptAmount','rcptRate','rcptCny','rcptRef','rcptUrl','rcptNotes'].forEach(id => document.getElementById(id).value = '');
+        loadReceipts();
+        loadOverview();
+        loadStatements();
+    } catch (e) { showToast('保存失败: ' + e.message, 'danger'); }
+}
+
+async function deleteReceipt(id) {
+    if (!confirm('确定删除这条收款记录？')) return;
+    try {
+        await api(`/api/reconciliation/receipts/${id}`, {method:'DELETE'});
+        showToast('已删除', 'success');
+        loadReceipts();
+        loadOverview();
+    } catch (e) { showToast('失败: ' + e.message, 'danger'); }
+}
+
+// Populate statement dropdown in receipt modal when it opens
+document.getElementById('addReceiptModal').addEventListener('show.bs.modal', () => {
+    const partnerSel = document.getElementById('rcptPartner');
+    partnerSel.addEventListener('change', () => {
+        populateReceiptStmts();
+        updateReceiptModalCurrency();
+        autoFillReceiptRate();
+    });
+    populateReceiptStmts();
+    updateReceiptModalCurrency();
+    // Default date = today
+    if (!document.getElementById('rcptDate').value) {
+        document.getElementById('rcptDate').value = new Date().toISOString().split('T')[0];
+    }
+    document.getElementById('rcptDate').addEventListener('change', autoFillReceiptRate);
+    autoFillReceiptRate();
+});
+
+// Update all "PLN" labels in receipt modal to the selected partner's currency
+function updateReceiptModalCurrency() {
+    const pid = document.getElementById('rcptPartner').value;
+    const curr = partnerCurrency(pid) || 'PLN';
+    document.querySelectorAll('.rcpt-curr-label').forEach(el => el.textContent = curr);
+}
+
+// Update all "PLN" labels in manual statement modal to the selected partner's currency
+function updateManualModalCurrency() {
+    const pid = document.getElementById('manPartner').value;
+    const curr = partnerCurrency(pid) || 'PLN';
+    document.querySelectorAll('.man-curr-label').forEach(el => el.textContent = curr);
+}
+
+// Wire up change event for manual statement modal
+document.addEventListener('DOMContentLoaded', () => {
+    const manPartner = document.getElementById('manPartner');
+    if (manPartner) manPartner.addEventListener('change', updateManualModalCurrency);
+    const manualModal = document.getElementById('manualStmtModal');
+    if (manualModal) manualModal.addEventListener('show.bs.modal', updateManualModalCurrency);
+});
+
+async function autoFillReceiptRate() {
+    const date = document.getElementById('rcptDate').value;
+    const pid = document.getElementById('rcptPartner').value;
+    if (!date || !pid) return;
+    const curr = partnerCurrency(pid) || 'PLN';
+    const [y, m] = date.split('-');
+    try {
+        const r = await api(`/api/reconciliation/rate?currency=${curr}&year=${y}&month=${parseInt(m)}`);
+        const rateEl = document.getElementById('rcptRate');
+        const hintEl = document.getElementById('rcptRateHint');
+        if (r.rate) {
+            // Only auto-fill if empty or current value matches previous auto-fill
+            if (!rateEl.value || rateEl.dataset.autoFilled === '1') {
+                rateEl.value = r.rate;
+                rateEl.dataset.autoFilled = '1';
+            }
+            hintEl.textContent = `（系统: ${r.rate}，${r.source_year_month||''}）`;
+            hintEl.className = 'text-muted';
+            // Trigger CNY calc
+            const a = parseFloat(document.getElementById('rcptAmount').value) || 0;
+            document.getElementById('rcptCny').value = (a * r.rate).toFixed(2);
+        } else {
+            hintEl.textContent = `（系统未配置 ${curr} 该月汇率）`;
+            hintEl.className = 'text-warning';
+        }
+    } catch (e) {}
+}
+
+// Clear auto-filled marker when user manually edits rate
+document.getElementById('rcptRate').addEventListener('input', function() { this.dataset.autoFilled = '0'; });
+
+async function populateReceiptStmts() {
+    const pid = document.getElementById('rcptPartner').value;
+    if (!pid) return;
+    try {
+        const stmts = await api(`/api/reconciliation/statements?partner_id=${pid}`);
+        const sel = document.getElementById('rcptStatement');
+        sel.innerHTML = '<option value="">-- 不关联 --</option>' + stmts.map(s => `<option value="${s.id}">${s.period_year}-${String(s.period_month).padStart(2,'0')} (应收 ${fmt(s.our_receivable_pln)} PLN)</option>`).join('');
+    } catch (e) {}
+}
+
+// ========== Partner Settings ==========
+async function loadPartnerSettings() {
+    if (!IS_RECON_ADMIN) return;
+    try {
+        const box = document.getElementById('partnersSettingsBox');
+        if (!partnersCache.length) {
+            box.innerHTML = `
+                <div class="alert alert-warning mb-0">
+                    <i class="bi bi-exclamation-triangle me-2"></i>
+                    <strong>未能加载到合伙人列表</strong><br>
+                    <small>可能原因：<br>
+                    1. 浏览器缓存旧版本，请按 <kbd>Ctrl+Shift+R</kbd>（Windows）或 <kbd>Cmd+Shift+R</kbd>（Mac）强制刷新<br>
+                    2. 打开浏览器开发者工具（F12）→ Console 标签，查看是否有红色错误<br>
+                    3. Network 标签里搜索 <code>/api/partners</code>，查看返回状态和内容<br>
+                    4. 如果确实需要新增合伙人，点击右上角"+ 新增合伙人"</small>
+                </div>`;
+            return;
+        }
+        box.innerHTML = partnersCache.map(p => `
+            <div class="border border-secondary border-opacity-25 rounded p-3 mb-3" data-partner="${p.id}">
+                <div class="d-flex justify-content-between align-items-start mb-2">
+                    <div>
+                        <h6 class="text-white mb-1">${p.name} <span class="badge bg-dark text-muted ms-1" style="font-weight:400;">${p.code||''}</span></h6>
+                        <div class="text-white-50 small">${p.description || '<span class="text-muted">（暂无描述）</span>'}</div>
+                    </div>
+                    <div class="d-flex gap-2 flex-wrap">
+                        <button class="btn btn-sm btn-outline-warning btn-edit-partner" data-id="${p.id}"><i class="bi bi-pencil"></i> 编辑</button>
+                        <button class="btn btn-sm btn-outline-info btn-edit-sites" data-id="${p.id}"><i class="bi bi-globe"></i> 绑定站点</button>
+                        ${IS_SUPER_ADMIN ? `<button class="btn btn-sm btn-outline-info btn-edit-users" data-id="${p.id}"><i class="bi bi-people"></i> 绑定用户</button>` : ''}
+                        ${IS_SUPER_ADMIN ? `<button class="btn btn-sm btn-outline-danger btn-del-partner" data-id="${p.id}" title="删除"><i class="bi bi-trash"></i></button>` : ''}
+                    </div>
+                </div>
+                <div class="row g-2">
+                    <div class="col-md-3"><label class="form-label text-white-50 small">产品成本占比</label><input type="number" step="0.01" class="form-control form-control-sm bg-dark text-white border-secondary p-cost" value="${p.cost_ratio}"></div>
+                    <div class="col-md-3"><label class="form-label text-white-50 small">合伙人利润占比</label><input type="number" step="0.01" class="form-control form-control-sm bg-dark text-white border-secondary p-pp" value="${p.partner_profit_ratio}"></div>
+                    <div class="col-md-3"><label class="form-label text-white-50 small">我方利润占比</label><input type="number" step="0.01" class="form-control form-control-sm bg-dark text-white border-secondary p-op" value="${p.our_profit_ratio}"></div>
+                    <div class="col-md-3 d-flex align-items-end"><button class="btn btn-sm btn-primary w-100 btn-save-ratio" data-id="${p.id}">保存比例</button></div>
+                </div>
+                <div class="mt-2 bound-info" id="bound-${p.id}"></div>
+            </div>
+        `).join('');
+
+        box.querySelectorAll('.btn-save-ratio').forEach(b => b.addEventListener('click', () => savePartnerRatio(parseInt(b.dataset.id))));
+        box.querySelectorAll('.btn-edit-partner').forEach(b => b.addEventListener('click', () => openEditPartner(parseInt(b.dataset.id))));
+        box.querySelectorAll('.btn-edit-sites').forEach(b => b.addEventListener('click', () => editPartnerSites(parseInt(b.dataset.id))));
+        box.querySelectorAll('.btn-edit-users').forEach(b => b.addEventListener('click', () => editPartnerUsers(parseInt(b.dataset.id))));
+        box.querySelectorAll('.btn-del-partner').forEach(b => b.addEventListener('click', () => deletePartner(parseInt(b.dataset.id))));
+
+        // Load bound info for each partner
+        partnersCache.forEach(async p => {
+            try {
+                const [sites, users] = await Promise.all([
+                    api(`/api/partners/${p.id}/sites`),
+                    IS_SUPER_ADMIN ? api(`/api/partners/${p.id}/users`) : Promise.resolve({bound_user_ids: [], all_users: []})
+                ]);
+                const boundSites = sites.all_sites.filter(s => sites.bound_site_ids.includes(s.id));
+                const boundUsers = users.all_users.filter(u => users.bound_user_ids.includes(u.id));
+                const el = document.getElementById(`bound-${p.id}`);
+                if (el) el.innerHTML = `
+                    <div class="text-white-50 small">
+                        <span class="me-3"><i class="bi bi-globe me-1"></i>已绑定 ${boundSites.length} 个站点: ${boundSites.slice(0,5).map(s => s.url.replace(/https?:\/\//,'')).join(', ')}${boundSites.length>5?'...':''}</span>
+                        ${IS_SUPER_ADMIN ? `<span><i class="bi bi-people me-1"></i>已绑定 ${boundUsers.length} 个用户: ${boundUsers.map(u => u.username).join(', ') || '无'}</span>` : ''}
+                    </div>
+                `;
+            } catch (e) {}
+        });
+    } catch (e) { console.error(e); }
+}
+
+async function savePartnerRatio(id) {
+    const row = document.querySelector(`[data-partner="${id}"]`);
+    const p = partnersCache.find(x => x.id === id);
+    const payload = {
+        name: p.name,
+        description: p.description,
+        cost_ratio: parseFloat(row.querySelector('.p-cost').value),
+        partner_profit_ratio: parseFloat(row.querySelector('.p-pp').value),
+        our_profit_ratio: parseFloat(row.querySelector('.p-op').value),
+        currency: p.currency
+    };
+    try {
+        await api(`/api/partners/${id}`, {method:'PUT', body: JSON.stringify(payload)});
+        showToast('分成比例已更新', 'success');
+        loadPartners();
+    } catch (e) { showToast('失败: ' + e.message, 'danger'); }
+}
+
+async function editPartnerSites(id) {
+    try {
+        const data = await api(`/api/partners/${id}/sites`);
+        const checked = new Set(data.bound_site_ids);
+        const html = data.all_sites.map(s => `
+            <div class="form-check">
+                <input class="form-check-input" type="checkbox" value="${s.id}" id="ps_${s.id}" ${checked.has(s.id)?'checked':''}>
+                <label class="form-check-label text-white" for="ps_${s.id}">
+                    <span class="badge bg-secondary me-1">${s.country||'-'}</span>${s.url.replace(/https?:\/\//,'')}
+                    <span class="text-muted small">(${s.manager||'-'})</span>
+                </label>
+            </div>
+        `).join('');
+        showPromptModal('绑定站点', html, async () => {
+            const ids = Array.from(document.querySelectorAll('#promptBody input[type=checkbox]:checked')).map(x => parseInt(x.value));
+            await api(`/api/partners/${id}/sites`, {method:'PUT', body: JSON.stringify({site_ids: ids})});
+            showToast('站点绑定已更新', 'success');
+            loadPartnerSettings();
+        });
+    } catch (e) { showToast('加载失败: ' + e.message, 'danger'); }
+}
+
+async function editPartnerUsers(id) {
+    try {
+        const data = await api(`/api/partners/${id}/users`);
+        const checked = new Set(data.bound_user_ids);
+        const tip = `
+            <div class="alert alert-info small mb-3">
+                <i class="bi bi-info-circle me-1"></i>
+                下拉只显示<b>已在"用户管理"中授予"合伙人对账权限"的用户</b>。<br>
+                • 勾选 = 该用户<b>只能看到此合伙人</b>的对账数据（用于外部合伙人，如金谷/金毅）<br>
+                • 不勾选任何合伙人 = 该用户<b>能看全部合伙人</b>（用于内部财务）
+            </div>`;
+        let html;
+        if (data.all_users.length === 0) {
+            html = tip + `
+                <div class="text-center text-muted py-4">
+                    <i class="bi bi-exclamation-circle fs-1"></i>
+                    <p class="mt-2">暂无可绑定用户</p>
+                    <p class="small">请先到 <a href="/users" class="text-info">系统设置 → 用户管理</a> 勾选某个用户的"合伙人对账权限"。</p>
+                </div>`;
+        } else {
+            html = tip + data.all_users.map(u => `
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" value="${u.id}" id="pu_${u.id}" ${checked.has(u.id)?'checked':''}>
+                    <label class="form-check-label text-white" for="pu_${u.id}">
+                        <strong>${u.username}</strong> <span class="text-muted small">(${u.name||'-'} / ${u.role})</span>
+                    </label>
+                </div>
+            `).join('');
+        }
+        showPromptModal('绑定用户（数据范围限制）', html, async () => {
+            const ids = Array.from(document.querySelectorAll('#promptBody input[type=checkbox]:checked')).map(x => parseInt(x.value));
+            await api(`/api/partners/${id}/users`, {method:'PUT', body: JSON.stringify({user_ids: ids})});
+            showToast('用户绑定已更新', 'success');
+            loadPartnerSettings();
+        });
+    } catch (e) { showToast('加载失败: ' + e.message, 'danger'); }
+}
+
+async function deletePartner(id) {
+    if (!confirm('确定删除此合伙人？所有相关对账单和收款记录都会被删除！')) return;
+    try {
+        await api(`/api/partners/${id}`, {method:'DELETE'});
+        showToast('已删除', 'success');
+        loadPartners().then(() => { loadOverview(); loadPartnerSettings(); });
+    } catch (e) { showToast('失败: ' + e.message, 'danger'); }
+}
+
+// Reset partner modal to "new" mode
+function resetPartnerModal() {
+    document.getElementById('partnerModalTitle').textContent = '新增合伙人';
+    document.getElementById('btnSavePartner').textContent = '创建';
+    document.getElementById('editPartnerId').value = '';
+    document.getElementById('newPartnerName').value = '';
+    document.getElementById('newPartnerCode').value = '';
+    document.getElementById('newPartnerCode').disabled = false;
+    document.getElementById('newPartnerDesc').value = '';
+    document.getElementById('newPartnerCurrency').value = 'PLN';
+    document.getElementById('newPartnerCost').value = '0.50';
+    document.getElementById('newPartnerPP').value = '0.25';
+    document.getElementById('newPartnerOP').value = '0.25';
+}
+
+// Open modal in "edit" mode, pre-filled with partner data
+function openEditPartner(id) {
+    const p = partnersCache.find(x => x.id === id);
+    if (!p) { showToast('未找到合伙人数据', 'danger'); return; }
+    document.getElementById('partnerModalTitle').textContent = `编辑合伙人：${p.name}`;
+    document.getElementById('btnSavePartner').textContent = '保存修改';
+    document.getElementById('editPartnerId').value = p.id;
+    document.getElementById('newPartnerName').value = p.name || '';
+    document.getElementById('newPartnerCode').value = p.code || '';
+    document.getElementById('newPartnerCode').disabled = true;  // code is immutable
+    document.getElementById('newPartnerDesc').value = p.description || '';
+    document.getElementById('newPartnerCurrency').value = p.currency || 'PLN';
+    document.getElementById('newPartnerCost').value = p.cost_ratio;
+    document.getElementById('newPartnerPP').value = p.partner_profit_ratio;
+    document.getElementById('newPartnerOP').value = p.our_profit_ratio;
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('addPartnerModal')).show();
+}
+
+// Unified save handler: POST for new, PUT for edit
+async function savePartner() {
+    const id = document.getElementById('editPartnerId').value;
+    const payload = {
+        name: document.getElementById('newPartnerName').value.trim(),
+        code: document.getElementById('newPartnerCode').value.trim(),
+        description: document.getElementById('newPartnerDesc').value,
+        cost_ratio: parseFloat(document.getElementById('newPartnerCost').value),
+        partner_profit_ratio: parseFloat(document.getElementById('newPartnerPP').value),
+        our_profit_ratio: parseFloat(document.getElementById('newPartnerOP').value),
+        currency: document.getElementById('newPartnerCurrency').value || 'PLN'
+    };
+    if (!payload.name) { showToast('请填写名称', 'warning'); return; }
+
+    // Validate ratios sum
+    const sum = payload.cost_ratio + payload.partner_profit_ratio + payload.our_profit_ratio;
+    if (Math.abs(sum - 1.0) > 0.001) {
+        if (!confirm(`三项占比之和为 ${sum.toFixed(3)}，不等于 1.00，是否继续？`)) return;
+    }
+
+    try {
+        if (id) {
+            await api(`/api/partners/${id}`, {method:'PUT', body: JSON.stringify(payload)});
+            showToast('合伙人已更新', 'success');
+        } else {
+            await api('/api/partners', {method:'POST', body: JSON.stringify(payload)});
+            showToast('合伙人已创建', 'success');
+        }
+        bootstrap.Modal.getInstance(document.getElementById('addPartnerModal')).hide();
+        loadPartners().then(loadPartnerSettings);
+    } catch (e) { showToast('失败: ' + e.message, 'danger'); }
+}
+
+// ========== Utility ==========
+function showToast(msg, type='info') {
+    const div = document.createElement('div');
+    div.className = 'toast-container position-fixed top-0 end-0 p-3';
+    div.style.zIndex = 9999;
+    div.innerHTML = `<div class="toast show bg-${type} text-white"><div class="toast-body">${msg}</div></div>`;
+    document.body.appendChild(div);
+    setTimeout(() => div.remove(), 3000);
+}
+
+function showPromptModal(title, bodyHtml, onConfirm) {
+    // Reuse a simple inline modal
+    let modal = document.getElementById('genericPromptModal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'genericPromptModal';
+        modal.className = 'modal fade';
+        modal.innerHTML = `<div class="modal-dialog"><div class="modal-content bg-dark border border-secondary">
+            <div class="modal-header border-bottom border-secondary"><h5 class="modal-title text-white" id="promptTitle"></h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+            <div class="modal-body" id="promptBody" style="max-height:60vh;overflow-y:auto;"></div>
+            <div class="modal-footer border-top border-secondary"><button class="btn btn-outline-light" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="promptOk">确定</button></div>
+        </div></div>`;
+        document.body.appendChild(modal);
+    }
+    document.getElementById('promptTitle').textContent = title;
+    document.getElementById('promptBody').innerHTML = bodyHtml;
+    const okBtn = document.getElementById('promptOk');
+    const newOk = okBtn.cloneNode(true);
+    okBtn.parentNode.replaceChild(newOk, okBtn);
+    newOk.addEventListener('click', async () => {
+        try {
+            await onConfirm();
+            bootstrap.Modal.getInstance(modal).hide();
+        } catch (e) { showToast('失败: ' + e.message, 'danger'); }
+    });
+    bootstrap.Modal.getOrCreateInstance(modal).show();
+}
+</script>
+{% endblock %}

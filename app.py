@@ -102,6 +102,60 @@ class User(UserMixin):
         except:
             return False
 
+    def can_view_reconciliation(self):
+        """Check if user can access partner reconciliation page (read-only gate).
+        Must have can_view_reconciliation flag OR be super admin."""
+        if self.username == 'admin':
+            return True
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_view_reconciliation FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return user and user['can_view_reconciliation'] == 1
+        except:
+            return False
+
+    def can_edit_reconciliation(self):
+        """Check if user can edit reconciliation data (write access).
+        Must have can_edit_reconciliation flag OR be super admin.
+        Partner members (bound in partner_users) typically do NOT have this flag."""
+        if self.username == 'admin':
+            return True
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_edit_reconciliation FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return user and user['can_edit_reconciliation'] == 1
+        except:
+            return False
+
+    def get_accessible_partner_ids(self):
+        """Return list of partner IDs the user can access.
+        Returns None = unrestricted (super admin, or user with permission but no bindings).
+        Returns list of IDs = restricted to bound partners.
+        Semantics:
+          - Super admin: None (all)
+          - Has permission + bound to partner(s): only those bound
+          - Has permission + no bindings: None (all — internal finance role)
+          - No permission: [] (blocked before reaching here)"""
+        if self.username == 'admin':
+            return None
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_view_reconciliation FROM users WHERE id = ?', (self.id,)).fetchone()
+            if not user or user['can_view_reconciliation'] != 1:
+                conn.close()
+                return []
+            # Has permission — check if scoped to specific partners
+            rows = conn.execute('SELECT partner_id FROM partner_users WHERE user_id = ?', (self.id,)).fetchall()
+            conn.close()
+            if rows:
+                return [r['partner_id'] for r in rows]
+            # No bindings = internal finance, sees all
+            return None
+        except:
+            return []
+
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -4092,6 +4146,136 @@ def init_sales_groups_tables():
     conn.close()
 
 
+def init_partner_reconciliation_tables():
+    """Initialize partner reconciliation related tables"""
+    conn = get_db_connection()
+
+    # Partners table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS partners (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            code TEXT UNIQUE,
+            description TEXT,
+            cost_ratio REAL DEFAULT 0.50,
+            partner_profit_ratio REAL DEFAULT 0.25,
+            our_profit_ratio REAL DEFAULT 0.25,
+            currency TEXT DEFAULT 'PLN',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # Partner-site bindings
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS partner_sites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_id INTEGER NOT NULL,
+            site_id INTEGER NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(partner_id, site_id),
+            FOREIGN KEY (partner_id) REFERENCES partners(id) ON DELETE CASCADE
+        )
+    ''')
+
+    # Partner-user bindings (which users can see which partner's data)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS partner_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(partner_id, user_id),
+            FOREIGN KEY (partner_id) REFERENCES partners(id) ON DELETE CASCADE
+        )
+    ''')
+
+    # Reconciliation statements (monthly)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS reconciliation_statements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_id INTEGER NOT NULL,
+            period_year INTEGER NOT NULL,
+            period_month INTEGER NOT NULL,
+            total_orders INTEGER DEFAULT 0,
+            total_gross_pln REAL DEFAULT 0,
+            total_net_pln REAL DEFAULT 0,
+            cost_amount_pln REAL DEFAULT 0,
+            partner_profit_pln REAL DEFAULT 0,
+            our_receivable_pln REAL DEFAULT 0,
+            exchange_rate_cny REAL,
+            our_receivable_cny REAL,
+            status TEXT DEFAULT 'draft',
+            is_manual INTEGER DEFAULT 0,
+            confirmed_at TEXT,
+            confirmed_by INTEGER,
+            locked_at TEXT,
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(partner_id, period_year, period_month),
+            FOREIGN KEY (partner_id) REFERENCES partners(id) ON DELETE CASCADE
+        )
+    ''')
+
+    # Partner receipts (money received from partners)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS partner_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_id INTEGER NOT NULL,
+            statement_id INTEGER,
+            receipt_date TEXT NOT NULL,
+            amount_pln REAL NOT NULL,
+            exchange_rate_cny REAL,
+            amount_cny REAL,
+            payment_method TEXT,
+            reference_no TEXT,
+            receipt_url TEXT,
+            notes TEXT,
+            created_by INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (partner_id) REFERENCES partners(id) ON DELETE CASCADE,
+            FOREIGN KEY (statement_id) REFERENCES reconciliation_statements(id) ON DELETE SET NULL
+        )
+    ''')
+
+    # Add can_view_reconciliation column to users table
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_view_reconciliation INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # Add can_edit_reconciliation column (write access — separate from view)
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_edit_reconciliation INTEGER DEFAULT 0')
+        # Migration: users who currently have view access and are NOT partner members
+        # were effectively "internal editors" — preserve their edit ability.
+        conn.execute('''
+            UPDATE users SET can_edit_reconciliation = 1
+            WHERE can_view_reconciliation = 1
+              AND id NOT IN (SELECT DISTINCT user_id FROM partner_users)
+        ''')
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # Seed default partner: 金谷金毅（波兰）
+    existing = conn.execute("SELECT id FROM partners WHERE code = 'poland_jin'").fetchone()
+    if not existing:
+        cursor = conn.execute('''
+            INSERT INTO partners (name, code, description, cost_ratio, partner_profit_ratio, our_profit_ratio, currency)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', ('金谷金毅（波兰）', 'poland_jin', '波兰线下店铺合伙人，负责囤货、发货、售后，COD收款', 0.50, 0.25, 0.25, 'PLN'))
+        partner_id = cursor.lastrowid
+        # Auto-bind all PL sites
+        pl_sites = conn.execute("SELECT id FROM sites WHERE country = 'PL'").fetchall()
+        for site in pl_sites:
+            conn.execute('INSERT OR IGNORE INTO partner_sites (partner_id, site_id) VALUES (?, ?)',
+                        (partner_id, site['id']))
+
+    conn.commit()
+    conn.close()
+
+
 # Initialize tables on startup
 with app.app_context():
     init_sites_table()
@@ -4103,6 +4287,7 @@ with app.app_context():
     init_user_preferences_table()
     init_sales_board_tables()
     init_sales_groups_tables()
+    init_partner_reconciliation_tables()
 
 @app.route('/settings')
 @login_required
@@ -5948,12 +6133,18 @@ def get_users():
     """Get all users"""
     conn = get_db_connection()
     try:
-        users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, created_at FROM users').fetchall()
+        users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, created_at FROM users').fetchall()
     except sqlite3.OperationalError:
         try:
-            users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, 0 as can_manage_users, created_at FROM users').fetchall()
+            users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, 0 as can_edit_reconciliation, created_at FROM users').fetchall()
         except sqlite3.OperationalError:
-            users = conn.execute('SELECT id, username, name, role, can_ship, 0 as can_view_report, 0 as can_view_sales_board, 0 as can_manage_users, created_at FROM users').fetchall()
+            try:
+                users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, created_at FROM users').fetchall()
+            except sqlite3.OperationalError:
+                try:
+                    users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, created_at FROM users').fetchall()
+                except sqlite3.OperationalError:
+                    users = conn.execute('SELECT id, username, name, role, can_ship, 0 as can_view_report, 0 as can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, created_at FROM users').fetchall()
     conn.close()
     is_super_admin = (current_user.username == 'admin')
     result = []
@@ -6044,15 +6235,20 @@ def update_user(user_id):
         if target_is_super_admin and role != 'admin':
             return jsonify({'error': '超级管理员角色不可更改'}), 403
 
-        # Only the 'admin' superuser can grant/revoke can_manage_users
+        # Only the 'admin' superuser can grant/revoke can_manage_users, can_view_reconciliation, can_edit_reconciliation
         if is_super_admin:
             can_manage_users_val = 1 if data.get('can_manage_users') else 0
+            can_view_reconciliation_val = 1 if data.get('can_view_reconciliation') else 0
+            can_edit_reconciliation_val = 1 if data.get('can_edit_reconciliation') else 0
+            # Edit permission requires view permission (can't edit what you can't see)
+            if can_edit_reconciliation_val and not can_view_reconciliation_val:
+                can_view_reconciliation_val = 1
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, user_id))
         else:
             # Non-superadmin: cannot change can_manage_users, can_view_sales_board, or set role to admin
             if password:
@@ -6161,8 +6357,929 @@ def update_user_permissions(user_id):
     
     conn.commit()
     conn.close()
-    
+
     return jsonify({'success': True})
+
+
+# ============== PARTNER RECONCILIATION ==============
+
+def reconciliation_viewer_required(f):
+    """Decorator: access partner reconciliation page (super admin, internal viewer, or partner member)"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login'))
+        if not current_user.can_view_reconciliation():
+            return render_template_string('''
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="UTF-8"><title>权限不足</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+<style>
+body{background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
+.box{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:48px;text-align:center;max-width:440px;}
+.icon{font-size:56px;color:#f59e0b;margin-bottom:20px;}
+h1{font-size:22px;font-weight:600;margin-bottom:12px;}
+p{color:#94a3b8;margin-bottom:24px;}
+a{background:#3b82f6;color:#fff;padding:10px 24px;border-radius:8px;text-decoration:none;}
+</style></head>
+<body><div class="box">
+<div class="icon"><i class="bi bi-shield-exclamation"></i></div>
+<h1>权限不足</h1>
+<p>合伙人对账功能需要授权，请联系超级管理员开通。</p>
+<a href="/"><i class="bi bi-house"></i> 返回首页</a>
+</div></body></html>
+            '''), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def reconciliation_api_required(f):
+    """Decorator: same check but returns JSON 403 for APIs"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return jsonify({'error': '未登录'}), 401
+        if not current_user.can_view_reconciliation():
+            return jsonify({'error': '无对账权限'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def _is_reconciliation_admin():
+    """Check if current user can manage (not just view) reconciliation data.
+    Requires can_edit_reconciliation flag (or being super admin).
+    View-only users (like partner members 金谷/金毅) will return False here."""
+    return current_user.can_edit_reconciliation()
+
+
+def _calc_partner_net_sales(partner_id, year, month):
+    """Aggregate net sales for all sites bound to partner in given month.
+    Uses the partner's configured currency to filter orders.
+    Net amount = success_amount - success_shipping (matches existing /monthly logic).
+    Field names use _pln suffix for historical reasons but values are in partner's native currency."""
+    conn = get_db_connection()
+    # Get partner currency
+    p = conn.execute('SELECT currency FROM partners WHERE id = ?', (partner_id,)).fetchone()
+    currency = (p['currency'] if p and p['currency'] else 'PLN')
+
+    # Get bound site URLs
+    sites = conn.execute('''
+        SELECT s.url FROM partner_sites ps
+        JOIN sites s ON s.id = ps.site_id
+        WHERE ps.partner_id = ?
+    ''', (partner_id,)).fetchall()
+    if not sites:
+        conn.close()
+        return {'total_orders': 0, 'total_gross_pln': 0, 'total_net_pln': 0, 'currency': currency}
+
+    site_urls = [s['url'] for s in sites]
+    placeholders = ','.join(['?'] * len(site_urls))
+    month_str = f'{year:04d}-{month:02d}'
+
+    # Aggregate from orders table — filtered by partner's currency
+    # Using the same "success" filter as /monthly (exclude failed/cancelled/etc.)
+    success_cond = "status NOT IN ('failed','cancelled','checkout-draft','trash','cheat')"
+    query = f'''
+        SELECT
+            COUNT(*) as total_orders,
+            COALESCE(SUM(CASE WHEN {success_cond} THEN total ELSE 0 END), 0) as gross,
+            COALESCE(SUM(CASE WHEN {success_cond} THEN total ELSE 0 END), 0) -
+            COALESCE(SUM(CASE WHEN {success_cond} THEN shipping_total ELSE 0 END), 0) as net,
+            COUNT(CASE WHEN {success_cond} THEN 1 END) as success_orders
+        FROM orders
+        WHERE source IN ({placeholders})
+        AND currency = ?
+        AND strftime('%Y-%m', date_created) = ?
+    '''
+    params = site_urls + [currency, month_str]
+    row = conn.execute(query, params).fetchone()
+    conn.close()
+    return {
+        'total_orders': row['success_orders'] or 0,
+        'total_gross_pln': round(row['gross'] or 0, 2),
+        'total_net_pln': round(row['net'] or 0, 2),
+        'currency': currency
+    }
+
+
+def _lookup_partner_rate(currency, year, month):
+    """Look up CNY rate for a currency in a specific month from exchange_rates table.
+    Returns (rate, actual_year_month) or (None, None) if no rate configured."""
+    if not currency or currency == 'CNY':
+        return 1.0, f'{year:04d}-{month:02d}'
+    ym = f'{year:04d}-{month:02d}'
+    return get_cny_rate(currency, ym)
+
+
+def _enrich_statement_cny(stmt_dict, partner_currency='PLN'):
+    """Attach CNY-converted fields to a statement dict.
+    Uses saved exchange_rate_cny if present, otherwise looks up from exchange_rates table."""
+    rate = stmt_dict.get('exchange_rate_cny')
+    rate_source = 'saved'
+    if not rate:
+        looked_up, actual_ym = _lookup_partner_rate(
+            partner_currency,
+            stmt_dict.get('period_year') or 0,
+            stmt_dict.get('period_month') or 0
+        )
+        rate = looked_up
+        rate_source = f'system({actual_ym})' if looked_up else 'none'
+
+    stmt_dict['effective_rate_cny'] = rate
+    stmt_dict['rate_source'] = rate_source
+
+    if rate:
+        for pln_field, cny_field in [
+            ('total_gross_pln', 'total_gross_cny'),
+            ('total_net_pln', 'total_net_cny'),
+            ('cost_amount_pln', 'cost_amount_cny'),
+            ('partner_profit_pln', 'partner_profit_cny'),
+            ('our_receivable_pln', 'our_receivable_cny'),
+        ]:
+            v = stmt_dict.get(pln_field)
+            if v is not None:
+                stmt_dict[cny_field] = round(v * rate, 2)
+    return stmt_dict
+
+
+# ---------- Partner CRUD ----------
+
+@app.route('/partner-reconciliation')
+@login_required
+@reconciliation_viewer_required
+def partner_reconciliation_page():
+    """Partner reconciliation main page"""
+    is_recon_admin = _is_reconciliation_admin()
+    import time
+    resp = make_response(render_template('partner_reconciliation.html',
+                          is_recon_admin=is_recon_admin,
+                          is_super_admin=(current_user.username == 'admin'),
+                          cache_bust=int(time.time())))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
+
+
+@app.route('/api/partners')
+@login_required
+@reconciliation_api_required
+def api_list_partners():
+    """List partners the current user can access"""
+    allowed_ids = current_user.get_accessible_partner_ids()
+    conn = get_db_connection()
+    if allowed_ids is None:
+        partners = conn.execute('SELECT * FROM partners ORDER BY id').fetchall()
+    elif len(allowed_ids) == 0:
+        conn.close()
+        return jsonify([])
+    else:
+        placeholders = ','.join(['?'] * len(allowed_ids))
+        partners = conn.execute(f'SELECT * FROM partners WHERE id IN ({placeholders}) ORDER BY id', allowed_ids).fetchall()
+    conn.close()
+    return jsonify([dict(p) for p in partners])
+
+
+@app.route('/api/partners', methods=['POST'])
+@login_required
+@reconciliation_api_required
+def api_create_partner():
+    """Create a new partner (admin only)"""
+    if not _is_reconciliation_admin():
+        return jsonify({'error': '无权创建合伙人'}), 403
+    data = request.json
+    name = (data.get('name') or '').strip()
+    code = (data.get('code') or '').strip()
+    if not name:
+        return jsonify({'error': '合伙人名称必填'}), 400
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute('''
+            INSERT INTO partners (name, code, description, cost_ratio, partner_profit_ratio, our_profit_ratio, currency)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (name, code or None, data.get('description', ''),
+              float(data.get('cost_ratio', 0.5)),
+              float(data.get('partner_profit_ratio', 0.25)),
+              float(data.get('our_profit_ratio', 0.25)),
+              data.get('currency', 'PLN')))
+        conn.commit()
+        return jsonify({'success': True, 'id': cursor.lastrowid})
+    except sqlite3.IntegrityError as e:
+        return jsonify({'error': f'创建失败: {e}'}), 400
+    finally:
+        conn.close()
+
+
+@app.route('/api/partners/<int:partner_id>', methods=['PUT'])
+@login_required
+@reconciliation_api_required
+def api_update_partner(partner_id):
+    """Update partner info and ratios (admin only)"""
+    if not _is_reconciliation_admin():
+        return jsonify({'error': '无权修改合伙人'}), 403
+    data = request.json
+    conn = get_db_connection()
+    try:
+        conn.execute('''
+            UPDATE partners SET name=?, description=?, cost_ratio=?, partner_profit_ratio=?, our_profit_ratio=?,
+                currency=?, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        ''', ((data.get('name') or '').strip(),
+              data.get('description', ''),
+              float(data.get('cost_ratio', 0.5)),
+              float(data.get('partner_profit_ratio', 0.25)),
+              float(data.get('our_profit_ratio', 0.25)),
+              data.get('currency', 'PLN'),
+              partner_id))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/partners/<int:partner_id>', methods=['DELETE'])
+@login_required
+@reconciliation_api_required
+def api_delete_partner(partner_id):
+    """Delete partner (super admin only)"""
+    if current_user.username != 'admin':
+        return jsonify({'error': '只有超级管理员可以删除合伙人'}), 403
+    conn = get_db_connection()
+    try:
+        conn.execute('DELETE FROM partners WHERE id = ?', (partner_id,))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/partners/<int:partner_id>/sites')
+@login_required
+@reconciliation_api_required
+def api_get_partner_sites(partner_id):
+    """Get sites bound to a partner + all available sites"""
+    conn = get_db_connection()
+    bound = conn.execute('SELECT site_id FROM partner_sites WHERE partner_id = ?', (partner_id,)).fetchall()
+    all_sites = conn.execute('SELECT id, url, country, manager FROM sites ORDER BY country, url').fetchall()
+    conn.close()
+    return jsonify({
+        'bound_site_ids': [b['site_id'] for b in bound],
+        'all_sites': [dict(s) for s in all_sites]
+    })
+
+
+@app.route('/api/partners/<int:partner_id>/sites', methods=['PUT'])
+@login_required
+@reconciliation_api_required
+def api_update_partner_sites(partner_id):
+    """Update sites bound to a partner (admin only)"""
+    if not _is_reconciliation_admin():
+        return jsonify({'error': '无权修改站点绑定'}), 403
+    data = request.json
+    site_ids = data.get('site_ids', [])
+    conn = get_db_connection()
+    try:
+        conn.execute('DELETE FROM partner_sites WHERE partner_id = ?', (partner_id,))
+        for sid in site_ids:
+            conn.execute('INSERT OR IGNORE INTO partner_sites (partner_id, site_id) VALUES (?, ?)',
+                        (partner_id, sid))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/partners/<int:partner_id>/users')
+@login_required
+@reconciliation_api_required
+def api_get_partner_users(partner_id):
+    """Get users bound to a partner + eligible users (those with can_view_reconciliation).
+    Super admin 'admin' is excluded — it already sees everything."""
+    conn = get_db_connection()
+    bound = conn.execute('SELECT user_id FROM partner_users WHERE partner_id = ?', (partner_id,)).fetchall()
+    try:
+        eligible_users = conn.execute('''
+            SELECT id, username, name, role
+            FROM users
+            WHERE can_view_reconciliation = 1 AND username != 'admin'
+            ORDER BY id
+        ''').fetchall()
+    except sqlite3.OperationalError:
+        eligible_users = []
+    conn.close()
+    return jsonify({
+        'bound_user_ids': [b['user_id'] for b in bound],
+        'all_users': [dict(u) for u in eligible_users]
+    })
+
+
+@app.route('/api/partners/<int:partner_id>/users', methods=['PUT'])
+@login_required
+@reconciliation_api_required
+def api_update_partner_users(partner_id):
+    """Update users bound to a partner (super admin only)"""
+    if current_user.username != 'admin':
+        return jsonify({'error': '只有超级管理员可以绑定用户'}), 403
+    data = request.json
+    user_ids = data.get('user_ids', [])
+    conn = get_db_connection()
+    try:
+        conn.execute('DELETE FROM partner_users WHERE partner_id = ?', (partner_id,))
+        for uid in user_ids:
+            conn.execute('INSERT OR IGNORE INTO partner_users (partner_id, user_id) VALUES (?, ?)',
+                        (partner_id, uid))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+# ---------- Reconciliation Statements ----------
+
+def _check_partner_access(partner_id):
+    """Return True if current user can access this partner's data."""
+    allowed = current_user.get_accessible_partner_ids()
+    if allowed is None:
+        return True
+    return partner_id in allowed
+
+
+@app.route('/api/reconciliation/statements')
+@login_required
+@reconciliation_api_required
+def api_list_statements():
+    """List statements, filtered by access + optional partner_id/year"""
+    partner_id = request.args.get('partner_id', type=int)
+    year = request.args.get('year', type=int)
+    allowed_ids = current_user.get_accessible_partner_ids()
+
+    conn = get_db_connection()
+    query = 'SELECT * FROM reconciliation_statements WHERE 1=1'
+    params = []
+    if partner_id:
+        if allowed_ids is not None and partner_id not in allowed_ids:
+            conn.close()
+            return jsonify({'error': '无权查看此合伙人'}), 403
+        query += ' AND partner_id = ?'
+        params.append(partner_id)
+    elif allowed_ids is not None:
+        if not allowed_ids:
+            conn.close()
+            return jsonify([])
+        placeholders = ','.join(['?'] * len(allowed_ids))
+        query += f' AND partner_id IN ({placeholders})'
+        params.extend(allowed_ids)
+    if year:
+        query += ' AND period_year = ?'
+        params.append(year)
+    query += ' ORDER BY period_year DESC, period_month DESC, partner_id'
+    rows = conn.execute(query, params).fetchall()
+    # Load partner currencies for enrichment
+    partner_curr = {p['id']: p['currency'] for p in conn.execute('SELECT id, currency FROM partners').fetchall()}
+    conn.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d['currency'] = partner_curr.get(d['partner_id'], 'PLN')
+        _enrich_statement_cny(d, d['currency'])
+        result.append(d)
+    return jsonify(result)
+
+
+@app.route('/api/reconciliation/statements/preview')
+@login_required
+@reconciliation_api_required
+def api_preview_statement():
+    """Preview a statement without saving (aggregates live from orders)"""
+    partner_id = request.args.get('partner_id', type=int)
+    year = request.args.get('year', type=int)
+    month = request.args.get('month', type=int)
+    if not all([partner_id, year, month]):
+        return jsonify({'error': '缺少参数'}), 400
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权查看此合伙人'}), 403
+
+    conn = get_db_connection()
+    partner = conn.execute('SELECT * FROM partners WHERE id = ?', (partner_id,)).fetchone()
+    conn.close()
+    if not partner:
+        return jsonify({'error': '合伙人不存在'}), 404
+
+    stats = _calc_partner_net_sales(partner_id, year, month)
+    net = stats['total_net_pln']
+    result = dict(stats)
+    result.update({
+        'partner_id': partner_id,
+        'partner_name': partner['name'],
+        'period_year': year,
+        'period_month': month,
+        'currency': partner['currency'],
+        'cost_amount_pln': round(net * partner['cost_ratio'], 2),
+        'partner_profit_pln': round(net * partner['partner_profit_ratio'], 2),
+        'our_receivable_pln': round(net * partner['our_profit_ratio'], 2),
+    })
+    # Attach CNY fields using system-configured rate
+    _enrich_statement_cny(result, partner['currency'])
+    return jsonify(result)
+
+
+@app.route('/api/reconciliation/statements/generate', methods=['POST'])
+@login_required
+@reconciliation_api_required
+def api_generate_statement():
+    """Generate (or refresh) a monthly statement from order data"""
+    if not _is_reconciliation_admin():
+        return jsonify({'error': '无权生成对账单'}), 403
+    data = request.json
+    partner_id = int(data.get('partner_id'))
+    year = int(data.get('year'))
+    month = int(data.get('month'))
+
+    conn = get_db_connection()
+    partner = conn.execute('SELECT * FROM partners WHERE id = ?', (partner_id,)).fetchone()
+    if not partner:
+        conn.close()
+        return jsonify({'error': '合伙人不存在'}), 404
+
+    # Check if already locked/settled
+    existing = conn.execute('''SELECT id, status FROM reconciliation_statements
+        WHERE partner_id=? AND period_year=? AND period_month=?''',
+        (partner_id, year, month)).fetchone()
+    if existing and existing['status'] in ('locked', 'settled'):
+        conn.close()
+        return jsonify({'error': '该月份对账单已锁定，无法重新生成'}), 400
+
+    stats = _calc_partner_net_sales(partner_id, year, month)
+    net = stats['total_net_pln']
+    cost = round(net * partner['cost_ratio'], 2)
+    p_profit = round(net * partner['partner_profit_ratio'], 2)
+    our_recv = round(net * partner['our_profit_ratio'], 2)
+
+    # Auto-lookup exchange rate from system settings
+    rate, _ = _lookup_partner_rate(partner['currency'], year, month)
+    our_recv_cny = round(our_recv * rate, 2) if rate else None
+
+    try:
+        if existing:
+            conn.execute('''UPDATE reconciliation_statements
+                SET total_orders=?, total_gross_pln=?, total_net_pln=?,
+                    cost_amount_pln=?, partner_profit_pln=?, our_receivable_pln=?,
+                    exchange_rate_cny=?, our_receivable_cny=?,
+                    status='generated', updated_at=CURRENT_TIMESTAMP
+                WHERE id=?''',
+                (stats['total_orders'], stats['total_gross_pln'], net,
+                 cost, p_profit, our_recv, rate, our_recv_cny, existing['id']))
+            stmt_id = existing['id']
+        else:
+            cursor = conn.execute('''INSERT INTO reconciliation_statements
+                (partner_id, period_year, period_month, total_orders, total_gross_pln, total_net_pln,
+                 cost_amount_pln, partner_profit_pln, our_receivable_pln,
+                 exchange_rate_cny, our_receivable_cny, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generated')''',
+                (partner_id, year, month, stats['total_orders'], stats['total_gross_pln'], net,
+                 cost, p_profit, our_recv, rate, our_recv_cny))
+            stmt_id = cursor.lastrowid
+        conn.commit()
+        return jsonify({'success': True, 'id': stmt_id, 'exchange_rate_cny': rate})
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/statements/manual', methods=['POST'])
+@login_required
+@reconciliation_api_required
+def api_manual_statement():
+    """Manually create a statement (for historical data before 2026)"""
+    if not _is_reconciliation_admin():
+        return jsonify({'error': '无权录入对账单'}), 403
+    data = request.json
+    partner_id = int(data.get('partner_id'))
+    year = int(data.get('year'))
+    month = int(data.get('month'))
+    net = float(data.get('total_net_pln', 0))
+
+    conn = get_db_connection()
+    partner = conn.execute('SELECT * FROM partners WHERE id = ?', (partner_id,)).fetchone()
+    if not partner:
+        conn.close()
+        return jsonify({'error': '合伙人不存在'}), 404
+
+    cost = round(net * partner['cost_ratio'], 2)
+    p_profit = round(net * partner['partner_profit_ratio'], 2)
+    our_recv = round(net * partner['our_profit_ratio'], 2)
+
+    # Auto-lookup exchange rate from system settings
+    rate, _ = _lookup_partner_rate(partner['currency'], year, month)
+    our_recv_cny = round(our_recv * rate, 2) if rate else None
+
+    try:
+        conn.execute('''INSERT OR REPLACE INTO reconciliation_statements
+            (partner_id, period_year, period_month, total_orders, total_gross_pln, total_net_pln,
+             cost_amount_pln, partner_profit_pln, our_receivable_pln,
+             exchange_rate_cny, our_receivable_cny, status, is_manual, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generated', 1, ?)''',
+            (partner_id, year, month,
+             int(data.get('total_orders', 0)),
+             float(data.get('total_gross_pln', net)),
+             net, cost, p_profit, our_recv,
+             rate, our_recv_cny,
+             data.get('notes', '手工录入历史数据')))
+        conn.commit()
+        return jsonify({'success': True, 'exchange_rate_cny': rate})
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/statements/<int:stmt_id>', methods=['GET'])
+@login_required
+@reconciliation_api_required
+def api_get_statement(stmt_id):
+    """Get statement detail"""
+    conn = get_db_connection()
+    stmt = conn.execute('''
+        SELECT s.*, p.name as partner_name, p.currency
+        FROM reconciliation_statements s
+        JOIN partners p ON s.partner_id = p.id
+        WHERE s.id = ?
+    ''', (stmt_id,)).fetchone()
+    if not stmt:
+        conn.close()
+        return jsonify({'error': '对账单不存在'}), 404
+    if not _check_partner_access(stmt['partner_id']):
+        conn.close()
+        return jsonify({'error': '无权查看'}), 403
+    receipts = conn.execute('''
+        SELECT * FROM partner_receipts WHERE statement_id = ? ORDER BY receipt_date DESC
+    ''', (stmt_id,)).fetchall()
+    conn.close()
+    result = dict(stmt)
+    _enrich_statement_cny(result, stmt['currency'] or 'PLN')
+    rate = result.get('effective_rate_cny')
+    result['receipts'] = [dict(r) for r in receipts]
+    result['total_received_pln'] = round(sum(r['amount_pln'] or 0 for r in receipts), 2)
+    result['outstanding_pln'] = round((stmt['our_receivable_pln'] or 0) - result['total_received_pln'], 2)
+    if rate:
+        result['total_received_cny'] = round(result['total_received_pln'] * rate, 2)
+        result['outstanding_cny'] = round(result['outstanding_pln'] * rate, 2)
+    return jsonify(result)
+
+
+@app.route('/api/reconciliation/statements/<int:stmt_id>', methods=['PUT'])
+@login_required
+@reconciliation_api_required
+def api_update_statement(stmt_id):
+    """Update statement (exchange rate, notes, status)"""
+    data = request.json
+    conn = get_db_connection()
+    stmt = conn.execute('SELECT * FROM reconciliation_statements WHERE id = ?', (stmt_id,)).fetchone()
+    if not stmt:
+        conn.close()
+        return jsonify({'error': '对账单不存在'}), 404
+    if not _check_partner_access(stmt['partner_id']):
+        conn.close()
+        return jsonify({'error': '无权修改'}), 403
+
+    is_admin = _is_reconciliation_admin()
+    try:
+        # Partner member can only confirm their own statement
+        if not is_admin:
+            if data.get('action') == 'confirm' and stmt['status'] == 'generated':
+                conn.execute('''UPDATE reconciliation_statements
+                    SET status='confirmed', confirmed_at=CURRENT_TIMESTAMP, confirmed_by=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?''', (current_user.id, stmt_id))
+                conn.commit()
+                return jsonify({'success': True})
+            return jsonify({'error': '无权执行此操作'}), 403
+
+        # Admin can update exchange rate, notes, status
+        if stmt['status'] in ('locked', 'settled') and data.get('action') != 'unlock':
+            return jsonify({'error': '对账单已锁定'}), 400
+
+        exchange_rate = data.get('exchange_rate_cny')
+        notes = data.get('notes')
+        action = data.get('action')
+
+        updates = []
+        params = []
+        if exchange_rate is not None:
+            rate = float(exchange_rate)
+            updates.append('exchange_rate_cny=?')
+            params.append(rate)
+            updates.append('our_receivable_cny=?')
+            params.append(round((stmt['our_receivable_pln'] or 0) * rate, 2))
+        if notes is not None:
+            updates.append('notes=?')
+            params.append(notes)
+        if action == 'lock':
+            updates.append("status='locked'")
+            updates.append('locked_at=CURRENT_TIMESTAMP')
+        elif action == 'unlock':
+            updates.append("status='generated'")
+            updates.append('locked_at=NULL')
+        elif action == 'settle':
+            updates.append("status='settled'")
+        elif action == 'confirm':
+            updates.append("status='confirmed'")
+            updates.append('confirmed_at=CURRENT_TIMESTAMP')
+            updates.append('confirmed_by=?')
+            params.append(current_user.id)
+
+        if updates:
+            updates.append('updated_at=CURRENT_TIMESTAMP')
+            params.append(stmt_id)
+            conn.execute(f'UPDATE reconciliation_statements SET {", ".join(updates)} WHERE id=?', params)
+            conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/statements/<int:stmt_id>', methods=['DELETE'])
+@login_required
+@reconciliation_api_required
+def api_delete_statement(stmt_id):
+    """Delete a statement (admin only, not if locked/settled)"""
+    if not _is_reconciliation_admin():
+        return jsonify({'error': '无权删除'}), 403
+    conn = get_db_connection()
+    stmt = conn.execute('SELECT status FROM reconciliation_statements WHERE id = ?', (stmt_id,)).fetchone()
+    if not stmt:
+        conn.close()
+        return jsonify({'error': '对账单不存在'}), 404
+    if stmt['status'] in ('locked', 'settled'):
+        conn.close()
+        return jsonify({'error': '已锁定的对账单不能删除'}), 400
+    try:
+        conn.execute('DELETE FROM reconciliation_statements WHERE id = ?', (stmt_id,))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+# ---------- Partner Receipts (money received from partner) ----------
+
+@app.route('/api/reconciliation/receipts')
+@login_required
+@reconciliation_api_required
+def api_list_receipts():
+    """List receipts, filtered by access + optional partner_id"""
+    partner_id = request.args.get('partner_id', type=int)
+    allowed_ids = current_user.get_accessible_partner_ids()
+
+    conn = get_db_connection()
+    query = '''SELECT r.*, p.name as partner_name, p.currency as currency, s.period_year, s.period_month
+               FROM partner_receipts r
+               JOIN partners p ON r.partner_id = p.id
+               LEFT JOIN reconciliation_statements s ON r.statement_id = s.id
+               WHERE 1=1'''
+    params = []
+    if partner_id:
+        if allowed_ids is not None and partner_id not in allowed_ids:
+            conn.close()
+            return jsonify({'error': '无权查看'}), 403
+        query += ' AND r.partner_id = ?'
+        params.append(partner_id)
+    elif allowed_ids is not None:
+        if not allowed_ids:
+            conn.close()
+            return jsonify([])
+        placeholders = ','.join(['?'] * len(allowed_ids))
+        query += f' AND r.partner_id IN ({placeholders})'
+        params.extend(allowed_ids)
+    query += ' ORDER BY r.receipt_date DESC, r.id DESC'
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/reconciliation/receipts', methods=['POST'])
+@login_required
+@reconciliation_api_required
+def api_create_receipt():
+    """Record a new receipt from partner"""
+    if not _is_reconciliation_admin():
+        return jsonify({'error': '无权录入收款'}), 403
+    data = request.json
+    partner_id = int(data.get('partner_id'))
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权'}), 403
+
+    amount_pln = float(data.get('amount_pln', 0))
+    rate = data.get('exchange_rate_cny')
+    rate_val = float(rate) if rate else None
+
+    # Auto-lookup rate from system if not provided
+    if rate_val is None and data.get('receipt_date'):
+        conn2 = get_db_connection()
+        p = conn2.execute('SELECT currency FROM partners WHERE id = ?', (partner_id,)).fetchone()
+        conn2.close()
+        if p:
+            try:
+                y, m = data['receipt_date'].split('-')[:2]
+                rate_val, _ = _lookup_partner_rate(p['currency'], int(y), int(m))
+            except Exception:
+                pass
+
+    amount_cny = round(amount_pln * rate_val, 2) if rate_val else None
+
+    conn = get_db_connection()
+    try:
+        conn.execute('''INSERT INTO partner_receipts
+            (partner_id, statement_id, receipt_date, amount_pln, exchange_rate_cny, amount_cny,
+             payment_method, reference_no, receipt_url, notes, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (partner_id,
+             data.get('statement_id') or None,
+             data.get('receipt_date'),
+             amount_pln, rate_val, amount_cny,
+             data.get('payment_method', ''),
+             data.get('reference_no', ''),
+             data.get('receipt_url', ''),
+             data.get('notes', ''),
+             current_user.id))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/receipts/<int:receipt_id>', methods=['PUT'])
+@login_required
+@reconciliation_api_required
+def api_update_receipt(receipt_id):
+    """Update a receipt"""
+    if not _is_reconciliation_admin():
+        return jsonify({'error': '无权修改'}), 403
+    data = request.json
+    conn = get_db_connection()
+    receipt = conn.execute('SELECT * FROM partner_receipts WHERE id = ?', (receipt_id,)).fetchone()
+    if not receipt:
+        conn.close()
+        return jsonify({'error': '收款记录不存在'}), 404
+    if not _check_partner_access(receipt['partner_id']):
+        conn.close()
+        return jsonify({'error': '无权'}), 403
+
+    amount_pln = float(data.get('amount_pln', receipt['amount_pln']))
+    rate = data.get('exchange_rate_cny')
+    rate_val = float(rate) if rate else None
+    amount_cny = round(amount_pln * rate_val, 2) if rate_val else None
+
+    try:
+        conn.execute('''UPDATE partner_receipts SET
+            statement_id=?, receipt_date=?, amount_pln=?, exchange_rate_cny=?, amount_cny=?,
+            payment_method=?, reference_no=?, receipt_url=?, notes=?
+            WHERE id=?''',
+            (data.get('statement_id') or None,
+             data.get('receipt_date', receipt['receipt_date']),
+             amount_pln, rate_val, amount_cny,
+             data.get('payment_method', ''),
+             data.get('reference_no', ''),
+             data.get('receipt_url', ''),
+             data.get('notes', ''),
+             receipt_id))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/receipts/<int:receipt_id>', methods=['DELETE'])
+@login_required
+@reconciliation_api_required
+def api_delete_receipt(receipt_id):
+    """Delete a receipt (admin only)"""
+    if not _is_reconciliation_admin():
+        return jsonify({'error': '无权删除'}), 403
+    conn = get_db_connection()
+    try:
+        conn.execute('DELETE FROM partner_receipts WHERE id = ?', (receipt_id,))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/rate')
+@login_required
+@reconciliation_api_required
+def api_get_reconciliation_rate():
+    """Lookup system exchange rate for a currency+year-month. Used by frontend to prefill rates."""
+    currency = request.args.get('currency', 'PLN')
+    year = request.args.get('year', type=int)
+    month = request.args.get('month', type=int)
+    if not year or not month:
+        return jsonify({'error': '缺少参数'}), 400
+    rate, actual_ym = _lookup_partner_rate(currency, year, month)
+    return jsonify({
+        'currency': currency,
+        'year': year,
+        'month': month,
+        'rate': rate,
+        'source_year_month': actual_ym if rate else None
+    })
+
+
+@app.route('/api/reconciliation/overview')
+@login_required
+@reconciliation_api_required
+def api_reconciliation_overview():
+    """Overview: total receivable, total received, outstanding, per partner"""
+    allowed_ids = current_user.get_accessible_partner_ids()
+    conn = get_db_connection()
+
+    # Get partners
+    if allowed_ids is None:
+        partners = conn.execute('SELECT * FROM partners ORDER BY id').fetchall()
+    elif len(allowed_ids) == 0:
+        conn.close()
+        return jsonify({'partners': [], 'totals': {}})
+    else:
+        placeholders = ','.join(['?'] * len(allowed_ids))
+        partners = conn.execute(f'SELECT * FROM partners WHERE id IN ({placeholders}) ORDER BY id', allowed_ids).fetchall()
+
+    result = []
+    total_receivable = 0
+    total_received = 0
+    total_receivable_cny = 0
+    total_received_cny = 0
+
+    for p in partners:
+        # Sum PLN amounts
+        recv_row = conn.execute('''SELECT COALESCE(SUM(our_receivable_pln), 0) as total
+            FROM reconciliation_statements WHERE partner_id = ?''', (p['id'],)).fetchone()
+        paid_row = conn.execute('''SELECT COALESCE(SUM(amount_pln), 0) as total
+            FROM partner_receipts WHERE partner_id = ?''', (p['id'],)).fetchone()
+        receivable = round(recv_row['total'] or 0, 2)
+        received = round(paid_row['total'] or 0, 2)
+
+        # Sum CNY amounts using each statement's historical rate
+        stmt_rows = conn.execute('''SELECT period_year, period_month, our_receivable_pln, exchange_rate_cny, our_receivable_cny
+            FROM reconciliation_statements WHERE partner_id = ?''', (p['id'],)).fetchall()
+        p_receivable_cny = 0
+        for sr in stmt_rows:
+            r_cny = sr['our_receivable_cny']
+            if r_cny is None and sr['our_receivable_pln']:
+                rate = sr['exchange_rate_cny']
+                if not rate:
+                    rate, _ = _lookup_partner_rate(p['currency'], sr['period_year'], sr['period_month'])
+                if rate:
+                    r_cny = (sr['our_receivable_pln'] or 0) * rate
+            p_receivable_cny += (r_cny or 0)
+
+        # Sum received CNY from receipts
+        receipt_rows = conn.execute('''SELECT amount_pln, exchange_rate_cny, amount_cny, receipt_date
+            FROM partner_receipts WHERE partner_id = ?''', (p['id'],)).fetchall()
+        p_received_cny = 0
+        for rr in receipt_rows:
+            a_cny = rr['amount_cny']
+            if a_cny is None and rr['amount_pln']:
+                rate = rr['exchange_rate_cny']
+                if not rate and rr['receipt_date']:
+                    try:
+                        y, m = rr['receipt_date'].split('-')[:2]
+                        rate, _ = _lookup_partner_rate(p['currency'], int(y), int(m))
+                    except:
+                        rate = None
+                if rate:
+                    a_cny = (rr['amount_pln'] or 0) * rate
+            p_received_cny += (a_cny or 0)
+
+        p_receivable_cny = round(p_receivable_cny, 2)
+        p_received_cny = round(p_received_cny, 2)
+
+        total_receivable += receivable
+        total_received += received
+        total_receivable_cny += p_receivable_cny
+        total_received_cny += p_received_cny
+
+        result.append({
+            'id': p['id'],
+            'name': p['name'],
+            'currency': p['currency'] or 'PLN',
+            'total_receivable_pln': receivable,
+            'total_received_pln': received,
+            'outstanding_pln': round(receivable - received, 2),
+            'total_receivable_cny': p_receivable_cny,
+            'total_received_cny': p_received_cny,
+            'outstanding_cny': round(p_receivable_cny - p_received_cny, 2)
+        })
+    conn.close()
+    return jsonify({
+        'partners': result,
+        'totals': {
+            'total_receivable_pln': round(total_receivable, 2),
+            'total_received_pln': round(total_received, 2),
+            'outstanding_pln': round(total_receivable - total_received, 2),
+            'total_receivable_cny': round(total_receivable_cny, 2),
+            'total_received_cny': round(total_received_cny, 2),
+            'outstanding_cny': round(total_receivable_cny - total_received_cny, 2)
+        }
+    })
 
 
 # ============== PRODUCT ANALYSIS ==============
