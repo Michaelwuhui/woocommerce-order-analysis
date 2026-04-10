@@ -251,7 +251,7 @@
                                 %}{% if source_display_mode != 'manager_only' %}<span class="source-badge">{{
                                     order.source.replace('https://www.', '').replace('https://', '') }}</span>{% endif
                                 %}</td>
-                            <td><span class="status-badge status-{{ order.status }}">{{ order.status|status_label(order.payment_method)
+                            <td><span class="status-badge {{ order.status|status_class(order.payment_method) }}">{{ order.status|status_label(order.payment_method)
                                     }}</span></td>
                             <td class="customer-cell">
                                 {% if customer_attributes and order.customer_email in customer_attributes %}

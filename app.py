@@ -1232,9 +1232,9 @@ def orders():
             COUNT(*) as total_orders,
             SUM(total) as total_amount,
             SUM(shipping_total) as total_shipping,
-            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') THEN 1 ELSE 0 END) as success_orders,
-            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') THEN total ELSE 0 END) as success_amount,
-            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') THEN shipping_total ELSE 0 END) as success_shipping,
+            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') THEN 1 ELSE 0 END) as success_orders,
+            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') THEN total ELSE 0 END) as success_amount,
+            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') THEN shipping_total ELSE 0 END) as success_shipping,
             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_orders,
             SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled_orders
         FROM orders {where_clause} GROUP BY source, currency
@@ -1663,27 +1663,30 @@ def monthly():
     if source_filter:
         conditions.append('source = ?')
         params.append(source_filter)
-        
+
     if start_month:
         conditions.append("strftime('%Y-%m', date_created) >= ?")
         params.append(start_month)
-        
+
     if end_month:
         conditions.append("strftime('%Y-%m', date_created) <= ?")
         params.append(end_month)
-    
+
+    # Exclude checkout drafts and trash — same as orders page
+    conditions.append("status NOT IN ('checkout-draft', 'trash')")
+
     where_clause = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
-    
+
     query = f'''
-        SELECT id, status, date_created, total, shipping_total, source, currency, line_items
+        SELECT id, status, date_created, total, shipping_total, source, currency, payment_method, line_items
         FROM orders
         {where_clause}
         ORDER BY date_created DESC
     '''
-    
+
     df = pd.read_sql_query(query, conn, params=params if params else None)
     conn.close()
-    
+
     if len(df) == 0:
         return render_template('monthly.html', monthly_stats=[], sources=all_sources, source_filter=source_filter, country_filter=country_filter, all_countries=all_countries, start_month=start_month, end_month=end_month)
     
@@ -1849,22 +1852,25 @@ def monthly_export():
     if start_month:
         conditions.append("strftime('%Y-%m', date_created) >= ?")
         params.append(start_month)
-        
+
     if end_month:
         conditions.append("strftime('%Y-%m', date_created) <= ?")
         params.append(end_month)
-    
+
+    # Exclude checkout drafts and trash — same as orders page
+    conditions.append("status NOT IN ('checkout-draft', 'trash')")
+
     where_clause = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
-    
+
     query = f'''
-        SELECT id, status, date_created, total, shipping_total, source, currency, line_items
+        SELECT id, status, date_created, total, shipping_total, source, currency, payment_method, line_items
         FROM orders
         {where_clause}
         ORDER BY date_created DESC
     '''
-    
+
     df = pd.read_sql_query(query, conn, params=params if params else None)
-    
+
     # Get site managers
     sites = conn.execute('SELECT url, manager FROM sites').fetchall()
     site_managers = {s['url']: s['manager'] or '' for s in sites}
@@ -3715,6 +3721,15 @@ def get_currency_symbol(currency):
 def status_label_filter(status, payment_method=None):
     """Jinja filter: {{ order.status|status_label(order.payment_method) }}"""
     return get_status_label(status, payment_method)
+
+
+@app.template_filter('status_class')
+def status_class_filter(status, payment_method=None):
+    """Jinja filter: returns CSS class for status badge, payment-mode-aware.
+    bacs + on-hold uses pending style (yellow = awaiting payment)."""
+    if status == 'on-hold' and payment_method == 'bacs':
+        return 'status-pending'
+    return f'status-{status}'
 
 
 @app.template_filter('format_currency')
@@ -6531,7 +6546,7 @@ def _calc_partner_net_sales(partner_id, year, month):
 
     # Aggregate from orders table — filtered by partner's currency
     # Using the same "success" filter as /monthly (exclude failed/cancelled/etc.)
-    success_cond = "status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')"
+    success_cond = "status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') AND NOT (status = 'on-hold' AND payment_method = 'bacs')"
     query = f'''
         SELECT
             COUNT(*) as total_orders,
@@ -7476,7 +7491,7 @@ def products():
         date_to = ''
     
     # Build filter conditions with permission check
-    conditions = ["status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')"]
+    conditions = ["status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') AND NOT (status = 'on-hold' AND payment_method = 'bacs')"]
     params = []
     
     # Add permission filter
@@ -7831,7 +7846,7 @@ def products():
     eight_weeks_ago = (today - timedelta(weeks=8)).isoformat()
     
     # Build conditions for 8-week query (with same permission filtering, but NOT date filter)
-    trend_conditions = ["status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')", "date_created >= ?"]
+    trend_conditions = ["status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') AND NOT (status = 'on-hold' AND payment_method = 'bacs')", "date_created >= ?"]
     trend_params = [eight_weeks_ago]
     
     # Add permission filter
@@ -8149,7 +8164,7 @@ def get_product_stats():
     days = int(request.args.get('days', 30))
     
     # Build conditions
-    conditions = ["status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')"]
+    conditions = ["status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') AND NOT (status = 'on-hold' AND payment_method = 'bacs')"]
     params = []
     
     if allowed_sources is not None:
@@ -8249,7 +8264,7 @@ def get_unknown_products():
     
     orders = conn.execute('''
         SELECT line_items, source FROM orders 
-        WHERE date_created >= ? AND status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod')
+        WHERE date_created >= ? AND status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
     ''', (date_from,)).fetchall()
     
     # Get brands cache
@@ -8473,7 +8488,7 @@ def get_product_samples():
     orders = conn.execute('''
         SELECT id, number, source, date_created, line_items 
         FROM orders 
-        WHERE status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod')
+        WHERE status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
         ORDER BY date_created DESC
         LIMIT 2000
     ''').fetchall()
@@ -10419,7 +10434,7 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
             SUM(total) as total_amount,
             SUM(total - shipping_total) as net_amount,
             currency,
-            SUM(CASE WHEN status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod')
+            SUM(CASE WHEN status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
                 THEN total - shipping_total ELSE 0 END) as success_net
         FROM orders
         WHERE date_created >= ? AND date_created <= ?
@@ -10821,7 +10836,7 @@ def sales_board():
             FROM orders
             WHERE source IN ({placeholders})
             AND strftime('%Y-%m', date_created) = ?
-            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod')
+            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
         ''', site_urls + [selected_month]).fetchall()
 
         # Previous month successful orders (for growth)
@@ -10830,7 +10845,7 @@ def sales_board():
             FROM orders
             WHERE source IN ({placeholders})
             AND strftime('%Y-%m', date_created) = ?
-            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod')
+            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
         ''', site_urls + [prev_month]).fetchall()
 
         # Current week orders
@@ -10839,7 +10854,7 @@ def sales_board():
             FROM orders
             WHERE source IN ({placeholders})
             AND date(date_created) >= ? AND date(date_created) <= ?
-            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod')
+            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
         ''', site_urls + [week_start.isoformat(), week_end.isoformat()]).fetchall()
 
         # Calculate month amounts by currency and total products
