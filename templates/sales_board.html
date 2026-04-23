@@ -3,6 +3,7 @@
 {% block title %}销售看板 - 苍赋管理系统{% endblock %}
 
 {% block content %}
+{% set leader_names = (group_summaries | map(attribute='leader_manager') | list) if group_summaries else [] %}
 <div class="container-fluid py-4">
     <!-- Header -->
     <div class="d-flex justify-content-between align-items-center mb-4">
@@ -19,6 +20,9 @@
             {% if current_user.is_admin() %}
             <button class="btn btn-sm btn-outline-warning" onclick="openTargetSettings()">
                 <i class="bi bi-gear me-1"></i>设置目标
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" id="toggleLeaderHideBtn" onclick="toggleLeaderHide()" title="演示模式：隐藏小组及组长带团奖金">
+                <i class="bi bi-eye-slash me-1" id="toggleLeaderHideIcon"></i><span id="toggleLeaderHideText">隐藏组长</span>
             </button>
             <button class="btn btn-sm btn-outline-info" onclick="openBrandSettings()">
                 <i class="bi bi-tag me-1"></i>免提成品牌
@@ -137,7 +141,8 @@
                     </thead>
                     <tbody>
                         {% for d in board_data %}
-                        <tr>
+                        {% set is_leader = d.manager in leader_names %}
+                        <tr data-manager="{{ d.manager }}"{% if is_leader %} data-is-leader="1"{% endif %}>
                             <td class="text-center fw-bold text-white grp-start">{{ d.manager }}</td>
                             <td>
                                 {% for site in d.sites %}
@@ -212,7 +217,12 @@
                             </td>
                             <!-- 底薪 -->
                             <td class="text-end grp-start text-white">
+                                {% if is_leader and d.masked_base_salary != d.base_salary %}
+                                <span class="leader-full-view">¥{{ "{:,.0f}".format(d.base_salary) }}</span>
+                                <span class="leader-personal-view">¥{{ "{:,.0f}".format(d.masked_base_salary) }}</span>
+                                {% else %}
                                 ¥{{ "{:,.0f}".format(d.base_salary) }}
+                                {% endif %}
                             </td>
                             <!-- 扣除 -->
                             <td class="text-end">
@@ -233,10 +243,15 @@
                             <td class="text-end">
                                 {% set group_bonus = leader_bonus_map.get(d.manager, 0) %}
                                 {% if group_bonus > 0 %}
-                                <span class="text-warning fw-bold fs-6">¥{{ "{:,.2f}".format(d.total_income + group_bonus) }}</span>
-                                <div class="text-info" style="font-size:0.68em;">
-                                    个人 ¥{{ "{:,.2f}".format(d.total_income) }}
-                                    +带团 ¥{{ "{:,.2f}".format(group_bonus) }}
+                                <div class="leader-full-view">
+                                    <span class="text-warning fw-bold fs-6">¥{{ "{:,.2f}".format(d.total_income + group_bonus) }}</span>
+                                    <div class="text-info" style="font-size:0.68em;">
+                                        个人 ¥{{ "{:,.2f}".format(d.total_income) }}
+                                        +带团 ¥{{ "{:,.2f}".format(group_bonus) }}
+                                    </div>
+                                </div>
+                                <div class="leader-personal-view">
+                                    <span class="text-warning fw-bold fs-6">¥{{ "{:,.2f}".format(d.masked_total_income) }}</span>
                                 </div>
                                 {% else %}
                                 <span class="text-warning fw-bold fs-6">¥{{ "{:,.2f}".format(d.total_income) }}</span>
@@ -255,7 +270,7 @@
                     {% if group_summaries %}
                     <tbody>
                         {% for g in group_summaries %}
-                        <tr style="background: rgba(13, 202, 240, 0.08); border-top: 2px solid rgba(13, 202, 240, 0.3);">
+                        <tr data-group-summary="1" style="background: rgba(13, 202, 240, 0.08); border-top: 2px solid rgba(13, 202, 240, 0.3);">
                             <td class="text-center fw-bold grp-start" colspan="2">
                                 <span class="badge bg-info bg-opacity-75 fs-6">
                                     <i class="bi bi-people-fill me-1"></i>{{ g.name }}
@@ -317,7 +332,10 @@
                             <td class="grp-start" colspan="3"></td>
                             <td class="grp-start" colspan="2"></td>
                             <td class="text-end text-info fw-bold">¥{{ "{:,.2f}".format(team_totals.total_commission) }}</td>
-                            <td class="text-end text-warning fw-bold fs-6">¥{{ "{:,.2f}".format(team_totals.total_income) }}</td>
+                            <td class="text-end text-warning fw-bold fs-6">
+                                <span class="leader-full-view">¥{{ "{:,.2f}".format(team_totals.total_income) }}</span>
+                                <span class="leader-personal-view">¥{{ "{:,.2f}".format(team_totals.total_income_no_bonus) }}</span>
+                            </td>
                         </tr>
                     </tfoot>
                     {% endif %}
@@ -536,6 +554,19 @@
     font-weight: 600;
     background: rgba(255,255,255,0.05);
 }
+body.hide-leader-commission tr[data-group-summary="1"] {
+    display: none !important;
+}
+.leader-personal-view { display: none; }
+body.hide-leader-commission .leader-full-view { display: none; }
+body.hide-leader-commission .leader-personal-view { display: block; }
+body.hide-leader-commission td > .leader-personal-view,
+body.hide-leader-commission .sales-board-table tfoot .leader-personal-view { display: inline; }
+#toggleLeaderHideBtn.active {
+    background-color: rgba(108, 117, 125, 0.35);
+    color: #fff;
+    border-color: rgba(108, 117, 125, 0.6);
+}
 </style>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/dark.css">
@@ -579,6 +610,28 @@ function showToast(msg, type) {
 }
 
 {% if current_user.is_admin() %}
+var LEADER_HIDE_KEY = 'salesboard_hide_leader_commission';
+
+function applyLeaderHideState() {
+    var isHidden = localStorage.getItem(LEADER_HIDE_KEY) === '1';
+    document.body.classList.toggle('hide-leader-commission', isHidden);
+    var btn = document.getElementById('toggleLeaderHideBtn');
+    var icon = document.getElementById('toggleLeaderHideIcon');
+    var text = document.getElementById('toggleLeaderHideText');
+    if (btn) btn.classList.toggle('active', isHidden);
+    if (icon) icon.className = isHidden ? 'bi bi-eye me-1' : 'bi bi-eye-slash me-1';
+    if (text) text.textContent = isHidden ? '显示组长' : '隐藏组长';
+}
+
+function toggleLeaderHide() {
+    var current = localStorage.getItem(LEADER_HIDE_KEY) === '1';
+    localStorage.setItem(LEADER_HIDE_KEY, current ? '0' : '1');
+    applyLeaderHideState();
+    showToast(current ? '已显示组长' : '已隐藏小组及组长带团奖金', 'success');
+}
+
+document.addEventListener('DOMContentLoaded', applyLeaderHideState);
+
 function openTargetSettings() {
     bootstrap.Modal.getOrCreateInstance(document.getElementById('targetModal')).show();
 }

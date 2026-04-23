@@ -11056,6 +11056,23 @@ def sales_board():
         'total_commission': sum(d['commission'] for d in board_data),
         'total_income': round(sum(d['total_income'] for d in board_data) + total_leader_bonuses, 2),
     }
+    # Compute masked values for "hide leader commission" display mode.
+    # Leaders' base salary is shown as the default (7000) so they look like regular members.
+    MASK_BASE_SALARY = 7000
+    leader_names_set = {g['leader_manager'] for g in group_summaries}
+    total_leader_base_reduction = 0
+    for d in board_data:
+        if d['manager'] in leader_names_set:
+            reduction = d['base_salary'] - MASK_BASE_SALARY
+            total_leader_base_reduction += reduction
+            d['masked_base_salary'] = MASK_BASE_SALARY
+            d['masked_total_income'] = round(MASK_BASE_SALARY - d['salary_deduction'] + d['commission'], 2)
+        else:
+            d['masked_base_salary'] = d['base_salary']
+            d['masked_total_income'] = d['total_income']
+    team_totals['total_income_no_bonus'] = round(
+        sum(d['total_income'] for d in board_data) - total_leader_base_reduction, 2
+    )
     if team_totals['monthly_target'] > 0:
         team_totals['month_achievement'] = round(team_totals['month_net_cny'] / team_totals['monthly_target'] * 100, 1)
     else:
