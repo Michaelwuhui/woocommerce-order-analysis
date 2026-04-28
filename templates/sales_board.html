@@ -30,6 +30,19 @@
             <button class="btn btn-sm btn-outline-success" onclick="openGroupSettings()">
                 <i class="bi bi-people me-1"></i>小组管理
             </button>
+            <button class="btn btn-sm btn-outline-warning" onclick="openRateSettings()" title="自定义本销售看板使用的汇率（不影响其它系统模块）">
+                <i class="bi bi-currency-exchange me-1"></i>自定义汇率
+            </button>
+            {% if current_user.username == 'admin' %}
+            <div class="btn-group btn-group-sm" role="group">
+                <button type="button" class="btn btn-outline-primary" onclick="exportSalesBoard()" id="exportBtn" title="仅超级管理员可用">
+                    <i class="bi bi-file-earmark-excel me-1"></i>导出Excel
+                </button>
+                <button type="button" class="btn btn-outline-primary" onclick="openExportHistory()" title="历史导出记录">
+                    <i class="bi bi-clock-history"></i>
+                </button>
+            </div>
+            {% endif %}
             {% endif %}
         </div>
     </div>
@@ -503,6 +516,96 @@
         </div>
     </div>
 </div>
+<!-- Custom Exchange Rate Modal -->
+<div class="modal fade" id="rateModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-currency-exchange me-2"></i>自定义汇率 - <span id="rateModalMonth">{{ selected_month }}</span></h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 text-info small">
+                    <i class="bi bi-info-circle me-1"></i>
+                    本汇率<strong>仅用于销售看板</strong>，不会影响订单列表/月度统计/产品分析等其它模块。<br>
+                    留空（或填 0）会回退到系统汇率。
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-dark table-sm align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th style="min-width:70px;">币种</th>
+                                <th style="min-width:120px;" class="text-end">系统汇率(¥)</th>
+                                <th style="min-width:160px;">自定义汇率(¥)</th>
+                                <th style="min-width:120px;">当前生效</th>
+                                <th style="min-width:100px;">来源</th>
+                            </tr>
+                        </thead>
+                        <tbody id="rateModalBody">
+                            <tr><td colspan="5" class="text-center text-white-50 py-4">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" onclick="saveRates()">
+                    <i class="bi bi-check-lg me-1"></i>保存并刷新
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if current_user.username == 'admin' %}
+<!-- Export History Modal -->
+<div class="modal fade" id="exportHistoryModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-clock-history me-2"></i>导出历史记录</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <div class="d-flex align-items-center gap-2">
+                        <label class="text-white-50 small mb-0">按月份筛选：</label>
+                        <input type="text" class="form-control form-control-sm bg-dark text-white border-secondary flatpickr-month"
+                               id="exportHistoryMonth" style="width:140px;" placeholder="全部">
+                        <button class="btn btn-sm btn-outline-light" onclick="loadExportHistory()">
+                            <i class="bi bi-search"></i>
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary" onclick="document.getElementById('exportHistoryMonth').value='';loadExportHistory()">
+                            <i class="bi bi-arrow-counterclockwise"></i>全部
+                        </button>
+                    </div>
+                </div>
+                <div class="table-responsive" style="max-height:60vh;overflow-y:auto;">
+                    <table class="table table-dark table-sm table-hover mb-0">
+                        <thead style="position:sticky;top:0;background:#212529;z-index:1;">
+                            <tr>
+                                <th>文件名</th>
+                                <th>月份</th>
+                                <th>模式</th>
+                                <th class="text-end">大小</th>
+                                <th>导出时间</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="exportHistoryBody">
+                            <tr><td colspan="6" class="text-center text-white-50 py-4">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">关闭</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 <!-- Group Settings Modal -->
 <div class="modal fade" id="groupModal" tabindex="-1">
     <div class="modal-dialog">
@@ -651,6 +754,191 @@ document.addEventListener('DOMContentLoaded', applyLeaderHideState);
 function openTargetSettings() {
     bootstrap.Modal.getOrCreateInstance(document.getElementById('targetModal')).show();
 }
+
+function openRateSettings() {
+    var monthLabel = document.getElementById('rateModalMonth');
+    if (monthLabel) monthLabel.textContent = '{{ selected_month }}';
+    var body = document.getElementById('rateModalBody');
+    body.innerHTML = '<tr><td colspan="5" class="text-center text-white-50 py-4">加载中...</td></tr>';
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('rateModal')).show();
+
+    fetch('/api/sales-board/exchange-rates?month={{ selected_month }}')
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        var rates = data.rates || [];
+        if (rates.length === 0) {
+            body.innerHTML = '<tr><td colspan="5" class="text-center text-white-50 py-4">本月暂无订单使用的币种</td></tr>';
+            return;
+        }
+        var html = '';
+        rates.forEach(function(r) {
+            var sysRate = r.system_rate != null ? Number(r.system_rate).toFixed(4) : '<span class="text-warning">无</span>';
+            var override = r.override_rate != null ? Number(r.override_rate) : '';
+            var inUse = r.in_use ? Number(r.in_use).toFixed(4) : '-';
+            var srcBadge = r.source === 'override'
+                ? '<span class="badge bg-warning text-dark">自定义</span>'
+                : '<span class="badge bg-secondary">系统</span>';
+            html += '<tr data-currency="' + r.currency + '">' +
+                '<td class="text-white fw-bold">' + r.currency + '</td>' +
+                '<td class="text-end text-white-50">' + sysRate + '</td>' +
+                '<td>' +
+                    '<div class="input-group input-group-sm">' +
+                        '<input type="number" step="0.0001" min="0" class="form-control bg-dark text-white border-secondary rate-input" ' +
+                            'value="' + override + '" placeholder="留空使用系统汇率">' +
+                        '<button class="btn btn-outline-secondary" type="button" onclick="resetRate(this)" title="清空回退到系统汇率">' +
+                            '<i class="bi bi-arrow-counterclockwise"></i></button>' +
+                    '</div>' +
+                '</td>' +
+                '<td class="text-info fw-bold">' + inUse + '</td>' +
+                '<td>' + srcBadge + '</td>' +
+            '</tr>';
+        });
+        body.innerHTML = html;
+    })
+    .catch(function(err) {
+        body.innerHTML = '<tr><td colspan="5" class="text-center text-danger py-4">加载失败：' + err.message + '</td></tr>';
+    });
+}
+
+function resetRate(btn) {
+    var input = btn.parentElement.querySelector('.rate-input');
+    if (input) input.value = '';
+}
+
+function saveRates() {
+    var rows = document.querySelectorAll('#rateModalBody tr[data-currency]');
+    var payload = [];
+    rows.forEach(function(row) {
+        var cur = row.dataset.currency;
+        var input = row.querySelector('.rate-input');
+        payload.push({
+            currency: cur,
+            rate: input && input.value !== '' ? parseFloat(input.value) : null
+        });
+    });
+    fetch('/api/sales-board/exchange-rates', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ month: '{{ selected_month }}', rates: payload })
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        if (data.success) {
+            showToast('汇率已保存，正在刷新...', 'success');
+            setTimeout(function() { location.reload(); }, 800);
+        } else {
+            showToast('保存失败: ' + (data.error || '未知错误'), 'error');
+        }
+    });
+}
+
+{% if current_user.username == 'admin' %}
+function exportSalesBoard() {
+    var btn = document.getElementById('exportBtn');
+    var originalHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status"></span>导出中...';
+
+    var hideLeader = document.body.classList.contains('hide-leader-commission');
+    fetch('/api/sales-board/export', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            month: '{{ selected_month }}',
+            hide_leader: hideLeader
+        })
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        btn.disabled = false;
+        btn.innerHTML = originalHtml;
+        if (data.success) {
+            showToast('导出成功：' + data.filename, 'success');
+            // Trigger auto-download
+            window.location.href = '/api/sales-board/exports/' + data.id + '/download';
+        } else {
+            showToast('导出失败: ' + (data.error || '未知错误'), 'error');
+        }
+    })
+    .catch(function(err) {
+        btn.disabled = false;
+        btn.innerHTML = originalHtml;
+        showToast('导出失败: ' + err.message, 'error');
+    });
+}
+
+function formatFileSize(bytes) {
+    if (!bytes) return '0 B';
+    var units = ['B', 'KB', 'MB', 'GB'];
+    var i = 0;
+    while (bytes >= 1024 && i < units.length - 1) { bytes /= 1024; i++; }
+    return bytes.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+}
+
+function loadExportHistory() {
+    var month = (document.getElementById('exportHistoryMonth') || {}).value || '';
+    var url = '/api/sales-board/exports' + (month ? '?month=' + encodeURIComponent(month) : '');
+    var tbody = document.getElementById('exportHistoryBody');
+    tbody.innerHTML = '<tr><td colspan="6" class="text-center text-white-50 py-4">加载中...</td></tr>';
+    fetch(url)
+    .then(function(res) { return res.json(); })
+    .then(function(rows) {
+        if (!rows || rows.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-white-50 py-4">暂无导出记录</td></tr>';
+            return;
+        }
+        var html = '';
+        rows.forEach(function(r) {
+            var mode = r.hide_leader ?
+                '<span class="badge bg-secondary">演示版</span>' :
+                '<span class="badge bg-info bg-opacity-75">完整版</span>';
+            html += '<tr>' +
+                '<td class="text-white" style="word-break:break-all;"><i class="bi bi-file-earmark-excel text-success me-1"></i>' + r.filename + '</td>' +
+                '<td class="text-info">' + r.year_month + '</td>' +
+                '<td>' + mode + '</td>' +
+                '<td class="text-end text-white-50">' + formatFileSize(r.file_size) + '</td>' +
+                '<td class="text-white-50"><small>' + r.created_at + '</small></td>' +
+                '<td>' +
+                    '<a class="btn btn-sm btn-outline-primary me-1" href="/api/sales-board/exports/' + r.id + '/download" title="下载">' +
+                        '<i class="bi bi-download"></i></a>' +
+                    '<button class="btn btn-sm btn-outline-danger" onclick="deleteExport(' + r.id + ', \'' + r.filename.replace(/'/g, "\\'") + '\')" title="删除">' +
+                        '<i class="bi bi-trash"></i></button>' +
+                '</td>' +
+            '</tr>';
+        });
+        tbody.innerHTML = html;
+    })
+    .catch(function(err) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-danger py-4">加载失败：' + err.message + '</td></tr>';
+    });
+}
+
+function openExportHistory() {
+    var monthInput = document.getElementById('exportHistoryMonth');
+    if (monthInput && !monthInput._flatpickr) {
+        flatpickr(monthInput, {
+            plugins: [new monthSelectPlugin({ shorthand: true, dateFormat: 'Y-m', altFormat: 'Y年m月', theme: 'dark' })],
+            locale: 'zh', theme: 'dark', disableMobile: true, allowInput: true
+        });
+    }
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('exportHistoryModal')).show();
+    loadExportHistory();
+}
+
+function deleteExport(id, filename) {
+    if (!confirm('确定要删除「' + filename + '」吗？文件将被永久删除。')) return;
+    fetch('/api/sales-board/exports/' + id, { method: 'DELETE' })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        if (data.success) {
+            showToast('已删除', 'success');
+            loadExportHistory();
+        } else {
+            showToast('删除失败: ' + (data.error || '未知错误'), 'error');
+        }
+    });
+}
+{% endif %}
 
 function openBrandSettings() {
     bootstrap.Modal.getOrCreateInstance(document.getElementById('brandModal')).show();

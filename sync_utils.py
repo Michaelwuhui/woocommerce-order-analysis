@@ -376,30 +376,38 @@ def sync_order_notes(wcapi, site_url, connection=None):
     except Exception as e:
         print(f"Error syncing order notes: {e}")
 
-def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_days=7):
+def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_days=7, full_history=False):
     """Sync a single site
-    
+
     Args:
-        sync_days: Only sync orders modified in the last N days. 
-                   Set to 0 or None for full sync (no time limit).
+        sync_days: Only sync orders modified in the last N days.
+                   Set to 0 or None for sync from last known order date.
+        full_history: When True, ignore all local cutoffs and fetch every order
+                      page from the WooCommerce API. Use this for first-time
+                      sync of a site or when local DB is missing historical data.
     """
     if progress_callback: progress_callback(f"Connecting to {url}...")
-    
+
     wcapi = create_robust_wcapi(url, consumer_key, consumer_secret, PROXY_CONFIG)
     if not wcapi:
         return {"status": "error", "message": "Failed to create API client"}
-    
+
     # 使用线程局部数据库连接，整个同步过程复用
     conn = get_thread_db_connection()
-    
+
     try:
         # Calculate time window for modified_after
         modified_after = None
-        if sync_days and sync_days > 0:
+        if full_history:
+            # No cutoff at all — fetch every page
+            modified_after = None
+            if progress_callback:
+                progress_callback("Full history sync (no date filter)...")
+        elif sync_days and sync_days > 0:
             from datetime import timedelta
             cutoff_date = datetime.now() - timedelta(days=sync_days)
             modified_after = cutoff_date.strftime("%Y-%m-%dT00:00:00")
-            if progress_callback: 
+            if progress_callback:
                 progress_callback(f"Syncing orders modified in last {sync_days} days...")
         else:
             # Full sync: use last modified date from DB
@@ -409,12 +417,12 @@ def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_d
                     progress_callback(f"Full sync from {modified_after}...")
                 else:
                     progress_callback("Full sync (all history)...")
-        
+
         # 1. Fetch new orders (only for first-time sync or when no cutoff)
         new_orders = []
-        if not sync_days or sync_days <= 0:
-            last_order_date = get_last_order_date_from_db(url)
-            if progress_callback: 
+        if full_history or not sync_days or sync_days <= 0:
+            last_order_date = None if full_history else get_last_order_date_from_db(url)
+            if progress_callback:
                 if last_order_date:
                     progress_callback(f"Fetching new orders after {last_order_date}...")
                 else:

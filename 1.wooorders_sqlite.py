@@ -597,6 +597,8 @@ def main(incremental=True, sync_status=True, start_date=None, clean_deleted=Fals
             last_order_date = start_date
         elif incremental:
             last_order_date = get_last_order_date_from_db(site['url'])
+        # When called as a "deep sync" (incremental=False), we deliberately
+        # leave last_order_date=None so the API fetches the entire history.
         
         # 获取订单数据
         orders = fetch_orders_incrementally(wcapi, site['url'], last_order_date)
