@@ -553,6 +553,19 @@ def editor_required(f):
     return decorated_function
 
 
+def super_admin_required(f):
+    """Decorator: only the built-in super admin (username == 'admin') may access."""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return jsonify({'error': '未登录'}), 401
+        if getattr(current_user, 'username', None) != 'admin':
+            return jsonify({'error': '该操作仅超级管理员可用'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
 def shipper_required(f):
     """Decorator to require shipping permission"""
     from functools import wraps
@@ -813,11 +826,20 @@ def dashboard():
     
     # Cancelled/failed orders count
     stats['cancelled_orders'] = conn.execute(f"SELECT COUNT(*) FROM orders {date_condition} AND status IN ('cancelled', 'failed')", params).fetchone()[0]
+
+    # Undelivered (refused/returned) orders count + shipping loss aggregated by currency
+    stats['undelivered_orders'] = conn.execute(f"SELECT COUNT(*) FROM orders {date_condition} AND is_undelivered = 1", params).fetchone()[0]
+    shipping_loss_raw = conn.execute(f'''
+        SELECT currency, SUM(COALESCE(shipping_loss_amount, 0)) as loss
+        FROM orders {date_condition} AND is_undelivered = 1
+        GROUP BY currency
+    ''', params).fetchall()
+    stats['shipping_loss_by_currency'] = {row['currency'] or 'N/A': float(row['loss'] or 0) for row in shipping_loss_raw}
     
     # Total revenue by currency - add status filter
     revenue_conditions = conditions.copy()
     revenue_conditions = conditions.copy()
-    revenue_conditions.append('status NOT IN ("failed", "cancelled", "checkout-draft", "trash", "cheat") AND NOT (status = "pending" AND COALESCE(payment_method,"cod") != "cod") AND NOT (status = "on-hold" AND payment_method = "bacs")')
+    revenue_conditions.append(_revenue_status_cond())
     revenue_where = 'WHERE ' + ' AND '.join(revenue_conditions)
     
     # Valid orders count (for AOV calculation)
@@ -867,7 +889,7 @@ def dashboard():
     # Query 2: Only successful orders for net revenue (净销售额)
     source_success_conditions = conditions.copy()
     source_success_conditions = conditions.copy()
-    source_success_conditions.append('status NOT IN ("failed", "cancelled", "checkout-draft", "trash", "cheat") AND NOT (status = "pending" AND COALESCE(payment_method,"cod") != "cod") AND NOT (status = "on-hold" AND payment_method = "bacs")')
+    source_success_conditions.append(_revenue_status_cond())
     source_success_where = 'WHERE ' + ' AND '.join(source_success_conditions)
     
     source_success_raw = conn.execute(f'''
@@ -929,7 +951,8 @@ def dashboard():
     
     recent_where = 'WHERE ' + ' AND '.join(recent_conditions)
     recent_orders = conn.execute(f'''
-        SELECT id, number, status, total, shipping_total, currency, date_created, source, line_items, billing
+        SELECT id, number, status, total, shipping_total, currency, date_created, source, line_items, billing,
+               payment_method, is_undelivered
         FROM orders
         {recent_where}
         ORDER BY date_created DESC
@@ -1036,11 +1059,11 @@ def dashboard():
                     break
             
             # Get customer stats
-            stats_row = conn.execute('''
-                SELECT 
+            stats_row = conn.execute(f'''
+                SELECT
                     COUNT(*) as total_orders,
-                    SUM(CASE WHEN (status IN ('completed','shipped','delivered','partial-shipped') OR (status = 'on-hold' AND COALESCE(payment_method,'cod') != 'bacs') OR (status = 'processing' AND COALESCE(payment_method,'cod') != 'cod')) THEN 1 ELSE 0 END) as successful_orders,
-                    SUM(CASE WHEN (status IN ('completed','shipped','delivered','partial-shipped') OR (status = 'on-hold' AND COALESCE(payment_method,'cod') != 'bacs') OR (status = 'processing' AND COALESCE(payment_method,'cod') != 'cod')) THEN total ELSE 0 END) as total_spending,
+                    SUM({_success_status_case()}) as successful_orders,
+                    {_success_amount_case('total')} as total_spending,
                     MAX(date_created) as last_order_date,
                     MIN(date_created) as first_order_date
                 FROM orders
@@ -1207,7 +1230,10 @@ def orders():
     if source_filter:
         conditions.append('source = ?')
         params.append(source_filter)
-    if status_filter:
+    if status_filter == 'undelivered':
+        # 'undelivered' is stored on a separate flag column, not in status
+        conditions.append('is_undelivered = 1')
+    elif status_filter:
         conditions.append('status = ?')
         params.append(status_filter)
     else:
@@ -1232,9 +1258,9 @@ def orders():
             COUNT(*) as total_orders,
             SUM(total) as total_amount,
             SUM(shipping_total) as total_shipping,
-            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') THEN 1 ELSE 0 END) as success_orders,
-            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') THEN total ELSE 0 END) as success_amount,
-            SUM(CASE WHEN status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') THEN shipping_total ELSE 0 END) as success_shipping,
+            SUM(CASE WHEN {_revenue_status_cond()} THEN 1 ELSE 0 END) as success_orders,
+            {_revenue_amount_case('total')} as success_amount,
+            {_revenue_amount_case('shipping_total')} as success_shipping,
             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_orders,
             SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled_orders
         FROM orders {where_clause} GROUP BY source, currency
@@ -1382,7 +1408,10 @@ def orders():
         
     source_query += ' ORDER BY source'
     sources = conn.execute(source_query, source_params).fetchall()
-    statuses = conn.execute('SELECT DISTINCT status FROM orders').fetchall()
+    statuses = [dict(s) for s in conn.execute('SELECT DISTINCT status FROM orders').fetchall()]
+    # Surface 'undelivered' as a synthetic filter option (it's stored on is_undelivered flag, not status column)
+    if not any(s.get('status') == 'undelivered' for s in statuses):
+        statuses.append({'status': 'undelivered'})
     
     # Get site managers mapping (url -> manager)
     sites = conn.execute('SELECT url, manager FROM sites').fetchall()
@@ -1451,11 +1480,11 @@ def orders():
         
         try:
             stats_results = conn.execute(f'''
-                SELECT 
+                SELECT
                     json_extract(billing, '$.email') as current_email,
                     COUNT(*) as total_orders,
-                    SUM(CASE WHEN (status IN ('completed','shipped','delivered','partial-shipped') OR (status = 'on-hold' AND COALESCE(payment_method,'cod') != 'bacs') OR (status = 'processing' AND COALESCE(payment_method,'cod') != 'cod')) THEN 1 ELSE 0 END) as successful_orders,
-                    SUM(CASE WHEN (status IN ('completed','shipped','delivered','partial-shipped') OR (status = 'on-hold' AND COALESCE(payment_method,'cod') != 'bacs') OR (status = 'processing' AND COALESCE(payment_method,'cod') != 'cod')) THEN total ELSE 0 END) as total_spending,
+                    SUM({_success_status_case()}) as successful_orders,
+                    {_success_amount_case('total')} as total_spending,
                     MAX(date_created) as last_order_date,
                     MIN(date_created) as first_order_date
                 FROM orders
@@ -1678,7 +1707,8 @@ def monthly():
     where_clause = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
 
     query = f'''
-        SELECT id, status, date_created, total, shipping_total, source, currency, payment_method, line_items
+        SELECT id, status, date_created, total, shipping_total, source, currency, payment_method, line_items,
+               is_undelivered, shipping_loss_amount
         FROM orders
         {where_clause}
         ORDER BY date_created DESC
@@ -1689,7 +1719,7 @@ def monthly():
 
     if len(df) == 0:
         return render_template('monthly.html', monthly_stats=[], sources=all_sources, source_filter=source_filter, country_filter=country_filter, all_countries=all_countries, start_month=start_month, end_month=end_month)
-    
+
     # Calculate product quantities
     def get_product_qty(line_items):
         try:
@@ -1697,21 +1727,21 @@ def monthly():
             return sum(item.get('quantity', 0) for item in items)
         except:
             return 0
-    
+
     df['product_qty'] = df['line_items'].apply(get_product_qty)
     df['month'] = pd.to_datetime(df['date_created']).dt.to_period('M')
-    
+
     # Group by month, source, and currency
     rows = []
     for (month, source), gdf in df.groupby(['month', 'source']):
         # Get the currency for this source (should be the same for all orders from same source)
         currency = gdf['currency'].iloc[0] if len(gdf) > 0 else 'N/A'
-        
+
         total_orders = len(gdf)
         total_products = gdf['product_qty'].sum()
         total_amount = gdf['total'].sum()
-        
-        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat']) & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod')) & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs'))
+
+        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat']) & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod')) & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs')) & (gdf['is_undelivered'].fillna(0) == 0)
         success_orders = int(success_mask.sum())
         success_amount = gdf.loc[success_mask, 'total'].sum()
         success_products = gdf.loc[success_mask, 'product_qty'].sum()
@@ -1723,7 +1753,11 @@ def monthly():
 
         cancelled_mask = gdf['status'] == 'cancelled'
         cancelled_orders = int(cancelled_mask.sum())
-        
+
+        undelivered_mask = gdf['is_undelivered'].fillna(0) == 1
+        undelivered_orders = int(undelivered_mask.sum())
+        shipping_loss = float(gdf.loc[undelivered_mask, 'shipping_loss_amount'].fillna(0).sum())
+
         rows.append({
             'month': str(month),
             'source': source,
@@ -1736,7 +1770,9 @@ def monthly():
             'success_amount': float(success_amount),
             'success_net_amount': float(success_net_amount),
             'failed_orders': failed_orders,
-            'cancelled_orders': cancelled_orders
+            'cancelled_orders': cancelled_orders,
+            'undelivered_orders': undelivered_orders,
+            'shipping_loss': shipping_loss
         })
     
     # Get sort parameter
@@ -1767,21 +1803,23 @@ def monthly():
     for row in rows:
         m = row['month']
         if m not in monthly_aggregates:
-            monthly_aggregates[m] = {'success_net_amount_cny': 0, 'success_orders': 0, 'success_products': 0, 'failed_orders': 0, 'cancelled_orders': 0, 'total_orders': 0, 'total_products': 0, 'currency_amounts': {}}
+            monthly_aggregates[m] = {'success_net_amount_cny': 0, 'success_orders': 0, 'success_products': 0, 'failed_orders': 0, 'cancelled_orders': 0, 'undelivered_orders': 0, 'total_orders': 0, 'total_products': 0, 'currency_amounts': {}}
         monthly_aggregates[m]['success_net_amount_cny'] += (row.get('success_net_amount_cny') or 0)
         monthly_aggregates[m]['success_orders'] += row['success_orders']
         monthly_aggregates[m]['success_products'] += row['success_products']
         monthly_aggregates[m]['failed_orders'] += row['failed_orders']
         monthly_aggregates[m]['cancelled_orders'] += row['cancelled_orders']
+        monthly_aggregates[m]['undelivered_orders'] += row.get('undelivered_orders', 0)
         monthly_aggregates[m]['total_orders'] += row['total_orders']
         monthly_aggregates[m]['total_products'] += row['total_products']
-        # Aggregate amounts by currency
+        # Aggregate amounts by currency (shipping_loss tracked here too — same currency as orders)
         currency = row.get('currency', 'PLN')
         if currency not in monthly_aggregates[m]['currency_amounts']:
-            monthly_aggregates[m]['currency_amounts'][currency] = {'total_amount': 0, 'success_amount': 0, 'success_net_amount': 0}
+            monthly_aggregates[m]['currency_amounts'][currency] = {'total_amount': 0, 'success_amount': 0, 'success_net_amount': 0, 'shipping_loss': 0}
         monthly_aggregates[m]['currency_amounts'][currency]['total_amount'] += row.get('total_amount', 0)
         monthly_aggregates[m]['currency_amounts'][currency]['success_amount'] += row.get('success_amount', 0)
         monthly_aggregates[m]['currency_amounts'][currency]['success_net_amount'] += row.get('success_net_amount', 0)
+        monthly_aggregates[m]['currency_amounts'][currency]['shipping_loss'] += row.get('shipping_loss', 0)
         
     return render_template('monthly.html', monthly_stats=rows, monthly_aggregates=monthly_aggregates, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, country_filter=country_filter, all_managers=all_managers, all_countries=all_countries, sort_by=sort_by, site_managers=site_managers, start_month=start_month, end_month=end_month)
 
@@ -1863,7 +1901,8 @@ def monthly_export():
     where_clause = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
 
     query = f'''
-        SELECT id, status, date_created, total, shipping_total, source, currency, payment_method, line_items
+        SELECT id, status, date_created, total, shipping_total, source, currency, payment_method, line_items,
+               is_undelivered, shipping_loss_amount
         FROM orders
         {where_clause}
         ORDER BY date_created DESC
@@ -1899,7 +1938,7 @@ def monthly_export():
         total_products = gdf['product_qty'].sum()
         total_amount = gdf['total'].sum()
         
-        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat']) & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod')) & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs'))
+        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat']) & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod')) & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs')) & (gdf['is_undelivered'].fillna(0) == 0)
         success_orders = int(success_mask.sum())
         success_amount = gdf.loc[success_mask, 'total'].sum()
         success_products = gdf.loc[success_mask, 'product_qty'].sum()
@@ -1908,11 +1947,16 @@ def monthly_export():
 
         failed_orders = int((gdf['status'] == 'failed').sum())
         cancelled_orders = int((gdf['status'] == 'cancelled').sum())
-        
+
+        undelivered_mask = gdf['is_undelivered'].fillna(0) == 1
+        undelivered_orders = int(undelivered_mask.sum())
+        shipping_loss = float(gdf.loc[undelivered_mask, 'shipping_loss_amount'].fillna(0).sum())
+
         # Get CNY rate
         rate, _ = get_cny_rate(currency, str(month))
         success_net_amount_cny = round(success_net_amount * rate, 2) if rate else 0
-        
+        shipping_loss_cny = round(shipping_loss * rate, 2) if rate else 0
+
         rows.append({
             '月份': str(month),
             '网站': source.replace('https://www.', '').replace('https://', ''),
@@ -1927,12 +1971,17 @@ def monthly_export():
             '成功净金额': round(float(success_net_amount), 2),
             '失败订单': failed_orders,
             '取消订单': cancelled_orders,
+            '未送达订单': undelivered_orders,
+            '运费损失': round(shipping_loss, 2),
+            '运费损失(CNY)': shipping_loss_cny,
             '汇率': round(rate, 4) if rate else 0,
             '净金额(CNY)': round(success_net_amount_cny, 2),
             '_total_amount': float(total_amount),
             '_success_amount': float(success_amount),
             '_success_net_amount': float(success_net_amount),
-            '_net_amount_cny': success_net_amount_cny
+            '_net_amount_cny': success_net_amount_cny,
+            '_shipping_loss': shipping_loss,
+            '_shipping_loss_cny': shipping_loss_cny
         })
     
     # Sort by month descending
@@ -1954,6 +2003,9 @@ def monthly_export():
                 'success_net_amount': 0,
                 'failed_orders': 0,
                 'cancelled_orders': 0,
+                'undelivered_orders': 0,
+                'shipping_loss': 0,
+                'shipping_loss_cny': 0,
                 'net_amount_cny': 0
             }
         monthly_totals[m]['site_count'] += 1
@@ -1966,6 +2018,9 @@ def monthly_export():
         monthly_totals[m]['success_net_amount'] += row['_success_net_amount']
         monthly_totals[m]['failed_orders'] += row['失败订单']
         monthly_totals[m]['cancelled_orders'] += row['取消订单']
+        monthly_totals[m]['undelivered_orders'] += row.get('未送达订单', 0)
+        monthly_totals[m]['shipping_loss'] += row.get('_shipping_loss', 0)
+        monthly_totals[m]['shipping_loss_cny'] += row.get('_shipping_loss_cny', 0)
         monthly_totals[m]['net_amount_cny'] += row['_net_amount_cny']
     
     # Create Excel workbook
@@ -2305,8 +2360,8 @@ def cancelled_analysis():
     source_query += ' ORDER BY source'
     all_sources = conn.execute(source_query, source_params).fetchall()
     
-    # Build query conditions for cancelled/failed orders
-    conditions = ["status IN ('cancelled', 'failed')"]
+    # Build query conditions for problem orders: cancelled / failed / undelivered
+    conditions = ["(status IN ('cancelled', 'failed') OR is_undelivered = 1)"]
     params = []
     
     if allowed_sources is not None:
@@ -2353,43 +2408,45 @@ def cancelled_analysis():
     
     where_clause = 'WHERE ' + ' AND '.join(conditions)
     
-    # Query cancelled/failed orders with date information
+    # Query problem orders (cancelled / failed / undelivered) with date information
     query = f'''
-        SELECT id, number, status, total, shipping_total, currency, date_created, date_modified, source, line_items, billing
+        SELECT id, number, status, total, shipping_total, currency, date_created, date_modified, source,
+               line_items, billing, payment_method, is_undelivered, shipping_loss_amount
         FROM orders
         {where_clause}
         ORDER BY date_created DESC
     '''
-    
+
     orders_data = conn.execute(query, params).fetchall()
-    
-    # Get available months
+
+    # Get available months (also covers undelivered)
     months_query = '''
-        SELECT DISTINCT strftime('%Y-%m', date_created) as month 
-        FROM orders 
-        WHERE status IN ('cancelled', 'failed')
+        SELECT DISTINCT strftime('%Y-%m', date_created) as month
+        FROM orders
+        WHERE status IN ('cancelled', 'failed') OR is_undelivered = 1
         ORDER BY month DESC
     '''
     available_months = conn.execute(months_query).fetchall()
     available_months = [m['month'] for m in available_months if m['month']]
-    
+
     # Process data for stats
     total_cancelled = 0
     total_amount = 0
     cancellation_rate = 0
     orders_list = []
-    
+
     timing_stats = {
         'within_1_day': {'count': 0, 'amount': 0},
         '1_to_7_days': {'count': 0, 'amount': 0},
         'over_7_days': {'count': 0, 'amount': 0}
     }
-    
+
     status_stats = {
         'cancelled': {'count': 0, 'amount': 0},
-        'failed': {'count': 0, 'amount': 0}
+        'failed': {'count': 0, 'amount': 0},
+        'undelivered': {'count': 0, 'amount': 0, 'shipping_loss': 0}
     }
-    
+
     source_stats = {}
     customer_type_stats = {
         'new': {'count': 0, 'amount': 0},
@@ -2458,17 +2515,30 @@ def cancelled_analysis():
             timing_stats['over_7_days']['amount'] += total
             od['timing_category'] = '7天+'
         
-        # Status stats
-        if status in status_stats:
+        # Status stats — undelivered (delivery refused/returned) is its own bucket,
+        # even if the underlying status is e.g. 'completed' before the order came back
+        is_undelivered = bool(order['is_undelivered']) if 'is_undelivered' in order.keys() else False
+        loss_amount = float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in order.keys() else 0.0
+        od['is_undelivered'] = is_undelivered
+        od['shipping_loss_amount'] = loss_amount
+
+        if is_undelivered:
+            status_stats['undelivered']['count'] += 1
+            status_stats['undelivered']['amount'] += total
+            status_stats['undelivered']['shipping_loss'] += loss_amount
+        elif status in status_stats:
             status_stats[status]['count'] += 1
             status_stats[status]['amount'] += total
-        
+
         # Source stats
         if source not in source_stats:
-            source_stats[source] = {'count': 0, 'amount': 0, 'cancelled': 0, 'failed': 0}
+            source_stats[source] = {'count': 0, 'amount': 0, 'cancelled': 0, 'failed': 0, 'undelivered': 0, 'shipping_loss': 0}
         source_stats[source]['count'] += 1
         source_stats[source]['amount'] += total
-        if status == 'cancelled':
+        if is_undelivered:
+            source_stats[source]['undelivered'] += 1
+            source_stats[source]['shipping_loss'] += loss_amount
+        elif status == 'cancelled':
             source_stats[source]['cancelled'] += 1
         else:
             source_stats[source]['failed'] += 1
@@ -2582,7 +2652,9 @@ def cancelled_analysis():
             'count': stats['count'],
             'amount': stats['amount'],
             'cancelled': stats['cancelled'],
-            'failed': stats['failed']
+            'failed': stats['failed'],
+            'undelivered': stats.get('undelivered', 0),
+            'shipping_loss': stats.get('shipping_loss', 0)
         })
     source_stats_list.sort(key=lambda x: x['count'], reverse=True)
     
@@ -2706,8 +2778,8 @@ def cancelled_analysis():
     source_query += ' ORDER BY source'
     all_sources = conn.execute(source_query, source_params).fetchall()
     
-    # Build query conditions for cancelled/failed orders
-    conditions = ["status IN ('cancelled', 'failed')"]
+    # Build query conditions for problem orders: cancelled / failed / undelivered
+    conditions = ["(status IN ('cancelled', 'failed') OR is_undelivered = 1)"]
     params = []
     
     if allowed_sources is not None:
@@ -2863,17 +2935,30 @@ def cancelled_analysis():
             timing_stats['over_7_days']['amount'] += total
             od['timing_category'] = '7天+'
         
-        # Status stats
-        if status in status_stats:
+        # Status stats — undelivered (delivery refused/returned) is its own bucket,
+        # even if the underlying status is e.g. 'completed' before the order came back
+        is_undelivered = bool(order['is_undelivered']) if 'is_undelivered' in order.keys() else False
+        loss_amount = float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in order.keys() else 0.0
+        od['is_undelivered'] = is_undelivered
+        od['shipping_loss_amount'] = loss_amount
+
+        if is_undelivered:
+            status_stats['undelivered']['count'] += 1
+            status_stats['undelivered']['amount'] += total
+            status_stats['undelivered']['shipping_loss'] += loss_amount
+        elif status in status_stats:
             status_stats[status]['count'] += 1
             status_stats[status]['amount'] += total
-        
+
         # Source stats
         if source not in source_stats:
-            source_stats[source] = {'count': 0, 'amount': 0, 'cancelled': 0, 'failed': 0}
+            source_stats[source] = {'count': 0, 'amount': 0, 'cancelled': 0, 'failed': 0, 'undelivered': 0, 'shipping_loss': 0}
         source_stats[source]['count'] += 1
         source_stats[source]['amount'] += total
-        if status == 'cancelled':
+        if is_undelivered:
+            source_stats[source]['undelivered'] += 1
+            source_stats[source]['shipping_loss'] += loss_amount
+        elif status == 'cancelled':
             source_stats[source]['cancelled'] += 1
         else:
             source_stats[source]['failed'] += 1
@@ -2982,7 +3067,9 @@ def cancelled_analysis():
             'count': stats['count'],
             'amount': stats['amount'],
             'cancelled': stats['cancelled'],
-            'failed': stats['failed']
+            'failed': stats['failed'],
+            'undelivered': stats.get('undelivered', 0),
+            'shipping_loss': stats.get('shipping_loss', 0)
         })
     source_stats_list.sort(key=lambda x: x['count'], reverse=True)
     
@@ -3110,13 +3197,15 @@ def customers():
     where_clause = 'WHERE ' + ' AND '.join(conditions)
     
     query = f'''
-        SELECT 
+        SELECT
             json_extract(billing, '$.email') as email,
             json_extract(billing, '$.first_name') || ' ' || json_extract(billing, '$.last_name') as name,
             json_extract(billing, '$.phone') as phone,
             COUNT(*) as total_orders,
-            SUM(CASE WHEN (status IN ('completed','shipped','delivered','partial-shipped') OR (status = 'on-hold' AND COALESCE(payment_method,'cod') != 'bacs') OR (status = 'processing' AND COALESCE(payment_method,'cod') != 'cod')) THEN 1 ELSE 0 END) as successful_orders,
-            SUM(CASE WHEN (status IN ('completed','shipped','delivered','partial-shipped') OR (status = 'on-hold' AND COALESCE(payment_method,'cod') != 'bacs') OR (status = 'processing' AND COALESCE(payment_method,'cod') != 'cod')) THEN total ELSE 0 END) as total_spent,
+            SUM({_success_status_case()}) as successful_orders,
+            {_success_amount_case('total')} as total_spent,
+            SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 1 ELSE 0 END) as undelivered_orders,
+            SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END) as shipping_loss_total,
             MAX(date_created) as last_order_date,
             MIN(date_created) as first_order_date,
             GROUP_CONCAT(DISTINCT source) as sources
@@ -3148,8 +3237,11 @@ def customers():
     for row in customers_data:
         c = dict(row)
         c['total_spent'] = float(c['total_spent'] or 0)
+        c['undelivered_orders'] = int(c.get('undelivered_orders') or 0)
+        c['shipping_loss_total'] = float(c.get('shipping_loss_total') or 0)
+        c['refusal_rate'] = round(c['undelivered_orders'] / c['total_orders'] * 100, 1) if c['total_orders'] else 0
         total_revenue += c['total_spent']
-        
+
         if c['successful_orders'] > 1:
             repeat_customers += 1
             
@@ -3260,10 +3352,13 @@ def chart_data():
         return jsonify(result)
     
     elif chart_type == 'status':
+        # Surface 'undelivered' as its own slice — covers the underlying status
         data = conn.execute('''
-            SELECT status, COUNT(*) as count
+            SELECT
+                CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 'undelivered' ELSE status END AS status,
+                COUNT(*) as count
             FROM orders
-            GROUP BY status
+            GROUP BY CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 'undelivered' ELSE status END
         ''').fetchall()
         
         conn.close()
@@ -3303,18 +3398,21 @@ def get_order_details(order_id):
     if order_dict['billing'] and order_dict['billing'].get('email'):
         email = order_dict['billing']['email']
         # 统计已完成订单（历史消费）
-        customer_stats = conn.execute('''
+        customer_stats = conn.execute(f'''
             SELECT COUNT(*) as count, SUM(total) as total
-            FROM orders 
-            WHERE json_extract(billing, '$.email') = ? AND (status IN ('completed','shipped','delivered','partial-shipped') OR (status = 'on-hold' AND COALESCE(payment_method,'cod') != 'bacs') OR (status = 'processing' AND COALESCE(payment_method,'cod') != 'cod'))
+            FROM orders
+            WHERE json_extract(billing, '$.email') = ? AND {_success_status_cond()}
         ''', (email,)).fetchone()
         
-        # 按状态分类统计所有订单
+        # 按状态分类统计所有订单 — 未送达视为独立分桶（覆盖底层 status）
         status_stats = conn.execute('''
-            SELECT status, COUNT(*) as count, SUM(total) as total
-            FROM orders 
+            SELECT
+                CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 'undelivered' ELSE status END AS status,
+                COUNT(*) as count,
+                SUM(total) as total
+            FROM orders
             WHERE json_extract(billing, '$.email') = ?
-            GROUP BY status
+            GROUP BY CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 'undelivered' ELSE status END
         ''', (email,)).fetchall()
         
         status_breakdown = {}
@@ -3357,8 +3455,13 @@ def get_order_details(order_id):
     if shipping_log:
         order_dict['shipping_log'] = dict(shipping_log)
 
+    # Resolve who marked the order as undelivered (for audit display)
+    if order_dict.get('is_undelivered') and order_dict.get('undelivered_by'):
+        marker = conn.execute('SELECT name FROM users WHERE id = ?', (order_dict['undelivered_by'],)).fetchone()
+        order_dict['undelivered_by_name'] = marker['name'] if marker else None
+
     conn.close()
-    
+
     return jsonify(order_dict)
 
 
@@ -3373,17 +3476,18 @@ def get_customer_details(email):
     
     # Get all orders from this customer
     orders = conn.execute('''
-        SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing, payment_method
+        SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing,
+               payment_method, is_undelivered, shipping_loss_amount
         FROM orders
         WHERE json_extract(billing, '$.email') = ? AND status NOT IN ('checkout-draft', 'trash')
         ORDER BY date_created DESC
     ''', (email,)).fetchall()
-    
+
     conn.close()
-    
+
     if not orders:
         return jsonify({'error': 'Customer not found'}), 404
-    
+
     # Process orders
     order_list = []
     all_products = {}
@@ -3393,6 +3497,8 @@ def get_customer_details(email):
     successful_orders = 0
     failed_orders = 0
     cancelled_orders = 0
+    undelivered_orders = 0
+    shipping_loss_total = 0.0
     dates = []
     
     # Initialize customer details
@@ -3445,7 +3551,11 @@ def get_customer_details(email):
         status = order['status']
         currency = order['currency'] or 'N/A'
         payment_method = order['payment_method'] or ''
-        if status in ['completed', 'shipped', 'delivered', 'partial-shipped'] or (status == 'on-hold' and payment_method != 'bacs') or (status == 'processing' and payment_method and payment_method != 'cod'):
+        is_undelivered = bool(order['is_undelivered']) if 'is_undelivered' in order.keys() else False
+        if is_undelivered:
+            undelivered_orders += 1
+            shipping_loss_total += float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in order.keys() else 0
+        elif status in ['completed', 'shipped', 'delivered', 'partial-shipped'] or (status == 'on-hold' and payment_method != 'bacs') or (status == 'processing' and payment_method and payment_method != 'cod'):
             successful_orders += 1
             order_total = float(order['total'] or 0)
             total_spending += order_total
@@ -3547,6 +3657,9 @@ def get_customer_details(email):
         'successful_orders': successful_orders,
         'failed_orders': failed_orders,
         'cancelled_orders': cancelled_orders,
+        'undelivered_orders': undelivered_orders,
+        'shipping_loss_total': round(shipping_loss_total, 2),
+        'refusal_rate': round(undelivered_orders / len(order_list) * 100, 1) if order_list else 0,
         'total_spending': total_spending,
         'spending_by_currency': spending_by_currency,  # New: currency breakdown
         'spending_cny': round(spending_cny, 2),  # New: CNY total
@@ -3606,6 +3719,7 @@ STATUS_LABELS = {
     'delivered': '已送达',
     'partial-shipped': '部分发货',
     'checkout-draft': '草稿',
+    'undelivered': '未送达',
 }
 
 # Status translation — Online payment mode (Stripe, credit card, etc.)
@@ -3621,6 +3735,7 @@ STATUS_LABELS_ONLINE = {
     'delivered': '已送达',
     'partial-shipped': '部分发货',
     'checkout-draft': '草稿',
+    'undelivered': '未送达',
 }
 
 # Status translation — Bank transfer mode (bacs)
@@ -3637,6 +3752,7 @@ STATUS_LABELS_BACS = {
     'delivered': '已送达',
     'partial-shipped': '部分发货',
     'checkout-draft': '草稿',
+    'undelivered': '未送达',
 }
 
 
@@ -3668,11 +3784,13 @@ def _success_status_case(prefix='', as_name='is_success'):
     Three payment modes:
       COD:   on-hold(shipped) + shipped/delivered/partial-shipped + completed
       bacs:  on-hold is NOT success (awaiting bank transfer) — only after processing
-      Online(Stripe): processing(paid) + shipped/delivered/partial-shipped + completed"""
+      Online(Stripe): processing(paid) + shipped/delivered/partial-shipped + completed
+    Undelivered (refused/returned) is never a success regardless of payment mode."""
     p = f'{prefix}.' if prefix else ''
-    return f"""(CASE WHEN {p}status IN ('completed','shipped','delivered','partial-shipped')
+    return f"""(CASE WHEN ({p}status IN ('completed','shipped','delivered','partial-shipped')
                     OR ({p}status = 'on-hold' AND COALESCE({p}payment_method,'cod') != 'bacs')
-                    OR ({p}status = 'processing' AND COALESCE({p}payment_method,'cod') != 'cod')
+                    OR ({p}status = 'processing' AND COALESCE({p}payment_method,'cod') != 'cod'))
+                    AND COALESCE({p}is_undelivered, 0) = 0
                THEN 1 ELSE 0 END)"""
 
 
@@ -3680,18 +3798,47 @@ def _success_status_cond(prefix=''):
     """SQL boolean condition: true if order is 'successful'.
     Same logic as _success_status_case but for WHERE clauses."""
     p = f'{prefix}.' if prefix else ''
-    return f"""({p}status IN ('completed','shipped','delivered','partial-shipped')
+    return f"""(({p}status IN ('completed','shipped','delivered','partial-shipped')
         OR ({p}status = 'on-hold' AND COALESCE({p}payment_method,'cod') != 'bacs')
-        OR ({p}status = 'processing' AND COALESCE({p}payment_method,'cod') != 'cod'))"""
+        OR ({p}status = 'processing' AND COALESCE({p}payment_method,'cod') != 'cod'))
+        AND COALESCE({p}is_undelivered, 0) = 0)"""
 
 
 def _revenue_status_cond(prefix=''):
     """SQL boolean condition: true if order should count toward revenue.
-    Excludes: failed/cancelled/draft/trash/cheat, online-pending, bacs-on-hold."""
+    Excludes: failed/cancelled/draft/trash/cheat, online-pending, bacs-on-hold,
+    and undelivered (package returned, no money collected)."""
     p = f'{prefix}.' if prefix else ''
     return f"""({p}status NOT IN ('failed','cancelled','checkout-draft','trash','cheat')
         AND NOT ({p}status = 'pending' AND COALESCE({p}payment_method,'cod') != 'cod')
-        AND NOT ({p}status = 'on-hold' AND {p}payment_method = 'bacs'))"""
+        AND NOT ({p}status = 'on-hold' AND {p}payment_method = 'bacs')
+        AND COALESCE({p}is_undelivered, 0) = 0)"""
+
+
+def _active_status_cond(prefix=''):
+    """SQL boolean condition: like _revenue_status_cond but a narrower exclusion list
+    (only filters failed/cancelled, not draft/trash/cheat). Used in legacy trend / chart
+    queries where draft/trash never carried real data anyway. Kept distinct so behavior
+    matches the previous inline strings exactly — do NOT consolidate without checking
+    each callsite's data semantics."""
+    p = f'{prefix}.' if prefix else ''
+    return f"""({p}status NOT IN ('failed','cancelled')
+        AND NOT ({p}status = 'pending' AND COALESCE({p}payment_method,'cod') != 'cod')
+        AND NOT ({p}status = 'on-hold' AND {p}payment_method = 'bacs')
+        AND COALESCE({p}is_undelivered, 0) = 0)"""
+
+
+def _success_amount_case(col, prefix=''):
+    """SQL fragment: SUM(CASE WHEN <successful> THEN <col> ELSE 0 END).
+    Use for summing amounts/quantities of orders that count as 'successful'."""
+    p = f'{prefix}.' if prefix else ''
+    return f"SUM(CASE WHEN {_success_status_cond(prefix)} THEN {p}{col} ELSE 0 END)"
+
+
+def _revenue_amount_case(col, prefix=''):
+    """SQL fragment: SUM(CASE WHEN <counts toward revenue> THEN <col> ELSE 0 END)."""
+    p = f'{prefix}.' if prefix else ''
+    return f"SUM(CASE WHEN {_revenue_status_cond(prefix)} THEN {p}{col} ELSE 0 END)"
 
 # Currency symbols mapping
 CURRENCY_SYMBOLS = {
@@ -3718,15 +3865,21 @@ def get_currency_symbol(currency):
 
 
 @app.template_filter('status_label')
-def status_label_filter(status, payment_method=None):
-    """Jinja filter: {{ order.status|status_label(order.payment_method) }}"""
+def status_label_filter(status, payment_method=None, is_undelivered=0):
+    """Jinja filter: {{ order.status|status_label(order.payment_method, order.is_undelivered) }}.
+    is_undelivered=1 wins over the underlying status (kept on a separate column to
+    survive WooCommerce sync overwrites — see init_undelivered_columns)."""
+    if is_undelivered:
+        return '未送达'
     return get_status_label(status, payment_method)
 
 
 @app.template_filter('status_class')
-def status_class_filter(status, payment_method=None):
+def status_class_filter(status, payment_method=None, is_undelivered=0):
     """Jinja filter: returns CSS class for status badge, payment-mode-aware.
     bacs + on-hold uses pending style (yellow = awaiting payment)."""
+    if is_undelivered:
+        return 'status-undelivered'
     if status == 'on-hold' and payment_method == 'bacs':
         return 'status-pending'
     return f'status-{status}'
@@ -3924,10 +4077,34 @@ def init_users_table():
     conn.close()
 
 
+def init_undelivered_columns():
+    """Add columns to orders table for tracking undelivered (refused/returned) orders.
+    Kept on a separate flag column instead of overloading status, because sync_utils
+    uses INSERT OR REPLACE which would otherwise overwrite a local 'undelivered' status."""
+    conn = get_db_connection()
+    for ddl in (
+        'ALTER TABLE orders ADD COLUMN is_undelivered INTEGER DEFAULT 0',
+        'ALTER TABLE orders ADD COLUMN shipping_loss_amount REAL DEFAULT 0',
+        'ALTER TABLE orders ADD COLUMN undelivered_at TEXT',
+        'ALTER TABLE orders ADD COLUMN undelivered_by INTEGER',
+        'ALTER TABLE orders ADD COLUMN undelivered_note TEXT',
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+    try:
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_is_undelivered ON orders(is_undelivered)')
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+    conn.close()
+
+
 def init_shipping_tables():
     """Initialize shipping-related tables"""
     conn = get_db_connection()
-    
+
     # Add can_ship column to users table if not exists
     try:
         conn.execute('ALTER TABLE users ADD COLUMN can_ship INTEGER DEFAULT 0')
@@ -4247,6 +4424,33 @@ def init_sales_groups_tables():
         )
     ''')
 
+    # Sales-board-only exchange rate overrides (does not affect rest of the system)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sales_board_exchange_rates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year_month TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            rate_to_cny REAL NOT NULL,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_by TEXT DEFAULT '',
+            UNIQUE(year_month, currency)
+        )
+    ''')
+
+    # Sales board export history
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sales_board_exports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year_month TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            file_size INTEGER DEFAULT 0,
+            hide_leader INTEGER DEFAULT 0,
+            created_by TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -4388,6 +4592,7 @@ with app.app_context():
     init_settings_table()
     init_users_table()
     init_shipping_tables()
+    init_undelivered_columns()
     init_product_tables()
     init_user_preferences_table()
     init_sales_board_tables()
@@ -5838,33 +6043,34 @@ def get_sync_summary():
 @app.route('/api/sync/deep', methods=['POST'])
 @login_required
 def trigger_deep_sync():
-    """Trigger deep sync using 1.wooorders_sqlite.py script"""
+    """Trigger TRUE deep sync — fetch every order page from each site, no date filter."""
     import subprocess
     import threading
-    
+
     DEEP_SYNC_ID = 888888
-    
+
     SYNC_STATUS[DEEP_SYNC_ID] = {
         'status': 'running',
         'message': '正在启动深度同步...',
         'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Deep sync job started"]
     }
-    
+
     def run_deep_sync(app_context):
         with app_context:
             try:
-                script_path = '/www/wwwroot/woo-analysis/1.wooorders_sqlite.py'
+                # Use the standalone full-resync script (no date filter, all pages, every site)
+                script_path = '/www/wwwroot/woo-analysis/full_resync_all.py'
                 venv_python = '/www/wwwroot/woo-analysis/venv/bin/python'
-                
-                SYNC_STATUS[DEEP_SYNC_ID]['message'] = '正在执行深度同步脚本...'
+
+                SYNC_STATUS[DEEP_SYNC_ID]['message'] = '正在执行全量深度同步...'
                 SYNC_STATUS[DEEP_SYNC_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Running {script_path}")
-                
+
                 result = subprocess.run(
-                    [venv_python, script_path],
+                    [venv_python, '-u', script_path],
                     cwd='/www/wwwroot/woo-analysis',
                     capture_output=True,
                     text=True,
-                    timeout=3600  # 1 hour timeout
+                    timeout=7200  # 2 hour timeout for full resync of all sites
                 )
                 
                 if result.returncode == 0:
@@ -6546,7 +6752,7 @@ def _calc_partner_net_sales(partner_id, year, month):
 
     # Aggregate from orders table — filtered by partner's currency
     # Using the same "success" filter as /monthly (exclude failed/cancelled/etc.)
-    success_cond = "status NOT IN ('failed','cancelled','checkout-draft','trash','cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') AND NOT (status = 'on-hold' AND payment_method = 'bacs')"
+    success_cond = _revenue_status_cond()
     query = f'''
         SELECT
             COUNT(*) as total_orders,
@@ -7491,7 +7697,7 @@ def products():
         date_to = ''
     
     # Build filter conditions with permission check
-    conditions = ["status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') AND NOT (status = 'on-hold' AND payment_method = 'bacs')"]
+    conditions = [_revenue_status_cond()]
     params = []
     
     # Add permission filter
@@ -7846,7 +8052,7 @@ def products():
     eight_weeks_ago = (today - timedelta(weeks=8)).isoformat()
     
     # Build conditions for 8-week query (with same permission filtering, but NOT date filter)
-    trend_conditions = ["status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') AND NOT (status = 'on-hold' AND payment_method = 'bacs')", "date_created >= ?"]
+    trend_conditions = [_active_status_cond(), "date_created >= ?"]
     trend_params = [eight_weeks_ago]
     
     # Add permission filter
@@ -8164,7 +8370,7 @@ def get_product_stats():
     days = int(request.args.get('days', 30))
     
     # Build conditions
-    conditions = ["status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs') AND NOT (status = 'on-hold' AND payment_method = 'bacs')"]
+    conditions = [_active_status_cond()]
     params = []
     
     if allowed_sources is not None:
@@ -8262,9 +8468,9 @@ def get_unknown_products():
     # Get orders from last N days
     date_from = (date.today() - timedelta(days=days)).isoformat()
     
-    orders = conn.execute('''
-        SELECT line_items, source FROM orders 
-        WHERE date_created >= ? AND status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
+    orders = conn.execute(f'''
+        SELECT line_items, source FROM orders
+        WHERE date_created >= ? AND {_active_status_cond()}
     ''', (date_from,)).fetchall()
     
     # Get brands cache
@@ -8485,10 +8691,10 @@ def get_product_samples():
         }
     
     # Search for orders - increase limit to find more sources
-    orders = conn.execute('''
-        SELECT id, number, source, date_created, line_items 
-        FROM orders 
-        WHERE status NOT IN ('failed', 'cancelled') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
+    orders = conn.execute(f'''
+        SELECT id, number, source, date_created, line_items
+        FROM orders
+        WHERE {_active_status_cond()}
         ORDER BY date_created DESC
         LIMIT 2000
     ''').fetchall()
@@ -9656,6 +9862,128 @@ def update_order_status(order_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/order/<int:order_id>/mark-undelivered', methods=['POST'])
+@login_required
+@shipper_required
+def mark_order_undelivered(order_id):
+    """Mark an order as undelivered (refused / returned to sender).
+    Stores the lost shipping fee and an audit trail. Adds a remote WooCommerce
+    note when possible so the WC admin reflects the same fact."""
+    import requests as req
+
+    data = request.get_json(silent=True) or {}
+    raw_amount = data.get('shipping_loss_amount', 0)
+    note_text = (data.get('note') or '').strip()
+
+    try:
+        loss_amount = float(raw_amount or 0)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': '运费损失金额格式不正确'}), 400
+    if loss_amount < 0:
+        return jsonify({'success': False, 'error': '运费损失金额不能为负数'}), 400
+
+    conn = get_db_connection()
+    order = conn.execute(
+        'SELECT id, number, source, is_undelivered FROM orders WHERE id = ?',
+        (order_id,)
+    ).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+
+    if order['is_undelivered']:
+        conn.close()
+        return jsonify({'success': False, 'error': '该订单已被标记为未送达'}), 409
+
+    try:
+        conn.execute('''
+            UPDATE orders
+               SET is_undelivered = 1,
+                   shipping_loss_amount = ?,
+                   undelivered_at = datetime('now'),
+                   undelivered_by = ?,
+                   undelivered_note = ?
+             WHERE id = ?
+        ''', (loss_amount, int(current_user.id), note_text or None, order_id))
+
+        # Local order_notes audit row (always succeeds even if remote API is down)
+        log_line = f"订单被 {current_user.name} 标记为「未送达/退回」，运费损失 {loss_amount:.2f}"
+        if note_text:
+            log_line += f"。原因：{note_text}"
+        conn.execute('''
+            INSERT INTO order_notes (order_id, note, date_created, customer_note, author, added_by_user)
+            VALUES (?, ?, datetime('now'), 0, ?, 1)
+        ''', (order_id, log_line, current_user.name))
+
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return jsonify({'success': False, 'error': f'本地写入失败: {e}'}), 500
+
+    # Best-effort remote note — failure is non-fatal
+    site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    conn.close()
+    if site and site['consumer_key'] and site['consumer_secret']:
+        try:
+            req.post(
+                f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes",
+                json={'note': log_line, 'customer_note': False},
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=10,
+                headers={
+                    'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+                    'Content-Type': 'application/json',
+                },
+            )
+        except Exception as remote_err:
+            app.logger.warning(f'Remote note for undelivered order {order_id} failed: {remote_err}')
+
+    return jsonify({
+        'success': True,
+        'message': f'已标记为未送达，运费损失 {loss_amount:.2f}',
+        'shipping_loss_amount': loss_amount,
+    })
+
+
+@app.route('/api/order/<int:order_id>/unmark-undelivered', methods=['POST'])
+@login_required
+@shipper_required
+def unmark_order_undelivered(order_id):
+    """Reverse a previous mark-undelivered (e.g., the shipper made a mistake)."""
+    conn = get_db_connection()
+    order = conn.execute(
+        'SELECT id, is_undelivered FROM orders WHERE id = ?',
+        (order_id,)
+    ).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    if not order['is_undelivered']:
+        conn.close()
+        return jsonify({'success': False, 'error': '该订单未被标记为未送达'}), 409
+
+    try:
+        conn.execute('''
+            UPDATE orders
+               SET is_undelivered = 0,
+                   shipping_loss_amount = 0,
+                   undelivered_at = NULL,
+                   undelivered_by = NULL,
+                   undelivered_note = NULL
+             WHERE id = ?
+        ''', (order_id,))
+        conn.execute('''
+            INSERT INTO order_notes (order_id, note, date_created, customer_note, author, added_by_user)
+            VALUES (?, ?, datetime('now'), 0, ?, 1)
+        ''', (order_id, f"{current_user.name} 撤销了「未送达」标记", current_user.name))
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return jsonify({'success': False, 'error': f'撤销失败: {e}'}), 500
+    conn.close()
+    return jsonify({'success': True, 'message': '已撤销未送达标记'})
+
+
 @app.route('/api/shipping/print/label/<int:order_id>')
 @login_required
 @shipper_required
@@ -10427,14 +10755,14 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
         time_expr = "strftime('%Y-%m', date_created)"
     
     query = f'''
-        SELECT 
+        SELECT
             source,
             {time_expr} as period,
             COUNT(*) as order_count,
             SUM(total) as total_amount,
             SUM(total - shipping_total) as net_amount,
             currency,
-            SUM(CASE WHEN status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
+            SUM(CASE WHEN {_revenue_status_cond()}
                 THEN total - shipping_total ELSE 0 END) as success_net
         FROM orders
         WHERE date_created >= ? AND date_created <= ?
@@ -10755,18 +11083,43 @@ def sales_board_required(f):
     return decorated_function
 
 
-@app.route('/sales-board')
-@login_required
-@sales_board_required
-def sales_board():
-    """Sales board dashboard"""
+def _get_sales_board_rate_overrides(year_month):
+    """Return dict of {currency_upper: rate} for the given month from sales_board_exchange_rates."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            'SELECT currency, rate_to_cny FROM sales_board_exchange_rates WHERE year_month = ?',
+            (year_month,)
+        ).fetchall()
+        return {(r['currency'] or '').upper(): float(r['rate_to_cny']) for r in rows}
+    finally:
+        conn.close()
+
+
+def _get_board_cny_rate(currency, year_month, overrides=None):
+    """CNY rate for sales-board calculations only.
+
+    overrides: optional pre-fetched dict for the month, to avoid repeated DB hits.
+    Falls back to the global get_cny_rate when no override is set.
+    """
+    if not currency or currency.upper() == 'CNY':
+        return 1.0, 'override' if overrides and 'CNY' in overrides else 'system'
+    cur_u = currency.upper()
+    if overrides is None:
+        overrides = _get_sales_board_rate_overrides(year_month)
+    if cur_u in overrides:
+        return overrides[cur_u], 'override'
+    rate, _ = get_cny_rate(currency, year_month)
+    return (rate or 0), 'system'
+
+
+def _compute_sales_board_data(selected_month):
+    """Compute sales board data (shared by view and export).
+
+    Returns a dict with all the data needed to render the sales board.
+    """
     import datetime
     from collections import defaultdict
-
-    selected_month = request.args.get('month', '')
-    if not selected_month:
-        today = datetime.date.today()
-        selected_month = today.strftime('%Y-%m')
 
     # Get previous month for growth calculation
     ym_parts = selected_month.split('-')
@@ -10777,6 +11130,10 @@ def sales_board():
         prev_month = f"{sel_year}-{sel_mon - 1:02d}"
 
     conn = get_db_connection()
+
+    # Sales-board-only exchange rate overrides
+    _board_overrides_cur = _get_sales_board_rate_overrides(selected_month)
+    _board_overrides_prev = _get_sales_board_rate_overrides(prev_month)
 
     # Get all managers and their sites
     sites = conn.execute('SELECT url, manager FROM sites WHERE manager IS NOT NULL AND manager != ""').fetchall()
@@ -10836,7 +11193,7 @@ def sales_board():
             FROM orders
             WHERE source IN ({placeholders})
             AND strftime('%Y-%m', date_created) = ?
-            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
+            AND {_revenue_status_cond()}
         ''', site_urls + [selected_month]).fetchall()
 
         # Previous month successful orders (for growth)
@@ -10845,7 +11202,7 @@ def sales_board():
             FROM orders
             WHERE source IN ({placeholders})
             AND strftime('%Y-%m', date_created) = ?
-            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
+            AND {_revenue_status_cond()}
         ''', site_urls + [prev_month]).fetchall()
 
         # Current week orders
@@ -10854,14 +11211,40 @@ def sales_board():
             FROM orders
             WHERE source IN ({placeholders})
             AND date(date_created) >= ? AND date(date_created) <= ?
-            AND status NOT IN ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat') AND NOT (status = 'pending' AND COALESCE(payment_method,'cod') != 'cod') AND NOT (status = 'on-hold' AND payment_method = 'bacs')
+            AND {_revenue_status_cond()}
         ''', site_urls + [week_start.isoformat(), week_end.isoformat()]).fetchall()
 
+        # Undelivered orders for this manager (for shipping-loss visibility — separate from revenue)
+        undelivered_rows = conn.execute(f'''
+            SELECT shipping_loss_amount, currency
+            FROM orders
+            WHERE source IN ({placeholders})
+            AND strftime('%Y-%m', date_created) = ?
+            AND is_undelivered = 1
+        ''', site_urls + [selected_month]).fetchall()
+
         # Calculate month amounts by currency and total products
-        month_currency_amounts = defaultdict(lambda: {'net_amount': 0, 'amount': 0})
+        month_currency_amounts = defaultdict(lambda: {'net_amount': 0, 'amount': 0, 'shipping': 0})
         month_total_products = 0
         month_net_cny = 0
         month_commission_base_cny = 0  # Sales eligible for commission (in CNY)
+        month_shipping_cny = 0           # Shipping not counted toward commission (in CNY)
+        month_excluded_cny = 0           # Excluded-brand product revenue (in CNY)
+        # Per-brand exclusion breakdown: {brand: {qty, revenue_by_currency, revenue_cny}}
+        excluded_brand_breakdown = defaultdict(lambda: {
+            'qty': 0, 'revenue_by_currency': defaultdict(float), 'revenue_cny': 0.0
+        })
+        order_count = len(month_orders)
+
+        # Per-currency exchange rate cache (rate for the selected month, with sales-board overrides)
+        _month_rates = {}
+        _month_rate_sources = {}  # 'override' or 'system'
+        def _rate_for(cur):
+            if cur not in _month_rates:
+                r, src = _get_board_cny_rate(cur, selected_month, _board_overrides_cur)
+                _month_rates[cur] = r or 0
+                _month_rate_sources[cur] = src
+            return _month_rates[cur]
 
         for order in month_orders:
             currency = order['currency'] or 'PLN'
@@ -10870,46 +11253,60 @@ def sales_board():
             net = total - shipping
             month_currency_amounts[currency]['amount'] += total
             month_currency_amounts[currency]['net_amount'] += net
+            month_currency_amounts[currency]['shipping'] += shipping
+
+            rate = _rate_for(currency)
 
             # Products count
             items = parse_json_field(order['line_items'])
             if isinstance(items, list):
                 for item in items:
-                    qty = item.get('quantity', 0)
+                    qty = item.get('quantity', 0) or 0
                     month_total_products += qty
 
                     # Check if product brand is excluded from commission
-                    product_name = item.get('name', '').upper()
-                    is_excluded = False
+                    product_name_raw = item.get('name', '') or ''
+                    product_name = product_name_raw.upper()
+                    excluded_brand = None
                     for nc_brand in no_commission_brands:
                         if nc_brand in product_name:
-                            is_excluded = True
+                            excluded_brand = nc_brand
                             break
                     # Also check against brands_cache for better matching
-                    if not is_excluded:
-                        parsed = parse_product_name(item.get('name', ''), brands_cache)
+                    if not excluded_brand:
+                        parsed = parse_product_name(product_name_raw, brands_cache)
                         if parsed.get('brand') and parsed['brand'].upper() in no_commission_brands:
-                            is_excluded = True
+                            excluded_brand = parsed['brand'].upper()
 
-                    if not is_excluded:
-                        item_total = float(item.get('total', 0))
-                        rate, _ = get_cny_rate(currency, selected_month)
+                    item_total = float(item.get('total', 0) or 0)
+                    if excluded_brand:
+                        bucket = excluded_brand_breakdown[excluded_brand]
+                        bucket['qty'] += qty
+                        bucket['revenue_by_currency'][currency] += item_total
+                        if rate:
+                            bucket['revenue_cny'] += item_total * rate
+                            month_excluded_cny += item_total * rate
+                    else:
                         if rate:
                             month_commission_base_cny += item_total * rate
 
-            # CNY conversion for net amount
-            rate, _ = get_cny_rate(currency, selected_month)
+            # CNY conversion for net amount & shipping
             if rate:
                 month_net_cny += net * rate
+                month_shipping_cny += shipping * rate
 
-        # Previous month CNY
+        # Previous month CNY (uses prev-month board overrides if set)
         prev_net_cny = 0
+        _prev_rate_cache = {}
         for order in prev_orders:
             currency = order['currency'] or 'PLN'
             total = float(order['total'] or 0)
             shipping = float(order['shipping_total'] or 0)
             net = total - shipping
-            rate, _ = get_cny_rate(currency, prev_month)
+            if currency not in _prev_rate_cache:
+                r, _src = _get_board_cny_rate(currency, prev_month, _board_overrides_prev)
+                _prev_rate_cache[currency] = r or 0
+            rate = _prev_rate_cache[currency]
             if rate:
                 prev_net_cny += net * rate
 
@@ -10926,9 +11323,21 @@ def sales_board():
             items = parse_json_field(order['line_items'])
             if isinstance(items, list):
                 week_total_products += sum(i.get('quantity', 0) for i in items)
-            rate, _ = get_cny_rate(currency, selected_month)
+            rate = _rate_for(currency)
             if rate:
                 week_net_cny += net * rate
+
+        # Aggregate undelivered shipping loss (count + by-currency + CNY-equivalent)
+        undelivered_count = len(undelivered_rows)
+        shipping_loss_by_currency = defaultdict(float)
+        shipping_loss_cny = 0
+        for u in undelivered_rows:
+            cur = u['currency'] or 'PLN'
+            amt = float(u['shipping_loss_amount'] or 0)
+            shipping_loss_by_currency[cur] += amt
+            r = _rate_for(cur)
+            if r:
+                shipping_loss_cny += amt * r
 
         # Get target info
         target = targets.get(manager, {})
@@ -10994,6 +11403,22 @@ def sales_board():
             'commission': commission,
             'total_income': total_income,
             'notes': target.get('notes', ''),
+            # Extra details for export / audit
+            'order_count': order_count,
+            'month_shipping_cny': round(month_shipping_cny, 2),
+            'month_excluded_cny': round(month_excluded_cny, 2),
+            'undelivered_count': undelivered_count,
+            'shipping_loss_by_currency': {c: round(v, 2) for c, v in shipping_loss_by_currency.items()},
+            'shipping_loss_cny': round(shipping_loss_cny, 2),
+            'excluded_brand_breakdown': {
+                brand: {
+                    'qty': v['qty'],
+                    'revenue_by_currency': {c: round(amt, 2) for c, amt in v['revenue_by_currency'].items()},
+                    'revenue_cny': round(v['revenue_cny'], 2),
+                } for brand, v in excluded_brand_breakdown.items()
+            },
+            'month_rates': {c: r for c, r in _month_rates.items() if r},
+            'month_rate_sources': dict(_month_rate_sources),
         })
 
     # Group summaries
@@ -11055,6 +11480,8 @@ def sales_board():
         'month_total_products': sum(d['month_total_products'] for d in board_data),
         'total_commission': sum(d['commission'] for d in board_data),
         'total_income': round(sum(d['total_income'] for d in board_data) + total_leader_bonuses, 2),
+        'undelivered_count': sum(d.get('undelivered_count', 0) for d in board_data),
+        'shipping_loss_cny': round(sum(d.get('shipping_loss_cny', 0) for d in board_data), 2),
     }
     # Compute masked values for "hide leader commission" display mode.
     # Leaders' base salary is shown as the default (7000) so they look like regular members.
@@ -11083,18 +11510,47 @@ def sales_board():
     # Build leader bonus map: {leader_manager: leader_bonus}
     leader_bonus_map = {g['leader_manager']: g['leader_bonus'] for g in group_summaries}
 
-    return render_template('sales_board.html',
-                           board_data=board_data,
-                           team_totals=team_totals,
-                           group_summaries=group_summaries,
-                           leader_bonus_map=leader_bonus_map,
-                           managers=managers,
-                           selected_month=selected_month,
-                           prev_month=prev_month,
-                           current_week_num=current_week_num,
-                           is_current_month=is_current_month,
-                           no_commission_brands=no_commission_brands_display,
-                           all_brands_list=all_brands_list)
+    # Aggregate the unique exchange rates used (for display in UI)
+    rates_in_use = {}
+    for d in board_data:
+        for cur, rate in (d.get('month_rates') or {}).items():
+            if cur not in rates_in_use:
+                rates_in_use[cur] = {
+                    'rate': rate,
+                    'source': (d.get('month_rate_sources') or {}).get(cur, 'system'),
+                }
+
+    return {
+        'board_data': board_data,
+        'team_totals': team_totals,
+        'group_summaries': group_summaries,
+        'leader_bonus_map': leader_bonus_map,
+        'managers': managers,
+        'selected_month': selected_month,
+        'prev_month': prev_month,
+        'current_week_num': current_week_num,
+        'is_current_month': is_current_month,
+        'no_commission_brands': no_commission_brands_display,
+        'all_brands_list': all_brands_list,
+        'rates_in_use': rates_in_use,
+        'rate_overrides': _board_overrides_cur,
+    }
+
+
+@app.route('/sales-board')
+@login_required
+@sales_board_required
+def sales_board():
+    """Sales board dashboard"""
+    import datetime
+
+    selected_month = request.args.get('month', '')
+    if not selected_month:
+        today = datetime.date.today()
+        selected_month = today.strftime('%Y-%m')
+
+    data = _compute_sales_board_data(selected_month)
+    return render_template('sales_board.html', **data)
 
 
 @app.route('/api/sales-targets', methods=['GET'])
@@ -11304,6 +11760,872 @@ def delete_sales_group(group_id):
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ----------------- Sales Board Custom Exchange Rates -----------------
+@app.route('/api/sales-board/exchange-rates', methods=['GET'])
+@login_required
+@admin_required
+def get_sales_board_exchange_rates():
+    """List custom rates + applicable system rates for a given month.
+
+    For each currency, returns {currency, system_rate, override_rate, in_use, source}.
+    """
+    month = (request.args.get('month') or '').strip()
+    if not month:
+        import datetime
+        month = datetime.date.today().strftime('%Y-%m')
+
+    overrides = _get_sales_board_rate_overrides(month)
+
+    # Determine which currencies are in use this month
+    conn = get_db_connection()
+    try:
+        rows = conn.execute('''
+            SELECT DISTINCT o.currency
+            FROM orders o
+            INNER JOIN sites s ON o.source = s.url
+            WHERE s.manager IS NOT NULL AND s.manager != ''
+              AND strftime('%Y-%m', o.date_created) = ?
+              AND o.currency IS NOT NULL AND o.currency != ''
+        ''', (month,)).fetchall()
+        currencies = sorted({(r['currency'] or '').upper() for r in rows if r['currency']})
+        # Always include any currency that has an override even if no orders this month
+        for c in overrides.keys():
+            if c not in currencies:
+                currencies.append(c)
+        currencies = sorted(set(currencies))
+
+        result = []
+        for cur in currencies:
+            if cur == 'CNY':
+                continue
+            sys_rate, _ = get_cny_rate(cur, month)
+            override = overrides.get(cur)
+            result.append({
+                'currency': cur,
+                'system_rate': round(sys_rate, 6) if sys_rate else None,
+                'override_rate': override,
+                'in_use': override if override is not None else (sys_rate or 0),
+                'source': 'override' if override is not None else 'system',
+            })
+        return jsonify({'month': month, 'rates': result})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/exchange-rates', methods=['POST'])
+@login_required
+@admin_required
+def save_sales_board_exchange_rates():
+    """Save custom exchange rate overrides for a month.
+
+    Payload: { "month": "YYYY-MM", "rates": [{"currency": "PLN", "rate": 1.95}, ...] }
+    A rate of null/empty/0 means "remove override (use system rate)".
+    """
+    data = request.get_json(silent=True) or {}
+    month = (data.get('month') or '').strip()
+    rates = data.get('rates') or []
+    if not month:
+        return jsonify({'error': '缺少月份参数'}), 400
+
+    conn = get_db_connection()
+    try:
+        for entry in rates:
+            cur = (entry.get('currency') or '').strip().upper()
+            if not cur or cur == 'CNY':
+                continue
+            raw = entry.get('rate', None)
+            try:
+                rate = float(raw) if raw not in (None, '', 0, '0') else None
+            except (TypeError, ValueError):
+                rate = None
+            if rate is None or rate <= 0:
+                conn.execute(
+                    'DELETE FROM sales_board_exchange_rates WHERE year_month = ? AND currency = ?',
+                    (month, cur)
+                )
+            else:
+                conn.execute('''
+                    INSERT INTO sales_board_exchange_rates (year_month, currency, rate_to_cny, updated_by)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(year_month, currency) DO UPDATE SET
+                        rate_to_cny = excluded.rate_to_cny,
+                        updated_at = CURRENT_TIMESTAMP,
+                        updated_by = excluded.updated_by
+                ''', (month, cur, rate, getattr(current_user, 'username', '') or ''))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ----------------- Sales Board Export -----------------
+def _get_sales_board_exports_dir():
+    import os
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'exports', 'sales_board')
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _generate_sales_board_excel(data, hide_leader=False):
+    """Generate a multi-sheet Excel workbook from sales board data.
+
+    Sheets:
+      1. 销售汇总 - Main per-person summary with totals
+      2. 币种明细 - Per-person currency breakdown (gross/net/shipping/rate/CNY)
+      3. 免提成产品 - Excluded-brand product revenue per person
+      4. 小组奖金 - Group leader bonus calculation (only if not hide_leader)
+      5. 规则说明 - Rules and notes
+    """
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    board_data = data['board_data']
+    team_totals = data['team_totals']
+    group_summaries = data['group_summaries']
+    leader_bonus_map = data['leader_bonus_map']
+    selected_month = data['selected_month']
+    prev_month = data['prev_month']
+    no_commission_brands = data['no_commission_brands']
+
+    leader_names = {g['leader_manager'] for g in group_summaries}
+
+    # Currency → country classification
+    CURRENCY_COUNTRY = {
+        'PLN': '波兰', 'EUR': '欧元',
+        'AUD': '澳洲',
+        'AED': '阿联酋',
+        'USD': '美元', 'GBP': '英镑', 'CNY': '中国',
+    }
+    def country_of(cur):
+        return CURRENCY_COUNTRY.get((cur or '').upper(), '其他')
+
+    def country_totals_for(d):
+        """Return (pl_cny, au_cny, other_cny) net sales by country for one manager."""
+        pl = au = other = 0.0
+        for cur, amt in (d.get('month_currency_amounts') or {}).items():
+            rate = (d.get('month_rates') or {}).get(cur, 0)
+            if not rate: continue
+            cny = amt.get('net_amount', 0) * rate
+            c = country_of(cur)
+            if c == '波兰': pl += cny
+            elif c == '澳洲': au += cny
+            else: other += cny
+        return round(pl, 2), round(au, 2), round(other, 2)
+
+    # ---------- Styles ----------
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill("solid", fgColor="305496")
+    group_fill = PatternFill("solid", fgColor="D9E1F2")
+    total_fill = PatternFill("solid", fgColor="FFF2CC")
+    sub_fill = PatternFill("solid", fgColor="F2F2F2")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    right = Alignment(horizontal="right", vertical="center")
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    thin = Side(border_style="thin", color="999999")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    money_fmt = '"¥"#,##0.00'
+    pct_fmt = '0.0%'
+
+    def write_header_row(ws, row, headers, col_widths=None):
+        for i, h in enumerate(headers, 1):
+            c = ws.cell(row=row, column=i, value=h)
+            c.font = header_font; c.fill = header_fill; c.alignment = center; c.border = border
+        ws.row_dimensions[row].height = 24
+        if col_widths:
+            for i, w in enumerate(col_widths, 1):
+                ws.column_dimensions[get_column_letter(i)].width = w
+
+    def set_default_row_height(ws, h=20):
+        ws.sheet_format.defaultRowHeight = h
+        ws.sheet_format.customHeight = True
+
+    def enforce_row_heights(ws, min_h=20):
+        """Explicitly set every used row's height to at least min_h.
+
+        Excel viewers often ignore sheet_format.defaultRowHeight and fall back
+        to their own default (~15). Setting an explicit height per row ensures
+        the desired minimum is honored.
+        """
+        for r in range(1, (ws.max_row or 0) + 1):
+            cur = ws.row_dimensions[r].height
+            if cur is None or cur < min_h:
+                ws.row_dimensions[r].height = min_h
+
+    def autofit_columns(ws, fixed_widths=None, min_width=8, max_width=50, padding=2):
+        """Auto-fit column widths based on cell content.
+
+        Treats CJK characters as 2 units wide; ASCII as 1 unit.
+        ``fixed_widths`` is a {column_letter: width} mapping that overrides auto-fit.
+        """
+        fixed_widths = fixed_widths or {}
+        for col_idx in range(1, (ws.max_column or 0) + 1):
+            letter = get_column_letter(col_idx)
+            if letter in fixed_widths:
+                ws.column_dimensions[letter].width = fixed_widths[letter]
+                continue
+            max_w = min_width
+            for row_idx in range(1, (ws.max_row or 0) + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                v = cell.value
+                if v is None:
+                    continue
+                # If this cell is part of a merged range that starts elsewhere, skip
+                text = str(v)
+                # Account for line breaks: take longest line
+                line_widths = []
+                for line in text.splitlines() or [text]:
+                    line_widths.append(sum(2 if ord(c) > 127 else 1 for c in line))
+                w = max(line_widths or [0])
+                if w > max_w:
+                    max_w = w
+            ws.column_dimensions[letter].width = min(max(max_w + padding, min_width), max_width)
+
+    def center_all_cells(ws, wrap_text=True):
+        """Set every cell's alignment to horizontal+vertical center."""
+        from openpyxl.styles import Alignment
+        align = Alignment(horizontal="center", vertical="center", wrap_text=wrap_text)
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row or 0):
+            for cell in row:
+                cell.alignment = align
+
+    wb = Workbook()
+
+    # =============== Sheet 1: 销售汇总 ===============
+    ws = wb.active
+    ws.title = "销售汇总"
+    set_default_row_height(ws)
+
+    ws.merge_cells('A1:P1')
+    ws['A1'] = f"销售看板 — {selected_month}" + ("（演示模式：已隐藏组长）" if hide_leader else "")
+    ws['A1'].font = Font(bold=True, size=14)
+    ws['A1'].alignment = center
+    ws.row_dimensions[1].height = 26
+
+    # Compute team country totals
+    team_pl = round(sum(country_totals_for(d)[0] for d in board_data), 2)
+    team_au = round(sum(country_totals_for(d)[1] for d in board_data), 2)
+    team_other = round(sum(country_totals_for(d)[2] for d in board_data), 2)
+
+    # Top summary cards
+    summary_pairs = [
+        ("团队月目标", team_totals['monthly_target']),
+        ("上月销售(¥)", team_totals['prev_net_cny']),
+        ("团队月实际(¥)", team_totals['month_net_cny']),
+        ("团队达成率", f"{team_totals['month_achievement']}%"),
+        ("团队总产品数", team_totals['month_total_products']),
+        ("波兰销售(¥)", team_pl),
+        ("澳洲销售(¥)", team_au),
+    ]
+    col = 1
+    for label, val in summary_pairs:
+        lc = ws.cell(row=2, column=col, value=label)
+        vc = ws.cell(row=2, column=col + 1, value=val)
+        lc.font = Font(bold=True); lc.fill = sub_fill; lc.alignment = right
+        vc.alignment = left
+        if isinstance(val, (int, float)) and '¥' in label:
+            vc.number_format = money_fmt
+        col += 2
+    ws.row_dimensions[2].height = 20
+
+    headers = [
+        "姓名", "网站", "月目标¥", "本月实际¥",
+        "波兰¥", "澳洲¥", "其他¥",
+        "达成率",
+        "订单数", "产品数", "运费(不计¥)", "免提成(不计¥)",
+        "提成基数¥", "提成率", "提成¥",
+        "底薪¥", "扣除¥", "达标情况", "预计薪资¥",
+    ]
+    col_widths = [10, 36, 12, 14, 12, 12, 12, 10, 10, 10, 14, 16, 16, 10, 12, 12, 12, 22, 16]
+    header_row = 4
+    write_header_row(ws, header_row, headers, col_widths)
+
+    r = header_row + 1
+    for d in board_data:
+        is_leader = d['manager'] in leader_names
+        group_bonus = leader_bonus_map.get(d['manager'], 0)
+
+        # Decide displayed salary/income
+        if hide_leader and is_leader:
+            base_salary_disp = d.get('masked_base_salary', d['base_salary'])
+            total_income_disp = d.get('masked_total_income', d['total_income'])
+        elif is_leader and group_bonus > 0:
+            base_salary_disp = d['base_salary']
+            total_income_disp = d['total_income'] + group_bonus
+        else:
+            base_salary_disp = d['base_salary']
+            total_income_disp = d['total_income']
+
+        if d['salary_protected']:
+            reason_parts = []
+            if d['growth_met']: reason_parts.append(f"环比+{d['growth_rate']}%")
+            if d['units_met']: reason_parts.append(f"{d['month_total_products']}支")
+            met_text = "达标（" + " / ".join(reason_parts) + "）"
+        else:
+            met_text = "未达标（扣底薪20%）"
+
+        pl_cny, au_cny, other_cny = country_totals_for(d)
+        row_vals = [
+            d['manager'],
+            ", ".join(d['sites']),
+            d['monthly_target'],
+            d['month_net_cny'],
+            pl_cny,
+            au_cny,
+            other_cny,
+            d['month_achievement'] / 100 if d['month_achievement'] else 0,
+            d['order_count'],
+            d['month_total_products'],
+            d['month_shipping_cny'],
+            d['month_excluded_cny'],
+            d['commission_base_cny'],
+            d['commission_rate'],
+            d['commission'],
+            base_salary_disp,
+            -d['salary_deduction'] if d['salary_deduction'] > 0 else 0,
+            met_text,
+            total_income_disp,
+        ]
+        # column index map (1-based):
+        # 1姓名 2网站 3月目标 4本月实际 5波兰 6澳洲 7其他 8达成率
+        # 9订单数 10产品数 11运费 12免提成 13提成基数 14提成率 15提成
+        # 16底薪 17扣除 18达标情况 19预计薪资
+        money_cols = {3, 4, 5, 6, 7, 11, 12, 13, 15, 16, 17, 19}
+        pct_cols = {8, 14}
+        center_cols = {9, 10}
+        for c_idx, val in enumerate(row_vals, 1):
+            cell = ws.cell(row=r, column=c_idx, value=val)
+            cell.border = border
+            if c_idx == 1:
+                cell.font = Font(bold=True); cell.alignment = center
+            elif c_idx == 2:
+                cell.alignment = left; cell.font = Font(size=9)
+            elif c_idx in money_cols:
+                cell.alignment = right; cell.number_format = money_fmt
+            elif c_idx in pct_cols:
+                cell.alignment = center; cell.number_format = pct_fmt
+            elif c_idx in center_cols:
+                cell.alignment = center
+            elif c_idx == 18:  # 达标情况
+                cell.alignment = center
+                if d['salary_protected']:
+                    cell.font = Font(color="008000")
+                else:
+                    cell.font = Font(color="C00000")
+        # Tint country cells subtly to help scanning
+        if pl_cny > 0:
+            ws.cell(row=r, column=5).fill = PatternFill("solid", fgColor="FFF4E5")  # PL 浅橙
+        if au_cny > 0:
+            ws.cell(row=r, column=6).fill = PatternFill("solid", fgColor="E8F4FC")  # AU 浅蓝
+        r += 1
+
+    # Group summaries (only if not hide_leader)
+    if not hide_leader and group_summaries:
+        # Blank separator
+        r += 1
+        ws.cell(row=r, column=1, value="— 小组汇总 —").font = Font(bold=True, italic=True, color="305496")
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=19)
+        r += 1
+        board_by_mgr = {d['manager']: d for d in board_data}
+        for g in group_summaries:
+            # Group-level country split
+            g_pl = g_au = g_other = 0.0
+            for m in g.get('members', []):
+                md = board_by_mgr.get(m)
+                if md:
+                    a, b, c = country_totals_for(md)
+                    g_pl += a; g_au += b; g_other += c
+            row_vals = [
+                g['name'] + f"（组长：{g['leader_manager']}）", "",
+                g['monthly_target'], g['month_net_cny'],
+                round(g_pl, 2), round(g_au, 2), round(g_other, 2),
+                g['month_achievement'] / 100 if g['month_achievement'] else 0,
+                "", g['month_total_products'], "", "",
+                g['bonus_base_cny'], g['bonus_rate'], g['leader_bonus'],
+                "", "", f"带团奖金 = 成员基数 × {g['bonus_rate']*100:.1f}%", "",
+            ]
+            money_cols_g = {3, 4, 5, 6, 7, 13, 15}
+            pct_cols_g = {8, 14}
+            for c_idx, val in enumerate(row_vals, 1):
+                cell = ws.cell(row=r, column=c_idx, value=val)
+                cell.border = border; cell.fill = group_fill
+                if c_idx in money_cols_g:
+                    cell.alignment = right; cell.number_format = money_fmt
+                elif c_idx in pct_cols_g:
+                    cell.alignment = center; cell.number_format = pct_fmt
+                elif c_idx == 1:
+                    cell.font = Font(bold=True); cell.alignment = left
+                elif c_idx == 18:
+                    cell.alignment = left; cell.font = Font(size=9, color="595959")
+                else:
+                    cell.alignment = center
+            r += 1
+
+    # Team total
+    r += 1
+    total_income = team_totals['total_income_no_bonus'] if hide_leader else team_totals['total_income']
+    total_row = [
+        "团队合计", "",
+        team_totals['monthly_target'], team_totals['month_net_cny'],
+        team_pl, team_au, team_other,
+        team_totals['month_achievement'] / 100 if team_totals['month_achievement'] else 0,
+        sum(d['order_count'] for d in board_data),
+        team_totals['month_total_products'],
+        round(sum(d['month_shipping_cny'] for d in board_data), 2),
+        round(sum(d['month_excluded_cny'] for d in board_data), 2),
+        round(sum(d['commission_base_cny'] for d in board_data), 2),
+        "", team_totals['total_commission'],
+        "", "", "", total_income,
+    ]
+    money_cols_t = {3, 4, 5, 6, 7, 11, 12, 13, 15, 19}
+    pct_cols_t = {8}
+    for c_idx, val in enumerate(total_row, 1):
+        cell = ws.cell(row=r, column=c_idx, value=val)
+        cell.border = border; cell.fill = total_fill; cell.font = Font(bold=True)
+        if c_idx in money_cols_t:
+            cell.alignment = right; cell.number_format = money_fmt
+        elif c_idx in pct_cols_t:
+            cell.alignment = center; cell.number_format = pct_fmt
+        else:
+            cell.alignment = center
+
+    ws.freeze_panes = 'C5'
+
+    # Finalize summary sheet styling (per request):
+    #  - All cells centered (horizontal + vertical), wrap text
+    #  - Column B (网站) fixed at width 30
+    #  - Other columns auto-fit by content
+    #  - Minimum row height = 50
+    center_all_cells(ws, wrap_text=True)
+    autofit_columns(ws, fixed_widths={'B': 30}, min_width=8, max_width=60, padding=3)
+    enforce_row_heights(ws, min_h=50)
+
+    # =============== Sheet 2: 币种明细 ===============
+    ws2 = wb.create_sheet("币种明细")
+    set_default_row_height(ws2)
+    ws2.merge_cells('A1:H1')
+    ws2['A1'] = f"每人每币种销售明细 — {selected_month}"
+    ws2['A1'].font = Font(bold=True, size=13); ws2['A1'].alignment = center
+    ws2.row_dimensions[1].height = 24
+
+    note = ws2.cell(row=2, column=1, value="说明：净额 = 订单总额 − 运费；运费不计入销售额，也不计入提成基数。")
+    note.font = Font(italic=True, color="808080", size=9); note.alignment = left
+    ws2.merge_cells('A2:H2')
+
+    hdr2 = ["姓名", "国家/地区", "币种", "订单毛额", "运费", "净额", "汇率", "净额折¥", "运费折¥"]
+    widths2 = [10, 10, 8, 14, 12, 14, 10, 14, 14]
+    write_header_row(ws2, 4, hdr2, widths2)
+
+    # Country-colored fills
+    pl_fill = PatternFill("solid", fgColor="FFF4E5")
+    au_fill = PatternFill("solid", fgColor="E8F4FC")
+
+    r = 5
+    for d in board_data:
+        # Sort currencies so PLN → AUD → others cluster by country
+        def _cur_order(cur):
+            c = country_of(cur)
+            return (0 if c == '波兰' else 1 if c == '澳洲' else 2, cur)
+        currencies = sorted(d['month_currency_amounts'].keys(), key=_cur_order)
+        if not currencies:
+            continue
+        first = True
+        subtotal_net_cny = 0
+        subtotal_ship_cny = 0
+        for cur in currencies:
+            amt = d['month_currency_amounts'][cur]
+            rate = d['month_rates'].get(cur, 0)
+            net_cny = amt['net_amount'] * rate if rate else 0
+            ship_cny = amt['shipping'] * rate if rate else 0
+            subtotal_net_cny += net_cny
+            subtotal_ship_cny += ship_cny
+            ctry = country_of(cur)
+            row_vals = [
+                d['manager'] if first else "",
+                ctry,
+                cur,
+                round(amt['amount'], 2),
+                round(amt['shipping'], 2),
+                round(amt['net_amount'], 2),
+                round(rate, 4) if rate else "无汇率",
+                round(net_cny, 2) if rate else "",
+                round(ship_cny, 2) if rate else "",
+            ]
+            row_fill = pl_fill if ctry == '波兰' else au_fill if ctry == '澳洲' else None
+            for c_idx, val in enumerate(row_vals, 1):
+                cell = ws2.cell(row=r, column=c_idx, value=val)
+                cell.border = border
+                if row_fill and c_idx in (2, 3):
+                    cell.fill = row_fill
+                if c_idx == 1:
+                    cell.font = Font(bold=True); cell.alignment = center
+                elif c_idx == 2:
+                    cell.font = Font(bold=True, color="305496")
+                    cell.alignment = center
+                elif c_idx == 3:
+                    cell.alignment = center
+                elif c_idx in (4, 5, 6):
+                    cell.alignment = right; cell.number_format = '#,##0.00'
+                elif c_idx == 7:
+                    cell.alignment = center; cell.number_format = '0.0000'
+                else:
+                    cell.alignment = right; cell.number_format = money_fmt
+            r += 1
+            first = False
+
+        # Subtotal per person
+        sub_row = ["", "", "合计¥", "", "", "", "", round(subtotal_net_cny, 2), round(subtotal_ship_cny, 2)]
+        for c_idx, val in enumerate(sub_row, 1):
+            cell = ws2.cell(row=r, column=c_idx, value=val)
+            cell.border = border; cell.fill = sub_fill; cell.font = Font(bold=True)
+            if c_idx in (8, 9): cell.alignment = right; cell.number_format = money_fmt
+            else: cell.alignment = center
+        r += 1
+
+    ws2.freeze_panes = 'A5'
+
+    # =============== Sheet 3: 免提成产品 ===============
+    ws3 = wb.create_sheet("免提成产品")
+    set_default_row_height(ws3)
+    ws3.merge_cells('A1:F1')
+    ws3['A1'] = f"免提成品牌产品明细 — {selected_month}"
+    ws3['A1'].font = Font(bold=True, size=13); ws3['A1'].alignment = center
+    ws3.row_dimensions[1].height = 24
+
+    note = ws3.cell(row=2, column=1, value=f"免提成品牌：{', '.join(no_commission_brands) or '（无）'}。这些品牌的销售额不计入提成基数。")
+    note.font = Font(italic=True, color="808080", size=9); note.alignment = left
+    ws3.merge_cells('A2:F2')
+
+    hdr3 = ["姓名", "品牌", "数量", "国家/地区", "币种", "原币金额", "折¥金额"]
+    widths3 = [10, 14, 10, 10, 10, 16, 16]
+    write_header_row(ws3, 4, hdr3, widths3)
+
+    r = 5
+    any_excluded = False
+    for d in board_data:
+        breakdown = d.get('excluded_brand_breakdown') or {}
+        if not breakdown:
+            continue
+        any_excluded = True
+        first = True
+        person_total_cny = 0
+        for brand in sorted(breakdown.keys()):
+            info = breakdown[brand]
+            person_total_cny += info['revenue_cny']
+            def _cur_order2(cur):
+                c = country_of(cur)
+                return (0 if c == '波兰' else 1 if c == '澳洲' else 2, cur)
+            curs = sorted(info['revenue_by_currency'].keys(), key=_cur_order2)
+            brand_first = True
+            for cur in curs:
+                ctry = country_of(cur)
+                row_vals = [
+                    d['manager'] if first else "",
+                    brand if brand_first else "",
+                    info['qty'] if brand_first else "",
+                    ctry,
+                    cur,
+                    info['revenue_by_currency'][cur],
+                    info['revenue_cny'] if brand_first else "",
+                ]
+                row_fill = pl_fill if ctry == '波兰' else au_fill if ctry == '澳洲' else None
+                for c_idx, val in enumerate(row_vals, 1):
+                    cell = ws3.cell(row=r, column=c_idx, value=val)
+                    cell.border = border
+                    if row_fill and c_idx in (4, 5):
+                        cell.fill = row_fill
+                    if c_idx == 1:
+                        cell.font = Font(bold=True); cell.alignment = center
+                    elif c_idx == 2:
+                        cell.font = Font(bold=True); cell.alignment = center
+                    elif c_idx == 4:
+                        cell.font = Font(bold=True, color="305496"); cell.alignment = center
+                    elif c_idx == 6:
+                        cell.alignment = right; cell.number_format = '#,##0.00'
+                    elif c_idx == 7:
+                        cell.alignment = right; cell.number_format = money_fmt
+                    else:
+                        cell.alignment = center
+                r += 1
+                first = False
+                brand_first = False
+        # Per-person subtotal
+        sub_row = ["", "合计¥", "", "", "", "", round(person_total_cny, 2)]
+        for c_idx, val in enumerate(sub_row, 1):
+            cell = ws3.cell(row=r, column=c_idx, value=val)
+            cell.border = border; cell.fill = sub_fill; cell.font = Font(bold=True)
+            if c_idx == 7: cell.alignment = right; cell.number_format = money_fmt
+            else: cell.alignment = center
+        r += 1
+
+    if not any_excluded:
+        ws3.cell(row=5, column=1, value="本月未记录到免提成品牌销售。").alignment = left
+        ws3.merge_cells(start_row=5, start_column=1, end_row=5, end_column=7)
+
+    ws3.freeze_panes = 'A5'
+
+    # =============== Sheet 4: 小组奖金 ===============
+    if not hide_leader and group_summaries:
+        ws4 = wb.create_sheet("小组奖金")
+        set_default_row_height(ws4)
+        ws4.merge_cells('A1:E1')
+        ws4['A1'] = f"小组带团奖金计算明细 — {selected_month}"
+        ws4['A1'].font = Font(bold=True, size=13); ws4['A1'].alignment = center
+        ws4.row_dimensions[1].height = 24
+
+        note = ws4.cell(row=2, column=1,
+            value="说明：组长的带团奖金 = 组内非组长成员的【提成基数（¥）】之和 × 带团奖金比例。")
+        note.font = Font(italic=True, color="808080", size=9); note.alignment = left
+        ws4.merge_cells('A2:E2')
+
+        hdr4 = ["小组", "成员", "角色", "提成基数¥", "计入奖金基数"]
+        widths4 = [14, 12, 14, 16, 14]
+        write_header_row(ws4, 4, hdr4, widths4)
+
+        board_by_mgr = {d['manager']: d for d in board_data}
+        r = 5
+        for g in group_summaries:
+            members = g['members'] or []
+            leader = g['leader_manager']
+            bonus_rate = g['bonus_rate']
+            first = True
+            for m in members:
+                mdata = board_by_mgr.get(m)
+                base = mdata['commission_base_cny'] if mdata else 0
+                is_grp_leader = (m == leader)
+                row_vals = [
+                    g['name'] if first else "",
+                    m,
+                    "组长" if is_grp_leader else "组员",
+                    base,
+                    "否（组长不计入）" if is_grp_leader else "是",
+                ]
+                for c_idx, val in enumerate(row_vals, 1):
+                    cell = ws4.cell(row=r, column=c_idx, value=val)
+                    cell.border = border
+                    if c_idx == 4:
+                        cell.alignment = right; cell.number_format = money_fmt
+                    elif c_idx == 3:
+                        cell.alignment = center
+                        if is_grp_leader:
+                            cell.font = Font(bold=True, color="305496")
+                    elif c_idx == 1:
+                        cell.font = Font(bold=True); cell.alignment = center
+                    else:
+                        cell.alignment = center
+                r += 1
+                first = False
+            # Summary row for this group
+            for c_idx, val in enumerate([
+                f"{g['name']} 奖金合计",
+                f"组长：{leader}",
+                f"比例 {bonus_rate*100:.1f}%",
+                g['bonus_base_cny'],
+                g['leader_bonus'],
+            ], 1):
+                cell = ws4.cell(row=r, column=c_idx, value=val)
+                cell.border = border; cell.fill = total_fill; cell.font = Font(bold=True)
+                if c_idx in (4, 5):
+                    cell.alignment = right; cell.number_format = money_fmt
+                else:
+                    cell.alignment = center
+            ws4.cell(row=r, column=5).font = Font(bold=True, color="C00000")
+            r += 2
+
+        ws4.freeze_panes = 'A5'
+
+    # =============== Sheet 5: 规则说明 ===============
+    ws5 = wb.create_sheet("规则说明")
+    set_default_row_height(ws5)
+    ws5.column_dimensions['A'].width = 100
+
+    rates_in_use = data.get('rates_in_use') or {}
+    rate_lines = []
+    if rates_in_use:
+        for cur in sorted(rates_in_use.keys()):
+            info = rates_in_use[cur]
+            tag = "（自定义）" if info.get('source') == 'override' else "（系统）"
+            rate_lines.append(f"    - {cur} → 1 {cur} = ¥{info['rate']:.4f} {tag}")
+
+    lines = [
+        (f"销售看板 — {selected_month}", True, 14),
+        ("", False, 11),
+        ("【统计范围】", True, 12),
+        (f"• 当月订单：{selected_month} 内状态为成功的订单（排除 failed / cancelled / checkout-draft / trash / cheat；排除未付款的 pending、未到账的 on-hold bacs）。", False, 10),
+        (f"• 环比对比月份：{prev_month}", False, 10),
+        ("", False, 10),
+        ("【本月使用汇率】", True, 12),
+        *([(line, False, 10) for line in rate_lines] if rate_lines else [("• （无）", False, 10)]),
+        ("• 自定义汇率仅作用于销售看板和本导出文件，不影响系统其它模块。", False, 10),
+        ("", False, 10),
+        ("【底薪保护（满足其一即可）】", True, 12),
+        ("• 环比增长 ≥ 20%", False, 10),
+        ("• 当月销售 ≥ 500 支", False, 10),
+        ("• 未达标则扣除底薪的 20%。", False, 10),
+        ("", False, 10),
+        ("【提成规则】", True, 12),
+        ("• 提成 = 提成基数(¥) × 提成率（默认 5%，在「设置目标」里按人配置）", False, 10),
+        ("• 提成基数 = 成功订单中 非免提成品牌 的产品小计（item.total），按本月汇率换算为人民币。", False, 10),
+        ("• 不计入提成：", False, 10),
+        ("    ① 运费（shipping_total）", False, 10),
+        (f"    ② 免提成品牌的产品收入（当前名单：{', '.join(no_commission_brands) or '无'}）", False, 10),
+        ("", False, 10),
+        ("【小组带团奖金】", True, 12),
+        ("• 组长带团奖金 = 组内非组长成员的提成基数(¥) 之和 × 带团奖金比例", False, 10),
+        ("• 组长个人仍按其自己的提成基数和提成率计算个人提成，与带团奖金独立。", False, 10),
+        ("", False, 10),
+        ("【演示/完整版说明】", True, 12),
+        ("• 完整版：包含小组汇总和组长带团奖金。", False, 10),
+        ("• 演示版：不包含「小组奖金」Sheet；汇总页中组长的底薪按标准 7000 展示，预计薪资也按此重新计算；团队合计的预计薪资会相应扣减，避免从合计倒推出带团奖金。", False, 10),
+        ("• 两份数字的差额 = 带团奖金之和。", False, 10),
+    ]
+    for i, (text, bold, size) in enumerate(lines, 1):
+        c = ws5.cell(row=i, column=1, value=text)
+        c.font = Font(bold=bold, size=size)
+        c.alignment = left
+        if bold and size >= 12:
+            c.fill = sub_fill
+        ws5.row_dimensions[i].height = 18 if size >= 12 else 16
+
+    # Force minimum row height on every used row in every sheet
+    for _sheet in wb.worksheets:
+        enforce_row_heights(_sheet, min_h=20)
+
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
+
+
+@app.route('/api/sales-board/export', methods=['POST'])
+@login_required
+@super_admin_required
+def export_sales_board():
+    """Generate an Excel export for the sales board and save to history."""
+    import datetime, os
+    payload = request.get_json(silent=True) or {}
+    month = payload.get('month') or datetime.date.today().strftime('%Y-%m')
+    hide_leader = bool(payload.get('hide_leader', False))
+
+    try:
+        data = _compute_sales_board_data(month)
+        bio = _generate_sales_board_excel(data, hide_leader=hide_leader)
+
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        suffix = '_演示版' if hide_leader else ''
+        filename = f"销售看板_{month}{suffix}_{ts}.xlsx"
+        file_path = os.path.join(_get_sales_board_exports_dir(), filename)
+        with open(file_path, 'wb') as f:
+            f.write(bio.getvalue())
+        file_size = os.path.getsize(file_path)
+
+        conn = get_db_connection()
+        cur = conn.execute(
+            '''INSERT INTO sales_board_exports
+               (year_month, filename, file_path, file_size, hide_leader, created_by)
+               VALUES (?, ?, ?, ?, ?, ?)''',
+            (month, filename, file_path, file_size, 1 if hide_leader else 0,
+             getattr(current_user, 'username', '') or '')
+        )
+        conn.commit()
+        export_id = cur.lastrowid
+        conn.close()
+
+        return jsonify({
+            'success': True,
+            'id': export_id,
+            'filename': filename,
+            'file_size': file_size,
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/sales-board/exports', methods=['GET'])
+@login_required
+@super_admin_required
+def list_sales_board_exports():
+    """List export history (optionally filter by month)."""
+    month = request.args.get('month', '').strip()
+    conn = get_db_connection()
+    try:
+        if month:
+            rows = conn.execute(
+                '''SELECT id, year_month, filename, file_size, hide_leader, created_by, created_at
+                   FROM sales_board_exports WHERE year_month = ?
+                   ORDER BY created_at DESC''',
+                (month,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                '''SELECT id, year_month, filename, file_size, hide_leader, created_by, created_at
+                   FROM sales_board_exports ORDER BY created_at DESC LIMIT 200'''
+            ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/exports/<int:export_id>/download', methods=['GET'])
+@login_required
+@super_admin_required
+def download_sales_board_export(export_id):
+    """Download a specific export file."""
+    import os
+    from flask import send_file
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            'SELECT filename, file_path FROM sales_board_exports WHERE id = ?',
+            (export_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return jsonify({'error': '导出记录不存在'}), 404
+    if not os.path.exists(row['file_path']):
+        return jsonify({'error': '文件不存在或已被删除'}), 404
+    return send_file(
+        row['file_path'],
+        as_attachment=True,
+        download_name=row['filename'],
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+
+@app.route('/api/sales-board/exports/<int:export_id>', methods=['DELETE'])
+@login_required
+@super_admin_required
+def delete_sales_board_export(export_id):
+    """Delete an export (both file and DB record)."""
+    import os
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            'SELECT file_path FROM sales_board_exports WHERE id = ?',
+            (export_id,)
+        ).fetchone()
+        if not row:
+            return jsonify({'error': '导出记录不存在'}), 404
+        try:
+            if os.path.exists(row['file_path']):
+                os.remove(row['file_path'])
+        except Exception:
+            pass
+        conn.execute('DELETE FROM sales_board_exports WHERE id = ?', (export_id,))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         conn.close()
 

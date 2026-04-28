@@ -201,14 +201,21 @@
                 </div>
                 <div class="card-body">
                     <h6 class="text-light mb-3">订单状态</h6>
-                    <div class="d-flex gap-3 mb-4">
-                        <div class="flex-fill text-center p-3 rounded" style="background: rgba(239, 68, 68, 0.2);">
+                    <div class="d-flex gap-2 mb-4 flex-wrap">
+                        <div class="flex-fill text-center p-3 rounded" style="background: rgba(239, 68, 68, 0.2); min-width: 90px;">
                             <div class="h4 text-danger mb-1">{{ status_stats.cancelled.count }}</div>
                             <small class="text-secondary">已取消</small>
                         </div>
-                        <div class="flex-fill text-center p-3 rounded" style="background: rgba(220, 38, 38, 0.2);">
+                        <div class="flex-fill text-center p-3 rounded" style="background: rgba(220, 38, 38, 0.2); min-width: 90px;">
                             <div class="h4 text-danger mb-1">{{ status_stats.failed.count }}</div>
                             <small class="text-secondary">失败</small>
+                        </div>
+                        <div class="flex-fill text-center p-3 rounded" style="background: rgba(168, 85, 247, 0.2); border: 1px solid rgba(168, 85, 247, 0.4); min-width: 90px;">
+                            <div class="h4 mb-1" style="color:#c084fc;">{{ status_stats.undelivered.count }}</div>
+                            <small class="text-secondary">未送达</small>
+                            {% if status_stats.undelivered.shipping_loss and status_stats.undelivered.shipping_loss > 0 %}
+                            <div class="mt-1"><small class="text-warning">运费损失 {{ "{:,.2f}".format(status_stats.undelivered.shipping_loss) }}</small></div>
+                            {% endif %}
                         </div>
                     </div>
 
@@ -241,7 +248,9 @@
                                     <th>网站</th>
                                     <th class="text-center">取消</th>
                                     <th class="text-center">失败</th>
+                                    <th class="text-center" style="color:#c084fc;">未送达</th>
                                     <th class="text-end">金额</th>
+                                    <th class="text-end" style="color:#c084fc;">运费损失</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -258,11 +267,13 @@
                                     </td>
                                     <td class="text-center text-danger">{{ stat.cancelled }}</td>
                                     <td class="text-center text-danger">{{ stat.failed }}</td>
+                                    <td class="text-center" style="color:#c084fc;">{{ stat.undelivered or 0 }}</td>
                                     <td class="text-end">{{ "{:,.2f}".format(stat.amount) }}</td>
+                                    <td class="text-end" style="color:{{ '#fbbf24' if stat.shipping_loss else '#6b7280' }};">{{ "{:,.2f}".format(stat.shipping_loss or 0) }}</td>
                                 </tr>
                                 {% else %}
                                 <tr>
-                                    <td colspan="4" class="text-center text-muted py-4">暂无数据</td>
+                                    <td colspan="6" class="text-center text-muted py-4">暂无数据</td>
                                 </tr>
                                 {% endfor %}
                             </tbody>
@@ -313,7 +324,12 @@
                                 </a>
                             </td>
                             <td>
-                                {% if order.status == 'cancelled' %}
+                                {% if order.is_undelivered %}
+                                <span class="badge" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);">未送达</span>
+                                {% if order.shipping_loss_amount and order.shipping_loss_amount > 0 %}
+                                <div><small class="text-warning">损失 {{ "{:,.2f}".format(order.shipping_loss_amount) }}</small></div>
+                                {% endif %}
+                                {% elif order.status == 'cancelled' %}
                                 <span class="badge bg-danger bg-opacity-25 text-danger">已取消</span>
                                 {% else %}
                                 <span class="badge bg-danger">失败</span>

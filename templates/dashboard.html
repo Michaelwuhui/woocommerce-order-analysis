@@ -136,6 +136,26 @@
                 </div>
             </a>
         </div>
+        <div class="col-xl col-md-6">
+            <a href="{{ url_for('orders', status='undelivered') }}" class="text-decoration-none">
+                <div class="stat-card h-100" style="border-color: rgba(168,85,247,0.4);">
+                    <div class="stat-icon" style="color:#c084fc;">
+                        <i class="bi bi-arrow-return-left"></i>
+                    </div>
+                    <div class="stat-content">
+                        <h3 style="color:#c084fc;">{{ stats.undelivered_orders or 0 }}</h3>
+                        {% if stats.shipping_loss_by_currency %}
+                            {% for cur, loss in stats.shipping_loss_by_currency.items() %}
+                                {% if loss > 0 %}
+                                <div class="small text-warning">运费损失 {{ "%.2f"|format(loss) }} {{ cur }}</div>
+                                {% endif %}
+                            {% endfor %}
+                        {% endif %}
+                        <p>未送达 / 退回 <i class="bi bi-arrow-right-short"></i></p>
+                    </div>
+                </div>
+            </a>
+        </div>
     </div>
 
     <div class="row g-4 mb-4">
@@ -282,8 +302,8 @@
                                         {% endif %}
                                         {% endif %}
                                     </td>
-                                    <td><span class="status-badge status-{{ order.status }}">{{
-                                            order.status|status_label }}</span></td>
+                                    <td><span class="status-badge {{ order.status|status_class(order.payment_method, order.is_undelivered) }}">{{
+                                            order.status|status_label(order.payment_method, order.is_undelivered) }}</span></td>
                                     <td class="text-end">{{ order.product_count }}</td>
                                     <td class="text-end"><strong>{{ order.total|format_currency }} {{ order.currency
                                             or

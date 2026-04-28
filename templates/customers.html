@@ -152,6 +152,7 @@
                             <th>等级</th>
                             <th class="text-center">订单数</th>
                             <th class="text-end">总消费 (PLN)</th>
+                            <th class="text-center" style="color:#c084fc;">未送达</th>
                             <th>最近购买</th>
                             <th>建议行动 (Smart Actions)</th>
                             <th>操作</th>
@@ -201,6 +202,21 @@
                             </td>
                             <td class="text-center">{{ c.successful_orders }}</td>
                             <td class="text-end fw-bold text-success">{{ c.total_spent|round(2) }}</td>
+                            <td class="text-center">
+                                {% if c.undelivered_orders and c.undelivered_orders > 0 %}
+                                <span class="badge" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);" title="拒收 {{ c.undelivered_orders }} 单 / 共 {{ c.total_orders }} 单 = {{ c.refusal_rate }}%">
+                                    {{ c.undelivered_orders }}
+                                    {% if c.refusal_rate >= 30 %}
+                                    <i class="bi bi-exclamation-triangle-fill ms-1" style="color:#fbbf24;" title="高拒收率"></i>
+                                    {% endif %}
+                                </span>
+                                {% if c.shipping_loss_total > 0 %}
+                                <div><small class="text-warning">损失 {{ "%.2f"|format(c.shipping_loss_total) }}</small></div>
+                                {% endif %}
+                                {% else %}
+                                <span class="text-secondary">—</span>
+                                {% endif %}
+                            </td>
                             <td>{{ c.last_order_date|replace('T', ' ')|truncate(11, True, '') }}</td>
                             <td>
                                 {% for action in c.actions %}

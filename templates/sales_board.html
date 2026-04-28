@@ -103,6 +103,22 @@
                 </div>
             </div>
         </div>
+        <div class="col">
+            <div class="card data-card" style="border-color: rgba(168,85,247,0.3);">
+                <div class="card-body py-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-white-50 small">未送达 / 运费损失</div>
+                            <div class="fw-bold fs-5" style="color:#c084fc;">{{ team_totals.undelivered_count or 0 }} 单</div>
+                            {% if team_totals.shipping_loss_cny and team_totals.shipping_loss_cny > 0 %}
+                            <div class="small" style="color:#fbbf24;">≈ ¥{{ "{:,.0f}".format(team_totals.shipping_loss_cny) }}</div>
+                            {% endif %}
+                        </div>
+                        <i class="bi bi-arrow-return-left fs-3 opacity-50" style="color:#c084fc;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Main Table -->

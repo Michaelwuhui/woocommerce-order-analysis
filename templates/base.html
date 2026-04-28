@@ -426,11 +426,13 @@
 
                     var statusLabels = {
                         'pending': '待付款', 'processing': '处理中', 'on-hold': '已发货',
-                        'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败', 'checkout-draft': '草稿'
+                        'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败', 'checkout-draft': '草稿',
+                        'undelivered': '未送达'
                     };
                     var statusColors = {
                         'pending': '#f59e0b', 'processing': '#3b82f6', 'on-hold': '#6b7280',
-                        'completed': '#10b981', 'cancelled': '#ef4444', 'refunded': '#f97316', 'failed': '#dc2626', 'checkout-draft': '#9ca3af'
+                        'completed': '#10b981', 'cancelled': '#ef4444', 'refunded': '#f97316', 'failed': '#dc2626', 'checkout-draft': '#9ca3af',
+                        'undelivered': '#c084fc'
                     };
 
                     var billing = order.billing || {};
@@ -448,6 +450,10 @@
                     html += '<p><strong>订单号:</strong> #' + order.number + '</p>';
 
                     // Status with dropdown for editing (only for users with edit permission)
+                    if (order.is_undelivered) {
+                        // Undelivered overrides the regular status display
+                        html += '<p><strong>状态:</strong> <span style="background:rgba(168,85,247,0.2); color:#c084fc; padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600; border:1px solid rgba(168,85,247,0.4);">未送达</span></p>';
+                    } else {
                     {% if current_user.can_edit() %}
                     html += '<p><strong>状态:</strong> ';
                     html += '<div class="dropdown d-inline-block">';
@@ -465,12 +471,46 @@
                     {% else %}
                     html += '<p><strong>状态:</strong> <span style="background:' + (statusColors[order.status] || '#6b7280') + '; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; color: white;">' + (statusLabels[order.status] || order.status) + '</span></p>';
                     {% endif %}
+                    }
 
                     html += '<p><strong>创建时间:</strong> ' + (order.date_created || '-').replace('T', ' ').substring(0, 16) + '</p>';
                     html += '<p><strong>付款时间:</strong> ' + (order.date_paid ? order.date_paid.replace('T', ' ').substring(0, 16) : '-') + '</p>';
                     html += '<p><strong>付款方式:</strong> ' + (order.payment_method_title || '-') + '</p>';
                     html += '<p><strong>来源网站:</strong> ' + (order.site_manager ? '<span style="background:rgba(23,162,184,0.3);color:#17a2b8;padding:2px 8px;border-radius:10px;font-size:12px;margin-right:6px;">' + order.site_manager + '</span>' : '') + '<span style="color: #a5b4fc;">' + (order.source || '-').replace('https://www.', '').replace('https://', '') + '</span></p>';
                     html += '</div></div></div>';
+
+                    // Undelivered (refused/returned) panel
+                    {% if current_user.can_ship() %}
+                    var canShip = true;
+                    {% else %}
+                    var canShip = false;
+                    {% endif %}
+                    if (order.is_undelivered) {
+                        var loss = parseFloat(order.shipping_loss_amount || 0).toFixed(2);
+                        var markedAt = (order.undelivered_at || '').replace('T', ' ').substring(0, 16);
+                        var markedBy = order.undelivered_by_name || ('用户#' + (order.undelivered_by || '?'));
+                        html += '<div class="col-12">';
+                        html += '<div class="info-card" style="border-color: rgba(168,85,247,0.4);">';
+                        html += '<div class="card-header" style="background: linear-gradient(90deg, rgba(168,85,247,0.15) 0%, transparent 100%);"><h6 style="color:#c084fc;"><i class="bi bi-arrow-return-left me-2"></i>未送达 / 退回记录</h6></div>';
+                        html += '<div class="card-body">';
+                        html += '<div class="row g-2">';
+                        html += '<div class="col-md-4"><strong>运费损失:</strong> <span style="color:#fbbf24; font-weight:600;">' + loss + ' ' + (order.currency || '') + '</span></div>';
+                        html += '<div class="col-md-4"><strong>标记人:</strong> ' + markedBy + '</div>';
+                        html += '<div class="col-md-4"><strong>标记时间:</strong> ' + (markedAt || '-') + '</div>';
+                        if (order.undelivered_note) {
+                            html += '<div class="col-12 mt-2"><strong>备注:</strong> <span style="color:#e2e8f0;">' + order.undelivered_note + '</span></div>';
+                        }
+                        if (canShip) {
+                            html += '<div class="col-12 mt-2"><button class="btn btn-sm btn-outline-light" onclick="unmarkUndelivered(' + order.id + ')"><i class="bi bi-arrow-counterclockwise me-1"></i>撤销标记</button></div>';
+                        }
+                        html += '</div></div></div></div>';
+                    } else if (canShip) {
+                        html += '<div class="col-12">';
+                        html += '<div class="info-card" style="border-color: rgba(168,85,247,0.25);"><div class="card-body d-flex align-items-center justify-content-between flex-wrap gap-2">';
+                        html += '<div><i class="bi bi-arrow-return-left me-2" style="color:#c084fc;"></i><span style="color:#e2e8f0;">如客户拒收 / 包裹被退回，可记录运费损失</span></div>';
+                        html += '<button class="btn btn-sm" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);" onclick="openMarkUndeliveredDialog(' + order.id + ', \'' + (order.currency || '') + '\')"><i class="bi bi-flag me-1"></i>标记为未送达</button>';
+                        html += '</div></div></div>';
+                    }
 
                     // Customer Info
                     html += '<div class="col-md-6">';
@@ -484,11 +524,13 @@
                         if (order.customer_stats.status_breakdown && Object.keys(order.customer_stats.status_breakdown).length > 0) {
                             var statusLabelsMap = {
                                 'pending': '待处理', 'processing': '处理中', 'on-hold': '暂停', 'shipped': '已发货',
-                                'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败'
+                                'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败',
+                                'undelivered': '未送达'
                             };
                             var statusColorsMap = {
                                 'pending': '#f59e0b', 'processing': '#3b82f6', 'on-hold': '#6b7280', 'shipped': '#8b5cf6',
-                                'completed': '#10b981', 'cancelled': '#ef4444', 'refunded': '#f97316', 'failed': '#dc2626'
+                                'completed': '#10b981', 'cancelled': '#ef4444', 'refunded': '#f97316', 'failed': '#dc2626',
+                                'undelivered': '#c084fc'
                             };
                             html += '<p class="mb-1"><strong>订单状态分布:</strong></p>';
                             html += '<div style="display: flex; flex-wrap: wrap; gap: 6px;">';
@@ -832,6 +874,62 @@
                     alert('请求失败: ' + err.message);
                     modalContent.innerHTML = originalContent;
                 });
+        }
+
+        function openMarkUndeliveredDialog(orderId, currency) {
+            var raw = prompt('运费损失金额（' + (currency || '') + '）：', '0');
+            if (raw === null) return;
+            var amount = parseFloat(String(raw).replace(',', '.'));
+            if (isNaN(amount) || amount < 0) {
+                alert('金额格式不正确');
+                return;
+            }
+            var note = prompt('备注（可选，比如客户拒收原因）：', '') || '';
+
+            fetch('/api/order/' + orderId + '/mark-undelivered', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ shipping_loss_amount: amount, note: note })
+            })
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                    if (data.success) {
+                        alert(data.message || '已标记');
+                        showOrderDetail(orderId);
+                        if (typeof refreshOrderList === 'function') {
+                            refreshOrderList();
+                        } else {
+                            location.reload();
+                        }
+                    } else {
+                        alert('标记失败: ' + (data.error || ''));
+                    }
+                })
+                .catch(function (err) { alert('请求失败: ' + err.message); });
+        }
+
+        function unmarkUndelivered(orderId) {
+            if (!confirm('确认撤销「未送达」标记？\n撤销后，运费损失记录会被清除。')) return;
+
+            fetch('/api/order/' + orderId + '/unmark-undelivered', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            })
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                    if (data.success) {
+                        alert(data.message || '已撤销');
+                        showOrderDetail(orderId);
+                        if (typeof refreshOrderList === 'function') {
+                            refreshOrderList();
+                        } else {
+                            location.reload();
+                        }
+                    } else {
+                        alert('撤销失败: ' + (data.error || ''));
+                    }
+                })
+                .catch(function (err) { alert('请求失败: ' + err.message); });
         }
 
         function showCustomerDetail(email) {
