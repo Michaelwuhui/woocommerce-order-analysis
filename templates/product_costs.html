@@ -1,0 +1,849 @@
+{% extends "base.html" %}
+
+{% block title %}成本管理 - 苍赋管理系统{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h5 class="text-light mb-0">
+            <i class="bi bi-calculator me-2"></i>产品成本管理
+        </h5>
+        <div class="d-flex align-items-center gap-2">
+            <select id="countryFilter" class="form-select form-select-sm bg-dark text-white border-secondary" style="width:120px;" onchange="saveCountry(); loadCosts()">
+                {% for c in countries %}
+                <option value="{{ c.code }}">{{ c.label }} {{ c.code }}</option>
+                {% endfor %}
+            </select>
+            <button class="btn btn-sm btn-outline-warning" onclick="showUnmapped()">
+                <i class="bi bi-exclamation-triangle me-1"></i>未映射产品
+            </button>
+            <button class="btn btn-sm btn-primary" onclick="openAddModal()">
+                <i class="bi bi-plus-lg me-1"></i>添加成本
+            </button>
+        </div>
+    </div>
+
+    <!-- Summary Cards -->
+    <div class="row g-3 mb-4">
+        <div class="col">
+            <div class="card data-card">
+                <div class="card-body py-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-white-50 small">已录入产品</div>
+                            <div class="text-info fw-bold fs-5" id="totalCostItems">0</div>
+                        </div>
+                        <i class="bi bi-box-seam text-info fs-3 opacity-50"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card data-card">
+                <div class="card-body py-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-white-50 small">未映射产品</div>
+                            <div class="text-warning fw-bold fs-5" id="unmappedCount">-</div>
+                        </div>
+                        <i class="bi bi-exclamation-triangle text-warning fs-3 opacity-50"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card data-card">
+                <div class="card-body py-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-white-50 small">涉及品牌</div>
+                            <div class="text-success fw-bold fs-5" id="totalBrands">0</div>
+                        </div>
+                        <i class="bi bi-tags text-success fs-3 opacity-50"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Cost Table -->
+    <div class="card data-card">
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-dark table-hover mb-0">
+                    <thead>
+                        <tr>
+                            <th>品牌</th>
+                            <th>系列</th>
+                            <th>口数</th>
+                            <th>口味</th>
+                            <th>国家</th>
+                            <th class="text-end">成本价</th>
+                            <th>币种</th>
+                            <th>生效日期</th>
+                            <th>备注</th>
+                            <th class="text-end">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="costsTableBody">
+                        <tr><td colspan="10" class="text-center text-muted py-4">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Add/Edit Modal -->
+<div class="modal fade" id="costModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content text-light" style="background-color: var(--bg-card);">
+            <div class="modal-header border-secondary">
+                <h5 class="modal-title" id="costModalTitle"><i class="bi bi-plus-circle me-2"></i>添加产品成本</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="editCostId">
+                <div class="row g-3">
+                    <div class="col-md-6">
+                        <label class="form-label">品牌 <span class="text-danger">*</span></label>
+                        <select id="costBrand" class="form-select form-select-sm bg-dark text-white border-secondary">
+                            <option value="">选择品牌</option>
+                        </select>
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">系列</label>
+                        <select id="costSeries" class="form-select form-select-sm bg-dark text-white border-secondary">
+                            <option value="">不限</option>
+                        </select>
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">口数</label>
+                        <input type="text" id="costPuffs" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="输入数字筛选" list="puffsList" autocomplete="off">
+                        <datalist id="puffsList"></datalist>
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">口味</label>
+                        <input type="text" id="costFlavor" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="输入筛选，留空=所有口味" list="flavorsList" autocomplete="off">
+                        <datalist id="flavorsList"></datalist>
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label">国家 <span class="text-danger">*</span></label>
+                        <select id="costCountry" class="form-select form-select-sm bg-dark text-white border-secondary">
+                            {% for c in countries %}
+                            <option value="{{ c.code }}">{{ c.code }} {{ c.label }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label">成本价 <span class="text-danger">*</span></label>
+                        <input type="number" step="0.01" id="costPrice" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="单个成本价">
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label">币种</label>
+                        <select id="costCurrency" class="form-select form-select-sm bg-dark text-white border-secondary">
+                            <option value="PLN">PLN</option>
+                            <option value="AED">AED</option>
+                            <option value="AUD">AUD</option>
+                            <option value="GBP">GBP</option>
+                            <option value="CNY">CNY</option>
+                        </select>
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">生效日期</label>
+                        <input type="date" id="costEffectiveDate" class="form-control form-control-sm bg-dark text-white border-secondary">
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">备注</label>
+                        <input type="text" id="costNotes" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="如：因取消退税涨价">
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer border-secondary">
+                <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-sm btn-primary" onclick="saveCost()">保存</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Unmapped Products Modal -->
+<div class="modal fade" id="unmappedModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content text-light" style="background-color: var(--bg-card);">
+            <div class="modal-header border-secondary">
+                <h5 class="modal-title"><i class="bi bi-exclamation-triangle me-2 text-warning"></i>未映射成本的产品</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+                    <span class="text-secondary">月份：</span>
+                    <input type="month" id="unmappedMonth" class="form-control form-control-sm bg-dark text-white border-secondary" style="width:160px;" onchange="loadUnmapped()">
+                    <span class="text-secondary ms-3">匹配粒度：</span>
+                    <div class="btn-group btn-group-sm" role="group">
+                        <input type="radio" class="btn-check" name="matchLevel" id="mlBrandPuffs" value="brand_puffs" onchange="loadUnmapped()">
+                        <label class="btn btn-outline-info" for="mlBrandPuffs">品牌+口数</label>
+                        <input type="radio" class="btn-check" name="matchLevel" id="mlBrandPuffsSeries" value="brand_puffs_series" checked onchange="loadUnmapped()">
+                        <label class="btn btn-outline-info" for="mlBrandPuffsSeries">品牌+口数+系列</label>
+                        <input type="radio" class="btn-check" name="matchLevel" id="mlFull" value="full" onchange="loadUnmapped()">
+                        <label class="btn btn-outline-info" for="mlFull">品牌+口数+系列+口味</label>
+                    </div>
+                </div>
+                <div id="unmappedHint" class="alert alert-info alert-sm py-1 px-2 mb-2 small" style="background:rgba(13,202,240,0.1);border-color:rgba(13,202,240,0.2);color:#5bc0de;"></div>
+                <div class="table-responsive">
+                    <table class="table table-dark table-hover mb-0">
+                        <thead>
+                            <tr id="unmappedTableHead">
+                                <th>产品名称</th>
+                                <th class="text-end">销量</th>
+                                <th class="text-end">销售额</th>
+                                <th>品牌</th>
+                                <th>口数</th>
+                                <th class="text-end">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="unmappedTableBody">
+                            <tr><td colspan="6" class="text-center text-muted py-4">选择月份后加载...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Product Mapping Modal (for fixing unmapped products) -->
+<div class="modal fade" id="costMappingModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-pencil-square me-2"></i>产品映射</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="card bg-black bg-opacity-50 border-info border-opacity-50 mb-3">
+                    <div class="card-header bg-info bg-opacity-10 py-2">
+                        <h6 class="mb-0 text-info"><i class="bi bi-database me-2"></i>原始数据 (来自订单)</h6>
+                    </div>
+                    <div class="card-body py-3">
+                        <p class="mb-1 text-white" style="word-break:break-all;font-size:1.1rem;">
+                            <strong id="cmOriginalName"></strong>
+                        </p>
+                        <div class="row mt-3">
+                            <div class="col-md-6">
+                                <small class="d-block mb-1" style="color:#cbd5e1;">来源网站：</small>
+                                <div id="cmSources"><span style="color:#cbd5e1;">加载中...</span></div>
+                            </div>
+                            <div class="col-md-6">
+                                <small class="d-block mb-1" style="color:#cbd5e1;">相关订单号 (最近10个)：</small>
+                                <div id="cmOrders" style="max-height:80px;overflow-y:auto;"><span style="color:#cbd5e1;">加载中...</span></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-4" style="background:rgba(30,41,59,0.8);border:1px solid rgba(99,102,241,0.3);">
+                    <div class="card-header py-2" style="background:rgba(99,102,241,0.1);border-bottom:1px solid rgba(99,102,241,0.2);">
+                        <h6 class="mb-0" style="color:#a5b4fc;"><i class="bi bi-cpu me-2"></i>系统自动解析结果</h6>
+                    </div>
+                    <div class="card-body py-2">
+                        <div class="row text-center">
+                            <div class="col-4">
+                                <small class="d-block" style="color:#cbd5e1;">品牌</small>
+                                <span id="cmAutoBrand" class="text-info fw-bold">-</span>
+                            </div>
+                            <div class="col-4">
+                                <small class="d-block" style="color:#cbd5e1;">口数</small>
+                                <span id="cmAutoPuffs" class="text-info fw-bold">-</span>
+                            </div>
+                            <div class="col-4">
+                                <small class="d-block" style="color:#cbd5e1;">口味</small>
+                                <span id="cmAutoFlavor" class="text-info fw-bold">-</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="card bg-primary bg-opacity-10 border-primary border-opacity-25">
+                    <div class="card-header bg-primary bg-opacity-10 py-2">
+                        <h6 class="mb-0 text-primary"><i class="bi bi-pencil me-2"></i>手动修正 (可选)</h6>
+                    </div>
+                    <div class="card-body">
+                        <input type="hidden" id="cmProductName">
+                        <div class="row g-3">
+                            <div class="col-md-3">
+                                <label class="form-label small" style="color:#cbd5e1;">品牌</label>
+                                <select class="form-select form-select-sm bg-black bg-opacity-25 text-white border-secondary" id="cmBrand" onchange="loadCmSeries()">
+                                    <option value="">-- 不修改 --</option>
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label small" style="color:#cbd5e1;">系列</label>
+                                <div class="input-group input-group-sm">
+                                    <select class="form-select form-select-sm bg-black bg-opacity-25 text-white border-secondary" id="cmSeries">
+                                        <option value="">-- 无 --</option>
+                                    </select>
+                                    <button class="btn btn-outline-info" type="button" onclick="promptAddSeries('cm')" title="添加系列"><i class="bi bi-plus-lg"></i></button>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label small" style="color:#cbd5e1;">口数 (Puffs)</label>
+                                <input type="number" class="form-control form-control-sm bg-black bg-opacity-25 text-white border-secondary" id="cmPuffs" placeholder="如：45000">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label small" style="color:#cbd5e1;">口味</label>
+                                <input type="text" class="form-control form-control-sm bg-black bg-opacity-25 text-white border-secondary" id="cmFlavor" placeholder="如：Strawberry Ice">
+                            </div>
+                        </div>
+                        <small class="d-block mt-2" style="color:#cbd5e1;">只填写需要修正的字段，留空则使用系统自动解析结果</small>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="cmSaveBtn">
+                    <i class="bi bi-check-lg me-1"></i>保存映射
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let allCosts = [];
+let brandsData = [];
+let seriesData = {};
+let productCombos = [];
+
+function saveCountry() {
+    localStorage.setItem('productCostsCountry', document.getElementById('countryFilter').value);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    var saved = localStorage.getItem('productCostsCountry');
+    if (saved) {
+        var sel = document.getElementById('countryFilter');
+        for (var i = 0; i < sel.options.length; i++) {
+            if (sel.options[i].value === saved) { sel.value = saved; break; }
+        }
+    }
+    loadBrands();
+    loadCosts();
+    loadCostOptions();
+    const now = new Date();
+    document.getElementById('unmappedMonth').value = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0');
+    document.getElementById('costEffectiveDate').value = now.toISOString().split('T')[0];
+
+    document.getElementById('costPuffs').addEventListener('input', onFieldChange);
+    document.getElementById('costFlavor').addEventListener('input', onFieldChange);
+    document.getElementById('costBrand').addEventListener('change', function() {
+        loadSeriesForBrand();
+        onFieldChange();
+    });
+});
+
+async function loadCostOptions() {
+    try {
+        const res = await fetch('/api/product-costs/options');
+        productCombos = await res.json();
+        refreshDataLists();
+    } catch(e) { console.error('加载选项失败', e); }
+}
+
+function getFilteredCombos() {
+    const brandId = document.getElementById('costBrand').value;
+    const puffsVal = document.getElementById('costPuffs').value.trim();
+    const flavorVal = document.getElementById('costFlavor').value.trim().toUpperCase();
+    let filtered = productCombos;
+    if (brandId) filtered = filtered.filter(c => c.brand_id == brandId);
+    if (puffsVal) filtered = filtered.filter(c => c.puff_count && String(c.puff_count) === puffsVal);
+    if (flavorVal) filtered = filtered.filter(c => c.flavor && c.flavor.toUpperCase().includes(flavorVal));
+    return filtered;
+}
+
+function onFieldChange() {
+    refreshDataLists();
+    refreshBrandOptions();
+}
+
+function refreshDataLists() {
+    const brandId = document.getElementById('costBrand').value;
+    const puffsVal = document.getElementById('costPuffs').value.trim();
+    const flavorVal = document.getElementById('costFlavor').value.trim().toUpperCase();
+
+    // Filter puff options: by brand + flavor
+    let puffSource = productCombos;
+    if (brandId) puffSource = puffSource.filter(c => c.brand_id == brandId);
+    if (flavorVal) puffSource = puffSource.filter(c => c.flavor && c.flavor.toUpperCase().includes(flavorVal));
+    const puffs = [...new Set(puffSource.filter(c => c.puff_count).map(c => c.puff_count))].sort((a,b) => a-b);
+    document.getElementById('puffsList').innerHTML = puffs.map(p =>
+        `<option value="${p}">`
+    ).join('');
+
+    // Filter flavor options: by brand + puffs
+    let flavorSource = productCombos;
+    if (brandId) flavorSource = flavorSource.filter(c => c.brand_id == brandId);
+    if (puffsVal) flavorSource = flavorSource.filter(c => c.puff_count && String(c.puff_count) === puffsVal);
+    const flavors = [...new Set(flavorSource.filter(c => c.flavor).map(c => c.flavor))].sort();
+    document.getElementById('flavorsList').innerHTML = flavors.map(f =>
+        `<option value="${f}">`
+    ).join('');
+}
+
+function refreshBrandOptions() {
+    const puffsVal = document.getElementById('costPuffs').value.trim();
+    const flavorVal = document.getElementById('costFlavor').value.trim().toUpperCase();
+    const sel = document.getElementById('costBrand');
+    const currentVal = sel.value;
+
+    if (!puffsVal && !flavorVal) {
+        sel.innerHTML = '<option value="">选择品牌</option>';
+        brandsData.forEach(b => {
+            sel.innerHTML += `<option value="${b.id}">${b.name}</option>`;
+        });
+    } else {
+        let source = productCombos;
+        if (puffsVal) source = source.filter(c => c.puff_count && String(c.puff_count) === puffsVal);
+        if (flavorVal) source = source.filter(c => c.flavor && c.flavor.toUpperCase().includes(flavorVal));
+        const matchIds = new Set(source.map(c => c.brand_id));
+        const matched = brandsData.filter(b => matchIds.has(b.id));
+        const others = brandsData.filter(b => !matchIds.has(b.id));
+        let html = '<option value="">选择品牌</option>';
+        if (matched.length > 0) {
+            html += `<optgroup label="匹配品牌">` + matched.map(b => `<option value="${b.id}">${b.name}</option>`).join('') + `</optgroup>`;
+        }
+        if (others.length > 0) {
+            html += `<optgroup label="其他品牌">` + others.map(b => `<option value="${b.id}">${b.name}</option>`).join('') + `</optgroup>`;
+        }
+        sel.innerHTML = html;
+    }
+    sel.value = currentVal;
+}
+
+async function loadBrands() {
+    try {
+        const res = await fetch('/api/brands');
+        brandsData = await res.json();
+        const sel = document.getElementById('costBrand');
+        sel.innerHTML = '<option value="">选择品牌</option>';
+        brandsData.forEach(b => {
+            sel.innerHTML += `<option value="${b.id}">${b.name}</option>`;
+        });
+    } catch(e) { console.error('加载品牌失败', e); }
+}
+
+async function loadSeriesForBrand() {
+    const brandId = document.getElementById('costBrand').value;
+    const sel = document.getElementById('costSeries');
+    sel.innerHTML = '<option value="">不限</option>';
+    if (!brandId) return;
+    if (seriesData[brandId]) {
+        seriesData[brandId].forEach(s => {
+            sel.innerHTML += `<option value="${s.id}">${s.name}</option>`;
+        });
+        return;
+    }
+    try {
+        const res = await fetch(`/api/series?brand_id=${brandId}`);
+        const data = await res.json();
+        seriesData[brandId] = data;
+        data.forEach(s => {
+            sel.innerHTML += `<option value="${s.id}">${s.name}</option>`;
+        });
+    } catch(e) { console.error('加载系列失败', e); }
+}
+
+async function loadCosts() {
+    const country = document.getElementById('countryFilter').value;
+    try {
+        const res = await fetch('/api/product-costs');
+        const data = await res.json();
+        allCosts = data.filter(c => c.country === country);
+        renderCosts();
+        updateSummary();
+    } catch(e) { console.error('加载成本失败', e); }
+}
+
+function renderCosts() {
+    const tbody = document.getElementById('costsTableBody');
+    if (allCosts.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-4">暂无数据，点击右上角"添加成本"开始录入</td></tr>';
+        return;
+    }
+    tbody.innerHTML = allCosts.map(c => `
+        <tr>
+            <td><span class="badge bg-primary bg-opacity-25 text-primary">${c.brand_name || '-'}</span></td>
+            <td>${c.series_name || '<span class="text-muted">不限</span>'}</td>
+            <td>${c.puff_count ? c.puff_count.toLocaleString() : '<span class="text-muted">不限</span>'}</td>
+            <td>${c.flavor || '<span class="text-muted">不限</span>'}</td>
+            <td>${c.country}</td>
+            <td class="text-end fw-bold text-info">${parseFloat(c.cost_price).toFixed(2)}</td>
+            <td>${c.cost_currency}</td>
+            <td>${c.effective_date || '-'}</td>
+            <td class="text-muted small">${c.notes || ''}</td>
+            <td class="text-end">
+                <button class="btn btn-sm btn-outline-info btn-sm me-1" onclick="editCost(${c.id})"><i class="bi bi-pencil"></i></button>
+                <button class="btn btn-sm btn-outline-danger btn-sm" onclick="deleteCost(${c.id})"><i class="bi bi-trash"></i></button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function updateSummary() {
+    document.getElementById('totalCostItems').textContent = allCosts.length;
+    const brands = new Set(allCosts.map(c => c.brand_name));
+    document.getElementById('totalBrands').textContent = brands.size;
+}
+
+function openAddModal() {
+    document.getElementById('editCostId').value = '';
+    document.getElementById('costModalTitle').innerHTML = '<i class="bi bi-plus-circle me-2"></i>添加产品成本';
+    document.getElementById('costPuffs').value = '';
+    document.getElementById('costFlavor').value = '';
+    document.getElementById('costBrand').value = '';
+    document.getElementById('costSeries').innerHTML = '<option value="">不限</option>';
+    document.getElementById('costCountry').value = document.getElementById('countryFilter').value;
+    document.getElementById('costPrice').value = '';
+    document.getElementById('costCurrency').value = getCurrencyForCountry(document.getElementById('countryFilter').value);
+    document.getElementById('costNotes').value = '';
+    refreshBrandOptions();
+    refreshDataLists();
+    new bootstrap.Modal(document.getElementById('costModal')).show();
+}
+
+function getCurrencyForCountry(country) {
+    const map = {'PL':'PLN','AE':'AED','AU':'AUD','DE':'EUR','FR':'EUR','UK':'GBP','US':'USD','CN':'CNY'};
+    return map[country] || 'PLN';
+}
+
+async function editCost(id) {
+    const c = allCosts.find(x => x.id === id);
+    if (!c) return;
+    document.getElementById('editCostId').value = id;
+    document.getElementById('costModalTitle').innerHTML = '<i class="bi bi-pencil me-2"></i>编辑产品成本';
+    document.getElementById('costPuffs').value = c.puff_count || '';
+    document.getElementById('costFlavor').value = c.flavor || '';
+    refreshBrandOptions();
+    document.getElementById('costBrand').value = c.brand_id;
+    await loadSeriesForBrand();
+    document.getElementById('costSeries').value = c.series_id || '';
+    document.getElementById('costCountry').value = c.country;
+    document.getElementById('costPrice').value = c.cost_price;
+    document.getElementById('costCurrency').value = c.cost_currency;
+    document.getElementById('costEffectiveDate').value = c.effective_date || '';
+    document.getElementById('costNotes').value = c.notes || '';
+    refreshDataLists();
+    new bootstrap.Modal(document.getElementById('costModal')).show();
+}
+
+async function saveCost() {
+    const id = document.getElementById('editCostId').value;
+    const data = {
+        brand_id: parseInt(document.getElementById('costBrand').value) || null,
+        series_id: parseInt(document.getElementById('costSeries').value) || null,
+        puff_count: parseInt(document.getElementById('costPuffs').value) || null,
+        flavor: document.getElementById('costFlavor').value.trim() || null,
+        country: document.getElementById('costCountry').value,
+        cost_price: parseFloat(document.getElementById('costPrice').value),
+        cost_currency: document.getElementById('costCurrency').value,
+        effective_date: document.getElementById('costEffectiveDate').value,
+        notes: document.getElementById('costNotes').value.trim()
+    };
+    if (!data.brand_id || isNaN(data.cost_price)) {
+        alert('请填写品牌和成本价');
+        return;
+    }
+    try {
+        const url = id ? `/api/product-costs/${id}` : '/api/product-costs';
+        const method = id ? 'PUT' : 'POST';
+        const res = await fetch(url, {
+            method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(data)
+        });
+        const result = await res.json();
+        if (result.error) { alert(result.error); return; }
+        bootstrap.Modal.getInstance(document.getElementById('costModal')).hide();
+        loadCosts();
+    } catch(e) { alert('保存失败: ' + e.message); }
+}
+
+async function deleteCost(id) {
+    if (!confirm('确定删除此成本记录？')) return;
+    try {
+        await fetch(`/api/product-costs/${id}`, {method:'DELETE'});
+        loadCosts();
+    } catch(e) { alert('删除失败'); }
+}
+
+async function showUnmapped() {
+    new bootstrap.Modal(document.getElementById('unmappedModal')).show();
+    loadUnmapped();
+}
+
+async function loadUnmapped() {
+    const month = document.getElementById('unmappedMonth').value;
+    const country = document.getElementById('countryFilter').value;
+    const level = document.querySelector('input[name="matchLevel"]:checked').value;
+    if (!month) return;
+    const tbody = document.getElementById('unmappedTableBody');
+    const thead = document.getElementById('unmappedTableHead');
+    const hint = document.getElementById('unmappedHint');
+    const hints = {
+        'brand_puffs': '仅显示缺少「品牌+口数」级别成本的组合，已有更细粒度条目的不会出现',
+        'brand_puffs_series': '显示缺少「品牌+口数+系列」级别成本的组合，仅有口味差异的不会出现',
+        'full': '显示所有未能匹配到成本的产品（最细粒度，含口味）'
+    };
+    hint.textContent = hints[level] || '';
+    tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-4"><i class="bi bi-hourglass-split me-2"></i>加载中...</td></tr>';
+    if (level === 'brand_puffs') {
+        thead.innerHTML = '<th>品牌</th><th>口数 (Puffs)</th><th class="text-end">涉及产品数</th><th class="text-end">总销量</th><th class="text-end">总销售额</th><th class="text-end">操作</th>';
+    } else if (level === 'brand_puffs_series') {
+        thead.innerHTML = '<th>品牌</th><th>系列</th><th>口数</th><th class="text-end">总销量</th><th class="text-end">总销售额</th><th class="text-end">操作</th>';
+    } else {
+        thead.innerHTML = '<th>产品名称</th><th class="text-end">销量</th><th class="text-end">销售额</th><th>品牌</th><th>口数</th><th class="text-end">操作</th>';
+    }
+    try {
+        const res = await fetch(`/api/product-costs/unmapped?year_month=${month}&country=${country}&match_level=${level}`);
+        const data = await res.json();
+        document.getElementById('unmappedCount').textContent = data.length;
+        if (data.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="6" class="text-center text-success py-4"><i class="bi bi-check-circle me-2"></i>该粒度下所有产品已映射成本</td></tr>`;
+            return;
+        }
+        if (level === 'brand_puffs') {
+            tbody.innerHTML = data.map((p, idx) => {
+                const needsMapping = !p.brand_id || !p.puff_count;
+                const actionBtn = needsMapping
+                    ? `<button class="btn btn-sm btn-outline-warning" onclick="toggleSubProducts('bp_${idx}')"><i class="bi bi-arrow-right-circle me-1"></i>去映射 (${(p.raw_names||[]).length})</button>`
+                    : `<button class="btn btn-sm btn-outline-primary" onclick="quickAddFromUnmapped('', ${p.brand_id}, ${p.puff_count})"><i class="bi bi-plus"></i> 添加成本</button>`;
+                const subRows = needsMapping ? renderSubProducts(p.raw_names || [], 6, `bp_${idx}`) : '';
+                return `<tr>
+                    <td>${p.brand_name ? '<span class="text-info">'+p.brand_name+'</span>' : '<span class="text-danger">未识别</span>'}</td>
+                    <td>${p.puff_count || '<span class="text-warning">缺失</span>'}</td>
+                    <td class="text-end">${p.product_count}</td>
+                    <td class="text-end">${p.total_qty}</td>
+                    <td class="text-end">${p.total_revenue.toFixed(2)}</td>
+                    <td class="text-end">${actionBtn}</td>
+                </tr>${subRows}`;
+            }).join('');
+        } else if (level === 'brand_puffs_series') {
+            tbody.innerHTML = data.map((p, idx) => {
+                const needsMapping = !p.brand_id || !p.puff_count;
+                const actionBtn = needsMapping
+                    ? `<button class="btn btn-sm btn-outline-warning" onclick="toggleSubProducts('bps_${idx}')"><i class="bi bi-arrow-right-circle me-1"></i>去映射 (${(p.raw_names||[]).length})</button>`
+                    : `<button class="btn btn-sm btn-outline-primary" onclick="quickAddFromUnmapped('', ${p.brand_id}, ${p.puff_count}, ${p.series_id||'null'})"><i class="bi bi-plus"></i> 添加成本</button>`;
+                const subRows = needsMapping ? renderSubProducts(p.raw_names || [], 6, `bps_${idx}`) : '';
+                return `<tr>
+                    <td>${p.brand_name ? '<span class="text-info">'+p.brand_name+'</span>' : '<span class="text-danger">未识别</span>'}</td>
+                    <td>${p.series_name || '<span class="text-muted">-</span>'}</td>
+                    <td>${p.puff_count || '<span class="text-warning">缺失</span>'}</td>
+                    <td class="text-end">${p.total_qty}</td>
+                    <td class="text-end">${p.total_revenue.toFixed(2)}</td>
+                    <td class="text-end">${actionBtn}</td>
+                </tr>${subRows}`;
+            }).join('');
+        } else {
+            tbody.innerHTML = data.map(p => {
+                const needsMapping = !p.brand_id || !p.puff_count;
+                const escaped = p.raw_name.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+                const actionBtn = needsMapping
+                    ? `<button class="btn btn-sm btn-outline-warning" onclick="openCostMapping('${escaped}')"><i class="bi bi-pencil-square me-1"></i>去映射</button>`
+                    : `<button class="btn btn-sm btn-outline-primary" onclick="quickAddFromUnmapped('${escaped}', ${p.brand_id}, ${p.puff_count||'null'})"><i class="bi bi-plus"></i> 添加成本</button>`;
+                return `<tr>
+                    <td>${p.raw_name}<br><small class="text-muted">${(p.sources||[]).map(s=>s.replace('https://www.','')).join(', ')}</small></td>
+                    <td class="text-end">${p.total_qty}</td>
+                    <td class="text-end">${p.total_revenue.toFixed(2)}</td>
+                    <td>${p.brand_id ? '<span class="text-info">ID:'+p.brand_id+'</span>' : '<span class="text-danger">未识别</span>'}</td>
+                    <td>${p.puff_count || '<span class="text-warning">缺失</span>'}</td>
+                    <td class="text-end">${actionBtn}</td>
+                </tr>`;
+            }).join('');
+        }
+    } catch(e) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-danger py-4">加载失败</td></tr>';
+    }
+}
+
+function renderSubProducts(rawNames, colSpan, id) {
+    if (!rawNames || !rawNames.length) return '';
+    const rows = rawNames.map(r => {
+        const escaped = r.name.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        return `<tr class="sub-products-${id}" style="display:none;background:rgba(255,193,7,0.05);">
+            <td colspan="${colSpan-1}" class="ps-4 py-1">
+                <small class="text-light"><i class="bi bi-arrow-return-right me-1 text-muted"></i>${r.name}</small>
+                <small class="text-muted ms-2">×${r.qty}</small>
+            </td>
+            <td class="text-end py-1">
+                <button class="btn btn-xs btn-outline-info py-0 px-2" style="font-size:11px;" onclick="event.stopPropagation();openCostMapping('${escaped}')">
+                    <i class="bi bi-pencil-square me-1"></i>映射
+                </button>
+            </td>
+        </tr>`;
+    }).join('');
+    return rows;
+}
+
+function toggleSubProducts(id) {
+    const rows = document.querySelectorAll('.sub-products-' + id);
+    const visible = rows.length && rows[0].style.display !== 'none';
+    rows.forEach(r => r.style.display = visible ? 'none' : '');
+}
+
+async function openCostMapping(productName) {
+    document.getElementById('cmOriginalName').textContent = productName;
+    document.getElementById('cmProductName').value = productName;
+    document.getElementById('cmSources').innerHTML = '<span class="text-muted">加载中...</span>';
+    document.getElementById('cmOrders').innerHTML = '<span class="text-muted">加载中...</span>';
+
+    const brandSel = document.getElementById('cmBrand');
+    brandSel.innerHTML = '<option value="">-- 不修改 --</option>';
+    brandsData.forEach(b => {
+        brandSel.innerHTML += `<option value="${b.id}">${b.name}</option>`;
+    });
+
+    const params = new URLSearchParams({name: productName});
+    try {
+        const res = await fetch('/api/products/samples?' + params.toString());
+        const data = await res.json();
+        if (data.sources && data.sources.length > 0) {
+            document.getElementById('cmSources').innerHTML = data.sources.map(s => {
+                let c = '';
+                if (s.manager) c += `<span class="badge me-1" style="background:rgba(23,162,184,0.3);color:#17a2b8;">${s.manager}</span>`;
+                c += `<span class="badge bg-success bg-opacity-25 text-success me-1">${s.site}</span>`;
+                return c;
+            }).join('');
+        } else {
+            document.getElementById('cmSources').innerHTML = '<span class="text-muted">未找到</span>';
+        }
+        if (data.orders && data.orders.length > 0) {
+            document.getElementById('cmOrders').innerHTML = data.orders.map(o =>
+                `<span class="badge bg-secondary bg-opacity-50 me-1 mb-1" title="${o.source} - ${o.date}">#${o.order_number}</span>`
+            ).join('');
+        } else {
+            document.getElementById('cmOrders').innerHTML = '<span class="text-muted">未找到</span>';
+        }
+
+        const brand = data.parsed_brand || '';
+        const puffs = data.parsed_puffs || '';
+        const flavor = data.parsed_flavor || '';
+        document.getElementById('cmAutoBrand').textContent = brand || '-';
+        document.getElementById('cmAutoBrand').className = (!brand || brand === 'Unknown') ? 'text-warning fw-bold' : 'fw-bold text-info';
+        document.getElementById('cmAutoPuffs').textContent = puffs || '-';
+        document.getElementById('cmAutoPuffs').className = !puffs ? 'text-warning fw-bold' : 'fw-bold text-info';
+        document.getElementById('cmAutoFlavor').textContent = flavor || '-';
+        document.getElementById('cmAutoFlavor').className = !flavor ? 'text-muted' : 'fw-bold text-info';
+
+        if (brand && brand !== 'Unknown') {
+            for (let i = 0; i < brandSel.options.length; i++) {
+                if (brandSel.options[i].text === brand) { brandSel.selectedIndex = i; break; }
+            }
+        }
+        document.getElementById('cmPuffs').value = puffs || '';
+        document.getElementById('cmFlavor').value = flavor || '';
+
+        // Load existing saved mapping (to restore series_id etc.)
+        try {
+            const savedRes = await fetch('/api/products/mapping?name=' + encodeURIComponent(productName));
+            const saved = await savedRes.json();
+            if (saved.brand_id) {
+                for (let i = 0; i < brandSel.options.length; i++) {
+                    if (brandSel.options[i].value == saved.brand_id) { brandSel.selectedIndex = i; break; }
+                }
+            }
+            if (saved.puff_count) document.getElementById('cmPuffs').value = saved.puff_count;
+            if (saved.flavor) document.getElementById('cmFlavor').value = saved.flavor;
+            await loadCmSeries();
+            if (saved.series_id) document.getElementById('cmSeries').value = saved.series_id;
+        } catch(e) {
+            await loadCmSeries();
+        }
+    } catch(e) {
+        document.getElementById('cmSources').innerHTML = '<span class="text-danger">加载失败</span>';
+        document.getElementById('cmOrders').innerHTML = '<span class="text-danger">加载失败</span>';
+        document.getElementById('cmAutoBrand').textContent = '-';
+        document.getElementById('cmAutoPuffs').textContent = '-';
+        document.getElementById('cmAutoFlavor').textContent = '-';
+        document.getElementById('cmPuffs').value = '';
+        document.getElementById('cmFlavor').value = '';
+    }
+
+    new bootstrap.Modal(document.getElementById('costMappingModal')).show();
+}
+
+async function promptAddSeries(prefix) {
+    const brandSel = document.getElementById(prefix === 'cm' ? 'cmBrand' : 'costBrand');
+    const brandId = brandSel.value;
+    if (!brandId) { alert('请先选择品牌'); return; }
+    const brandName = brandSel.options[brandSel.selectedIndex].text;
+    const name = prompt(`为品牌「${brandName}」添加新系列：`);
+    if (!name || !name.trim()) return;
+    try {
+        const res = await fetch('/api/series', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({brand_id: parseInt(brandId), name: name.trim()})
+        });
+        const data = await res.json();
+        if (data.success) {
+            if (prefix === 'cm') {
+                await loadCmSeries();
+                document.getElementById('cmSeries').value = data.id;
+            } else {
+                await loadSeriesForBrand();
+                document.getElementById('costSeries').value = data.id;
+            }
+        } else {
+            alert('添加失败: ' + (data.error || ''));
+        }
+    } catch(e) { alert('请求失败'); }
+}
+
+async function loadCmSeries() {
+    const brandId = document.getElementById('cmBrand').value;
+    const sel = document.getElementById('cmSeries');
+    sel.innerHTML = '<option value="">-- 无 --</option>';
+    if (!brandId) return;
+    try {
+        const res = await fetch('/api/series?brand_id=' + brandId);
+        const data = await res.json();
+        data.forEach(s => {
+            sel.innerHTML += `<option value="${s.id}">${s.name}</option>`;
+        });
+    } catch(e) {}
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    document.getElementById('cmSaveBtn').addEventListener('click', async function() {
+        const rawName = document.getElementById('cmProductName').value;
+        const brandId = document.getElementById('cmBrand').value;
+        const seriesId = document.getElementById('cmSeries').value;
+        const puffs = document.getElementById('cmPuffs').value;
+        const flavor = document.getElementById('cmFlavor').value;
+        try {
+            const res = await fetch('/api/products/mapping', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({raw_name: rawName, brand_id: brandId || null, series_id: seriesId || null, puff_count: puffs || null, flavor: flavor || null})
+            });
+            const result = await res.json();
+            if (result.success) {
+                bootstrap.Modal.getInstance(document.getElementById('costMappingModal')).hide();
+                alert('映射保存成功！');
+                loadUnmapped();
+            } else {
+                alert('保存失败: ' + (result.error || '未知错误'));
+            }
+        } catch(e) {
+            alert('请求失败: ' + e);
+        }
+    });
+});
+
+function quickAddFromUnmapped(name, brandId, puffs, seriesId) {
+    bootstrap.Modal.getInstance(document.getElementById('unmappedModal')).hide();
+    openAddModal();
+    if (brandId) document.getElementById('costBrand').value = brandId;
+    if (puffs) document.getElementById('costPuffs').value = puffs;
+    loadSeriesForBrand().then(() => {
+        if (seriesId) document.getElementById('costSeries').value = seriesId;
+    });
+}
+</script>
+{% endblock %}

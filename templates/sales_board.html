@@ -134,6 +134,107 @@
         </div>
     </div>
 
+    <!-- Profit Section -->
+    {% if current_user.is_admin() %}
+    <div class="card data-card mb-4">
+        <div class="card-body py-3">
+            <div class="d-flex justify-content-between align-items-center">
+                <div class="d-flex align-items-center gap-3">
+                    <h6 class="mb-0 text-light"><i class="bi bi-graph-up me-2"></i>利润计算</h6>
+                    <div class="btn-group btn-group-sm" role="group">
+                        <input type="radio" class="btn-check" name="profitMode" id="modePct" value="percentage"
+                            {{ 'checked' if profit_mode == 'percentage' else '' }} onchange="switchProfitMode('percentage')">
+                        <label class="btn btn-outline-secondary" for="modePct">百分比模式</label>
+                        <input type="radio" class="btn-check" name="profitMode" id="modeActual" value="actual"
+                            {{ 'checked' if profit_mode == 'actual' else '' }} onchange="switchProfitMode('actual')">
+                        <label class="btn btn-outline-secondary" for="modeActual">实际成本模式</label>
+                    </div>
+                    <div class="d-flex align-items-center gap-2" id="pctControl">
+                        <span class="text-secondary small">利润率：</span>
+                        <input type="number" id="profitPctInput" class="form-control form-control-sm bg-dark text-white border-secondary"
+                            style="width:80px;" value="{{ profit_percentage }}" min="0" max="100" step="1">
+                        <span class="text-secondary small">%</span>
+                        <button class="btn btn-sm btn-outline-info" onclick="saveProfitSettings()">保存</button>
+                    </div>
+                </div>
+                {% if profit_mode == 'actual' %}
+                <div class="w-100 mt-2">
+                    <table class="table table-sm table-dark mb-0" style="font-size:0.85rem;">
+                        <thead>
+                            <tr style="border-bottom:1px solid rgba(255,255,255,0.15);">
+                                <th class="text-white-50 fw-normal">国家</th>
+                                <th class="text-end text-white-50 fw-normal">净销售额(¥)</th>
+                                <th class="text-end text-white-50 fw-normal">成本(¥)</th>
+                                <th class="text-end text-white-50 fw-normal">实际利润(¥)</th>
+                                <th class="text-end text-white-50 fw-normal">未映射</th>
+                                <th class="text-end text-white-50 fw-normal">未送达/损失(¥)</th>
+                                <th class="text-end text-white-50 fw-normal">利润率%</th>
+                                <th class="text-end text-white-50 fw-normal">百分比利润(¥)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for code, cp in team_totals.country_profit.items() %}
+                            <tr style="border-bottom:1px solid rgba(255,255,255,0.08);">
+                                <td><span class="badge bg-secondary bg-opacity-50">{{ code }}</span></td>
+                                <td class="text-end">¥{{ "{:,.0f}".format(cp.net_cny) }}</td>
+                                <td class="text-end text-danger">¥{{ "{:,.0f}".format(cp.cost_cny) }}</td>
+                                <td class="text-end text-success fw-bold">¥{{ "{:,.0f}".format(cp.profit_actual_cny) }}</td>
+                                <td class="text-end">
+                                    {% if cp.unmapped_count > 0 %}
+                                    <span class="text-warning" style="cursor:pointer;" onclick="showUnmappedDetail()">
+                                        {{ cp.unmapped_count }}个 / ¥{{ "{:,.0f}".format(cp.unmapped_revenue_cny) }}
+                                    </span>
+                                    {% else %}<span class="text-muted">-</span>{% endif %}
+                                </td>
+                                <td class="text-end">
+                                    {% if cp.undelivered_count > 0 %}
+                                    <span class="text-danger">{{ cp.undelivered_count }}单 / ¥{{ "{:,.0f}".format(cp.shipping_loss_cny) }}</span>
+                                    {% else %}<span class="text-muted">-</span>{% endif %}
+                                </td>
+                                <td class="text-end">
+                                    <input type="number" class="form-control form-control-sm bg-dark text-white border-secondary d-inline-block text-end country-pct-input"
+                                        data-country="{{ code }}" style="width:60px;padding:1px 4px;font-size:0.8rem;"
+                                        value="{{ cp.profit_pct }}" min="0" max="100" step="1">
+                                </td>
+                                <td class="text-end text-white-50">¥{{ "{:,.0f}".format(cp.profit_pct_cny) }}</td>
+                            </tr>
+                            {% endfor %}
+                            <tr style="border-top:2px solid rgba(255,255,255,0.2);">
+                                <td class="fw-bold">合计</td>
+                                <td class="text-end fw-bold">¥{{ "{:,.0f}".format(team_totals.month_net_cny) }}</td>
+                                <td class="text-end text-danger fw-bold">¥{{ "{:,.0f}".format(team_totals.month_cost_cny) }}</td>
+                                <td class="text-end text-success fw-bold">¥{{ "{:,.0f}".format(team_totals.month_profit_actual_cny) }}</td>
+                                <td class="text-end">
+                                    {% if team_totals.month_unmapped_count > 0 %}
+                                    <span class="text-warning" style="cursor:pointer;" onclick="showUnmappedDetail()">
+                                        {{ team_totals.month_unmapped_count }}个 / ¥{{ "{:,.0f}".format(team_totals.month_unmapped_revenue_cny) }}
+                                    </span>
+                                    {% endif %}
+                                </td>
+                                <td class="text-end">
+                                    {% if team_totals.undelivered_count > 0 %}
+                                    <span class="text-danger">{{ team_totals.undelivered_count }}单 / ¥{{ "{:,.0f}".format(team_totals.shipping_loss_cny) }}</span>
+                                    {% endif %}
+                                </td>
+                                <td></td>
+                                <td class="text-end text-white-50 fw-bold">¥{{ "{:,.0f}".format(team_totals.month_profit_pct_cny) }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="d-flex align-items-center gap-4">
+                    <div class="text-end">
+                        <div class="text-white-50 small">估算利润(¥) <span class="opacity-50">{{ profit_percentage }}%</span></div>
+                        <div class="text-success fw-bold fs-5">¥{{ "{:,.0f}".format(team_totals.month_profit_pct_cny) }}</div>
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
     <!-- Main Table -->
     <div class="card data-card">
         <div class="card-body p-0">
@@ -657,6 +758,50 @@
     </div>
 </div>
 {% endif %}
+
+<!-- Unmapped Products Detail Modal -->
+<div class="modal fade" id="unmappedDetailModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-warning"><i class="bi bi-exclamation-triangle me-2"></i>未映射成本的产品明细</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" style="max-height:70vh; overflow-y:auto;">
+                <div id="unmappedDetailLoading" class="text-center py-4">
+                    <div class="spinner-border text-warning"></div>
+                    <div class="text-white-50 mt-2">加载中...</div>
+                </div>
+                <div id="unmappedDetailContent" style="display:none;">
+                    <div class="mb-3 d-flex justify-content-between align-items-center">
+                        <span class="text-white-50" id="unmappedDetailSummary"></span>
+                        <a href="/product-costs" class="btn btn-sm btn-outline-warning">
+                            <i class="bi bi-gear me-1"></i>前往成本管理
+                        </a>
+                    </div>
+                    <table class="table table-dark table-hover table-sm mb-0">
+                        <thead style="position:sticky;top:0;z-index:1;background-color:#1a1d23;">
+                            <tr>
+                                <th>#</th>
+                                <th>品牌</th>
+                                <th class="text-end">口数</th>
+                                <th>国家</th>
+                                <th class="text-end">数量</th>
+                                <th class="text-end">金额 (¥)</th>
+                                <th>负责人</th>
+                                <th style="width:40px;"></th>
+                            </tr>
+                        </thead>
+                        <tbody id="unmappedDetailBody"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">关闭</button>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -715,6 +860,41 @@ function updateMonth(value) {
     if (value) {
         window.location.href = '/sales-board?month=' + encodeURIComponent(value);
     }
+}
+
+function switchProfitMode(mode) {
+    var pct = parseFloat(document.getElementById('profitPctInput').value) || 50;
+    saveProfitSettingsInner(mode, pct);
+}
+
+function saveProfitSettings() {
+    var mode = document.querySelector('input[name="profitMode"]:checked').value;
+    var pct = parseFloat(document.getElementById('profitPctInput').value) || 50;
+    saveProfitSettingsInner(mode, pct);
+}
+
+function saveProfitSettingsInner(mode, pct) {
+    var cp = {};
+    document.querySelectorAll('.country-pct-input').forEach(function(el) {
+        cp[el.dataset.country] = parseFloat(el.value) || pct;
+    });
+    fetch('/api/sales-board/profit-settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            year_month: '{{ selected_month }}',
+            profit_mode: mode,
+            profit_percentage: pct,
+            country_percentages: cp
+        })
+    }).then(function(res) { return res.json(); })
+    .then(function(data) {
+        if (data.success) {
+            window.location.reload();
+        } else {
+            showToast(data.error || '保存失败', 'error');
+        }
+    });
 }
 
 function showToast(msg, type) {
@@ -1224,5 +1404,54 @@ function deleteGroup() {
         }
     });
 })();
+
+async function showUnmappedDetail() {
+    var modal = new bootstrap.Modal(document.getElementById('unmappedDetailModal'));
+    modal.show();
+    document.getElementById('unmappedDetailLoading').style.display = '';
+    document.getElementById('unmappedDetailContent').style.display = 'none';
+    try {
+        var ym = document.querySelector('.flatpickr-month').value || new Date().toISOString().slice(0,7);
+        var res = await fetch('/api/sales-board/unmapped?year_month=' + ym);
+        var data = await res.json();
+        var totalQty = 0, totalCny = 0;
+        data.forEach(function(d) { totalQty += d.qty; totalCny += d.revenue_cny; });
+        document.getElementById('unmappedDetailSummary').textContent =
+            '共 ' + data.length + ' 组 / ' + totalQty + ' 件 / ¥' + totalCny.toLocaleString('zh-CN', {minimumFractionDigits:0, maximumFractionDigits:0});
+        var html = '';
+        data.forEach(function(d, i) {
+            var rowId = 'unmapped_sub_' + i;
+            html += '<tr>'
+                + '<td>' + (i+1) + '</td>'
+                + '<td>' + (d.brand || '<span class="text-muted">Unknown</span>') + '</td>'
+                + '<td class="text-end">' + (d.puffs || '-') + '</td>'
+                + '<td>' + d.country + '</td>'
+                + '<td class="text-end">' + d.qty + '</td>'
+                + '<td class="text-end text-warning">¥' + d.revenue_cny.toLocaleString('zh-CN', {minimumFractionDigits:0, maximumFractionDigits:0}) + '</td>'
+                + '<td><small class="text-white-50">' + d.managers.join(', ') + '</small></td>'
+                + '<td><button class="btn btn-sm btn-outline-secondary py-0 px-1" onclick="toggleUnmappedSub(\'' + rowId + '\')"><i class="bi bi-chevron-down"></i></button></td>'
+                + '</tr>';
+            html += '<tr id="' + rowId + '" style="display:none;"><td colspan="8" class="ps-4 py-1" style="background:rgba(255,255,255,0.03);">';
+            html += '<table class="table table-sm table-dark mb-0" style="font-size:0.8rem;">';
+            html += '<thead><tr><th>产品名</th><th class="text-end">数量</th><th class="text-end">金额(¥)</th></tr></thead><tbody>';
+            d.products.forEach(function(p) {
+                html += '<tr><td class="text-white-50">' + p.name + '</td>'
+                    + '<td class="text-end">' + p.qty + '</td>'
+                    + '<td class="text-end">¥' + p.revenue_cny.toLocaleString('zh-CN', {minimumFractionDigits:0, maximumFractionDigits:0}) + '</td></tr>';
+            });
+            html += '</tbody></table></td></tr>';
+        });
+        document.getElementById('unmappedDetailBody').innerHTML = html;
+        document.getElementById('unmappedDetailLoading').style.display = 'none';
+        document.getElementById('unmappedDetailContent').style.display = '';
+    } catch(e) {
+        document.getElementById('unmappedDetailLoading').innerHTML = '<div class="text-danger">加载失败: ' + e.message + '</div>';
+    }
+}
+
+function toggleUnmappedSub(rowId) {
+    var row = document.getElementById(rowId);
+    row.style.display = row.style.display === 'none' ? '' : 'none';
+}
 </script>
 {% endblock %}

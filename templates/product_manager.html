@@ -1,0 +1,1787 @@
+{% extends "base.html" %}
+
+{% block title %}产品管理 - 苍赋管理系统{% endblock %}
+
+{% block content %}
+<style>
+    .pm-table th, .pm-table td { vertical-align: middle; }
+    .pm-table .pm-sku { font-family: monospace; font-size: 0.8rem; color: #94a3b8; }
+    .pm-table .pm-thumb {
+        width: 40px; height: 40px; border-radius: 6px; object-fit: cover;
+        background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+    }
+    .pm-table .pm-name { line-height: 1.3; max-width: 280px; }
+    .pm-table .pm-price-input { width: 90px; }
+    .pm-table .pm-stock-input { width: 70px; }
+    .pm-table .pm-status-input { width: 110px; }
+    .pm-low-stock { color: #fbbf24; font-weight: 600; }
+    .pm-out-of-stock { color: #ef4444; font-weight: 600; }
+    .pm-row-modified { background: rgba(59, 130, 246, 0.08) !important; }
+    .pm-row-saving { background: rgba(168, 85, 247, 0.1) !important; }
+    .pm-row-success { background: rgba(34, 197, 94, 0.08) !important; }
+    .pm-row-error { background: rgba(239, 68, 68, 0.1) !important; }
+    .pm-toggle-wrap { display: flex; flex-direction: column; gap: 5px; }
+    .pm-toggle-label { font-size: 0.7rem; color: #94a3b8; }
+    /* Stock display chip — prominent, color-coded by stock level */
+    .pm-stock-display {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 4px 10px; border-radius: 6px;
+        font-weight: 700; font-size: 0.95rem;
+        background: rgba(99,102,241,0.15);
+        color: #a5b4fc;
+        line-height: 1.2;
+        min-width: 70px; justify-content: center;
+        transition: background 0.15s, color 0.15s;
+    }
+    .pm-stock-display.high { background: rgba(34,197,94,0.18); color: #4ade80; }
+    .pm-stock-display.medium { background: rgba(99,102,241,0.18); color: #a5b4fc; }
+    .pm-stock-display.low { background: rgba(251,191,36,0.22); color: #fbbf24; }
+    .pm-stock-display.out { background: rgba(239,68,68,0.22); color: #fca5a5; }
+    .pm-stock-display.unset { background: rgba(107,114,128,0.18); color: #9ca3af; font-weight: 500; font-style: italic; }
+    .pm-stock-display.instock { background: rgba(34,197,94,0.18); color: #4ade80; }
+    .pm-stock-display.outofstock { background: rgba(239,68,68,0.22); color: #fca5a5; }
+    .pm-stock-display.onbackorder { background: rgba(251,191,36,0.22); color: #fbbf24; }
+    /* Stock edit row (below display) */
+    .pm-stock-line {
+        display: flex; align-items: center; gap: 6px;
+    }
+    .pm-stock-line-label {
+        font-size: 0.7rem; color: #6b7280; min-width: 26px; flex-shrink: 0;
+    }
+    .pm-stock-input, .pm-status-input {
+        color: #fff !important;
+        background: rgba(0,0,0,0.4) !important;
+        border: 1px solid rgba(99,102,241,0.5) !important;
+        font-weight: 600;
+    }
+    .pm-stock-input:focus, .pm-status-input:focus {
+        background: rgba(99,102,241,0.15) !important;
+        border-color: #818cf8 !important;
+        color: #fff !important;
+    }
+    .pm-stock-input::-webkit-outer-spin-button,
+    .pm-stock-input::-webkit-inner-spin-button {
+        opacity: 0.4;
+    }
+    /* Explicit dark-mode option styling — browsers render <option> natively
+       and ignore most parent styles. Without this, the dropdown shows white
+       text on white background → invisible options. */
+    .pm-status-input option {
+        background-color: #1a1a2e !important;
+        color: #fff !important;
+    }
+    .pm-status-input option:checked,
+    .pm-status-input option:hover {
+        background: linear-gradient(0deg, #6366f1 0%, #6366f1 100%) !important;
+        background-color: #6366f1 !important;
+        color: #fff !important;
+    }
+    .pm-aggregate-summary {
+        display: inline-flex; align-items: center; gap: 6px;
+        font-size: 0.75rem; color: #c4b5fd; margin-left: 8px; flex-wrap: wrap;
+    }
+    .pm-aggregate-pill {
+        background: rgba(168,85,247,0.12);
+        padding: 2px 6px; border-radius: 4px;
+        white-space: nowrap;
+    }
+    /* Sticky filter toolbar — pinned below navbar so 加载/全部展开/全部折叠
+       are always one click away no matter how far down you've scrolled. */
+    .pm-filter-sticky {
+        position: sticky;
+        top: 64px; /* below the fixed-top .navbar (~64px tall) */
+        z-index: 50;
+        background: var(--bg-card, #1a1a2e);
+        box-shadow: 0 6px 16px -8px rgba(0, 0, 0, 0.5);
+    }
+    /* Bootstrap's .text-muted (#6c757d) is too dim on our dark background.
+       Override page-wide for product manager: bumps to slate-400 (#94a3b8) which
+       is comfortably readable while still clearly subdued. */
+    .pm-page .text-muted, .pm-page small.text-muted, .pm-page .text-muted small {
+        color: #a1aab8 !important;
+    }
+    /* Also brighten <code> blocks (used in routing info to show URLs) */
+    .pm-page code {
+        color: #c4b5fd;
+        background: rgba(168, 85, 247, 0.1);
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 0.85em;
+    }
+    /* Variation rows */
+    .pm-variation-row td {
+        background: rgba(168, 85, 247, 0.04);
+        border-top: 1px dashed rgba(168, 85, 247, 0.2) !important;
+    }
+    .pm-variation-row.pm-row-modified td { background: rgba(59, 130, 246, 0.12) !important; }
+    .pm-variation-row.pm-row-saving td { background: rgba(168, 85, 247, 0.18) !important; }
+    .pm-variation-row.pm-row-success td { background: rgba(34, 197, 94, 0.12) !important; }
+    .pm-variation-row.pm-row-error td { background: rgba(239, 68, 68, 0.15) !important; }
+    .pm-var-marker {
+        color: #c084fc; font-size: 1.1rem; padding-left: 12px;
+    }
+    .pm-var-attrs {
+        font-size: 0.78rem; color: #c4b5fd; line-height: 1.3;
+    }
+    .pm-expand-btn {
+        background: rgba(168,85,247,0.12);
+        color: #c084fc;
+        border: 1px solid rgba(168,85,247,0.35);
+        font-size: 0.78rem;
+        padding: 3px 10px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+    .pm-expand-btn:hover { background: rgba(168,85,247,0.25); }
+    .pm-expand-btn.expanded { background: rgba(168,85,247,0.3); }
+    .pm-expand-btn .bi-chevron-down { transition: transform 0.15s; }
+    .pm-expand-btn.expanded .bi-chevron-down { transform: rotate(180deg); }
+    .pm-variations-loading td {
+        background: rgba(168, 85, 247, 0.05);
+        text-align: center; padding: 20px !important; color: #c084fc;
+    }
+    .pm-master-chip {
+        background: rgba(168,85,247,0.15); color: #c084fc;
+        border: 1px solid rgba(168,85,247,0.4);
+        font-size: 0.7rem; padding: 2px 8px; border-radius: 8px;
+    }
+    .pm-empty-state {
+        text-align: center; padding: 60px 20px; color: #6b7280;
+    }
+    .pm-batch-bar {
+        background: rgba(59, 130, 246, 0.1);
+        border: 1px solid rgba(59, 130, 246, 0.3);
+        border-radius: 8px; padding: 12px 16px;
+        display: none;
+    }
+    .pm-batch-bar.visible { display: flex; }
+</style>
+
+<div class="container-fluid py-4 pm-page">
+    <!-- Header -->
+    <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+        <div>
+            <h5 class="text-light mb-0"><i class="bi bi-pencil-square me-2"></i>产品管理</h5>
+            <small class="text-muted">跨站点的库存与价格批量编辑（Layer 1：单站点视图）</small>
+        </div>
+    </div>
+
+    <!-- Filter bar (sticky to top below navbar) -->
+    <div class="card data-card mb-3 pm-filter-sticky">
+        <div class="card-body py-3">
+            <div class="row g-3 align-items-end">
+                <div class="col-lg-4 col-md-6">
+                    <label class="form-label text-white-50 small mb-1">站点</label>
+                    <select class="form-select bg-dark text-white border-secondary border-opacity-25" id="pmSiteSelect">
+                        <option value="">请选择站点 ...</option>
+                        {% for s in sites %}
+                        <option value="{{ s.id }}"
+                            data-master-id="{{ s.product_master_id or '' }}"
+                            data-host="{{ s.url.replace('https://www.', '').replace('https://', '').replace('http://', '') }}">
+                            {% if s.manager %}[{{ s.manager }}] {% endif %}{{ s.url.replace('https://www.', '').replace('https://', '').replace('http://', '') }}{% if s.product_master_id %} 🔗{% endif %}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-lg-3 col-md-4">
+                    <label class="form-label text-white-50 small mb-1">搜索（名称 / SKU）</label>
+                    <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                        id="pmSearchInput" placeholder="输入关键字...">
+                </div>
+                <div class="col-lg-2 col-md-3">
+                    <label class="form-label text-white-50 small mb-1">状态</label>
+                    <select class="form-select bg-dark text-white border-secondary border-opacity-25" id="pmStatusSelect">
+                        <option value="any">全部</option>
+                        <option value="publish">上架</option>
+                        <option value="draft">草稿</option>
+                        <option value="private">私密</option>
+                        <option value="pending">待审核</option>
+                    </select>
+                </div>
+                <div class="col-lg-3 col-md-12 d-flex gap-2">
+                    <button class="btn btn-primary flex-fill" id="pmLoadBtn">
+                        <i class="bi bi-search me-1"></i>加载产品
+                    </button>
+                    <button class="btn btn-outline-light" id="pmRefreshBtn" title="刷新当前列表">
+                        <i class="bi bi-arrow-clockwise"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="d-flex justify-content-between align-items-center mt-2 flex-wrap gap-2">
+                <div id="pmRoutingInfo" class="small text-muted" style="display:none;"></div>
+                <div class="d-flex gap-3 align-items-center flex-wrap">
+                    <button class="btn btn-sm btn-outline-light" id="pmExpandAllBtn" disabled
+                        title="展开当前页所有可变产品的变体">
+                        <i class="bi bi-arrows-expand me-1"></i>全部展开
+                    </button>
+                    <button class="btn btn-sm btn-outline-light" id="pmCollapseAllBtn" disabled
+                        title="折叠所有已展开的变体">
+                        <i class="bi bi-arrows-collapse me-1"></i>全部折叠
+                    </button>
+                    <div class="form-check form-switch m-0">
+                        <input class="form-check-input" type="checkbox" id="pmAutoExpandToggle">
+                        <label class="form-check-label small text-white-50" for="pmAutoExpandToggle">
+                            加载时自动展开所有变体
+                            <span class="text-muted">（首次加载会慢一些）</span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Auto-expand progress overlay -->
+    <div id="pmAutoExpandProgress" class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 small d-none">
+        <span class="spinner-border spinner-border-sm me-2"></span>
+        正在自动展开变体 <span id="pmAutoExpandCount">0 / 0</span>...
+    </div>
+
+    <!-- Batch operations bar (only visible when rows are selected) -->
+    <div class="pm-batch-bar mb-3 align-items-center justify-content-between flex-wrap gap-2" id="pmBatchBar">
+        <div class="text-white">
+            <i class="bi bi-check2-square me-2"></i>
+            已选中 <strong id="pmSelectedCount">0</strong> 个产品
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+            <button class="btn btn-sm btn-outline-warning" id="pmBatchPriceBtn">
+                <i class="bi bi-currency-exchange me-1"></i>批量改价
+            </button>
+            <button class="btn btn-sm btn-outline-info" id="pmBatchStockBtn">
+                <i class="bi bi-archive me-1"></i>批量改库存
+            </button>
+            <button class="btn btn-sm" style="background:rgba(239,68,68,0.15); color:#fca5a5; border:1px solid rgba(239,68,68,0.4);"
+                id="pmBatchSoldOutBtn" title="关闭库存管理 + 状态设为售完，防止订单取消后被自动重新激活">
+                <i class="bi bi-shield-exclamation me-1"></i>批量标记售完
+            </button>
+            <button class="btn btn-sm btn-outline-success" id="pmBatchRestoreBtn">
+                <i class="bi bi-arrow-counterclockwise me-1"></i>恢复库存管理
+            </button>
+            <button class="btn btn-sm" style="background:rgba(168,85,247,0.18); color:#c084fc; border:1px solid rgba(168,85,247,0.4);"
+                id="pmBatchCloneBtn" title="把选中的产品克隆到其他站点">
+                <i class="bi bi-files me-1"></i>批量克隆
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" id="pmBatchClearBtn">
+                <i class="bi bi-x-lg"></i>
+            </button>
+        </div>
+    </div>
+
+    <!-- Products table -->
+    <div class="card data-card">
+        <div class="card-body p-0">
+            <div id="pmTableArea">
+                <div class="pm-empty-state" id="pmInitialEmpty">
+                    <i class="bi bi-box-seam display-4 d-block mb-3 opacity-50"></i>
+                    选择一个站点，然后点击「加载产品」开始管理
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Pagination -->
+    <nav class="mt-3" id="pmPagination" style="display:none;">
+        <ul class="pagination pagination-sm justify-content-center" id="pmPaginationList"></ul>
+    </nav>
+</div>
+
+<!-- Batch operation modal (generic) -->
+<div class="modal fade" id="pmBatchModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white" id="pmBatchModalTitle">批量操作</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="pmBatchModalBody">
+                <!-- Filled by JS depending on the operation -->
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="pmBatchApplyBtn">应用</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Batch result modal -->
+<div class="modal fade" id="pmResultModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-list-check me-2"></i>操作结果</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="pmResultModalBody">
+                <!-- Filled by JS -->
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-primary" data-bs-dismiss="modal">关闭</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Clone-to-site dialog -->
+<div class="modal fade" id="pmCloneModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">
+                    <i class="bi bi-files me-2" style="color:#a78bfa;"></i>克隆产品到其他站点
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 small">
+                    将复制 <strong id="pmCloneCount">N</strong> 个产品到另一个站点（连同所有变体）。
+                    分类/标签按 <code>slug</code> 在目标站匹配；找不到的会跳过，需在目标后台手动设置。
+                    新产品默认状态为 <strong>草稿</strong>，确认无误后再发布。
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50 small">源站点</label>
+                    <input type="text" class="form-control bg-dark text-white-50 border-secondary border-opacity-25"
+                        id="pmCloneSource" readonly>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50 small">目标站点 <span class="text-danger">*</span></label>
+                    <select class="form-select bg-dark text-white border-secondary border-opacity-25" id="pmCloneTarget">
+                        <option value="">请选择 ...</option>
+                    </select>
+                    <div class="text-muted small mt-1">
+                        受 multistore 控制的站点会自动写入对应 master，再同步到下游。
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50 small">目标站初始状态</label>
+                    <select class="form-select bg-dark text-white border-secondary border-opacity-25" id="pmCloneStatus">
+                        <option value="draft" selected>草稿（推荐 — 先审核再上架）</option>
+                        <option value="pending">待审核</option>
+                        <option value="private">私密</option>
+                        <option value="publish">直接发布</option>
+                    </select>
+                </div>
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="pmCloneIncludeVariations" checked>
+                    <label class="form-check-label text-white-50" for="pmCloneIncludeVariations">
+                        克隆变体（针对可变产品）
+                    </label>
+                </div>
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="pmCloneIncludeImages" checked>
+                    <label class="form-check-label text-white-50" for="pmCloneIncludeImages">
+                        克隆图片（目标站会从源 URL 下载，可能需要 1-2 分钟）
+                    </label>
+                </div>
+                <div id="pmCloneFeedback" class="mt-3"></div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="pmCloneApplyBtn">
+                    <i class="bi bi-files me-1"></i>开始克隆
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    // State
+    let currentSiteId = null;
+    let currentPage = 1;
+    let currentTotalPages = 1;
+    let currentRouting = null;
+    let products = [];          // Last loaded products (canonical state from API)
+    let modifiedRows = new Set(); // Set of product IDs with unsaved changes
+    let selectedRows = new Set(); // Set of product IDs selected for batch ops
+
+    const $ = (id) => document.getElementById(id);
+    const formatPrice = (v) => v === null || v === undefined || v === '' ? '' : v;
+
+    // ==================================================
+    // Loading
+    // ==================================================
+
+    function showRoutingInfo(routing) {
+        const el = $('pmRoutingInfo');
+        if (!routing) { el.style.display = 'none'; return; }
+        const host = (routing.effective_url || '').replace(/^https?:\/\/(www\.)?/, '');
+        if (routing.is_routed_to_master) {
+            el.innerHTML = `<i class="bi bi-info-circle me-1" style="color:#a78bfa;"></i>` +
+                `产品改动会写入 <strong style="color:#c084fc;">${routing.master_label || host}</strong> ` +
+                `(<code>${host}</code>)，` +
+                `再由 WooMultistore 自动同步到下游下游店点。`;
+        } else {
+            el.innerHTML = `<i class="bi bi-info-circle me-1" style="color:#60a5fa;"></i>` +
+                `直连站点 <code>${host}</code>，改动直接生效。`;
+        }
+        el.style.display = '';
+    }
+
+    function loadProducts(page = 1) {
+        const siteId = $('pmSiteSelect').value;
+        if (!siteId) {
+            alert('请先选择站点');
+            return;
+        }
+        currentSiteId = siteId;
+        currentPage = page;
+
+        const search = $('pmSearchInput').value.trim();
+        const status = $('pmStatusSelect').value;
+
+        $('pmTableArea').innerHTML = `
+            <div class="pm-empty-state">
+                <div class="spinner-border text-primary mb-3"></div>
+                <div>加载中...</div>
+            </div>`;
+        $('pmPagination').style.display = 'none';
+        modifiedRows.clear();
+        selectedRows.clear();
+        // Clear cache & expansion state — fresh load = fresh state
+        Object.keys(variationsCache).forEach(k => delete variationsCache[k]);
+        expandedParents.clear();
+        updateBatchBar();
+
+        const params = new URLSearchParams({
+            site_id: siteId, search, status, page, per_page: 50
+        });
+
+        fetch(`/api/product-manager/products?${params}`)
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    $('pmTableArea').innerHTML = `
+                        <div class="pm-empty-state">
+                            <i class="bi bi-exclamation-triangle text-warning display-4 d-block mb-3"></i>
+                            <div class="text-warning">${data.error}</div>
+                            ${data.detail ? '<pre class="text-muted small mt-3" style="max-height:200px;overflow:auto;">' + data.detail + '</pre>' : ''}
+                        </div>`;
+                    showRoutingInfo(data.routing);
+                    return;
+                }
+                products = data.products || [];
+                currentTotalPages = data.total_pages || 1;
+                currentRouting = data.routing;
+                showRoutingInfo(data.routing);
+                renderTable(data.total);
+                renderPagination();
+
+                // Enable expand/collapse buttons if any variable products exist
+                const hasVariable = products.some(p => p.type === 'variable');
+                $('pmExpandAllBtn').disabled = !hasVariable;
+                $('pmCollapseAllBtn').disabled = !hasVariable;
+
+                // If auto-expand is on, kick off variation fetches for all variable products
+                if ($('pmAutoExpandToggle').checked) {
+                    autoExpandAll();
+                }
+            })
+            .catch(err => {
+                $('pmTableArea').innerHTML = `
+                    <div class="pm-empty-state">
+                        <i class="bi bi-exclamation-triangle text-danger display-4 d-block mb-3"></i>
+                        <div class="text-danger">请求失败: ${err.message}</div>
+                    </div>`;
+            });
+    }
+
+    function autoExpandAll() {
+        return expandAllVariations();
+    }
+
+    function expandAllVariations() {
+        const variableProducts = products.filter(p => p.type === 'variable');
+        if (variableProducts.length === 0) return Promise.resolve();
+
+        const progressEl = $('pmAutoExpandProgress');
+        const countEl = $('pmAutoExpandCount');
+        let done = 0;
+        progressEl.classList.remove('d-none');
+        countEl.textContent = `0 / ${variableProducts.length}`;
+
+        // Concurrency limit: 5 parallel requests at a time (gentle on WC API)
+        const limit = 5;
+        let cursor = 0;
+
+        function next() {
+            if (cursor >= variableProducts.length) return Promise.resolve();
+            const p = variableProducts[cursor++];
+            const btn = document.querySelector(`tr[data-row-key="prod-${p.id}"] .pm-expand-variations`);
+            if (!btn) {
+                done++;
+                countEl.textContent = `${done} / ${variableProducts.length}`;
+                return next();
+            }
+            const promise = toggleVariations(p.id, btn) || Promise.resolve();
+            return promise.finally(() => {
+                done++;
+                countEl.textContent = `${done} / ${variableProducts.length}`;
+                return next();
+            });
+        }
+
+        const workers = [];
+        for (let i = 0; i < Math.min(limit, variableProducts.length); i++) {
+            workers.push(next());
+        }
+        return Promise.all(workers).finally(() => {
+            progressEl.classList.add('d-none');
+        });
+    }
+
+    function collapseAllVariations() {
+        // Find all currently-expanded parents and collapse them
+        const ids = [...expandedParents];
+        ids.forEach(parentId => {
+            const btn = document.querySelector(`tr[data-row-key="prod-${parentId}"] .pm-expand-variations`);
+            if (btn) toggleVariations(parentId, btn);
+        });
+    }
+
+    // ==================================================
+    // Render
+    // ==================================================
+
+    function renderTable(total) {
+        if (!products.length) {
+            $('pmTableArea').innerHTML = `
+                <div class="pm-empty-state">
+                    <i class="bi bi-search display-4 d-block mb-3 opacity-50"></i>
+                    没有找到产品
+                </div>`;
+            return;
+        }
+
+        let html = `
+            <div class="px-4 py-2 border-bottom border-secondary border-opacity-25 small text-muted">
+                共 ${total} 个产品 · 第 ${currentPage} / ${currentTotalPages} 页
+            </div>
+            <div class="table-responsive">
+                <table class="table table-dark table-hover mb-0 pm-table" style="--bs-table-bg:transparent;">
+                    <thead>
+                        <tr>
+                            <th style="width:40px;" class="ps-3">
+                                <input type="checkbox" class="form-check-input" id="pmSelectAll">
+                            </th>
+                            <th style="width:50px;"></th>
+                            <th>产品</th>
+                            <th style="width:120px;">类型 / 状态</th>
+                            <th style="width:200px;">库存</th>
+                            <th style="width:130px;">原价</th>
+                            <th style="width:130px;">销售价</th>
+                            <th style="width:100px;" class="text-end pe-3">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>`;
+
+        products.forEach(p => {
+            html += renderProductRow(p);
+        });
+
+        html += `</tbody></table></div>`;
+        $('pmTableArea').innerHTML = html;
+        attachRowListeners();
+    }
+
+    function renderProductRow(p) {
+        const isVariable = p.type === 'variable';
+        const isManageStock = p.manage_stock;
+        const stockClass = (isManageStock && p.stock_quantity !== null && p.stock_quantity < 10) ? 'pm-low-stock' :
+                          (!isManageStock && p.stock_status === 'outofstock') ? 'pm-out-of-stock' : '';
+
+        const statusBadge = {
+            'publish': '<span class="badge bg-success bg-opacity-25 text-success small">上架</span>',
+            'draft': '<span class="badge bg-secondary bg-opacity-25 text-secondary small">草稿</span>',
+            'private': '<span class="badge bg-warning bg-opacity-25 text-warning small">私密</span>',
+            'pending': '<span class="badge bg-info bg-opacity-25 text-info small">待审</span>',
+        }[p.status] || `<span class="badge bg-secondary small">${p.status}</span>`;
+
+        const typeBadge = isVariable
+            ? '<span class="badge bg-info bg-opacity-25 text-info small">可变</span>'
+            : '<span class="badge bg-secondary bg-opacity-25 text-light small">简单</span>';
+
+        const rowKey = `prod-${p.id}`;
+        return `
+            <tr data-product-id="${p.id}" data-row-key="${rowKey}">
+                <td class="ps-3">
+                    <input type="checkbox" class="form-check-input pm-row-check"
+                        data-row-key="${rowKey}" data-product-id="${p.id}">
+                </td>
+                <td>
+                    ${p.image ? `<img src="${p.image}" class="pm-thumb" alt="" loading="lazy">` :
+                              `<div class="pm-thumb d-flex align-items-center justify-content-center text-muted"><i class="bi bi-image"></i></div>`}
+                </td>
+                <td>
+                    <div class="pm-name text-white">${escapeHtml(p.name || '(无名称)')}</div>
+                    <div class="pm-sku">SKU: ${escapeHtml(p.sku) || '<em class="text-muted">无</em>'}</div>
+                </td>
+                <td>
+                    <div>${typeBadge} ${statusBadge}</div>
+                </td>
+                <td>
+                    ${isVariable ? `
+                        <button class="pm-expand-btn pm-expand-variations" data-product-id="${p.id}">
+                            <i class="bi bi-chevron-down me-1"></i>${p.variations_count} 个变体
+                        </button>
+                    ` : `
+                        <div class="pm-toggle-wrap">
+                            ${renderStockDisplayHtml(p)}
+                            <div class="form-check form-switch m-0">
+                                <input class="form-check-input pm-manage-stock" type="checkbox"
+                                    data-row-key="${rowKey}" ${isManageStock ? 'checked' : ''}>
+                                <span class="pm-toggle-label">${isManageStock ? '启用管理' : '关闭管理'}</span>
+                            </div>
+                            <div class="pm-stock-mode" data-row-key="${rowKey}">
+                                ${isManageStock ? `
+                                    <div class="pm-stock-line">
+                                        <span class="pm-stock-line-label">数量</span>
+                                        <input type="number" min="0" step="1"
+                                            class="form-control form-control-sm pm-stock-input pm-edit-field ${stockClass}"
+                                            data-field="stock_quantity"
+                                            value="${p.stock_quantity !== null ? p.stock_quantity : ''}">
+                                    </div>
+                                ` : `
+                                    <div class="pm-stock-line">
+                                        <span class="pm-stock-line-label">状态</span>
+                                        <select class="form-select form-select-sm pm-status-input pm-edit-field"
+                                            data-field="stock_status">
+                                            <option value="instock" ${p.stock_status==='instock'?'selected':''}>有货</option>
+                                            <option value="outofstock" ${p.stock_status==='outofstock'?'selected':''}>售完</option>
+                                            <option value="onbackorder" ${p.stock_status==='onbackorder'?'selected':''}>缺货中</option>
+                                        </select>
+                                    </div>
+                                `}
+                            </div>
+                        </div>
+                    `}
+                </td>
+                <td>
+                    ${isVariable ? '<span class="text-muted small">展开看变体</span>' : `
+                        <input type="text" inputmode="decimal"
+                            class="form-control form-control-sm bg-dark text-white border-secondary border-opacity-25 pm-price-input pm-edit-field"
+                            data-field="regular_price"
+                            placeholder="—" value="${formatPrice(p.regular_price)}">
+                    `}
+                </td>
+                <td>
+                    ${isVariable ? `<span class="text-muted small">${p.price || '—'}</span>` : `
+                        <input type="text" inputmode="decimal"
+                            class="form-control form-control-sm bg-dark text-white border-secondary border-opacity-25 pm-price-input pm-edit-field"
+                            data-field="sale_price"
+                            placeholder="—" value="${formatPrice(p.sale_price)}">
+                    `}
+                </td>
+                <td class="text-end pe-3">
+                    <div class="btn-group btn-group-sm">
+                        ${isVariable ? `
+                            <a href="${p.permalink}" target="_blank" class="btn btn-outline-light" title="去 WC 后台">
+                                <i class="bi bi-box-arrow-up-right"></i>
+                            </a>
+                        ` : `
+                            <button class="btn btn-outline-primary pm-save-btn" data-row-key="${rowKey}" disabled title="保存改动">
+                                <i class="bi bi-save"></i>
+                            </button>
+                        `}
+                        <button class="btn btn-outline-info pm-clone-btn" data-product-id="${p.id}" title="克隆到其他站点">
+                            <i class="bi bi-files"></i>
+                        </button>
+                    </div>
+                </td>
+            </tr>`;
+    }
+
+    function renderVariationRow(parent, v) {
+        const isManageStock = v.manage_stock;
+        const stockClass = (isManageStock && v.stock_quantity !== null && v.stock_quantity < 10) ? 'pm-low-stock' :
+                          (!isManageStock && v.stock_status === 'outofstock') ? 'pm-out-of-stock' : '';
+        // Compose key used as data-product-id for variations:  v.parent_id + '_' + v.id
+        // (we route variation saves via a different endpoint, so we need both ids)
+        const rowKey = `var-${parent.id}-${v.id}`;
+        return `
+            <tr class="pm-variation-row" data-row-key="${rowKey}"
+                data-variation-id="${v.id}" data-parent-id="${parent.id}">
+                <td class="ps-3">
+                    <input type="checkbox" class="form-check-input pm-row-check"
+                        data-row-key="${rowKey}" data-variation-id="${v.id}" data-parent-id="${parent.id}">
+                </td>
+                <td class="text-center">
+                    <span class="pm-var-marker">↳</span>
+                </td>
+                <td>
+                    <div class="pm-var-attrs">
+                        ${escapeHtml(v.attributes_summary || '(变体)')}
+                    </div>
+                    <div class="pm-sku">SKU: ${escapeHtml(v.sku) || '<em class="text-muted">无</em>'}</div>
+                </td>
+                <td>
+                    <span class="badge bg-info bg-opacity-10 text-info small">变体</span>
+                </td>
+                <td>
+                    <div class="pm-toggle-wrap">
+                        ${renderStockDisplayHtml(v)}
+                        <div class="form-check form-switch m-0">
+                            <input class="form-check-input pm-manage-stock" type="checkbox"
+                                data-row-key="${rowKey}" ${isManageStock ? 'checked' : ''}>
+                            <span class="pm-toggle-label">${isManageStock ? '启用管理' : '关闭管理'}</span>
+                        </div>
+                        <div class="pm-stock-mode" data-row-key="${rowKey}">
+                            ${isManageStock ? `
+                                <div class="pm-stock-line">
+                                    <span class="pm-stock-line-label">数量</span>
+                                    <input type="number" min="0" step="1"
+                                        class="form-control form-control-sm pm-stock-input pm-edit-field"
+                                        data-field="stock_quantity"
+                                        value="${v.stock_quantity !== null ? v.stock_quantity : ''}">
+                                </div>
+                            ` : `
+                                <div class="pm-stock-line">
+                                    <span class="pm-stock-line-label">状态</span>
+                                    <select class="form-select form-select-sm pm-status-input pm-edit-field"
+                                        data-field="stock_status">
+                                        <option value="instock" ${v.stock_status==='instock'?'selected':''}>有货</option>
+                                        <option value="outofstock" ${v.stock_status==='outofstock'?'selected':''}>售完</option>
+                                        <option value="onbackorder" ${v.stock_status==='onbackorder'?'selected':''}>缺货中</option>
+                                    </select>
+                                </div>
+                            `}
+                        </div>
+                    </div>
+                </td>
+                <td>
+                    <input type="text" inputmode="decimal"
+                        class="form-control form-control-sm bg-dark text-white border-secondary border-opacity-25 pm-price-input pm-edit-field"
+                        data-field="regular_price"
+                        placeholder="—" value="${formatPrice(v.regular_price)}">
+                </td>
+                <td>
+                    <input type="text" inputmode="decimal"
+                        class="form-control form-control-sm bg-dark text-white border-secondary border-opacity-25 pm-price-input pm-edit-field"
+                        data-field="sale_price"
+                        placeholder="—" value="${formatPrice(v.sale_price)}">
+                </td>
+                <td class="text-end pe-3">
+                    <button class="btn btn-sm btn-outline-primary pm-save-btn"
+                        data-row-key="${rowKey}" disabled>
+                        <i class="bi bi-save"></i>
+                    </button>
+                </td>
+            </tr>`;
+    }
+
+    function escapeHtml(s) {
+        if (s === null || s === undefined) return '';
+        return String(s).replace(/[&<>"']/g, c => ({
+            '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+        }[c]));
+    }
+
+    // Compute the display class (color level) and content for a stock cell
+    function buildStockDisplay(item) {
+        // item: { manage_stock, stock_quantity, stock_status }
+        if (item.manage_stock) {
+            if (item.stock_quantity === null || item.stock_quantity === undefined) {
+                return { cls: 'unset', icon: 'bi-question-circle', text: '未设置' };
+            }
+            const q = Number(item.stock_quantity) || 0;
+            let cls = 'high';
+            if (q === 0) cls = 'out';
+            else if (q < 10) cls = 'low';
+            else if (q < 50) cls = 'medium';
+            return { cls, icon: 'bi-archive-fill', text: String(q) };
+        } else {
+            const map = {
+                instock: { cls: 'instock', icon: 'bi-check-circle-fill', text: '有货' },
+                outofstock: { cls: 'outofstock', icon: 'bi-x-circle-fill', text: '售完' },
+                onbackorder: { cls: 'onbackorder', icon: 'bi-clock-history', text: '缺货中' },
+            };
+            return map[item.stock_status] || { cls: 'unset', icon: 'bi-dash-circle', text: '未知' };
+        }
+    }
+
+    function renderStockDisplayHtml(item) {
+        const d = buildStockDisplay(item);
+        return `<span class="pm-stock-display ${d.cls}">
+                    <i class="bi ${d.icon}"></i>
+                    <span class="pm-stock-display-value">${d.text}</span>
+                </span>`;
+    }
+
+    function renderPagination() {
+        if (currentTotalPages <= 1) {
+            $('pmPagination').style.display = 'none';
+            return;
+        }
+        const list = $('pmPaginationList');
+        let items = [];
+        const win = 2; // pages either side of current
+        items.push(`<li class="page-item ${currentPage<=1?'disabled':''}">
+            <a class="page-link bg-dark border-secondary text-light" href="#" data-page="${currentPage-1}">上一页</a></li>`);
+        for (let p = 1; p <= currentTotalPages; p++) {
+            if (p === 1 || p === currentTotalPages || (p >= currentPage - win && p <= currentPage + win)) {
+                items.push(`<li class="page-item ${p===currentPage?'active':''}">
+                    <a class="page-link bg-dark border-secondary text-light" href="#" data-page="${p}">${p}</a></li>`);
+            } else if (p === currentPage - win - 1 || p === currentPage + win + 1) {
+                items.push(`<li class="page-item disabled"><span class="page-link bg-dark border-secondary text-muted">…</span></li>`);
+            }
+        }
+        items.push(`<li class="page-item ${currentPage>=currentTotalPages?'disabled':''}">
+            <a class="page-link bg-dark border-secondary text-light" href="#" data-page="${currentPage+1}">下一页</a></li>`);
+        list.innerHTML = items.join('');
+        $('pmPagination').style.display = '';
+    }
+
+    // ==================================================
+    // Row interactions
+    // ==================================================
+
+    // ==================================================
+    // Row identification helpers (works for both simple products and variations)
+    // ==================================================
+    // Row keys:
+    //   "prod-{product_id}"            for simple products
+    //   "var-{parent_id}-{variation_id}" for variations
+    function rowKeyToIds(rowKey) {
+        if (rowKey.startsWith('prod-')) {
+            return { type: 'product', product_id: parseInt(rowKey.slice(5), 10) };
+        }
+        if (rowKey.startsWith('var-')) {
+            const parts = rowKey.slice(4).split('-');
+            return { type: 'variation',
+                     parent_id: parseInt(parts[0], 10),
+                     variation_id: parseInt(parts[1], 10) };
+        }
+        return null;
+    }
+
+    function findRowByKey(rowKey) {
+        return document.querySelector(`tr[data-row-key="${rowKey}"]`);
+    }
+
+    // Re-render the stock display chip based on the row's current edit state
+    function refreshStockDisplay(row) {
+        if (!row) return;
+        const display = row.querySelector('.pm-stock-display');
+        if (!display) return;
+        const manageStockEl = row.querySelector('.pm-manage-stock');
+        const isManaged = manageStockEl ? manageStockEl.checked : false;
+        const item = { manage_stock: isManaged };
+        if (isManaged) {
+            const qtyEl = row.querySelector('input[data-field="stock_quantity"]');
+            const v = qtyEl?.value;
+            item.stock_quantity = (v === '' || v === null || v === undefined) ? null : Number(v);
+        } else {
+            const statusEl = row.querySelector('select[data-field="stock_status"]');
+            item.stock_status = statusEl?.value || 'instock';
+        }
+        const newHtml = renderStockDisplayHtml(item);
+        display.outerHTML = newHtml;
+    }
+
+    // Guard: only attach handlers to elements that don't already have them.
+    // We mark elements with data-pm-bound after attaching.
+    function _q(sel) { return document.querySelectorAll(sel + ':not([data-pm-bound])'); }
+    function _bind(el) { el.setAttribute('data-pm-bound', '1'); }
+
+    // Parent → variations cascade: when user checks/unchecks parent, propagate to
+    // all currently-expanded variations of that parent.
+    function cascadeParentToVariations(productId, checked) {
+        document.querySelectorAll(`.pm-row-check[data-parent-id="${productId}"]`).forEach(cb => {
+            cb.checked = checked;
+            cb.indeterminate = false;
+            const k = cb.dataset.rowKey;
+            if (checked) selectedRows.add(k);
+            else selectedRows.delete(k);
+        });
+    }
+
+    // Variation → parent: re-derive parent's checked / indeterminate state from
+    // its variation siblings. Three cases:
+    //   all checked    → parent checked, no indeterminate
+    //   none checked   → parent unchecked, no indeterminate
+    //   some checked   → parent unchecked but indeterminate (the "─" state)
+    function syncParentTriState(parentId) {
+        const variations = document.querySelectorAll(`.pm-row-check[data-parent-id="${parentId}"]`);
+        if (variations.length === 0) return;
+        const total = variations.length;
+        const checkedCount = [...variations].filter(c => c.checked).length;
+        const parentCheck = document.querySelector(`tr[data-row-key="prod-${parentId}"] .pm-row-check`);
+        if (!parentCheck) return;
+        const parentKey = parentCheck.dataset.rowKey;
+
+        if (checkedCount === 0) {
+            parentCheck.checked = false;
+            parentCheck.indeterminate = false;
+            selectedRows.delete(parentKey);
+        } else if (checkedCount === total) {
+            parentCheck.checked = true;
+            parentCheck.indeterminate = false;
+            selectedRows.add(parentKey);
+        } else {
+            // Partial: visual indeterminate, parent NOT in selection (since batch
+            // operations would skip variable parents anyway, this avoids confusion)
+            parentCheck.checked = false;
+            parentCheck.indeterminate = true;
+            selectedRows.delete(parentKey);
+        }
+    }
+
+    function attachRowListeners() {
+        // Manage-stock toggle (works on both products and variations)
+        _q('.pm-manage-stock').forEach(el => {
+            _bind(el);
+            el.addEventListener('change', function() {
+                const rowKey = this.dataset.rowKey;
+                const row = this.closest('tr');
+                const modeContainer = row.querySelector('.pm-stock-mode');
+                const checked = this.checked;
+                this.closest('.form-switch').querySelector('.pm-toggle-label').textContent = checked ? '启用管理' : '关闭管理';
+
+                // Find current values from local cache (preserve qty/status when toggling back)
+                const ids = rowKeyToIds(rowKey);
+                let curQty = 0, curStatus = 'outofstock';
+                if (ids?.type === 'product') {
+                    const p = products.find(x => x.id === ids.product_id);
+                    if (p) {
+                        curQty = (p.stock_quantity !== null) ? p.stock_quantity : 0;
+                        curStatus = p.stock_status || 'outofstock';
+                    }
+                } else if (ids?.type === 'variation') {
+                    const cache = variationsCache[ids.parent_id] || [];
+                    const v = cache.find(x => x.id === ids.variation_id);
+                    if (v) {
+                        curQty = (v.stock_quantity !== null) ? v.stock_quantity : 0;
+                        curStatus = v.stock_status || 'outofstock';
+                    }
+                }
+
+                if (checked) {
+                    modeContainer.innerHTML = `
+                        <div class="pm-stock-line">
+                            <span class="pm-stock-line-label">数量</span>
+                            <input type="number" min="0" step="1"
+                                class="form-control form-control-sm pm-stock-input pm-edit-field"
+                                data-field="stock_quantity" value="${curQty}">
+                        </div>`;
+                } else {
+                    modeContainer.innerHTML = `
+                        <div class="pm-stock-line">
+                            <span class="pm-stock-line-label">状态</span>
+                            <select class="form-select form-select-sm pm-status-input pm-edit-field"
+                                data-field="stock_status">
+                                <option value="instock" ${curStatus==='instock'?'selected':''}>有货</option>
+                                <option value="outofstock" ${curStatus==='outofstock'?'selected':''}>售完</option>
+                                <option value="onbackorder" ${curStatus==='onbackorder'?'selected':''}>缺货中</option>
+                            </select>
+                        </div>`;
+                }
+                modeContainer.querySelectorAll('.pm-edit-field').forEach(f => {
+                    f.addEventListener('input', () => {
+                        markRowModified(rowKey);
+                        refreshStockDisplay(row);
+                    });
+                    f.addEventListener('change', () => {
+                        markRowModified(rowKey);
+                        refreshStockDisplay(row);
+                    });
+                });
+                refreshStockDisplay(row);
+                markRowModified(rowKey);
+            });
+        });
+
+        // Edit fields
+        _q('.pm-edit-field').forEach(el => {
+            _bind(el);
+            const handler = () => {
+                const row = el.closest('tr');
+                if (!row) return;
+                markRowModified(row.dataset.rowKey);
+                // Live-update stock display chip when stock_quantity / stock_status changes
+                const field = el.dataset.field;
+                if (field === 'stock_quantity' || field === 'stock_status') {
+                    refreshStockDisplay(row);
+                }
+            };
+            el.addEventListener('input', handler);
+            el.addEventListener('change', handler);
+        });
+
+        // Save buttons (per row)
+        _q('.pm-save-btn').forEach(el => {
+            _bind(el);
+            el.addEventListener('click', () => saveRow(el.dataset.rowKey));
+        });
+
+        // Row checkboxes — with parent↔variation cascade
+        _q('.pm-row-check').forEach(el => {
+            _bind(el);
+            el.addEventListener('change', function() {
+                const rowKey = this.dataset.rowKey;
+                const productId = this.dataset.productId;
+                const parentId = this.dataset.parentId;
+
+                // Update self in selectedRows
+                if (this.checked) selectedRows.add(rowKey);
+                else selectedRows.delete(rowKey);
+
+                if (productId && !parentId) {
+                    // Parent product checkbox → cascade to all expanded variations
+                    cascadeParentToVariations(productId, this.checked);
+                } else if (parentId) {
+                    // Variation checkbox → re-derive parent's tri-state
+                    syncParentTriState(parentId);
+                }
+
+                updateBatchBar();
+            });
+        });
+
+        // Select all (only attached once)
+        const selectAll = $('pmSelectAll');
+        if (selectAll && !selectAll.hasAttribute('data-pm-bound')) {
+            _bind(selectAll);
+            selectAll.addEventListener('change', function() {
+                document.querySelectorAll('.pm-row-check').forEach(cb => {
+                    cb.checked = this.checked;
+                    const k = cb.dataset.rowKey;
+                    if (this.checked) selectedRows.add(k);
+                    else selectedRows.delete(k);
+                });
+                updateBatchBar();
+            });
+        }
+
+        // Expand-variations buttons
+        _q('.pm-expand-variations').forEach(btn => {
+            _bind(btn);
+            btn.addEventListener('click', function() {
+                const productId = parseInt(this.dataset.productId, 10);
+                toggleVariations(productId, this);
+            });
+        });
+
+        // Pagination clicks (only attached once)
+        const pgList = $('pmPaginationList');
+        if (pgList && !pgList.hasAttribute('data-pm-bound')) {
+            _bind(pgList);
+            pgList.addEventListener('click', function(e) {
+                const a = e.target.closest('a[data-page]');
+                if (!a) return;
+                e.preventDefault();
+                const p = parseInt(a.dataset.page, 10);
+                if (p >= 1 && p <= currentTotalPages && p !== currentPage) {
+                    loadProducts(p);
+                }
+            });
+        }
+    }
+
+    function markRowModified(rowKey) {
+        modifiedRows.add(rowKey);
+        const row = findRowByKey(rowKey);
+        if (row) {
+            row.classList.add('pm-row-modified');
+            row.classList.remove('pm-row-success', 'pm-row-error');
+        }
+        const btn = row?.querySelector('.pm-save-btn');
+        if (btn) btn.disabled = false;
+    }
+
+    function collectRowPayload(rowKey) {
+        // Only includes fields the user actually changed — avoids accidentally
+        // clobbering empty fields (e.g., sale_price='' would clear an existing
+        // sale price even if the user didn't touch it).
+        const row = findRowByKey(rowKey);
+        if (!row) return null;
+        const ids = rowKeyToIds(rowKey);
+
+        // Find the saved/canonical state to diff against
+        let original = null;
+        if (ids?.type === 'product') {
+            original = products.find(p => p.id === ids.product_id);
+        } else if (ids?.type === 'variation') {
+            original = (variationsCache[ids.parent_id] || []).find(v => v.id === ids.variation_id);
+        }
+
+        const payload = {};
+
+        // manage_stock — diff against original
+        const manageStockEl = row.querySelector('.pm-manage-stock');
+        if (manageStockEl) {
+            const newVal = manageStockEl.checked;
+            if (!original || newVal !== Boolean(original.manage_stock)) {
+                payload.manage_stock = newVal;
+            }
+        }
+
+        // Edit fields — only include when user-edited value differs from original
+        row.querySelectorAll('.pm-edit-field').forEach(f => {
+            const field = f.dataset.field;
+            if (!field) return;
+            const newVal = f.value;
+            if (!original) {
+                payload[field] = newVal;
+                return;
+            }
+            const oldVal = original[field];
+            if (field === 'stock_quantity') {
+                const newNum = newVal === '' ? null : Number(newVal);
+                const oldNum = (oldVal === null || oldVal === undefined) ? null : Number(oldVal);
+                if (newNum !== oldNum) payload[field] = newVal;
+            } else {
+                // String comparison for prices and stock_status
+                const newStr = String(newVal == null ? '' : newVal);
+                const oldStr = String(oldVal == null ? '' : oldVal);
+                if (newStr !== oldStr) payload[field] = newVal;
+            }
+        });
+
+        // When manage_stock is being toggled, the dependent field must accompany it
+        // (otherwise WC won't have the new mode's value).
+        if (payload.manage_stock === true && !('stock_quantity' in payload)) {
+            const qtyEl = row.querySelector('input[data-field="stock_quantity"]');
+            if (qtyEl && qtyEl.value !== '') payload.stock_quantity = qtyEl.value;
+        }
+        if (payload.manage_stock === false && !('stock_status' in payload)) {
+            const statusEl = row.querySelector('select[data-field="stock_status"]');
+            if (statusEl) payload.stock_status = statusEl.value;
+        }
+
+        return payload;
+    }
+
+    function saveRow(rowKey) {
+        const payload = collectRowPayload(rowKey);
+        if (!payload) return;
+        const ids = rowKeyToIds(rowKey);
+        if (!ids) return;
+
+        // Nothing actually changed → just clear the modified state, no API call
+        if (Object.keys(payload).length === 0) {
+            const row = findRowByKey(rowKey);
+            row?.classList.remove('pm-row-modified');
+            modifiedRows.delete(rowKey);
+            const btn = row?.querySelector('.pm-save-btn');
+            if (btn) btn.disabled = true;
+            return;
+        }
+
+        const row = findRowByKey(rowKey);
+        const btn = row?.querySelector('.pm-save-btn');
+        const originalIcon = btn ? btn.innerHTML : '';
+        if (btn) {
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+        }
+        row?.classList.add('pm-row-saving');
+        row?.classList.remove('pm-row-modified', 'pm-row-success', 'pm-row-error');
+
+        // Pick the right URL: simple product vs variation
+        const url = ids.type === 'variation'
+            ? `/api/product-manager/products/${currentSiteId}/${ids.parent_id}/variations/${ids.variation_id}`
+            : `/api/product-manager/products/${currentSiteId}/${ids.product_id}`;
+
+        fetch(url, {
+            method: 'PUT',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(payload),
+        })
+            .then(r => r.json())
+            .then(result => {
+                row?.classList.remove('pm-row-saving');
+                if (btn) btn.innerHTML = originalIcon;
+                if (result.success) {
+                    row?.classList.add('pm-row-success');
+                    modifiedRows.delete(rowKey);
+                    // Update local cache
+                    if (ids.type === 'product' && result.product) {
+                        const idx = products.findIndex(p => p.id === ids.product_id);
+                        if (idx >= 0) Object.assign(products[idx], result.product);
+                    } else if (ids.type === 'variation' && result.variation) {
+                        const cache = variationsCache[ids.parent_id];
+                        if (cache) {
+                            const idx = cache.findIndex(v => v.id === ids.variation_id);
+                            if (idx >= 0) Object.assign(cache[idx], result.variation);
+                            // Refresh parent's aggregate label since variation stock/status changed
+                            updateParentAggregateLabel(ids.parent_id, expandedParents.has(ids.parent_id));
+                        }
+                    }
+                    setTimeout(() => row?.classList.remove('pm-row-success'), 2500);
+                } else {
+                    row?.classList.add('pm-row-error');
+                    if (btn) btn.disabled = false;
+                    alert('保存失败: ' + (result.error || '未知错误'));
+                }
+            })
+            .catch(err => {
+                row?.classList.remove('pm-row-saving');
+                row?.classList.add('pm-row-error');
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = originalIcon;
+                }
+                alert('请求失败: ' + err.message);
+            });
+    }
+
+    // ==================================================
+    // Variation expansion
+    // ==================================================
+    const variationsCache = {};  // parent_id → variations array
+    const expandedParents = new Set();  // parent_ids currently expanded
+
+    function computeAggregate(variations) {
+        let totalStock = 0;
+        let managedCount = 0;
+        let lowStockCount = 0;   // qty > 0 && qty < 10
+        let zeroStockCount = 0;  // qty == 0 (managed)
+        const statusCount = { instock: 0, outofstock: 0, onbackorder: 0 };
+        for (const v of variations) {
+            if (v.manage_stock && v.stock_quantity !== null) {
+                const q = Number(v.stock_quantity) || 0;
+                totalStock += q;
+                managedCount++;
+                if (q === 0) zeroStockCount++;
+                else if (q < 10) lowStockCount++;
+            }
+            if (statusCount[v.stock_status] !== undefined) {
+                statusCount[v.stock_status]++;
+            }
+        }
+        return { totalStock, managedCount, lowStockCount, zeroStockCount, statusCount, total: variations.length };
+    }
+
+    function updateParentAggregateLabel(parentId, expanded) {
+        const parentRow = document.querySelector(`tr[data-row-key="prod-${parentId}"]`);
+        if (!parentRow) return;
+        const btn = parentRow.querySelector('.pm-expand-variations');
+        if (!btn) return;
+        const cache = variationsCache[parentId];
+        const stockCell = btn.parentElement;  // The <td> containing the button
+        const count = cache ? cache.length : (products.find(p => p.id === parentId)?.variations_count || 0);
+        const arrow = expanded ? '▲' : '▼';
+
+        let summaryHtml = '';
+        if (cache) {
+            const agg = computeAggregate(cache);
+            const parts = [];
+            if (agg.managedCount > 0) {
+                parts.push(`<span class="pm-aggregate-pill">总库存 ${agg.totalStock}</span>`);
+            }
+            if (agg.lowStockCount > 0) {
+                parts.push(`<span class="pm-aggregate-pill" style="background:rgba(251,191,36,0.18);color:#fbbf24;" title="库存数量介于 1-9 之间的变体数">⚠ 低库存 ${agg.lowStockCount}</span>`);
+            }
+            if (agg.zeroStockCount > 0) {
+                parts.push(`<span class="pm-aggregate-pill" style="background:rgba(239,68,68,0.18);color:#fca5a5;" title="库存为 0 的变体数（仍处于库存管理中）">⚠ 零库存 ${agg.zeroStockCount}</span>`);
+            }
+            if (agg.statusCount.outofstock > 0) {
+                parts.push(`<span class="pm-aggregate-pill" style="background:rgba(239,68,68,0.15);color:#fca5a5;" title="状态被设为售完的变体数">售完 ${agg.statusCount.outofstock}</span>`);
+            }
+            if (agg.statusCount.onbackorder > 0) {
+                parts.push(`<span class="pm-aggregate-pill" style="background:rgba(251,191,36,0.15);color:#fbbf24;">缺货 ${agg.statusCount.onbackorder}</span>`);
+            }
+            if (parts.length) {
+                summaryHtml = `<span class="pm-aggregate-summary">${parts.join('')}</span>`;
+            }
+        }
+
+        // Re-render the button + summary
+        btn.innerHTML = `<i class="bi bi-chevron-${expanded ? 'up' : 'down'} me-1"></i>${count} 个变体`;
+        btn.classList.toggle('expanded', expanded);
+
+        // Insert/update summary as sibling of button
+        let summary = stockCell.querySelector('.pm-aggregate-summary');
+        if (summary) summary.remove();
+        if (summaryHtml) {
+            stockCell.insertAdjacentHTML('beforeend', summaryHtml);
+        }
+    }
+
+    function toggleVariations(parentId, btnEl) {
+        if (expandedParents.has(parentId)) {
+            // Collapse: remove all variation rows for this parent
+            document.querySelectorAll(`tr.pm-variation-row[data-parent-id="${parentId}"]`).forEach(r => r.remove());
+            document.querySelectorAll(`tr.pm-variations-loading[data-parent-id="${parentId}"]`).forEach(r => r.remove());
+            expandedParents.delete(parentId);
+            // Drop selected/modified state for this parent's variations
+            [...selectedRows].forEach(k => {
+                if (k.startsWith(`var-${parentId}-`)) selectedRows.delete(k);
+            });
+            [...modifiedRows].forEach(k => {
+                if (k.startsWith(`var-${parentId}-`)) modifiedRows.delete(k);
+            });
+            updateBatchBar();
+            updateParentAggregateLabel(parentId, false);
+            return;
+        }
+
+        const parentRow = document.querySelector(`tr[data-row-key="prod-${parentId}"]`);
+        if (!parentRow) return;
+
+        const loadingRow = document.createElement('tr');
+        loadingRow.className = 'pm-variations-loading';
+        loadingRow.dataset.parentId = parentId;
+        loadingRow.innerHTML = `<td colspan="8"><span class="spinner-border spinner-border-sm me-2"></span>加载变体...</td>`;
+        parentRow.after(loadingRow);
+
+        const renderVariations = (variations) => {
+            loadingRow.remove();
+            const parent = products.find(p => p.id === parentId) || { id: parentId };
+            const fragment = [...variations].reverse();
+            for (const v of fragment) {
+                const tmp = document.createElement('template');
+                tmp.innerHTML = renderVariationRow(parent, v).trim();
+                parentRow.after(tmp.content.firstChild);
+            }
+            attachRowListeners();
+            expandedParents.add(parentId);
+            updateParentAggregateLabel(parentId, true);
+
+            // If the parent is currently checked, inherit that state to the
+            // freshly-rendered variations (so checking parent BEFORE expanding
+            // still ends up with all variations selected after expansion).
+            const parentCheck = document.querySelector(`tr[data-row-key="prod-${parentId}"] .pm-row-check`);
+            if (parentCheck && parentCheck.checked) {
+                cascadeParentToVariations(parentId, true);
+                updateBatchBar();
+            }
+        };
+
+        if (variationsCache[parentId]) {
+            renderVariations(variationsCache[parentId]);
+            return;
+        }
+
+        return fetch(`/api/product-manager/variations/${currentSiteId}/${parentId}`)
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    loadingRow.querySelector('td').innerHTML =
+                        `<span class="text-danger">加载变体失败: ${escapeHtml(data.error)}</span>`;
+                    return;
+                }
+                variationsCache[parentId] = data.variations || [];
+                renderVariations(variationsCache[parentId]);
+            })
+            .catch(err => {
+                loadingRow.querySelector('td').innerHTML =
+                    `<span class="text-danger">请求失败: ${escapeHtml(err.message)}</span>`;
+            });
+    }
+
+    // ==================================================
+    // Batch operations
+    // ==================================================
+
+    function updateBatchBar() {
+        const count = selectedRows.size;
+        $('pmSelectedCount').textContent = count;
+        $('pmBatchBar').classList.toggle('visible', count > 0);
+    }
+
+    function openBatchModal(type) {
+        const count = selectedRows.size;
+        if (count === 0) return;
+
+        const titles = {
+            'price': '批量改价',
+            'stock': '批量改库存数量',
+            'soldout': '批量标记为售完',
+            'restore': '恢复库存管理',
+        };
+        $('pmBatchModalTitle').textContent = titles[type] + ` (${count} 个产品)`;
+
+        let body = '';
+        if (type === 'price') {
+            body = `
+                <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 small">
+                    选填：留空的字段不会被改动。
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50 small">原价</label>
+                    <input type="text" inputmode="decimal" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                        id="pmBatchRegularPrice" placeholder="例如 199.00（留空保持不变）">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50 small">销售价</label>
+                    <input type="text" inputmode="decimal" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                        id="pmBatchSalePrice" placeholder="例如 159.00（留空保持不变；填 0 可清空）">
+                </div>
+                <div class="text-muted small">
+                    已选中 ${count} 个产品。可变产品会被跳过（需在 WC 后台单独编辑变体）。
+                </div>`;
+        } else if (type === 'stock') {
+            body = `
+                <div class="mb-3">
+                    <label class="form-label text-white-50 small">库存数量</label>
+                    <input type="number" min="0" step="1" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                        id="pmBatchStockQty" placeholder="0">
+                </div>
+                <div class="alert alert-warning bg-warning bg-opacity-10 border-warning border-opacity-25 small mb-0">
+                    <i class="bi bi-exclamation-triangle me-1"></i>
+                    会同时把库存管理设为<strong>启用</strong>。如需"硬锁售完"请改用<strong>批量标记售完</strong>。
+                </div>`;
+        } else if (type === 'soldout') {
+            body = `
+                <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 small">
+                    将对 ${count} 个产品执行：<br>
+                    <code class="text-warning">manage_stock = false</code>（关闭库存管理）<br>
+                    <code class="text-warning">stock_status = outofstock</code>（强制售完）<br>
+                    这样订单取消时不会自动加回库存，产品会一直保持售完状态直到你手动恢复。
+                </div>`;
+        } else if (type === 'restore') {
+            body = `
+                <div class="mb-3">
+                    <label class="form-label text-white-50 small">恢复后的初始库存数量</label>
+                    <input type="number" min="0" step="1" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                        id="pmBatchRestoreQty" placeholder="0" value="0">
+                </div>
+                <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 small mb-0">
+                    将对 ${count} 个产品执行：<br>
+                    <code class="text-success">manage_stock = true</code>（启用库存管理）<br>
+                    <code class="text-success">stock_quantity = 上面填的数</code>
+                </div>`;
+        }
+        $('pmBatchModalBody').innerHTML = body;
+        $('pmBatchApplyBtn').dataset.opType = type;
+        const modal = bootstrap.Modal.getOrCreateInstance($('pmBatchModal'));
+        modal.show();
+    }
+
+    function applyBatchOp() {
+        const type = $('pmBatchApplyBtn').dataset.opType;
+        const rowKeys = Array.from(selectedRows);
+        if (rowKeys.length === 0) return;
+
+        let baseChange = {};
+        if (type === 'price') {
+            const rp = $('pmBatchRegularPrice').value.trim();
+            const sp = $('pmBatchSalePrice').value.trim();
+            if (!rp && !sp) {
+                alert('请至少填写一个价格');
+                return;
+            }
+            if (rp) baseChange.regular_price = rp;
+            if (sp || sp === '0') baseChange.sale_price = sp;
+        } else if (type === 'stock') {
+            const q = $('pmBatchStockQty').value.trim();
+            if (q === '') {
+                alert('请填写库存数量');
+                return;
+            }
+            baseChange = { manage_stock: true, stock_quantity: parseInt(q, 10) };
+        } else if (type === 'soldout') {
+            baseChange = { manage_stock: false, stock_status: 'outofstock' };
+        } else if (type === 'restore') {
+            const q = $('pmBatchRestoreQty').value.trim() || '0';
+            baseChange = { manage_stock: true, stock_quantity: parseInt(q, 10) };
+        }
+
+        // Build items list: each rowKey → either {product_id} (simple) or {product_id, parent_id} (variation)
+        // For price ops, skip variable parent products (they have no direct price; use variations instead)
+        const items = [];
+        let skippedVariableParents = 0;
+        rowKeys.forEach(rowKey => {
+            const ids = rowKeyToIds(rowKey);
+            if (!ids) return;
+            if (ids.type === 'product') {
+                const p = products.find(x => x.id === ids.product_id);
+                if (!p) return;
+                if (type === 'price' && p.type === 'variable') {
+                    skippedVariableParents++;
+                    return;
+                }
+                items.push({ product_id: ids.product_id, ...baseChange });
+            } else if (ids.type === 'variation') {
+                items.push({
+                    product_id: ids.variation_id,
+                    parent_id: ids.parent_id,
+                    ...baseChange,
+                });
+            }
+        });
+
+        if (items.length === 0) {
+            alert('没有可应用的项目（可变产品的父行不能直接改价/库存，请展开变体后选择）');
+            return;
+        }
+
+        const applyBtn = $('pmBatchApplyBtn');
+        applyBtn.disabled = true;
+        applyBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>处理中...';
+
+        fetch('/api/product-manager/bulk', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ site_id: currentSiteId, items }),
+        })
+            .then(r => r.json())
+            .then(data => {
+                applyBtn.disabled = false;
+                applyBtn.innerHTML = '应用';
+                bootstrap.Modal.getInstance($('pmBatchModal'))?.hide();
+                if (skippedVariableParents > 0) {
+                    data.skip_note = `跳过 ${skippedVariableParents} 个可变产品父行（请展开变体后选择具体变体）`;
+                }
+                showBatchResult(data);
+                // Refresh table to reflect canonical state. Variation cache is invalidated.
+                Object.keys(variationsCache).forEach(k => delete variationsCache[k]);
+                expandedParents.clear();
+                loadProducts(currentPage);
+            })
+            .catch(err => {
+                applyBtn.disabled = false;
+                applyBtn.innerHTML = '应用';
+                alert('请求失败: ' + err.message);
+            });
+    }
+
+    function showBatchResult(data) {
+        const succ = data.success_count || 0;
+        const fail = data.failed_count || 0;
+        let html = `
+            <div class="row g-3 mb-3">
+                <div class="col">
+                    <div class="text-center p-3 rounded" style="background:rgba(34,197,94,0.15);">
+                        <div class="h3 text-success mb-0">${succ}</div>
+                        <small class="text-secondary">成功</small>
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="text-center p-3 rounded" style="background:rgba(239,68,68,0.15);">
+                        <div class="h3 text-danger mb-0">${fail}</div>
+                        <small class="text-secondary">失败</small>
+                    </div>
+                </div>
+            </div>`;
+        if (data.skip_note) {
+            html += `<div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 small">
+                <i class="bi bi-info-circle me-1"></i>${escapeHtml(data.skip_note)}
+            </div>`;
+        }
+        if (fail > 0 && data.results?.failed?.length) {
+            html += `<h6 class="text-light mt-3 mb-2">失败明细</h6><div style="max-height:300px;overflow-y:auto;">`;
+            data.results.failed.forEach(f => {
+                const idLabel = f.parent_id
+                    ? `变体 #${f.product_id} (父 #${f.parent_id})`
+                    : `产品 #${f.product_id || '?'}`;
+                html += `<div class="small text-danger mb-1">
+                    ${idLabel}: ${escapeHtml(f.error || '')}
+                </div>`;
+            });
+            html += `</div>`;
+        }
+        $('pmResultModalBody').innerHTML = html;
+        bootstrap.Modal.getOrCreateInstance($('pmResultModal')).show();
+    }
+
+    // ==================================================
+    // Wire UI
+    // ==================================================
+
+    $('pmLoadBtn').addEventListener('click', () => loadProducts(1));
+    $('pmRefreshBtn').addEventListener('click', () => {
+        if (currentSiteId) loadProducts(currentPage);
+        else alert('请先选择站点并加载');
+    });
+    $('pmSearchInput').addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); loadProducts(1); }
+    });
+
+    // Auto-expand toggle — remember choice in localStorage
+    const autoExpandKey = 'pmAutoExpandVariations';
+    const autoExpandToggle = $('pmAutoExpandToggle');
+    if (autoExpandToggle) {
+        autoExpandToggle.checked = localStorage.getItem(autoExpandKey) === '1';
+        autoExpandToggle.addEventListener('change', function() {
+            localStorage.setItem(autoExpandKey, this.checked ? '1' : '0');
+        });
+    }
+
+    $('pmBatchPriceBtn').addEventListener('click', () => openBatchModal('price'));
+    $('pmBatchStockBtn').addEventListener('click', () => openBatchModal('stock'));
+    $('pmBatchSoldOutBtn').addEventListener('click', () => openBatchModal('soldout'));
+    $('pmBatchRestoreBtn').addEventListener('click', () => openBatchModal('restore'));
+    $('pmBatchClearBtn').addEventListener('click', () => {
+        selectedRows.clear();
+        document.querySelectorAll('.pm-row-check').forEach(cb => cb.checked = false);
+        const sa = $('pmSelectAll'); if (sa) sa.checked = false;
+        updateBatchBar();
+    });
+    $('pmBatchApplyBtn').addEventListener('click', applyBatchOp);
+
+    $('pmExpandAllBtn').addEventListener('click', () => expandAllVariations());
+    $('pmCollapseAllBtn').addEventListener('click', () => collapseAllVariations());
+
+    // ==================================================
+    // Layer 2: Clone products to another site
+    // ==================================================
+    // Site dropdown options come from the Jinja-rendered <select> at the top.
+    // We just clone its options into the target picker (excluding current source).
+    function populateCloneTargetPicker() {
+        const sourceSelect = $('pmSiteSelect');
+        const targetSelect = $('pmCloneTarget');
+        if (!sourceSelect || !targetSelect) return;
+        targetSelect.innerHTML = '<option value="">请选择 ...</option>';
+        // Skip the placeholder option (value="") and the currently selected source
+        const currentSourceId = sourceSelect.value;
+        Array.from(sourceSelect.options).forEach(opt => {
+            if (!opt.value) return;  // placeholder
+            if (opt.value === currentSourceId) return;  // can't target self
+            const newOpt = document.createElement('option');
+            newOpt.value = opt.value;
+            newOpt.textContent = opt.textContent;
+            targetSelect.appendChild(newOpt);
+        });
+    }
+
+    function openCloneDialog(productIds) {
+        if (!currentSiteId) {
+            alert('请先加载产品');
+            return;
+        }
+        if (!productIds || productIds.length === 0) {
+            alert('未选择产品');
+            return;
+        }
+
+        const sourceSelect = $('pmSiteSelect');
+        const sourceText = sourceSelect.options[sourceSelect.selectedIndex]?.textContent || '';
+
+        $('pmCloneSource').value = sourceText;
+        $('pmCloneCount').textContent = productIds.length;
+        $('pmCloneFeedback').innerHTML = '';
+        $('pmCloneApplyBtn').dataset.productIds = JSON.stringify(productIds);
+        populateCloneTargetPicker();
+        bootstrap.Modal.getOrCreateInstance($('pmCloneModal')).show();
+    }
+
+    function applyClone() {
+        const ids = JSON.parse($('pmCloneApplyBtn').dataset.productIds || '[]');
+        const targetId = $('pmCloneTarget').value;
+        if (!targetId) {
+            $('pmCloneFeedback').innerHTML = '<div class="text-danger small">请选择目标站点</div>';
+            return;
+        }
+        if (!ids.length) return;
+
+        const payload = {
+            source_site_id: parseInt(currentSiteId, 10),
+            target_site_id: parseInt(targetId, 10),
+            product_ids: ids,
+            include_variations: $('pmCloneIncludeVariations').checked,
+            include_images: $('pmCloneIncludeImages').checked,
+            status_on_target: $('pmCloneStatus').value,
+        };
+
+        const applyBtn = $('pmCloneApplyBtn');
+        applyBtn.disabled = true;
+        applyBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>克隆中... (每个产品约 30 秒)';
+        $('pmCloneFeedback').innerHTML = '<div class="text-info small">克隆涉及拉取源数据 + 创建目标产品 + 同步变体，可能需要几分钟，请勿关闭页面。</div>';
+
+        fetch('/api/product-manager/clone', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(payload),
+        })
+            .then(r => r.json())
+            .then(data => {
+                applyBtn.disabled = false;
+                applyBtn.innerHTML = '<i class="bi bi-files me-1"></i>开始克隆';
+                bootstrap.Modal.getInstance($('pmCloneModal'))?.hide();
+                showCloneResult(data);
+            })
+            .catch(err => {
+                applyBtn.disabled = false;
+                applyBtn.innerHTML = '<i class="bi bi-files me-1"></i>开始克隆';
+                $('pmCloneFeedback').innerHTML = `<div class="text-danger small">请求失败: ${escapeHtml(err.message)}</div>`;
+            });
+    }
+
+    function showCloneResult(data) {
+        const succ = data.success_count || 0;
+        const fail = data.failed_count || 0;
+        const targetUrl = (data.target_url || '').replace(/^https?:\/\/(www\.)?/, '');
+        let html = `
+            <div class="row g-3 mb-3">
+                <div class="col">
+                    <div class="text-center p-3 rounded" style="background:rgba(34,197,94,0.15);">
+                        <div class="h3 text-success mb-0">${succ}</div>
+                        <small class="text-secondary">成功克隆</small>
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="text-center p-3 rounded" style="background:rgba(239,68,68,0.15);">
+                        <div class="h3 text-danger mb-0">${fail}</div>
+                        <small class="text-secondary">失败</small>
+                    </div>
+                </div>
+            </div>
+            <div class="text-muted small mb-2">目标站: <code>${escapeHtml(targetUrl)}</code></div>`;
+
+        if (data.results?.success?.length) {
+            html += '<h6 class="text-light mt-3 mb-2">成功明细</h6><div style="max-height:240px;overflow-y:auto;">';
+            data.results.success.forEach(s => {
+                const sku = s.sku ? `<code>${escapeHtml(s.sku)}</code>` : '';
+                const link = s.permalink ? `<a href="${s.permalink}" target="_blank" class="text-info">查看 <i class="bi bi-box-arrow-up-right"></i></a>` : '';
+                const warns = (s.warnings || []).map(w => `<div class="small ms-3" style="color:#fbbf24;">⚠ ${escapeHtml(w)}</div>`).join('');
+                html += `<div class="small text-success mb-2">
+                    ✓ #${s.source_id} → #${s.target_id} ${sku ? '· ' + sku : ''} ${link}
+                    ${warns}
+                </div>`;
+            });
+            html += '</div>';
+        }
+        if (data.results?.failed?.length) {
+            html += '<h6 class="text-light mt-3 mb-2">失败明细</h6><div style="max-height:240px;overflow-y:auto;">';
+            data.results.failed.forEach(f => {
+                html += `<div class="small text-danger mb-1">
+                    产品 #${f.product_id || '?'}: ${escapeHtml(f.error || '')}
+                </div>`;
+            });
+            html += '</div>';
+        }
+        $('pmResultModalBody').innerHTML = html;
+        bootstrap.Modal.getOrCreateInstance($('pmResultModal')).show();
+    }
+
+    // Per-row clone button (event delegation since rows are dynamic)
+    document.body.addEventListener('click', function(e) {
+        const btn = e.target.closest('.pm-clone-btn');
+        if (!btn) return;
+        const pid = parseInt(btn.dataset.productId, 10);
+        if (!isNaN(pid)) openCloneDialog([pid]);
+    });
+
+    // Bulk clone button
+    $('pmBatchCloneBtn').addEventListener('click', () => {
+        // Collect selected PRODUCT IDs only — variations aren't clonable independently.
+        const productIds = [];
+        const seenParents = new Set();
+        Array.from(selectedRows).forEach(rowKey => {
+            const ids = rowKeyToIds(rowKey);
+            if (!ids) return;
+            if (ids.type === 'product') {
+                productIds.push(ids.product_id);
+            } else if (ids.type === 'variation') {
+                // Promote a selected variation to its parent (so the whole product gets cloned)
+                seenParents.add(ids.parent_id);
+            }
+        });
+        seenParents.forEach(pid => {
+            if (!productIds.includes(pid)) productIds.push(pid);
+        });
+        if (productIds.length === 0) {
+            alert('请先勾选至少一个产品（或它的某个变体）');
+            return;
+        }
+        openCloneDialog(productIds);
+    });
+
+    $('pmCloneApplyBtn').addEventListener('click', applyClone);
+
+})();
+</script>
+{% endblock %}

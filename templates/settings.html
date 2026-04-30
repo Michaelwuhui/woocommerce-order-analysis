@@ -161,6 +161,14 @@
                                         {% endif %}
                                         <span class="text-white">{{ site.url.replace('https://www.',
                                             '').replace('https://', '') }}</span>
+                                        {% if site.product_master_id and masters_lookup.get(site.product_master_id) %}
+                                        {% set m = masters_lookup[site.product_master_id] %}
+                                        <span class="badge ms-2"
+                                            style="background:rgba(168,85,247,0.15); color:#c084fc; border:1px solid rgba(168,85,247,0.4); font-weight:500;"
+                                            title="产品由 {{ m.label }} ({{ m.host }}) 管理">
+                                            <i class="bi bi-link-45deg me-1"></i>{{ m.label }}
+                                        </span>
+                                        {% endif %}
                                     </div>
                                 </div>
                             </td>
@@ -241,7 +249,8 @@
                                     data-site-id="{{ site.id }}" data-url="{{ site.url }}"
                                     data-key="{{ site.consumer_key }}" data-secret="{{ site.consumer_secret }}"
                                     data-manager="{{ site.manager or '' }}" data-mask-id="{{ site.mask_id or '' }}"
-                                    data-country="{{ site.country or '' }}"><i class="bi bi-pencil"></i></button>
+                                    data-country="{{ site.country or '' }}"
+                                    data-product-master-id="{{ site.product_master_id or '' }}"><i class="bi bi-pencil"></i></button>
                                 <button class="btn btn-sm btn-outline-danger delete-btn" data-site-id="{{ site.id }}"><i
                                         class="bi bi-trash"></i></button>
                             </td>
@@ -256,6 +265,147 @@
                         {% endfor %}
                     </tbody>
                 </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Product Masters Management Card -->
+<div class="card data-card mb-4">
+    <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
+        <h5 class="card-title text-white mb-0">
+            <i class="bi bi-link-45deg me-2" style="color:#a78bfa;"></i>Master 站点
+            <span class="text-muted small ms-2">（WooMultistore 产品管理源）</span>
+        </h5>
+        <button class="btn btn-sm btn-outline-primary" id="openAddMasterFromSettingsBtn">
+            <i class="bi bi-plus-lg me-1"></i> 新增 Master
+        </button>
+    </div>
+    <div class="card-body p-0">
+        <div class="alert alert-info bg-info bg-opacity-10 border-0 rounded-0 small mb-0 px-4 py-2">
+            <i class="bi bi-info-circle me-1"></i>
+            这里管理的是 WooMultistore <strong>master 站点</strong>——本系统通过它的 WC REST API 写产品，
+            再由 Multistore 自动同步到下游下游店。Master 站不出现在订单分析等业务视图里。
+        </div>
+        <div class="table-responsive">
+            <table class="table table-dark table-hover align-middle mb-0" style="--bs-table-bg: transparent;">
+                <thead>
+                    <tr>
+                        <th class="ps-4">别名</th>
+                        <th>URL</th>
+                        <th>Consumer Key</th>
+                        <th>状态</th>
+                        <th>使用中</th>
+                        <th class="text-end pe-4">操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for pm in product_masters %}
+                    <tr data-master-id="{{ pm.id }}">
+                        <td class="ps-4 text-white">
+                            <i class="bi bi-link-45deg me-1" style="color:#a78bfa;"></i>{{ pm.label }}
+                        </td>
+                        <td class="text-white-50 small">{{ pm.url.replace('https://www.', '').replace('https://', '').replace('http://', '') }}</td>
+                        <td class="text-white-50 font-monospace small">{{ pm.consumer_key_short }}</td>
+                        <td>
+                            {% if pm.api_status == 'ok' %}
+                            <span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25"
+                                title="上次测试: {{ pm.last_tested_at or '?' }}">
+                                <i class="bi bi-check-circle me-1"></i>正常
+                            </span>
+                            {% elif pm.api_status == 'error' %}
+                            <span class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25"
+                                title="{{ pm.last_api_error or '连接失败' }}" style="cursor:help;">
+                                <i class="bi bi-x-circle me-1"></i>错误
+                            </span>
+                            {% else %}
+                            <span class="badge bg-secondary bg-opacity-10 text-secondary border border-secondary border-opacity-25"
+                                title="未测试">
+                                <i class="bi bi-question-circle me-1"></i>未测试
+                            </span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if pm.ref_count > 0 %}
+                            <span class="badge bg-info bg-opacity-10 text-info border border-info border-opacity-25">
+                                {{ pm.ref_count }} 个站点
+                            </span>
+                            {% else %}
+                            <span class="text-muted small">未引用</span>
+                            {% endif %}
+                        </td>
+                        <td class="text-end pe-4">
+                            <button class="btn btn-sm btn-outline-secondary me-1 test-master-btn"
+                                data-master-id="{{ pm.id }}" title="测试连接">
+                                <i class="bi bi-broadcast"></i>
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary me-1 edit-master-btn"
+                                data-master-id="{{ pm.id }}" data-label="{{ pm.label }}"
+                                data-url="{{ pm.url }}" data-key="{{ pm.consumer_key }}"
+                                title="编辑">
+                                <i class="bi bi-pencil"></i>
+                            </button>
+                            <button class="btn btn-sm btn-outline-danger delete-master-btn"
+                                data-master-id="{{ pm.id }}" data-label="{{ pm.label }}"
+                                data-ref-count="{{ pm.ref_count }}" title="删除">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="6" class="text-center py-4 text-muted">
+                            <i class="bi bi-link-45deg fs-3 d-block mb-2 opacity-50"></i>
+                            暂无 master 站点。在站点编辑弹窗里勾选 multistore 选项可以新增。
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Edit Master Modal -->
+<div class="modal fade" id="editMasterModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">
+                    <i class="bi bi-pencil me-2" style="color:#a78bfa;"></i>编辑 Master 站点
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="editMasterForm">
+                    <input type="hidden" id="editMasterId">
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">别名 <span class="text-danger">*</span></label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            id="editMasterLabel" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">Master 站点 URL <span class="text-danger">*</span></label>
+                        <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            id="editMasterUrl" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">Consumer Key <span class="text-danger">*</span></label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            id="editMasterKey" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">Consumer Secret</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            id="editMasterSecret" placeholder="留空 = 保持原值不变">
+                        <div class="text-muted small mt-1">出于安全考虑这里不显示原 secret。留空则保持不变；填新值则替换。</div>
+                    </div>
+                </form>
+                <div id="editMasterFeedback"></div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="updateMasterBtn">保存</button>
             </div>
         </div>
     </div>
@@ -976,11 +1126,98 @@
                         <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
                             name="consumer_secret" id="editSiteSecret" required>
                     </div>
+
+                    <hr class="border-secondary border-opacity-25 my-3">
+
+                    <!-- Multistore section -->
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" id="editSiteMultistoreToggle">
+                        <label class="form-check-label text-white-50" for="editSiteMultistoreToggle">
+                            <i class="bi bi-link-45deg me-1" style="color:#a78bfa;"></i>
+                            此站点的产品由 master 站管理（WooMultistore 受控站）
+                        </label>
+                        <div class="text-muted small mt-1" style="line-height:1.4;">
+                            勾选后，本系统的产品改动会写入 master 站，再由 multistore 自动同步到本站。
+                        </div>
+                    </div>
+                    <div id="editSiteMultistoreFields" style="display:none;">
+                        <div class="mb-2 ps-4">
+                            <label class="form-label text-white-50 small">选择 master 站点</label>
+                            <div class="d-flex gap-2 align-items-center">
+                                <select class="form-select bg-dark text-white border-secondary border-opacity-25"
+                                    name="product_master_id" id="editSiteMasterSelect">
+                                    <option value="">请选择 ...</option>
+                                    {% for pm in product_masters %}
+                                    <option value="{{ pm.id }}" data-url="{{ pm.url }}">
+                                        {{ pm.label }} ({{ pm.url.replace('https://www.', '').replace('https://', '').replace('http://', '') }})
+                                    </option>
+                                    {% endfor %}
+                                </select>
+                                <button type="button" class="btn btn-sm btn-outline-info text-nowrap"
+                                    id="editSiteAddMasterBtn" title="新增 master 站点">
+                                    <i class="bi bi-plus-lg"></i> 新增
+                                </button>
+                            </div>
+                            <div class="text-muted small mt-1" id="editSiteMasterHint">
+                                没有可选的 master？点"新增"建一个。
+                            </div>
+                        </div>
+                    </div>
                 </form>
             </div>
             <div class="modal-footer border-top border-secondary border-opacity-25">
                 <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
                 <button type="button" class="btn btn-primary" id="updateSiteBtn">更新</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Add Master Modal (inline, opens on top of edit-site modal) -->
+<div class="modal fade" id="addMasterModal" tabindex="-1" data-bs-backdrop="static" style="z-index: 1070;">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white">
+                    <i class="bi bi-plus-circle me-2" style="color:#a78bfa;"></i>新增 Master 站点
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 small">
+                    Master 站点是 WooMultistore 拓扑的"产品源"，本系统通过它的 WC REST API 写产品，再由
+                    Multistore 自动分发到所有下游站点。<br>
+                    去 master 后台 → WooCommerce → 设置 → 高级 → REST API 生成一对
+                    <strong>读/写</strong>权限的密钥。
+                </div>
+                <form id="addMasterForm">
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">别名 <span class="text-danger">*</span></label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="label" id="newMasterLabel" placeholder="如：VapeGo 主站" required>
+                        <div class="text-muted small mt-1">用来识别这个 master 的友好名字。</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">Master 站点 URL <span class="text-danger">*</span></label>
+                        <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="url" id="newMasterUrl" placeholder="https://master.vapego.pl" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">Consumer Key <span class="text-danger">*</span></label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="consumer_key" id="newMasterKey" placeholder="ck_..." required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">Consumer Secret <span class="text-danger">*</span></label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                            name="consumer_secret" id="newMasterSecret" placeholder="cs_..." required>
+                    </div>
+                </form>
+                <div id="addMasterFeedback"></div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" id="saveMasterBtn">保存并选用</button>
             </div>
         </div>
     </div>
@@ -1838,6 +2075,78 @@
             });
         }
 
+        // Multistore toggle: show/hide master selection fields
+        const multistoreToggle = document.getElementById('editSiteMultistoreToggle');
+        if (multistoreToggle) {
+            multistoreToggle.addEventListener('change', function () {
+                const fields = document.getElementById('editSiteMultistoreFields');
+                fields.style.display = this.checked ? '' : 'none';
+                if (!this.checked) {
+                    document.getElementById('editSiteMasterSelect').value = '';
+                }
+            });
+        }
+
+        // "+ 新增 master" button — opens add-master modal on top
+        const addMasterBtn = document.getElementById('editSiteAddMasterBtn');
+        if (addMasterBtn) {
+            addMasterBtn.addEventListener('click', function () {
+                document.getElementById('addMasterForm').reset();
+                document.getElementById('addMasterFeedback').innerHTML = '';
+                const modal = getModal('addMasterModal');
+                if (modal) modal.show();
+            });
+        }
+
+        // Save new master from add-master modal, then auto-select it in the dropdown
+        const saveMasterBtn = document.getElementById('saveMasterBtn');
+        if (saveMasterBtn) {
+            saveMasterBtn.addEventListener('click', function () {
+                const form = document.getElementById('addMasterForm');
+                if (!form.checkValidity()) {
+                    form.reportValidity();
+                    return;
+                }
+                const data = Object.fromEntries(new FormData(form).entries());
+                const feedback = document.getElementById('addMasterFeedback');
+                feedback.innerHTML = '<div class="text-info small"><span class="spinner-border spinner-border-sm me-2"></span>保存中...</div>';
+                saveMasterBtn.disabled = true;
+
+                fetch('/api/product-masters', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                })
+                    .then(r => r.json())
+                    .then(result => {
+                        saveMasterBtn.disabled = false;
+                        if (result.success) {
+                            // Append to dropdown and auto-select
+                            const select = document.getElementById('editSiteMasterSelect');
+                            const opt = document.createElement('option');
+                            opt.value = result.id;
+                            const host = (result.url || '').replace(/^https?:\/\/(www\.)?/, '');
+                            opt.textContent = `${data.label} (${host})`;
+                            opt.selected = true;
+                            select.appendChild(opt);
+                            // Close add-master modal
+                            const modalEl = document.getElementById('addMasterModal');
+                            const modalInst = bootstrap.Modal.getInstance(modalEl);
+                            if (modalInst) modalInst.hide();
+                            // Brief feedback in the parent form
+                            document.getElementById('editSiteMasterHint').innerHTML =
+                                '<span class="text-success">✓ 新 master 已保存并选中。可点"更新"保存站点。</span>';
+                        } else {
+                            feedback.innerHTML = `<div class="text-danger small">${result.error || '保存失败'}</div>`;
+                        }
+                    })
+                    .catch(err => {
+                        saveMasterBtn.disabled = false;
+                        feedback.innerHTML = `<div class="text-danger small">请求失败: ${err.message}</div>`;
+                    });
+            });
+        }
+
         // Update Site
         const updateBtn = document.getElementById('updateSiteBtn');
         if (updateBtn) {
@@ -1851,6 +2160,17 @@
                 const formData = new FormData(form);
                 const data = Object.fromEntries(formData.entries());
                 const siteId = data.site_id;
+
+                // If multistore toggle is off, force product_master_id to empty
+                // (the field would carry whatever was selected before unchecking)
+                if (!document.getElementById('editSiteMultistoreToggle').checked) {
+                    data.product_master_id = '';
+                }
+                // Validate: if toggle is on, must have a master selected
+                if (document.getElementById('editSiteMultistoreToggle').checked && !data.product_master_id) {
+                    alert('已勾选 multistore，但未选择 master 站点。请选择或新增一个 master。');
+                    return;
+                }
 
                 fetch(`/api/sites/${siteId}`, {
                     method: 'PUT',
@@ -1889,6 +2209,21 @@
                 document.getElementById('editSiteManager').value = manager;
                 document.getElementById('editSiteMaskId').value = maskId;
                 document.getElementById('editSiteCountry').value = country;
+
+                // Populate multistore section
+                const productMasterId = editBtn.dataset.productMasterId || '';
+                const toggle = document.getElementById('editSiteMultistoreToggle');
+                const fields = document.getElementById('editSiteMultistoreFields');
+                const masterSelect = document.getElementById('editSiteMasterSelect');
+                if (productMasterId) {
+                    toggle.checked = true;
+                    fields.style.display = '';
+                    masterSelect.value = productMasterId;
+                } else {
+                    toggle.checked = false;
+                    fields.style.display = 'none';
+                    masterSelect.value = '';
+                }
 
                 const modal = getModal('editSiteModal');
                 if (modal) modal.show();
@@ -2784,6 +3119,128 @@
     const apiLogFilterSite = document.getElementById('apiLogFilterSite');
     if (apiLogFilterSite) {
         apiLogFilterSite.addEventListener('change', loadApiSyncLogs);
+    }
+
+    // ============================================================
+    // Product Masters CRUD (Master site management section)
+    // ============================================================
+
+    // "新增 Master" button at the top of the master section
+    const openAddMasterFromSettingsBtn = document.getElementById('openAddMasterFromSettingsBtn');
+    if (openAddMasterFromSettingsBtn) {
+        openAddMasterFromSettingsBtn.addEventListener('click', function () {
+            document.getElementById('addMasterForm').reset();
+            document.getElementById('addMasterFeedback').innerHTML = '';
+            const modal = getModal('addMasterModal');
+            if (modal) modal.show();
+        });
+    }
+
+    // Master action buttons (test / edit / delete) — event delegation
+    document.body.addEventListener('click', function (e) {
+        const testBtn = e.target.closest('.test-master-btn');
+        if (testBtn) {
+            const masterId = testBtn.dataset.masterId;
+            const original = testBtn.innerHTML;
+            testBtn.disabled = true;
+            testBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+            fetch(`/api/product-masters/${masterId}/test`, { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    testBtn.disabled = false;
+                    testBtn.innerHTML = original;
+                    if (data.status === 'ok') {
+                        testBtn.classList.remove('btn-outline-secondary');
+                        testBtn.classList.add('btn-success');
+                        setTimeout(() => location.reload(), 800);
+                    } else {
+                        alert('连接失败：\n' + (data.message || data.error || '未知错误'));
+                        testBtn.classList.remove('btn-outline-secondary');
+                        testBtn.classList.add('btn-outline-danger');
+                    }
+                })
+                .catch(err => {
+                    testBtn.disabled = false;
+                    testBtn.innerHTML = original;
+                    alert('请求失败: ' + err.message);
+                });
+            return;
+        }
+
+        const editMasterBtn = e.target.closest('.edit-master-btn');
+        if (editMasterBtn) {
+            document.getElementById('editMasterId').value = editMasterBtn.dataset.masterId;
+            document.getElementById('editMasterLabel').value = editMasterBtn.dataset.label;
+            document.getElementById('editMasterUrl').value = editMasterBtn.dataset.url;
+            document.getElementById('editMasterKey').value = editMasterBtn.dataset.key;
+            document.getElementById('editMasterSecret').value = '';
+            document.getElementById('editMasterFeedback').innerHTML = '';
+            const modal = getModal('editMasterModal');
+            if (modal) modal.show();
+            return;
+        }
+
+        const deleteMasterBtn = e.target.closest('.delete-master-btn');
+        if (deleteMasterBtn) {
+            const refCount = parseInt(deleteMasterBtn.dataset.refCount || '0', 10);
+            const label = deleteMasterBtn.dataset.label;
+            if (refCount > 0) {
+                alert(`无法删除「${label}」：还有 ${refCount} 个站点引用它。请先在那些站点的设置里取消勾选 multistore。`);
+                return;
+            }
+            if (!confirm(`确定要删除 master 站点「${label}」吗？\n这会清除已保存的 API 凭据。`)) return;
+            fetch(`/api/product-masters/${deleteMasterBtn.dataset.masterId}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        location.reload();
+                    } else {
+                        alert('删除失败: ' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(err => alert('请求失败: ' + err.message));
+            return;
+        }
+    });
+
+    // Update Master (from edit modal)
+    const updateMasterBtn = document.getElementById('updateMasterBtn');
+    if (updateMasterBtn) {
+        updateMasterBtn.addEventListener('click', function () {
+            const form = document.getElementById('editMasterForm');
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+            const masterId = document.getElementById('editMasterId').value;
+            const data = {
+                label: document.getElementById('editMasterLabel').value.trim(),
+                url: document.getElementById('editMasterUrl').value.trim(),
+                consumer_key: document.getElementById('editMasterKey').value.trim(),
+                consumer_secret: document.getElementById('editMasterSecret').value.trim()
+            };
+            const feedback = document.getElementById('editMasterFeedback');
+            feedback.innerHTML = '<div class="text-info small"><span class="spinner-border spinner-border-sm me-2"></span>保存中...</div>';
+            updateMasterBtn.disabled = true;
+            fetch(`/api/product-masters/${masterId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            })
+                .then(r => r.json())
+                .then(result => {
+                    updateMasterBtn.disabled = false;
+                    if (result.success) {
+                        location.reload();
+                    } else {
+                        feedback.innerHTML = `<div class="text-danger small">${result.error || '保存失败'}</div>`;
+                    }
+                })
+                .catch(err => {
+                    updateMasterBtn.disabled = false;
+                    feedback.innerHTML = `<div class="text-danger small">请求失败: ${err.message}</div>`;
+                });
+        });
     }
 
 </script>

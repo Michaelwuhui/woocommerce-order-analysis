@@ -89,6 +89,20 @@ class User(UserMixin):
         except:
             return False
 
+    def can_manage_products(self):
+        """Check if user can access the multi-site product manager (Layer 1).
+        Super admin always passes. Other users must have the flag set explicitly;
+        their site-level scope is enforced separately via user_site_permissions."""
+        if self.username == 'admin':
+            return True
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_manage_products FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return user and user['can_manage_products'] == 1
+        except sqlite3.OperationalError:
+            return False
+
     def can_manage_users(self):
         """Check if user can manage other users and permissions (super admin privilege)"""
         # 'admin' username always has this right as a safety net
@@ -126,6 +140,20 @@ class User(UserMixin):
             user = conn.execute('SELECT can_edit_reconciliation FROM users WHERE id = ?', (self.id,)).fetchone()
             conn.close()
             return user and user['can_edit_reconciliation'] == 1
+        except:
+            return False
+
+    def can_view_costs(self):
+        """Check if user can view the cost management page (read-only gate).
+        Must have can_view_costs flag OR be super admin. Editing costs still
+        requires admin role (enforced separately via @admin_required)."""
+        if self.username == 'admin':
+            return True
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_view_costs FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return bool(user and user['can_view_costs'] == 1)
         except:
             return False
 
@@ -575,6 +603,54 @@ def shipper_required(f):
             return redirect(url_for('login'))
         if not current_user.can_ship():
             return jsonify({'error': '无发货权限', 'permission': 'shipping'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def product_manager_required(f):
+    """Decorator to require product-manage permission. Super admin passes through."""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login'))
+        if not current_user.can_manage_products():
+            # If this is an API call, return JSON; otherwise return HTML 403
+            if request.path.startswith('/api/'):
+                return jsonify({'error': '无产品管理权限', 'permission': 'product_manager'}), 403
+            return render_template_string('''
+<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">
+<title>访问受限</title>
+<style>body{background:#0f0f23;color:#e0e0e0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
+.box{text-align:center;padding:60px;background:rgba(255,255,255,0.05);border-radius:24px;max-width:480px;}
+h1{color:#ef4444;margin:0 0 16px;}p{color:#9ca3af;line-height:1.6;}a{color:#a78bfa;}</style></head>
+<body><div class="box"><h1>无产品管理权限</h1><p>请联系超级管理员授予「产品管理」权限。</p>
+<a href="{{ url_for('dashboard') }}">返回首页</a></div></body></html>
+'''), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def costs_view_required(f):
+    """Decorator to require cost-view permission. Super admin passes through.
+    For API endpoints returns JSON 403; for pages returns a styled HTML 403."""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login'))
+        if not current_user.can_view_costs():
+            if request.path.startswith('/api/'):
+                return jsonify({'error': '无成本管理查看权限', 'permission': 'view_costs'}), 403
+            return render_template_string('''
+<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">
+<title>访问受限</title>
+<style>body{background:#0f0f23;color:#e0e0e0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
+.box{text-align:center;padding:60px;background:rgba(255,255,255,0.05);border-radius:24px;max-width:480px;}
+h1{color:#ef4444;margin:0 0 16px;}p{color:#9ca3af;line-height:1.6;}a{color:#a78bfa;}</style></head>
+<body><div class="box"><h1>无成本管理查看权限</h1><p>请联系超级管理员授予「成本管理 · 查看」权限。</p>
+<a href="{{ url_for('dashboard') }}">返回首页</a></div></body></html>
+'''), 403
         return f(*args, **kwargs)
     return decorated_function
 
@@ -3951,6 +4027,40 @@ def init_sites_table():
         conn.execute('ALTER TABLE sites ADD COLUMN country TEXT')
     except:
         pass  # Column already exists
+    # Add product_master_id for WooMultistore-managed sites
+    # (NULL = standalone site, otherwise points to product_masters.id)
+    try:
+        conn.execute('ALTER TABLE sites ADD COLUMN product_master_id INTEGER')
+    except:
+        pass  # Column already exists
+    conn.commit()
+    conn.close()
+
+
+def init_product_masters_table():
+    """Initialize product_masters table — stores WooCommerce master site
+    credentials used for product CRUD on multistore-managed sites. These are
+    intentionally separate from `sites` so they never appear in any order /
+    customer / analytics view (which all query `sites`)."""
+    conn = get_db_connection()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS product_masters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            url TEXT NOT NULL,
+            consumer_key TEXT NOT NULL,
+            consumer_secret TEXT NOT NULL,
+            api_status TEXT DEFAULT 'unknown',
+            last_api_error TEXT,
+            last_tested_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    try:
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_product_masters_url ON product_masters(url)')
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -4243,7 +4353,7 @@ def normalize_flavor(flavor):
     return s
 
 
-def parse_product_name(name, brands_cache=None):
+def parse_product_name(name, brands_cache=None, series_cache=None):
     """
     Parse product name to extract brand, series, puff count, and flavor.
     
@@ -4259,15 +4369,18 @@ def parse_product_name(name, brands_cache=None):
     
     # 1. Extract puff count
     # Handle optional "+" and Polish term "zaciągnięć"
-    puff_match = re.search(r'(\d+)\+?\s*(?:puffs?|zaciągnięć)', name, re.IGNORECASE)
+    # Support spaced/dotted/comma'd thousands: "50 000", "50.000", "50,000"
+    puffs_end = None  # end index of the puffs marker in `name`, used by flavor fallback below
+    puff_match = re.search(r'\b(\d{1,3}(?:[\s.,]\d{3})+|\d+)\+?\s*(?:puffs?|zaciągnięć)', name, re.IGNORECASE)
     if puff_match:
-        result['puffs'] = int(puff_match.group(1))
+        result['puffs'] = int(re.sub(r'[\s.,]', '', puff_match.group(1)))
+        puffs_end = puff_match.end()
     else:
         # Fallback: Look for "Number Disposable" pattern e.g. "9000 Disposable"
-        # Only for numbers >= 100 to avoid matching "1 Disposable"
-        disposable_match = re.search(r'(\d{3,})\s*Disposable', name, re.IGNORECASE)
-        if disposable_match:
-            result['puffs'] = int(disposable_match.group(1))
+        disposable_match = re.search(r'\b(\d{1,3}(?:[\s.,]\d{3})+|\d+)\s*Disposable', name, re.IGNORECASE)
+        if disposable_match and int(re.sub(r'[\s.,]', '', disposable_match.group(1))) >= 100:
+            result['puffs'] = int(re.sub(r'[\s.,]', '', disposable_match.group(1)))
+            puffs_end = disposable_match.end()
     
     # 2. Get brands from cache or database
     if brands_cache is None:
@@ -4290,21 +4403,45 @@ def parse_product_name(name, brands_cache=None):
                 'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
             })
     
-    # 3. Match brand (longest match first)
+    # 3. Match brand (earliest position first, then longest match)
     name_upper = name.upper()
     matched_brand = None
+    matched_pos = len(name_upper)
     matched_len = 0
-    
+
     for brand in brands_cache:
         for pattern in brand['patterns']:
-            if pattern in name_upper and len(pattern) > matched_len:
+            pos = name_upper.find(pattern)
+            if pos >= 0 and (pos < matched_pos or (pos == matched_pos and len(pattern) > matched_len)):
                 matched_brand = brand
+                matched_pos = pos
                 matched_len = len(pattern)
     
     if matched_brand:
         result['brand'] = matched_brand['name']
         result['brand_id'] = matched_brand['id']
-    
+
+    # 3b. Match series (if brand found and series_cache available)
+    if matched_brand and series_cache is None:
+        try:
+            conn2 = get_db_connection()
+            s_rows = conn2.execute('SELECT id, brand_id, name FROM series').fetchall()
+            conn2.close()
+            series_cache = [{'id': r['id'], 'brand_id': r['brand_id'], 'name': r['name']} for r in s_rows]
+        except:
+            series_cache = []
+    if matched_brand and series_cache:
+        matched_series = None
+        matched_series_len = 0
+        for s in series_cache:
+            if s['brand_id'] == matched_brand['id']:
+                if s['name'].upper() in name_upper and len(s['name']) > matched_series_len:
+                    matched_series = s
+                    matched_series_len = len(s['name'])
+        if matched_series:
+            result['series'] = matched_series['name']
+            result['series_id'] = matched_series['id']
+
     # 4. Extract flavor (usually after separator)
     flavor = None
     for sep in [' - ', ' – ', ' | ', ' / ']:
@@ -4316,7 +4453,31 @@ def parse_product_name(name, brands_cache=None):
                 if any(x in flavor.lower() for x in ['puff', 'disposable', 'vape', 'mg', 'ml']):
                     flavor = None
                 break
-    
+
+    # 4b. Fallback: if no separator-based flavor was found but we know where the
+    # puffs marker ends, treat the remaining text as a flavor candidate. Handles
+    # formats like "Merrymi Blade 30000 Puffs Aperol" where the flavor is just
+    # appended without a separator.
+    if not flavor and puffs_end is not None:
+        tail = name[puffs_end:].strip()
+        # Drop leading separators/punctuation (keep periods inside flavors like "Mr. Blue")
+        tail = re.sub(r'^[\s\-–|/,:;]+', '', tail).strip()
+        if tail:
+            # Strip standalone product-spec words (English + Polish equivalents)
+            cleaned = re.sub(
+                r'\b(disposable|vape|jednorazowy|e-?papieros|puffs?)\b',
+                ' ',
+                tail,
+                flags=re.IGNORECASE,
+            )
+            # Strip standalone unit values like "20mg", "5ml"
+            cleaned = re.sub(r'\b\d+\s*(mg|ml)\b', ' ', cleaned, flags=re.IGNORECASE)
+            # Collapse separator residue (but preserve periods)
+            cleaned = re.sub(r'[\-–|/,:;]+', ' ', cleaned)
+            cleaned = ' '.join(cleaned.split()).strip()
+            if cleaned:
+                flavor = cleaned
+
     result['flavor'] = flavor
     
     # 5. Build normalized name
@@ -4357,6 +4518,14 @@ def init_sales_board_tables():
         conn.commit()
     except:
         pass
+
+    # Add can_manage_products column — gates access to /product-manager. Site-level
+    # scoping reuses user_site_permissions (the same table that filters orders).
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_manage_products INTEGER DEFAULT 0')
+        conn.commit()
+    except:
+        pass  # Column already exists
 
     # Sales targets table - monthly targets per manager
     conn.execute('''
@@ -4567,6 +4736,13 @@ def init_partner_reconciliation_tables():
     except sqlite3.OperationalError:
         pass  # column already exists
 
+    # Add can_view_costs column — gates access to /product-costs (cost management).
+    # Default 0; super admin (username='admin') always passes regardless of flag.
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_view_costs INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     # Seed default partner: 金谷金毅（波兰）
     existing = conn.execute("SELECT id FROM partners WHERE code = 'poland_jin'").fetchone()
     if not existing:
@@ -4585,9 +4761,52 @@ def init_partner_reconciliation_tables():
     conn.close()
 
 
+def init_product_costs_tables():
+    """Initialize product costs and profit settings tables"""
+    conn = get_db_connection()
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS product_costs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            brand_id INTEGER NOT NULL,
+            series_id INTEGER,
+            puff_count INTEGER,
+            flavor TEXT,
+            country TEXT NOT NULL DEFAULT 'PL',
+            cost_price REAL NOT NULL,
+            cost_currency TEXT NOT NULL DEFAULT 'PLN',
+            effective_date TEXT NOT NULL DEFAULT '2024-01-01',
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (brand_id) REFERENCES brands(id),
+            FOREIGN KEY (series_id) REFERENCES series(id)
+        )
+    ''')
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sales_board_profit_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year_month TEXT NOT NULL UNIQUE,
+            profit_mode TEXT NOT NULL DEFAULT 'percentage',
+            profit_percentage REAL NOT NULL DEFAULT 50.0,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    conn.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_product_costs_match
+        ON product_costs (brand_id, COALESCE(series_id, 0), COALESCE(puff_count, 0), COALESCE(flavor, ''), country)
+    ''')
+
+    conn.commit()
+    conn.close()
+
+
 # Initialize tables on startup
 with app.app_context():
     init_sites_table()
+    init_product_masters_table()
     init_sync_logs_table()
     init_settings_table()
     init_users_table()
@@ -4598,6 +4817,7 @@ with app.app_context():
     init_sales_board_tables()
     init_sales_groups_tables()
     init_partner_reconciliation_tables()
+    init_product_costs_tables()
 
 @app.route('/settings')
 @login_required
@@ -4606,23 +4826,48 @@ def settings():
     """Settings page for site management - Admin only"""
     conn = get_db_connection()
     sites = conn.execute('SELECT * FROM sites').fetchall()
-    
+
     # Get exchange rates
     exchange_rates = conn.execute('''
         SELECT id, year_month, currency, rate_to_cny, updated_at
         FROM exchange_rates
         ORDER BY year_month DESC, currency
     ''').fetchall()
-    
+
     # Get distinct currencies from orders
     currencies = conn.execute('SELECT DISTINCT currency FROM orders WHERE currency IS NOT NULL').fetchall()
     currency_list = [c['currency'] for c in currencies if c['currency']]
-    
+
+    # Get product masters (for the multistore dropdown + management section)
+    pm_rows = conn.execute('''
+        SELECT id, label, url, consumer_key, api_status, last_api_error,
+               last_tested_at, created_at, updated_at
+        FROM product_masters ORDER BY label
+    ''').fetchall()
+    # Build a quick id→label/url map for chip display on each site row
+    product_masters_list = []
+    masters_lookup = {}
+    for r in pm_rows:
+        ref_count = conn.execute(
+            'SELECT COUNT(*) FROM sites WHERE product_master_id = ?', (r['id'],)
+        ).fetchone()[0]
+        d = dict(r)
+        d['ref_count'] = ref_count
+        d['consumer_key_short'] = (d['consumer_key'] or '')[:10] + '...' if d['consumer_key'] else ''
+        product_masters_list.append(d)
+        masters_lookup[r['id']] = {
+            'label': r['label'],
+            'url': r['url'],
+            'host': r['url'].replace('https://www.', '').replace('https://', '').replace('http://', '')
+        }
+
     conn.close()
-    return render_template('settings.html', 
-                          sites=sites, 
+    return render_template('settings.html',
+                          sites=sites,
                           exchange_rates=exchange_rates,
-                          currencies=currency_list)
+                          currencies=currency_list,
+                          product_masters=product_masters_list,
+                          masters_lookup=masters_lookup)
 
 
 @app.route('/api/exchange-rates', methods=['GET', 'POST'])
@@ -4750,6 +4995,1128 @@ def import_sites_from_script():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ============================================================================
+# Product Masters (WooMultistore master sites for product CRUD)
+# ============================================================================
+
+def get_product_api_endpoint(conn, site_row):
+    """Resolve the (url, consumer_key, consumer_secret) tuple to use for product
+    CRUD on a given site row. For WooMultistore-managed sites this routes to
+    the configured master; standalone sites route to themselves.
+
+    Always pass a fresh `conn` — closes only the caller's connection."""
+    master_id = site_row['product_master_id'] if 'product_master_id' in site_row.keys() else None
+    if master_id:
+        master = conn.execute(
+            'SELECT url, consumer_key, consumer_secret FROM product_masters WHERE id = ?',
+            (master_id,)
+        ).fetchone()
+        if master:
+            return (master['url'], master['consumer_key'], master['consumer_secret'])
+    return (site_row['url'], site_row['consumer_key'], site_row['consumer_secret'])
+
+
+@app.route('/api/product-masters', methods=['GET'])
+@login_required
+@admin_required
+def list_product_masters():
+    """List all configured product masters (for the dropdown + management UI)."""
+    conn = get_db_connection()
+    rows = conn.execute('''
+        SELECT id, label, url, consumer_key,
+               api_status, last_api_error, last_tested_at, created_at, updated_at
+        FROM product_masters ORDER BY label
+    ''').fetchall()
+    # Annotate with reference count (how many sites use this master)
+    result = []
+    for r in rows:
+        ref_count = conn.execute(
+            'SELECT COUNT(*) FROM sites WHERE product_master_id = ?',
+            (r['id'],)
+        ).fetchone()[0]
+        d = dict(r)
+        d['ref_count'] = ref_count
+        # Mask the key in list output (only show first 10 chars)
+        d['consumer_key'] = (d['consumer_key'] or '')[:10] + '...' if d['consumer_key'] else ''
+        result.append(d)
+    conn.close()
+    return jsonify(result)
+
+
+@app.route('/api/product-masters', methods=['POST'])
+@login_required
+@admin_required
+def create_product_master():
+    """Create a new product master."""
+    data = request.get_json(silent=True) or {}
+    label = (data.get('label') or '').strip()
+    url = (data.get('url') or '').strip().rstrip('/')
+    ck = (data.get('consumer_key') or '').strip()
+    cs = (data.get('consumer_secret') or '').strip()
+
+    if not all([label, url, ck, cs]):
+        return jsonify({'error': '请填写完整：别名、URL、Consumer Key、Consumer Secret'}), 400
+    if not url.startswith(('http://', 'https://')):
+        return jsonify({'error': 'URL 必须以 http:// 或 https:// 开头'}), 400
+
+    conn = get_db_connection()
+    try:
+        cur = conn.execute('''
+            INSERT INTO product_masters (label, url, consumer_key, consumer_secret)
+            VALUES (?, ?, ?, ?)
+        ''', (label, url, ck, cs))
+        conn.commit()
+        new_id = cur.lastrowid
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': f'创建失败: {e}'}), 500
+    conn.close()
+    return jsonify({'success': True, 'id': new_id, 'label': label, 'url': url})
+
+
+@app.route('/api/product-masters/<int:master_id>', methods=['PUT'])
+@login_required
+@admin_required
+def update_product_master(master_id):
+    """Update a product master. consumer_secret is optional — empty means keep current."""
+    data = request.get_json(silent=True) or {}
+    label = (data.get('label') or '').strip()
+    url = (data.get('url') or '').strip().rstrip('/')
+    ck = (data.get('consumer_key') or '').strip()
+    cs = (data.get('consumer_secret') or '').strip()  # empty = unchanged
+
+    if not all([label, url, ck]):
+        return jsonify({'error': '请填写：别名、URL、Consumer Key'}), 400
+    if not url.startswith(('http://', 'https://')):
+        return jsonify({'error': 'URL 必须以 http:// 或 https:// 开头'}), 400
+
+    conn = get_db_connection()
+    existing = conn.execute('SELECT id FROM product_masters WHERE id = ?', (master_id,)).fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({'error': 'Master 站点不存在'}), 404
+    try:
+        if cs:
+            conn.execute('''
+                UPDATE product_masters
+                SET label = ?, url = ?, consumer_key = ?, consumer_secret = ?,
+                    updated_at = datetime('now')
+                WHERE id = ?
+            ''', (label, url, ck, cs, master_id))
+        else:
+            conn.execute('''
+                UPDATE product_masters
+                SET label = ?, url = ?, consumer_key = ?,
+                    updated_at = datetime('now')
+                WHERE id = ?
+            ''', (label, url, ck, master_id))
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': f'更新失败: {e}'}), 500
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/api/product-masters/<int:master_id>', methods=['DELETE'])
+@login_required
+@admin_required
+def delete_product_master(master_id):
+    """Delete a product master — only if no site references it."""
+    conn = get_db_connection()
+    ref_count = conn.execute(
+        'SELECT COUNT(*) FROM sites WHERE product_master_id = ?',
+        (master_id,)
+    ).fetchone()[0]
+    if ref_count > 0:
+        ref_sites = conn.execute(
+            'SELECT url FROM sites WHERE product_master_id = ? LIMIT 5',
+            (master_id,)
+        ).fetchall()
+        site_list = '、'.join(s['url'].replace('https://www.', '').replace('https://', '') for s in ref_sites)
+        conn.close()
+        return jsonify({
+            'error': f'无法删除：还有 {ref_count} 个站点引用此 master（{site_list}）。请先在那些站点的设置里取消勾选。'
+        }), 409
+    try:
+        conn.execute('DELETE FROM product_masters WHERE id = ?', (master_id,))
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': f'删除失败: {e}'}), 500
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/api/product-masters/<int:master_id>/test', methods=['POST'])
+@login_required
+@admin_required
+def test_product_master(master_id):
+    """Test the master's WC REST API connection (read + write capability check)."""
+    import requests as req
+    conn = get_db_connection()
+    m = conn.execute(
+        'SELECT id, url, consumer_key, consumer_secret FROM product_masters WHERE id = ?',
+        (master_id,)
+    ).fetchone()
+    if not m:
+        conn.close()
+        return jsonify({'error': 'Master 站点不存在'}), 404
+
+    api_url = f"{m['url']}/wp-json/wc/v3/products?per_page=1"
+    try:
+        resp = req.get(api_url, auth=(m['consumer_key'], m['consumer_secret']),
+                       timeout=15,
+                       headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+                                'Accept': 'application/json'})
+    except req.RequestException as e:
+        conn.execute('''
+            UPDATE product_masters
+            SET api_status = 'error', last_api_error = ?, last_tested_at = datetime('now')
+            WHERE id = ?
+        ''', (f'网络错误: {e}', master_id))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'error', 'message': f'连接失败: {e}'}), 200
+
+    body = resp.text or ''
+    if resp.status_code != 200:
+        msg = f'HTTP {resp.status_code}'
+        try:
+            j = resp.json()
+            msg = f"{msg}: {j.get('message', body[:200])}"
+        except Exception:
+            msg = f'{msg}: {body[:200]}'
+        conn.execute('''
+            UPDATE product_masters
+            SET api_status = 'error', last_api_error = ?, last_tested_at = datetime('now')
+            WHERE id = ?
+        ''', (msg, master_id))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'error', 'message': msg}), 200
+
+    # 200 OK — read works. Note: this doesn't verify write perm; we'll surface
+    # write errors at first edit. Keeping the test light avoids creating junk products.
+    conn.execute('''
+        UPDATE product_masters
+        SET api_status = 'ok', last_api_error = NULL, last_tested_at = datetime('now')
+        WHERE id = ?
+    ''', (master_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'ok', 'message': '连接成功（已验证读权限；写权限将在首次编辑时验证）'}), 200
+
+
+# ============================================================================
+# Product Manager — Layer 1: stock + price batch editing across sites
+# ============================================================================
+
+# Whitelist of fields editable through this UI. WC product schema has many more,
+# but we deliberately restrict to avoid accidental clobbering of unrelated fields.
+PRODUCT_EDIT_WHITELIST = {
+    'manage_stock', 'stock_quantity', 'stock_status',
+    'regular_price', 'sale_price',
+}
+
+
+def _resolve_site_for_product_edit(conn, site_id):
+    """Return (site_row, api_url, ck, cs) or raise ValueError with user-friendly message.
+    Routes multistore-managed sites to their master automatically.
+
+    Permission rule: only the site's named manager (sites.manager == users.name)
+    can edit its products. Super admin bypasses. This is stricter than
+    user_site_permissions (used elsewhere for read access) — viewers and other
+    users cannot edit even if they have read permission for the site."""
+    site = conn.execute(
+        'SELECT id, url, consumer_key, consumer_secret, product_master_id, manager FROM sites WHERE id = ?',
+        (site_id,)
+    ).fetchone()
+    if not site:
+        raise ValueError(f'站点 {site_id} 不存在')
+
+    # Site-level permission check: name must match site manager (admin bypasses)
+    if not current_user.is_admin():
+        user_name = (current_user.name or '').strip()
+        site_manager = (site['manager'] or '').strip()
+        if not user_name or not site_manager or user_name != site_manager:
+            raise ValueError(
+                f'你没有该站点（{site["url"]}）的产品管理权限，'
+                f'仅站点负责人可在此管理产品。'
+            )
+
+    api_url, ck, cs = get_product_api_endpoint(conn, site)
+    if not (api_url and ck and cs):
+        raise ValueError('站点未配置完整的 WC REST API 凭据')
+    return site, api_url, ck, cs
+
+
+def _parse_wc_response(resp):
+    """Parse a WC REST API response defensively. Returns (data, error_message).
+
+    Handles all the ways the call can go wrong without exceptions:
+      - non-2xx status: extracts WC's error message (or HTML preview if not JSON)
+      - 200 OK with HTML body: surfaces a hint about CF/cache/PHP-error
+      - empty / malformed JSON: returns None data with explanation
+
+    Either `data` is the parsed JSON (could be {} or [] for empty), or
+    `error_message` is a Chinese string ready to put in the API response.
+    Both will not be set; one will be None."""
+    body_preview = ((resp.text or '')[:300]).replace('\n', ' ')
+    looks_like_html = body_preview.lstrip().lower().startswith(('<!doctype', '<html', '<?xml'))
+
+    if resp.status_code not in (200, 201):
+        try:
+            j = resp.json()
+            msg = j.get('message') or body_preview or '(无响应内容)'
+        except Exception:
+            msg = body_preview or '(无响应内容)'
+        return None, f'WC API 错误 HTTP {resp.status_code}: {msg}'
+
+    try:
+        return resp.json(), None
+    except Exception:
+        if looks_like_html:
+            hint = (
+                f'WC API 返回了 HTML 而不是 JSON（HTTP {resp.status_code}）。'
+                f'常见原因：CloudFlare 拦截、缓存插件命中、PHP 致命错误页。'
+                f'响应开头: {body_preview}'
+            )
+        else:
+            hint = f'WC API 响应解析失败（HTTP {resp.status_code}）：{body_preview}'
+        return None, hint
+
+
+@app.route('/api/product-manager/products')
+@login_required
+@product_manager_required
+def product_manager_list():
+    """List products from a single site via WC REST API (live, no caching).
+    For multistore-managed sites, fetches from the configured master.
+
+    Query params:
+      site_id    (required) — id of a site row in `sites` table
+      search     (optional) — full-text search (WC's `?search=`)
+      status     (optional) — publish/draft/private/any (default: any)
+      page       (optional) — pagination, default 1
+      per_page   (optional) — default 50, max 100
+    """
+    import requests as req
+
+    try:
+        site_id = int(request.args.get('site_id', '0'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'site_id 必须是整数'}), 400
+    if not site_id:
+        return jsonify({'error': '请指定 site_id'}), 400
+
+    search = request.args.get('search', '').strip()
+    status = request.args.get('status', 'any').strip() or 'any'
+    try:
+        page = max(1, int(request.args.get('page', '1')))
+        per_page = min(100, max(1, int(request.args.get('per_page', '50'))))
+    except (TypeError, ValueError):
+        page = 1
+        per_page = 50
+
+    conn = get_db_connection()
+    try:
+        site, api_url, ck, cs = _resolve_site_for_product_edit(conn, site_id)
+    except ValueError as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 400
+
+    # Surface the routing decision for the UI ("写到 master.vapego.pl" hint)
+    routing_info = {
+        'site_url': site['url'],
+        'effective_url': api_url,
+        'is_routed_to_master': bool(site['product_master_id']),
+    }
+    if site['product_master_id']:
+        m = conn.execute(
+            'SELECT label FROM product_masters WHERE id = ?',
+            (site['product_master_id'],)
+        ).fetchone()
+        routing_info['master_label'] = m['label'] if m else None
+    conn.close()
+
+    params = {'page': page, 'per_page': per_page, 'status': status}
+    if search:
+        params['search'] = search
+
+    try:
+        resp = req.get(
+            f'{api_url}/wp-json/wc/v3/products',
+            auth=(ck, cs),
+            params=params,
+            timeout=60,  # WC list endpoints can be slow on big catalogs
+            headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+                     'Accept': 'application/json'},
+        )
+    except req.RequestException as e:
+        return jsonify({'error': f'连接 WC API 失败: {e}', 'routing': routing_info}), 502
+
+    products, err = _parse_wc_response(resp)
+    if err:
+        app.logger.warning(f'GET products from {api_url} failed: {err}')
+        return jsonify({'error': err, 'routing': routing_info}), 502
+    products = products or []
+    # Strip down to the fields we actually need (smaller payload, less surface area)
+    slim = []
+    for p in products:
+        slim.append({
+            'id': p.get('id'),
+            'name': p.get('name'),
+            'sku': p.get('sku', ''),
+            'type': p.get('type', 'simple'),
+            'status': p.get('status'),
+            'manage_stock': bool(p.get('manage_stock', False)),
+            'stock_quantity': p.get('stock_quantity'),
+            'stock_status': p.get('stock_status', 'instock'),
+            'regular_price': p.get('regular_price', ''),
+            'sale_price': p.get('sale_price', ''),
+            'price': p.get('price', ''),  # display-only effective price
+            'permalink': p.get('permalink', ''),
+            'image': (p.get('images') or [{}])[0].get('src', '') if p.get('images') else '',
+            'variations_count': len(p.get('variations') or []),
+        })
+
+    total = int(resp.headers.get('X-WP-Total', len(slim)))
+    total_pages = int(resp.headers.get('X-WP-TotalPages', 1))
+    return jsonify({
+        'products': slim,
+        'page': page,
+        'per_page': per_page,
+        'total': total,
+        'total_pages': total_pages,
+        'routing': routing_info,
+    })
+
+
+def _build_product_update_payload(data):
+    """Build a WC API PUT body from raw user input. Returns (payload, error_msg).
+    Filters out non-whitelisted fields and normalizes types.
+
+    Empty string values are treated as 'clear this field' (matches WC API behavior)
+    EXCEPT for stock_quantity, where empty means 'leave unchanged' (skip the field)
+    so toggling manage_stock without retyping the qty doesn't reset stock to 0."""
+    payload = {}
+
+    if 'manage_stock' in data:
+        payload['manage_stock'] = bool(data['manage_stock'])
+
+    # stock_quantity — process independently of whether manage_stock is in this
+    # payload. The frontend uses dirty-tracking and may send stock_quantity alone
+    # (manage_stock unchanged on the WC side stays as-is). Empty/None means skip.
+    if 'stock_quantity' in data:
+        v = data['stock_quantity']
+        if v != '' and v is not None:
+            try:
+                qty = int(v)
+            except (TypeError, ValueError):
+                return None, '库存数量必须是整数'
+            if qty < 0:
+                return None, '库存数量不能为负数'
+            payload['stock_quantity'] = qty
+
+    # stock_status — only set if non-empty
+    if 'stock_status' in data and data['stock_status']:
+        valid = {'instock', 'outofstock', 'onbackorder'}
+        if data['stock_status'] not in valid:
+            return None, f'无效的库存状态: {data["stock_status"]}'
+        payload['stock_status'] = data['stock_status']
+
+    # Prices — WC accepts strings. Empty string explicitly clears the field on WC.
+    # Treat None/empty as clear (= valid input), only reject actually malformed numbers.
+    for k in ('regular_price', 'sale_price'):
+        if k in data:
+            v = data[k]
+            if v is None or v == '':
+                payload[k] = ''
+                continue
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None, f'价格格式错误: {k}={v}'
+            if f < 0:
+                return None, f'价格不能为负数: {k}={v}'
+            payload[k] = str(v).strip()
+
+    # Drop empty payload — would be a no-op write
+    if not payload:
+        return None, '没有可更新的字段'
+    # Drop fields not in whitelist (defense in depth)
+    payload = {k: v for k, v in payload.items() if k in PRODUCT_EDIT_WHITELIST}
+    return payload, None
+
+
+@app.route('/api/product-manager/variations/<int:site_id>/<int:parent_id>')
+@login_required
+@product_manager_required
+def product_manager_list_variations(site_id, parent_id):
+    """List all variations of a variable product (paginated under the hood;
+    most variable products have <100 variations so we just fetch all)."""
+    import requests as req
+
+    conn = get_db_connection()
+    try:
+        site, api_url, ck, cs = _resolve_site_for_product_edit(conn, site_id)
+    except ValueError as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 400
+    conn.close()
+
+    # WC variations max 100 per page; fetch all pages until empty
+    all_variations = []
+    page = 1
+    while True:
+        try:
+            resp = req.get(
+                f'{api_url}/wp-json/wc/v3/products/{parent_id}/variations',
+                auth=(ck, cs),
+                params={'page': page, 'per_page': 100},
+                timeout=60,
+                headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+                         'Accept': 'application/json'},
+            )
+        except req.RequestException as e:
+            return jsonify({'error': f'连接 WC API 失败: {e}'}), 502
+
+        batch, err = _parse_wc_response(resp)
+        if err:
+            app.logger.warning(f'GET variations of {parent_id} from {api_url} failed: {err}')
+            return jsonify({'error': err}), 502
+        batch = batch or []
+        if not batch:
+            break
+        all_variations.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+        if page > 10:  # safety bound — 1000 variations is already absurd
+            break
+
+    slim = []
+    for v in all_variations:
+        # WC returns attributes as list of {id, name, option}
+        attr_summary = ' / '.join(
+            f"{a.get('name', '')}: {a.get('option', '')}"
+            for a in (v.get('attributes') or [])
+            if a.get('option')
+        )
+        slim.append({
+            'id': v.get('id'),
+            'parent_id': parent_id,
+            'sku': v.get('sku', ''),
+            'attributes_summary': attr_summary,
+            'manage_stock': bool(v.get('manage_stock', False)),
+            'stock_quantity': v.get('stock_quantity'),
+            'stock_status': v.get('stock_status', 'instock'),
+            'regular_price': v.get('regular_price', ''),
+            'sale_price': v.get('sale_price', ''),
+            'price': v.get('price', ''),
+            'image': (v.get('image') or {}).get('src', ''),
+        })
+    return jsonify({'variations': slim, 'parent_id': parent_id})
+
+
+@app.route('/api/product-manager/products/<int:site_id>/<int:parent_id>/variations/<int:variation_id>', methods=['PUT'])
+@login_required
+@product_manager_required
+def product_manager_update_variation(site_id, parent_id, variation_id):
+    """Update a single variation. Routes to master if applicable."""
+    import requests as req
+
+    data = request.get_json(silent=True) or {}
+    payload, err = _build_product_update_payload(data)
+    if err:
+        return jsonify({'success': False, 'error': err}), 400
+
+    conn = get_db_connection()
+    try:
+        site, api_url, ck, cs = _resolve_site_for_product_edit(conn, site_id)
+    except ValueError as e:
+        conn.close()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    conn.close()
+
+    try:
+        resp = req.put(
+            f'{api_url}/wp-json/wc/v3/products/{parent_id}/variations/{variation_id}',
+            auth=(ck, cs),
+            json=payload,
+            timeout=90,  # WooMultistore can take 30-60s to sync to child stores
+            headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+                     'Content-Type': 'application/json',
+                     'Accept': 'application/json'},
+        )
+    except req.RequestException as e:
+        return jsonify({'success': False, 'error': f'连接失败: {e}'}), 502
+
+    v, err = _parse_wc_response(resp)
+    if err:
+        app.logger.warning(f'PUT variation {parent_id}/{variation_id} on {api_url} failed: {err}')
+        return jsonify({'success': False, 'error': err}), 502
+
+    v = v or {}
+    return jsonify({
+        'success': True,
+        'variation': {
+            'id': v.get('id'),
+            'manage_stock': bool(v.get('manage_stock', False)),
+            'stock_quantity': v.get('stock_quantity'),
+            'stock_status': v.get('stock_status'),
+            'regular_price': v.get('regular_price', ''),
+            'sale_price': v.get('sale_price', ''),
+            'price': v.get('price', ''),
+        },
+    })
+
+
+@app.route('/api/product-manager/products/<int:site_id>/<int:product_id>', methods=['PUT'])
+@login_required
+@product_manager_required
+def product_manager_update(site_id, product_id):
+    """Update a single product on a specific site. Routes to master if applicable."""
+    import requests as req
+
+    data = request.get_json(silent=True) or {}
+    payload, err = _build_product_update_payload(data)
+    if err:
+        return jsonify({'success': False, 'error': err}), 400
+
+    conn = get_db_connection()
+    try:
+        site, api_url, ck, cs = _resolve_site_for_product_edit(conn, site_id)
+    except ValueError as e:
+        conn.close()
+        return jsonify({'success': False, 'error': str(e)}), 400
+
+    routing_label = None
+    if site['product_master_id']:
+        m = conn.execute(
+            'SELECT label FROM product_masters WHERE id = ?',
+            (site['product_master_id'],)
+        ).fetchone()
+        routing_label = m['label'] if m else None
+    conn.close()
+
+    try:
+        resp = req.put(
+            f'{api_url}/wp-json/wc/v3/products/{product_id}',
+            auth=(ck, cs),
+            json=payload,
+            timeout=90,  # WooMultistore can take 30-60s to sync to child stores
+            headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+                     'Content-Type': 'application/json',
+                     'Accept': 'application/json'},
+        )
+    except req.RequestException as e:
+        return jsonify({'success': False, 'error': f'连接失败: {e}'}), 502
+
+    p, err = _parse_wc_response(resp)
+    if err:
+        app.logger.warning(f'PUT product {product_id} on {api_url} failed: {err}')
+        return jsonify({'success': False, 'error': err}), 502
+
+    p = p or {}
+    return jsonify({
+        'success': True,
+        'product': {
+            'id': p.get('id'),
+            'manage_stock': bool(p.get('manage_stock', False)),
+            'stock_quantity': p.get('stock_quantity'),
+            'stock_status': p.get('stock_status'),
+            'regular_price': p.get('regular_price', ''),
+            'sale_price': p.get('sale_price', ''),
+            'price': p.get('price', ''),
+        },
+        'routing_label': routing_label,
+    })
+
+
+@app.route('/api/product-manager/bulk', methods=['POST'])
+@login_required
+@product_manager_required
+def product_manager_bulk():
+    """Bulk update products on a single site.
+
+    Request body:
+      {
+        "site_id": 123,
+        "items": [
+          { "product_id": 456, "manage_stock": false, "stock_status": "outofstock" },
+          { "product_id": 789, "regular_price": "199.00", "sale_price": "159.00" },
+          ...
+        ]
+      }
+
+    Returns per-item success/failure so partial failures don't lose state.
+    """
+    import requests as req
+
+    data = request.get_json(silent=True) or {}
+    try:
+        site_id = int(data.get('site_id', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'site_id 必须是整数'}), 400
+    items = data.get('items') or []
+    if not site_id or not isinstance(items, list) or not items:
+        return jsonify({'error': '请提供 site_id 和非空 items 列表'}), 400
+    if len(items) > 200:
+        return jsonify({'error': '单次最多处理 200 个产品，请分批'}), 400
+
+    conn = get_db_connection()
+    try:
+        site, api_url, ck, cs = _resolve_site_for_product_edit(conn, site_id)
+    except ValueError as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 400
+    conn.close()
+
+    headers = {
+        'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+
+    results = {'success': [], 'failed': []}
+    for item in items:
+        pid = item.get('product_id')
+        parent_id = item.get('parent_id')  # if present → this is a variation
+        if not pid:
+            results['failed'].append({'product_id': None, 'error': '缺少 product_id'})
+            continue
+
+        payload, err = _build_product_update_payload(item)
+        if err:
+            results['failed'].append({'product_id': pid, 'parent_id': parent_id, 'error': err})
+            continue
+
+        # Route to variation endpoint if parent_id is given, otherwise to product endpoint
+        if parent_id:
+            url = f'{api_url}/wp-json/wc/v3/products/{parent_id}/variations/{pid}'
+        else:
+            url = f'{api_url}/wp-json/wc/v3/products/{pid}'
+
+        try:
+            resp = req.put(url, auth=(ck, cs), json=payload, timeout=90, headers=headers)
+        except req.RequestException as e:
+            results['failed'].append({
+                'product_id': pid, 'parent_id': parent_id,
+                'error': f'连接失败: {e}'
+            })
+            continue
+
+        p, err = _parse_wc_response(resp)
+        if err:
+            results['failed'].append({
+                'product_id': pid, 'parent_id': parent_id,
+                'error': err,
+            })
+            continue
+        p = p or {}
+        results['success'].append({
+            'product_id': pid,
+            'parent_id': parent_id,
+            'manage_stock': bool(p.get('manage_stock', False)),
+            'stock_quantity': p.get('stock_quantity'),
+            'stock_status': p.get('stock_status'),
+            'regular_price': p.get('regular_price', ''),
+            'sale_price': p.get('sale_price', ''),
+        })
+
+    return jsonify({
+        'success_count': len(results['success']),
+        'failed_count': len(results['failed']),
+        'results': results,
+    })
+
+
+# ----------------------------------------------------------------------------
+# Layer 2: product cloning across sites
+# ----------------------------------------------------------------------------
+
+_WC_HEADERS = {
+    'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+}
+
+
+def _resolve_taxonomy_on_target(api_url, ck, cs, taxonomy, source_terms):
+    """For each source category/tag, look up the corresponding term on the
+    target site by slug. Returns (target_terms_list, warnings_list).
+
+    `taxonomy` = 'categories' | 'tags'. Source terms are WC's typical
+    [{id, name, slug}] shape. We don't auto-create missing terms — we just
+    warn so the user knows to set them manually on the target."""
+    import requests as req
+
+    target_terms = []
+    warnings = []
+    label = '分类' if taxonomy == 'categories' else '标签'
+    for src in source_terms or []:
+        slug = (src.get('slug') or '').strip()
+        name = src.get('name') or slug or '?'
+        if not slug:
+            warnings.append(f'源 {label} "{name}" 缺少 slug，已跳过')
+            continue
+        try:
+            resp = req.get(
+                f'{api_url}/wp-json/wc/v3/products/{taxonomy}',
+                auth=(ck, cs),
+                params={'slug': slug, 'per_page': 1},
+                timeout=20,
+                headers={'User-Agent': _WC_HEADERS['User-Agent'], 'Accept': 'application/json'},
+            )
+            terms, err = _parse_wc_response(resp)
+            if err or not terms:
+                warnings.append(f'目标站不存在 {label} "{name}" (slug={slug})，已跳过')
+                continue
+            target_terms.append({'id': terms[0].get('id')})
+        except Exception as e:
+            warnings.append(f'查询 {label} "{name}" 失败: {e}')
+    return target_terms, warnings
+
+
+def _clone_variations(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
+                      src_parent_id, tgt_parent_id, options):
+    """Clone all variations of a variable product. Returns dict with success/failed lists."""
+    import requests as req
+
+    # Fetch all source variations (paginated)
+    all_variations = []
+    page = 1
+    while True:
+        try:
+            resp = req.get(
+                f'{src_url}/wp-json/wc/v3/products/{src_parent_id}/variations',
+                auth=(src_ck, src_cs),
+                params={'page': page, 'per_page': 100},
+                timeout=60,
+                headers={'User-Agent': _WC_HEADERS['User-Agent'], 'Accept': 'application/json'},
+            )
+            batch, err = _parse_wc_response(resp)
+            if err or not batch:
+                break
+            all_variations.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+            if page > 10:
+                break
+        except Exception:
+            break
+
+    success = []
+    failed = []
+    for v in all_variations:
+        payload = {
+            'regular_price': v.get('regular_price', ''),
+            'sale_price': v.get('sale_price', ''),
+            'manage_stock': bool(v.get('manage_stock', False)),
+            'stock_status': v.get('stock_status', 'instock'),
+            # Map attributes by name (WC will match against parent's local attrs)
+            'attributes': [
+                {'name': a.get('name'), 'option': a.get('option')}
+                for a in (v.get('attributes') or []) if a.get('name')
+            ],
+        }
+        if v.get('manage_stock') and v.get('stock_quantity') is not None:
+            payload['stock_quantity'] = v['stock_quantity']
+        if v.get('weight'):
+            payload['weight'] = v['weight']
+        if v.get('dimensions'):
+            payload['dimensions'] = v['dimensions']
+        sku = (v.get('sku') or '').strip()
+        if sku:
+            payload['sku'] = sku
+        if options.get('include_images') and v.get('image') and v['image'].get('src'):
+            payload['image'] = {'src': v['image'].get('src')}
+
+        try:
+            resp = req.post(
+                f'{tgt_url}/wp-json/wc/v3/products/{tgt_parent_id}/variations',
+                auth=(tgt_ck, tgt_cs), json=payload, timeout=60, headers=_WC_HEADERS,
+            )
+            new_v, err = _parse_wc_response(resp)
+            if err:
+                # SKU collision? Retry without sku as a soft fallback
+                if sku and 'sku' in err.lower():
+                    retry_payload = dict(payload)
+                    retry_payload.pop('sku', None)
+                    try:
+                        resp2 = req.post(
+                            f'{tgt_url}/wp-json/wc/v3/products/{tgt_parent_id}/variations',
+                            auth=(tgt_ck, tgt_cs), json=retry_payload, timeout=60, headers=_WC_HEADERS,
+                        )
+                        new_v, err2 = _parse_wc_response(resp2)
+                        if err2:
+                            failed.append({'src_id': v.get('id'), 'sku': sku, 'error': err2})
+                            continue
+                        success.append({'src_id': v.get('id'), 'tgt_id': new_v.get('id'), 'note': 'SKU 冲突，已跳过 SKU'})
+                        continue
+                    except Exception as e:
+                        failed.append({'src_id': v.get('id'), 'sku': sku, 'error': str(e)})
+                        continue
+                failed.append({'src_id': v.get('id'), 'sku': sku, 'error': err})
+                continue
+            success.append({'src_id': v.get('id'), 'tgt_id': new_v.get('id')})
+        except Exception as e:
+            failed.append({'src_id': v.get('id'), 'sku': sku, 'error': str(e)})
+
+    return {'success': success, 'failed': failed, 'total_source': len(all_variations)}
+
+
+def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
+                       source_product_id, options):
+    """Clone a single product. Returns dict with new_id + warnings, or error key."""
+    import requests as req
+
+    # 1. Fetch full source product
+    try:
+        resp = req.get(
+            f'{src_url}/wp-json/wc/v3/products/{source_product_id}',
+            auth=(src_ck, src_cs), timeout=60,
+            headers={'User-Agent': _WC_HEADERS['User-Agent'], 'Accept': 'application/json'},
+        )
+        src, err = _parse_wc_response(resp)
+        if err:
+            return {'error': f'读取源产品失败: {err}'}
+    except Exception as e:
+        return {'error': f'读取源产品失败: {e}'}
+
+    if not src:
+        return {'error': '源产品不存在'}
+
+    warnings = []
+
+    # 2. Build base payload
+    payload = {
+        'name': src.get('name', ''),
+        'type': src.get('type', 'simple'),
+        'status': options.get('status_on_target', 'draft'),
+        'description': src.get('description', ''),
+        'short_description': src.get('short_description', ''),
+        'regular_price': src.get('regular_price', ''),
+        'sale_price': src.get('sale_price', ''),
+        'manage_stock': bool(src.get('manage_stock', False)),
+        'stock_status': src.get('stock_status', 'instock'),
+        'tax_status': src.get('tax_status', 'taxable'),
+        'tax_class': src.get('tax_class', ''),
+        'featured': bool(src.get('featured', False)),
+        'catalog_visibility': src.get('catalog_visibility', 'visible'),
+        'weight': src.get('weight', ''),
+        'dimensions': src.get('dimensions') or {},
+    }
+    if src.get('manage_stock') and src.get('stock_quantity') is not None:
+        payload['stock_quantity'] = src['stock_quantity']
+
+    # SKU
+    src_sku = (src.get('sku') or '').strip()
+    if src_sku:
+        payload['sku'] = src_sku
+
+    # Images — WC fetches these from URL on POST
+    if options.get('include_images'):
+        imgs = src.get('images') or []
+        payload['images'] = [
+            {'src': i.get('src'), 'name': i.get('name', ''), 'alt': i.get('alt', '')}
+            for i in imgs if i.get('src')
+        ]
+
+    # Categories / tags — resolved by slug on target
+    target_cats, cat_warnings = _resolve_taxonomy_on_target(
+        tgt_url, tgt_ck, tgt_cs, 'categories', src.get('categories') or [])
+    if target_cats:
+        payload['categories'] = target_cats
+    warnings.extend(cat_warnings)
+
+    target_tags, tag_warnings = _resolve_taxonomy_on_target(
+        tgt_url, tgt_ck, tgt_cs, 'tags', src.get('tags') or [])
+    if target_tags:
+        payload['tags'] = target_tags
+    warnings.extend(tag_warnings)
+
+    # Attributes (variation axes for variable; spec attrs for simple)
+    attrs_in = src.get('attributes') or []
+    attrs_out = []
+    for a in attrs_in:
+        attrs_out.append({
+            'id': 0,  # local attribute on target (avoids global pa_xxx ID mismatch)
+            'name': a.get('name'),
+            'position': a.get('position', 0),
+            'visible': a.get('visible', True),
+            'variation': a.get('variation', src.get('type') == 'variable'),
+            'options': a.get('options') or [],
+        })
+    if attrs_out:
+        payload['attributes'] = attrs_out
+
+    # 3. POST to target — handle SKU collision with -COPY suffix
+    def _post_create(p):
+        return req.post(
+            f'{tgt_url}/wp-json/wc/v3/products',
+            auth=(tgt_ck, tgt_cs), json=p, timeout=90, headers=_WC_HEADERS,
+        )
+
+    try:
+        resp = _post_create(payload)
+        new_data, err = _parse_wc_response(resp)
+    except Exception as e:
+        return {'error': f'创建目标产品失败: {e}'}
+
+    if err and src_sku and ('sku' in err.lower() or 'unique' in err.lower()):
+        # Retry with a -COPY suffix
+        retry_payload = dict(payload)
+        retry_payload['sku'] = src_sku + '-COPY'
+        try:
+            resp = _post_create(retry_payload)
+            new_data, err = _parse_wc_response(resp)
+            if not err:
+                warnings.append(f'SKU "{src_sku}" 在目标站冲突，已改用 "{retry_payload["sku"]}"')
+                payload = retry_payload
+        except Exception as e:
+            return {'error': f'重试创建失败: {e}'}
+
+    if err:
+        return {'error': f'创建目标产品失败: {err}'}
+    if not new_data or not new_data.get('id'):
+        return {'error': '创建目标产品成功但未返回新 ID'}
+
+    new_id = new_data['id']
+
+    # 4. Variations (if variable + option enabled)
+    if options.get('include_variations') and src.get('type') == 'variable':
+        var_results = _clone_variations(
+            src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
+            source_product_id, new_id, options,
+        )
+        if var_results['failed']:
+            warnings.append(f'变体克隆：{len(var_results["success"])} 成功 / {len(var_results["failed"])} 失败')
+        else:
+            warnings.append(f'变体克隆：{len(var_results["success"])} 个成功')
+
+    return {
+        'new_id': new_id,
+        'name': new_data.get('name'),
+        'sku': new_data.get('sku', ''),
+        'permalink': new_data.get('permalink', ''),
+        'warnings': warnings,
+    }
+
+
+@app.route('/api/product-manager/clone', methods=['POST'])
+@login_required
+@product_manager_required
+def product_manager_clone():
+    """Clone products from source site to target site.
+
+    Request body:
+      {
+        "source_site_id": 16,
+        "target_site_id": 1,
+        "product_ids": [9946, 9950, ...],
+        "include_variations": true,
+        "include_images": true,
+        "status_on_target": "draft"
+      }
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        source_site_id = int(data.get('source_site_id', 0))
+        target_site_id = int(data.get('target_site_id', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'site_id 必须是整数'}), 400
+
+    product_ids = data.get('product_ids') or []
+    if not (source_site_id and target_site_id and isinstance(product_ids, list) and product_ids):
+        return jsonify({'error': '请提供 source_site_id / target_site_id / product_ids'}), 400
+    if source_site_id == target_site_id:
+        return jsonify({'error': '源站点和目标站点不能相同'}), 400
+    if len(product_ids) > 50:
+        return jsonify({'error': '单次最多克隆 50 个产品，请分批操作'}), 400
+
+    options = {
+        'include_variations': bool(data.get('include_variations', True)),
+        'include_images': bool(data.get('include_images', True)),
+        'status_on_target': data.get('status_on_target') or 'draft',
+    }
+    if options['status_on_target'] not in ('draft', 'pending', 'private', 'publish'):
+        options['status_on_target'] = 'draft'
+
+    conn = get_db_connection()
+    try:
+        src_site, src_url, src_ck, src_cs = _resolve_site_for_product_edit(conn, source_site_id)
+        tgt_site, tgt_url, tgt_ck, tgt_cs = _resolve_site_for_product_edit(conn, target_site_id)
+    except ValueError as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 400
+    conn.close()
+
+    results = {'success': [], 'failed': []}
+    for pid in product_ids:
+        try:
+            r = _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs, pid, options)
+        except Exception as e:
+            results['failed'].append({'product_id': pid, 'error': f'未知错误: {e}'})
+            continue
+        if r.get('error'):
+            results['failed'].append({'product_id': pid, 'error': r['error']})
+        else:
+            results['success'].append({
+                'source_id': pid,
+                'target_id': r['new_id'],
+                'name': r.get('name'),
+                'sku': r.get('sku'),
+                'permalink': r.get('permalink'),
+                'warnings': r.get('warnings') or [],
+            })
+
+    return jsonify({
+        'success_count': len(results['success']),
+        'failed_count': len(results['failed']),
+        'results': results,
+        'target_url': tgt_url,
+    })
+
+
+@app.route('/product-manager')
+@login_required
+@product_manager_required
+def product_manager():
+    """Product manager page — Layer 1 of multi-site product management.
+    Site list is scoped to user's permissions: super admin sees all; everyone
+    else sees only sites where they are the named manager (sites.manager ==
+    users.name). This matches the edit-permission rule enforced by
+    _resolve_site_for_product_edit."""
+    conn = get_db_connection()
+    sites = conn.execute('''
+        SELECT id, url, manager, country, product_master_id
+        FROM sites
+        WHERE consumer_key IS NOT NULL AND consumer_key != ''
+          AND consumer_secret IS NOT NULL AND consumer_secret != ''
+        ORDER BY country, manager, url
+    ''').fetchall()
+
+    # Non-admin: restrict to sites where the user is the named manager.
+    if not current_user.is_admin():
+        user_name = (current_user.name or '').strip()
+        sites = [s for s in sites if user_name and (s['manager'] or '').strip() == user_name]
+
+    # Build display info, including which master (if any) drives writes for each site
+    masters_lookup = {}
+    pm_rows = conn.execute('SELECT id, label, url FROM product_masters').fetchall()
+    for r in pm_rows:
+        masters_lookup[r['id']] = {
+            'label': r['label'],
+            'host': r['url'].replace('https://www.', '').replace('https://', '').replace('http://', ''),
+        }
+    conn.close()
+    return render_template('product_manager.html', sites=sites, masters_lookup=masters_lookup)
+
+
 @app.route('/api/sites', methods=['POST'])
 @login_required
 def add_site():
@@ -4761,18 +6128,23 @@ def add_site():
     manager = data.get('manager', '')
     mask_id = data.get('mask_id', '')
     country = data.get('country', '')
-    
+    # product_master_id: optional. Empty string / None / 0 / "" → NULL (standalone site)
+    raw_pm = data.get('product_master_id')
+    product_master_id = int(raw_pm) if raw_pm not in (None, '', 0, '0') else None
+
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
-        
+
     # Remove trailing slash from URL
     if url.endswith('/'):
         url = url[:-1]
-        
+
     conn = get_db_connection()
     try:
-        conn.execute('INSERT INTO sites (url, consumer_key, consumer_secret, manager, mask_id, country) VALUES (?, ?, ?, ?, ?, ?)',
-                     (url, ck, cs, manager, mask_id, country))
+        conn.execute('''INSERT INTO sites
+            (url, consumer_key, consumer_secret, manager, mask_id, country, product_master_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                     (url, ck, cs, manager, mask_id, country, product_master_id))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
@@ -4793,18 +6165,24 @@ def update_site(site_id):
     manager = data.get('manager', '')
     mask_id = data.get('mask_id', '')
     country = data.get('country', '')
-    
+    # product_master_id: optional. Empty string / None / 0 / "" → NULL (un-link / standalone)
+    raw_pm = data.get('product_master_id')
+    product_master_id = int(raw_pm) if raw_pm not in (None, '', 0, '0') else None
+
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
-        
+
     # Remove trailing slash from URL
     if url.endswith('/'):
         url = url[:-1]
-        
+
     conn = get_db_connection()
     try:
-        conn.execute('UPDATE sites SET url = ?, consumer_key = ?, consumer_secret = ?, manager = ?, mask_id = ?, country = ? WHERE id = ?',
-                     (url, ck, cs, manager, mask_id, country, site_id))
+        conn.execute('''UPDATE sites
+            SET url = ?, consumer_key = ?, consumer_secret = ?,
+                manager = ?, mask_id = ?, country = ?, product_master_id = ?
+            WHERE id = ?''',
+                     (url, ck, cs, manager, mask_id, country, product_master_id, site_id))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
@@ -6444,18 +7822,25 @@ def get_users():
     """Get all users"""
     conn = get_db_connection()
     try:
-        users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, created_at FROM users').fetchall()
+        users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, created_at FROM users').fetchall()
     except sqlite3.OperationalError:
+        # Older schema fallbacks. Provide missing columns as 0.
         try:
-            users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, 0 as can_edit_reconciliation, created_at FROM users').fetchall()
+            users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
         except sqlite3.OperationalError:
             try:
-                users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, created_at FROM users').fetchall()
+                users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
             except sqlite3.OperationalError:
                 try:
-                    users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, created_at FROM users').fetchall()
+                    users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
                 except sqlite3.OperationalError:
-                    users = conn.execute('SELECT id, username, name, role, can_ship, 0 as can_view_report, 0 as can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, created_at FROM users').fetchall()
+                    try:
+                        users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
+                    except sqlite3.OperationalError:
+                        try:
+                            users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
+                        except sqlite3.OperationalError:
+                            users = conn.execute('SELECT id, username, name, role, can_ship, 0 as can_view_report, 0 as can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
     conn.close()
     is_super_admin = (current_user.username == 'admin')
     result = []
@@ -6515,6 +7900,7 @@ def update_user(user_id):
     can_ship = data.get('can_ship', 0)
     can_view_report = data.get('can_view_report', 0)
     can_view_sales_board = data.get('can_view_sales_board', 0)
+    can_manage_products = 1 if data.get('can_manage_products') else 0
 
     if role not in ['admin', 'user', 'viewer']:
         role = 'user'
@@ -6546,28 +7932,31 @@ def update_user(user_id):
         if target_is_super_admin and role != 'admin':
             return jsonify({'error': '超级管理员角色不可更改'}), 403
 
-        # Only the 'admin' superuser can grant/revoke can_manage_users, can_view_reconciliation, can_edit_reconciliation
+        # Only the 'admin' superuser can grant/revoke can_manage_users,
+        # can_view_reconciliation, can_edit_reconciliation, can_view_costs
         if is_super_admin:
             can_manage_users_val = 1 if data.get('can_manage_users') else 0
             can_view_reconciliation_val = 1 if data.get('can_view_reconciliation') else 0
             can_edit_reconciliation_val = 1 if data.get('can_edit_reconciliation') else 0
+            can_view_costs_val = 1 if data.get('can_view_costs') else 0
             # Edit permission requires view permission (can't edit what you can't see)
             if can_edit_reconciliation_val and not can_view_reconciliation_val:
                 can_view_reconciliation_val = 1
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, user_id))
         else:
             # Non-superadmin: cannot change can_manage_users, can_view_sales_board, or set role to admin
+            # but CAN grant can_manage_products (a regular operator-level permission)
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_manage_products=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_manage_products, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_manage_products=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_manage_products, user_id))
         conn.commit()
         return jsonify({'success': True})
     finally:
@@ -7595,49 +8984,6 @@ def api_reconciliation_overview():
 
 # ============== PRODUCT ANALYSIS ==============
 
-@app.route('/api/products/mapping', methods=['POST'])
-@login_required
-@editor_required
-def save_product_mapping():
-    """Save manual product mapping"""
-    try:
-        data = request.json
-        raw_name = data.get('raw_name')
-        brand_name = data.get('brand_name')
-        puff_count = data.get('puff_count')
-        flavor = data.get('flavor')
-        
-        if not raw_name:
-            return jsonify({'success': False, 'error': 'Product name is required'})
-            
-        conn = get_db_connection()
-        
-        # Resolve brand_id if brand provided
-        brand_id = None
-        if brand_name:
-            brand_row = conn.execute('SELECT id FROM brands WHERE name = ?', (brand_name,)).fetchone()
-            if brand_row:
-                brand_id = brand_row['id']
-        
-        # Insert or update mapping
-        conn.execute('''
-            INSERT INTO product_mappings (raw_name, brand_id, puff_count, flavor, is_manual, source)
-            VALUES (?, ?, ?, ?, 1, 'manual')
-            ON CONFLICT(raw_name, source) DO UPDATE SET
-            brand_id = excluded.brand_id,
-            puff_count = excluded.puff_count,
-            flavor = excluded.flavor,
-            updated_at = CURRENT_TIMESTAMP
-        ''', (raw_name, brand_id, puff_count, flavor))
-        
-        conn.commit()
-        conn.close()
-        
-        return jsonify({'success': True})
-        
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
 @app.route('/products')
 @login_required
 def products():
@@ -7773,10 +9119,15 @@ def products():
             'aliases': aliases,
             'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
         })
-    
+
+    # Load series cache
+    _series_rows = conn.execute('SELECT id, brand_id, name FROM series').fetchall()
+    series_cache = [{'id': r['id'], 'brand_id': r['brand_id'], 'name': r['name']} for r in _series_rows]
+    series_names_map = {r['id']: r['name'] for r in _series_rows}
+
     # Load manual product mappings
     mappings_rows = conn.execute('''
-        SELECT pm.raw_name, pm.puff_count, pm.flavor, b.name as brand_name
+        SELECT pm.raw_name, pm.puff_count, pm.flavor, pm.series_id, b.name as brand_name
         FROM product_mappings pm
         LEFT JOIN brands b ON pm.brand_id = b.id
         WHERE pm.is_manual = 1
@@ -7786,9 +9137,10 @@ def products():
         manual_mappings[m['raw_name']] = {
             'brand': m['brand_name'],
             'puffs': m['puff_count'],
-            'flavor': m['flavor']
+            'flavor': m['flavor'],
+            'series': series_names_map.get(m['series_id'], '')
         }
-    
+
     # Aggregate product data
     product_stats = {}
     brand_stats = {}
@@ -7835,27 +9187,25 @@ def products():
             
             # Check for manual mapping first (using full name with flavor)
             full_name, _, meta_puffs = get_full_product_name(item)
+            series = ''
             if full_name in manual_mappings:
                 mapping = manual_mappings[full_name]
                 brand = mapping.get('brand') or 'Unknown'
-                # Use meta_puffs if mapping doesn't have puffs
                 puffs = mapping.get('puffs') or meta_puffs
                 flavor = mapping.get('flavor') or meta_flavor or ''
+                series = mapping.get('series') or ''
             elif product_name in manual_mappings:
                 mapping = manual_mappings[product_name]
                 brand = mapping.get('brand') or 'Unknown'
-                # Use meta_puffs if mapping doesn't have puffs
                 puffs = mapping.get('puffs') or meta_puffs
-                # Use meta_flavor if mapping doesn't have flavor
                 flavor = mapping.get('flavor') or meta_flavor or ''
+                series = mapping.get('series') or ''
             else:
-                # Parse product name automatically
-                parsed = parse_product_name(product_name, brands_cache)
+                parsed = parse_product_name(product_name, brands_cache, series_cache)
                 brand = parsed.get('brand') or 'Unknown'
-                # Prefer meta_puffs from WooCommerce variation data, then parsed puffs
                 puffs = meta_puffs or parsed.get('puffs')
-                # Prefer meta_flavor from WooCommerce variation data
                 flavor = meta_flavor or parsed.get('flavor') or ''
+                series = parsed.get('series') or ''
             
             # Apply brand filter
             if brand_filter and brand != brand_filter:
@@ -7874,13 +9224,14 @@ def products():
                 flavor_display = ''
             else:
                 flavor_display = flavor_normalized  # Use normalized for display too
-            product_key = f"{brand}|{puffs or 'N/A'}|{flavor_normalized}"
+            product_key = f"{brand}|{series}|{puffs or 'N/A'}|{flavor_normalized}"
             if product_key not in product_stats:
                 product_stats[product_key] = {
-                    'name': product_name,  # Store one sample name for mapping
+                    'name': product_name,
                     'brand': brand,
+                    'series': series,
                     'puffs': puffs,
-                    'flavor': flavor_display,  # Store normalized flavor for consistent display
+                    'flavor': flavor_display,
                     'quantity': 0,
                     'revenue_by_currency': {},
                     'gross_revenue_by_currency': {},
@@ -7930,7 +9281,8 @@ def products():
                 unknown_products_map[product_name]['count'] += 1
     
     # Sort products by quantity (top sellers)
-    top_products = sorted(product_stats.values(), key=lambda x: x['quantity'], reverse=True)[:50]
+    top_n = int(request.args.get('top_n', 50))
+    top_products = sorted(product_stats.values(), key=lambda x: x['quantity'], reverse=True)[:top_n]
     
     # Sort brands by quantity
     brand_ranking = sorted(
@@ -8264,7 +9616,8 @@ def products():
                               'puffs': puff_filter,
                               'quick_date': quick_date,
                               'manager': manager_filter,
-                              'country': country_filter
+                              'country': country_filter,
+                              'top_n': top_n
                           },
                           all_managers=all_managers,
                           all_countries=all_countries)
@@ -8309,6 +9662,17 @@ def add_brand():
         return jsonify({'error': 'Brand name is required'}), 400
     
     conn = get_db_connection()
+    existing = conn.execute('SELECT id, aliases FROM brands WHERE name = ?', (name,)).fetchone()
+    if existing:
+        existing_aliases = json.loads(existing['aliases']) if existing['aliases'] else []
+        for a in aliases:
+            if a and a not in existing_aliases:
+                existing_aliases.append(a)
+        conn.execute('UPDATE brands SET aliases = ? WHERE id = ?',
+                    (json.dumps(existing_aliases) if existing_aliases else None, existing['id']))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'id': existing['id'], 'merged': True})
     try:
         conn.execute('INSERT INTO brands (name, aliases) VALUES (?, ?)',
                     (name, json.dumps(aliases) if aliases else None))
@@ -8354,6 +9718,44 @@ def delete_brand(brand_id):
     conn.close()
     
     return jsonify({'success': True})
+
+
+@app.route('/api/series')
+@login_required
+def get_series():
+    """Get series, optionally filtered by brand_id"""
+    brand_id = request.args.get('brand_id')
+    conn = get_db_connection()
+    try:
+        if brand_id:
+            rows = conn.execute('SELECT id, brand_id, name FROM series WHERE brand_id = ? ORDER BY name', (brand_id,)).fetchall()
+        else:
+            rows = conn.execute('SELECT id, brand_id, name FROM series ORDER BY brand_id, name').fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route('/api/series', methods=['POST'])
+@login_required
+@admin_required
+def add_series():
+    data = request.json
+    name = (data.get('name') or '').strip()
+    brand_id = data.get('brand_id')
+    if not name or not brand_id:
+        return jsonify({'error': 'name and brand_id are required'}), 400
+    conn = get_db_connection()
+    try:
+        existing = conn.execute('SELECT id FROM series WHERE brand_id = ? AND name = ?', (brand_id, name)).fetchone()
+        if existing:
+            return jsonify({'success': True, 'id': existing['id'], 'existed': True})
+        conn.execute('INSERT INTO series (brand_id, name) VALUES (?, ?)', (brand_id, name))
+        conn.commit()
+        new_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        return jsonify({'success': True, 'id': new_id})
+    finally:
+        conn.close()
 
 
 @app.route('/api/products/stats')
@@ -8569,6 +9971,7 @@ def product_mapping():
                 'raw_name': mapping['raw_name'],
                 'brand_id': mapping['brand_id'],
                 'brand_name': mapping['brand_name'],
+                'series_id': mapping['series_id'],
                 'puff_count': mapping['puff_count'],
                 'flavor': mapping['flavor'],
                 'is_manual': mapping['is_manual']
@@ -8577,17 +9980,22 @@ def product_mapping():
             return jsonify({'exists': False})
     
     else:  # POST - Save mapping
+        if not current_user.can_edit():
+            conn.close()
+            return jsonify({'success': False, 'error': '只读用户无法修改数据', 'readonly': True}), 403
+
         data = request.get_json()
         raw_name = data.get('raw_name', '').strip()
-        
+
         if not raw_name:
             conn.close()
             return jsonify({'success': False, 'error': 'Product name is required'})
         
         brand_id = data.get('brand_id')
+        series_id = data.get('series_id')
         puff_count = data.get('puff_count')
         flavor = data.get('flavor')
-        
+
         # Convert to proper types
         if brand_id and str(brand_id).strip():
             try:
@@ -8596,7 +10004,15 @@ def product_mapping():
                 brand_id = None
         else:
             brand_id = None
-            
+
+        if series_id and str(series_id).strip():
+            try:
+                series_id = int(series_id)
+            except ValueError:
+                series_id = None
+        else:
+            series_id = None
+
         if puff_count and str(puff_count).strip():
             try:
                 puff_count = int(puff_count)
@@ -8604,32 +10020,32 @@ def product_mapping():
                 puff_count = None
         else:
             puff_count = None
-            
+
         if flavor:
             flavor = str(flavor).strip()
         else:
             flavor = ''
-        
+
         try:
             # Check if mapping exists
             existing = conn.execute(
-                'SELECT id FROM product_mappings WHERE raw_name = ?', 
+                'SELECT id FROM product_mappings WHERE raw_name = ?',
                 (raw_name,)
             ).fetchone()
-            
+
             if existing:
                 # Update existing
                 conn.execute('''
-                    UPDATE product_mappings 
-                    SET brand_id = ?, puff_count = ?, flavor = ?, is_manual = 1
+                    UPDATE product_mappings
+                    SET brand_id = ?, series_id = ?, puff_count = ?, flavor = ?, is_manual = 1
                     WHERE raw_name = ?
-                ''', (brand_id, puff_count, flavor, raw_name))
+                ''', (brand_id, series_id, puff_count, flavor, raw_name))
             else:
                 # Insert new
                 conn.execute('''
-                    INSERT INTO product_mappings (raw_name, brand_id, puff_count, flavor, is_manual)
-                    VALUES (?, ?, ?, ?, 1)
-                ''', (raw_name, brand_id, puff_count, flavor))
+                    INSERT INTO product_mappings (raw_name, brand_id, series_id, puff_count, flavor, is_manual)
+                    VALUES (?, ?, ?, ?, ?, 1)
+                ''', (raw_name, brand_id, series_id, puff_count, flavor))
             
             conn.commit()
             conn.close()
@@ -8745,9 +10161,14 @@ def get_product_samples():
                 # Check if matches the filter criteria
                 brand_match = not brand_filter or item_brand.upper() == brand_filter.upper()
                 puffs_match = not puffs_filter or item_puffs == puffs_filter
-                # For flavor, use case-insensitive contains match
-                flavor_match = not flavor_filter or (item_flavor and flavor_filter.upper() in item_flavor.upper())
-                
+                # Flavor matching: if filter provided, do case-insensitive contains;
+                # if filter is empty, only match items that ALSO have no recognized flavor
+                # (otherwise an "unknown flavor" bucket would pull in every flavor variant)
+                if flavor_filter:
+                    flavor_match = bool(item_flavor) and flavor_filter.upper() in item_flavor.upper()
+                else:
+                    flavor_match = not item_flavor
+
                 matched = brand_match and puffs_match and flavor_match
             else:
                 # Fallback to exact name match
@@ -8775,11 +10196,24 @@ def get_product_samples():
                 break  # One match per order is enough
     
     sources_list = [{'site': k, 'manager': v} for k, v in sources_map.items()]
-    
+
+    parsed = parse_product_name(product_name, brands_cache)
+    parsed_brand = parsed.get('brand') or ''
+    parsed_puffs = parsed.get('puffs') or ''
+    parsed_flavor = parsed.get('flavor') or ''
+    if product_name in manual_mappings:
+        m = manual_mappings[product_name]
+        if m.get('brand'): parsed_brand = m['brand']
+        if m.get('puffs'): parsed_puffs = m['puffs']
+        if m.get('flavor'): parsed_flavor = m['flavor']
+
     return jsonify({
         'sources': sources_list,
         'orders': results,
-        'total_found': len(results)
+        'total_found': len(results),
+        'parsed_brand': parsed_brand,
+        'parsed_puffs': parsed_puffs,
+        'parsed_flavor': parsed_flavor
     })
 
 
@@ -11174,6 +12608,41 @@ def _compute_sales_board_data(selected_month):
             'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
         })
 
+    # Load profit settings for this month
+    profit_row = conn.execute(
+        'SELECT profit_mode, profit_percentage, country_percentages FROM sales_board_profit_settings WHERE year_month = ?',
+        (selected_month,)
+    ).fetchone()
+    profit_mode = profit_row['profit_mode'] if profit_row else 'percentage'
+    profit_percentage = profit_row['profit_percentage'] if profit_row else 50.0
+    try:
+        country_percentages = json.loads(profit_row['country_percentages']) if profit_row and profit_row['country_percentages'] else {}
+    except:
+        country_percentages = {}
+
+    # Load product costs lookup (for actual cost mode), keyed by (brand_id, series_id, puff_count, flavor, country)
+    cost_lookup = {}
+    if profit_mode == 'actual':
+        cost_rows = conn.execute('''
+            SELECT brand_id, series_id, puff_count, flavor, country, cost_price, cost_currency
+            FROM product_costs
+        ''').fetchall()
+        for cr in cost_rows:
+            key = (cr['brand_id'], cr['series_id'], cr['puff_count'], cr['flavor'], cr['country'])
+            cost_lookup[key] = {'price': cr['cost_price'], 'currency': cr['cost_currency']}
+
+        # Load product_mappings for item->brand resolution
+        pm_rows = conn.execute('SELECT raw_name, source, brand_id, series_id, puff_count, flavor FROM product_mappings').fetchall()
+        product_mappings_cache = {}
+        for pm in pm_rows:
+            product_mappings_cache[(pm['raw_name'], pm['source'])] = pm
+
+        # Build site->country map
+        site_country_map = {}
+        sc_rows = conn.execute('SELECT url, country FROM sites').fetchall()
+        for sc in sc_rows:
+            site_country_map[sc['url']] = sc['country'] or 'PL'
+
     # Calculate current week range (Monday to Sunday)
     today = datetime.date.today()
     week_start = today - datetime.timedelta(days=today.weekday())
@@ -11216,7 +12685,7 @@ def _compute_sales_board_data(selected_month):
 
         # Undelivered orders for this manager (for shipping-loss visibility — separate from revenue)
         undelivered_rows = conn.execute(f'''
-            SELECT shipping_loss_amount, currency
+            SELECT shipping_loss_amount, currency, source
             FROM orders
             WHERE source IN ({placeholders})
             AND strftime('%Y-%m', date_created) = ?
@@ -11230,6 +12699,11 @@ def _compute_sales_board_data(selected_month):
         month_commission_base_cny = 0  # Sales eligible for commission (in CNY)
         month_shipping_cny = 0           # Shipping not counted toward commission (in CNY)
         month_excluded_cny = 0           # Excluded-brand product revenue (in CNY)
+        month_cost_cny = 0               # Total product cost (in CNY, actual mode)
+        month_unmapped_revenue_cny = 0   # Revenue of products without cost mapping
+        month_unmapped_count = 0         # Number of unmapped product types
+        # Per-country profit tracking
+        country_profit = defaultdict(lambda: {'net_cny': 0, 'cost_cny': 0, 'unmapped_revenue_cny': 0, 'unmapped_count': 0, 'shipping_loss_cny': 0, 'undelivered_count': 0})
         # Per-brand exclusion breakdown: {brand: {qty, revenue_by_currency, revenue_cny}}
         excluded_brand_breakdown = defaultdict(lambda: {
             'qty': 0, 'revenue_by_currency': defaultdict(float), 'revenue_cny': 0.0
@@ -11256,6 +12730,7 @@ def _compute_sales_board_data(selected_month):
             month_currency_amounts[currency]['shipping'] += shipping
 
             rate = _rate_for(currency)
+            order_country = site_country_map.get(order['source'], 'PL') if profit_mode == 'actual' else None
 
             # Products count
             items = parse_json_field(order['line_items'])
@@ -11290,10 +12765,64 @@ def _compute_sales_board_data(selected_month):
                         if rate:
                             month_commission_base_cny += item_total * rate
 
+                    # Actual cost calculation
+                    if profit_mode == 'actual' and rate and qty > 0:
+                        source = order['source']
+                        country = order_country
+                        pm = product_mappings_cache.get((product_name_raw, source)) or product_mappings_cache.get((product_name_raw, '')) or product_mappings_cache.get((product_name_raw, None))
+                        if pm:
+                            b_id = pm['brand_id']
+                            s_id = pm['series_id']
+                            p_cnt = pm['puff_count']
+                            flav = pm['flavor']
+                        else:
+                            if not hasattr(parse_product_name, '_parsed_cache'):
+                                parse_product_name._parsed_cache = {}
+                            cache_key = product_name_raw
+                            if cache_key not in parse_product_name._parsed_cache:
+                                parse_product_name._parsed_cache[cache_key] = parse_product_name(product_name_raw, brands_cache)
+                            parsed_item = parse_product_name._parsed_cache[cache_key]
+                            b_id = None
+                            if parsed_item.get('brand'):
+                                for bc in brands_cache:
+                                    if bc['name'].upper() == parsed_item['brand'].upper():
+                                        b_id = bc['id']
+                                        break
+                            s_id = None
+                            p_cnt = parsed_item.get('puffs')
+                            flav = parsed_item.get('flavor')
+
+                        # Find cost entry matching this country (priority fallback)
+                        cost_entry = None
+                        if b_id:
+                            for try_key in [
+                                (b_id, s_id, p_cnt, flav, country),
+                                (b_id, s_id, p_cnt, None, country),
+                                (b_id, None, p_cnt, None, country),
+                                (b_id, None, None, None, country),
+                            ]:
+                                entry = cost_lookup.get(try_key)
+                                if entry:
+                                    cost_entry = entry
+                                    break
+
+                        if cost_entry:
+                            cost_rate = _rate_for(cost_entry['currency'])
+                            item_cost = cost_entry['price'] * qty * cost_rate
+                            month_cost_cny += item_cost
+                            country_profit[country]['cost_cny'] += item_cost
+                        else:
+                            month_unmapped_revenue_cny += item_total * rate
+                            month_unmapped_count += 1
+                            country_profit[country]['unmapped_revenue_cny'] += item_total * rate
+                            country_profit[country]['unmapped_count'] += 1
+
             # CNY conversion for net amount & shipping
             if rate:
                 month_net_cny += net * rate
                 month_shipping_cny += shipping * rate
+                if order_country:
+                    country_profit[order_country]['net_cny'] += net * rate
 
         # Previous month CNY (uses prev-month board overrides if set)
         prev_net_cny = 0
@@ -11338,6 +12867,9 @@ def _compute_sales_board_data(selected_month):
             r = _rate_for(cur)
             if r:
                 shipping_loss_cny += amt * r
+                u_country = site_country_map.get(u['source'], 'PL')
+                country_profit[u_country]['shipping_loss_cny'] += amt * r
+                country_profit[u_country]['undelivered_count'] += 1
 
         # Get target info
         target = targets.get(manager, {})
@@ -11419,6 +12951,20 @@ def _compute_sales_board_data(selected_month):
             },
             'month_rates': {c: r for c, r in _month_rates.items() if r},
             'month_rate_sources': dict(_month_rate_sources),
+            # Profit calculation fields
+            'month_cost_cny': round(month_cost_cny, 2),
+            'month_unmapped_revenue_cny': round(month_unmapped_revenue_cny, 2),
+            'month_unmapped_count': month_unmapped_count,
+            'month_profit_actual_cny': round(month_net_cny - month_cost_cny - month_unmapped_revenue_cny * (1 - profit_percentage / 100), 2) if profit_mode == 'actual' else 0,
+            'month_profit_pct_cny': round(month_net_cny * profit_percentage / 100, 2),
+            'country_profit': {c: {
+                'net_cny': round(v['net_cny'], 2),
+                'cost_cny': round(v['cost_cny'], 2),
+                'unmapped_revenue_cny': round(v['unmapped_revenue_cny'], 2),
+                'unmapped_count': v['unmapped_count'],
+                'shipping_loss_cny': round(v['shipping_loss_cny'], 2),
+                'undelivered_count': v['undelivered_count'],
+            } for c, v in country_profit.items()},
         })
 
     # Group summaries
@@ -11520,6 +13066,37 @@ def _compute_sales_board_data(selected_month):
                     'source': (d.get('month_rate_sources') or {}).get(cur, 'system'),
                 }
 
+    # Profit summary for team totals
+    team_totals['month_cost_cny'] = round(sum(d.get('month_cost_cny', 0) for d in board_data), 2)
+    team_totals['month_unmapped_revenue_cny'] = round(sum(d.get('month_unmapped_revenue_cny', 0) for d in board_data), 2)
+    team_totals['month_unmapped_count'] = sum(d.get('month_unmapped_count', 0) for d in board_data)
+    team_totals['month_profit_actual_cny'] = round(sum(d.get('month_profit_actual_cny', 0) for d in board_data), 2)
+    team_totals['month_profit_pct_cny'] = round(sum(d.get('month_profit_pct_cny', 0) for d in board_data), 2)
+
+    # Per-country profit totals
+    country_profit_totals = defaultdict(lambda: {'net_cny': 0, 'cost_cny': 0, 'unmapped_revenue_cny': 0, 'unmapped_count': 0, 'shipping_loss_cny': 0, 'undelivered_count': 0})
+    for d in board_data:
+        for c, v in d.get('country_profit', {}).items():
+            for k in country_profit_totals[c]:
+                country_profit_totals[c][k] += v.get(k, 0)
+    team_totals['country_profit'] = {}
+    for c, v in sorted(country_profit_totals.items()):
+        cpct = country_percentages.get(c, profit_percentage)
+        team_totals['country_profit'][c] = {
+            'net_cny': round(v['net_cny'], 2),
+            'cost_cny': round(v['cost_cny'], 2),
+            'unmapped_revenue_cny': round(v['unmapped_revenue_cny'], 2),
+            'unmapped_count': v['unmapped_count'],
+            'shipping_loss_cny': round(v['shipping_loss_cny'], 2),
+            'undelivered_count': v['undelivered_count'],
+            'profit_pct': cpct,
+            'profit_actual_cny': round(v['net_cny'] - v['cost_cny'] - v['unmapped_revenue_cny'] * (1 - cpct / 100), 2),
+            'profit_pct_cny': round(v['net_cny'] * cpct / 100, 2),
+        }
+    # Recalculate total pct profit from per-country values when country percentages differ
+    if country_percentages:
+        team_totals['month_profit_pct_cny'] = round(sum(cp['profit_pct_cny'] for cp in team_totals['country_profit'].values()), 2)
+
     return {
         'board_data': board_data,
         'team_totals': team_totals,
@@ -11534,6 +13111,9 @@ def _compute_sales_board_data(selected_month):
         'all_brands_list': all_brands_list,
         'rates_in_use': rates_in_use,
         'rate_overrides': _board_overrides_cur,
+        'profit_mode': profit_mode,
+        'profit_percentage': profit_percentage,
+        'country_percentages': country_percentages,
     }
 
 
@@ -12626,6 +14206,554 @@ def delete_sales_board_export(export_id):
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ===== Product Costs Management APIs =====
+
+@app.route('/product-costs')
+@login_required
+@costs_view_required
+def product_costs_page():
+    """Product costs management page"""
+    conn = get_db_connection()
+    country_rows = conn.execute("SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != '' ORDER BY country").fetchall()
+    conn.close()
+    country_map = {'PL': '波兰', 'AE': '阿联酋', 'AU': '澳洲', 'DE': '德国', 'FR': '法国', 'UK': '英国', 'US': '美国', 'CN': '中国'}
+    countries = [{'code': r['country'], 'label': country_map.get(r['country'], r['country'])} for r in country_rows]
+    return render_template('product_costs.html', countries=countries)
+
+
+@app.route('/api/product-costs/options', methods=['GET'])
+@login_required
+@costs_view_required
+def get_product_cost_options():
+    """Get brand-puffs-flavor combinations for cascading selectors"""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute('''
+            SELECT pm.brand_id, b.name as brand_name, pm.puff_count, pm.flavor
+            FROM product_mappings pm
+            LEFT JOIN brands b ON pm.brand_id = b.id
+            WHERE pm.brand_id IS NOT NULL
+        ''').fetchall()
+        combos = []
+        for r in rows:
+            combos.append({
+                'brand_id': r['brand_id'],
+                'brand_name': r['brand_name'] or '',
+                'puff_count': r['puff_count'],
+                'flavor': r['flavor'] or ''
+            })
+        return jsonify(combos)
+    finally:
+        conn.close()
+
+
+@app.route('/api/product-costs', methods=['GET'])
+@login_required
+@costs_view_required
+def get_product_costs():
+    """Get all product costs with brand/series names"""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute('''
+            SELECT pc.*, b.name as brand_name,
+                   s.name as series_name
+            FROM product_costs pc
+            LEFT JOIN brands b ON pc.brand_id = b.id
+            LEFT JOIN series s ON pc.series_id = s.id
+            ORDER BY b.name, s.name, pc.puff_count
+        ''').fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route('/api/product-costs', methods=['POST'])
+@login_required
+@admin_required
+def create_product_cost():
+    """Create a new product cost entry"""
+    data = request.get_json()
+    brand_id = data.get('brand_id')
+    series_id = data.get('series_id') or None
+    puff_count = data.get('puff_count') or None
+    flavor = data.get('flavor') or None
+    country = data.get('country', 'PL')
+    cost_price = data.get('cost_price')
+    cost_currency = data.get('cost_currency', 'PLN')
+    effective_date = data.get('effective_date', '2024-01-01')
+    notes = data.get('notes', '')
+
+    if not brand_id or cost_price is None:
+        return jsonify({'error': '品牌和成本价为必填项'}), 400
+
+    conn = get_db_connection()
+    try:
+        conn.execute('''
+            INSERT INTO product_costs
+            (brand_id, series_id, puff_count, flavor, country, cost_price, cost_currency, effective_date, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (brand_id, series_id, puff_count, flavor, country, cost_price, cost_currency, effective_date, notes))
+        conn.commit()
+        return jsonify({'success': True, 'id': conn.execute('SELECT last_insert_rowid()').fetchone()[0]})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/product-costs/<int:cost_id>', methods=['PUT'])
+@login_required
+@admin_required
+def update_product_cost(cost_id):
+    """Update a product cost entry"""
+    data = request.get_json()
+    conn = get_db_connection()
+    try:
+        existing = conn.execute('SELECT id FROM product_costs WHERE id = ?', (cost_id,)).fetchone()
+        if not existing:
+            return jsonify({'error': '记录不存在'}), 404
+
+        conn.execute('''
+            UPDATE product_costs SET
+                brand_id = ?, series_id = ?, puff_count = ?, flavor = ?,
+                country = ?, cost_price = ?, cost_currency = ?,
+                effective_date = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        ''', (
+            data.get('brand_id'), data.get('series_id') or None,
+            data.get('puff_count') or None, data.get('flavor') or None,
+            data.get('country', 'PL'), data.get('cost_price'),
+            data.get('cost_currency', 'PLN'), data.get('effective_date', '2024-01-01'),
+            data.get('notes', ''), cost_id
+        ))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/product-costs/<int:cost_id>', methods=['DELETE'])
+@login_required
+@admin_required
+def delete_product_cost(cost_id):
+    """Delete a product cost entry"""
+    conn = get_db_connection()
+    try:
+        conn.execute('DELETE FROM product_costs WHERE id = ?', (cost_id,))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/product-costs/unmapped', methods=['GET'])
+@login_required
+@costs_view_required
+def get_unmapped_products():
+    """Get products sold in a given month that have no cost mapping"""
+    import datetime
+    year_month = request.args.get('year_month')
+    country = request.args.get('country', 'PL')
+    match_level = request.args.get('match_level', 'brand_puffs_series')
+    if not year_month:
+        year_month = datetime.date.today().strftime('%Y-%m')
+
+    conn = get_db_connection()
+    try:
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country,)).fetchall()
+        country_urls = [s['url'] for s in country_sites]
+        if not country_urls:
+            return jsonify([])
+
+        placeholders = ', '.join(['?' for _ in country_urls])
+        orders = conn.execute(f'''
+            SELECT line_items, source FROM orders
+            WHERE source IN ({placeholders})
+            AND strftime('%Y-%m', date_created) = ?
+            AND {_revenue_status_cond()}
+        ''', country_urls + [year_month]).fetchall()
+
+        brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+        brands_cache = []
+        brand_names = {}
+        for row in brands_rows:
+            brand_name = row['name']
+            brand_names[row['id']] = brand_name
+            try:
+                aliases = json.loads(row['aliases']) if row['aliases'] else []
+            except:
+                aliases = []
+            brands_cache.append({
+                'id': row['id'], 'name': brand_name, 'aliases': aliases,
+                'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
+            })
+
+        series_rows = conn.execute('SELECT id, name FROM series').fetchall()
+        series_names = {r['id']: r['name'] for r in series_rows}
+
+        costs = conn.execute('''
+            SELECT brand_id, series_id, puff_count, flavor, country FROM product_costs WHERE country = ?
+        ''', (country,)).fetchall()
+
+        cost_keys_full = set()
+        cost_keys_bps = set()
+        cost_keys_bp = set()
+        for c in costs:
+            cost_keys_full.add((c['brand_id'], c['series_id'], c['puff_count'], c['flavor']))
+            cost_keys_bps.add((c['brand_id'], c['series_id'], c['puff_count']))
+            cost_keys_bp.add((c['brand_id'], c['puff_count']))
+
+        product_mappings = {}
+        pm_rows = conn.execute('SELECT raw_name, source, brand_id, series_id, puff_count, flavor FROM product_mappings').fetchall()
+        for pm in pm_rows:
+            product_mappings[(pm['raw_name'], pm['source'])] = pm
+
+        unmapped = {}
+        for order in orders:
+            items = parse_json_field(order['line_items'])
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                name = item.get('name', '') or ''
+                qty = item.get('quantity', 0) or 0
+                item_total = float(item.get('total', 0) or 0)
+                source = order['source']
+
+                pm = product_mappings.get((name, source)) or product_mappings.get((name, '')) or product_mappings.get((name, None))
+                if pm:
+                    brand_id = pm['brand_id']
+                    series_id = pm['series_id']
+                    puffs = pm['puff_count']
+                    flav = pm['flavor']
+                else:
+                    parsed = parse_product_name(name, brands_cache)
+                    brand_id = None
+                    if parsed.get('brand'):
+                        for bc in brands_cache:
+                            if bc['name'].upper() == parsed['brand'].upper():
+                                brand_id = bc['id']
+                                break
+                    series_id = None
+                    puffs = parsed.get('puffs')
+                    flav = parsed.get('flavor')
+
+                if match_level == 'brand_puffs':
+                    matched = brand_id and (brand_id, puffs) in cost_keys_bp
+                elif match_level == 'brand_puffs_series':
+                    matched = brand_id and (
+                        (brand_id, series_id, puffs) in cost_keys_bps or
+                        (brand_id, None, puffs) in cost_keys_bps
+                    )
+                else:
+                    matched = _match_cost_key(brand_id, series_id, puffs, flav, cost_keys_full)
+
+                if not matched:
+                    if match_level == 'brand_puffs':
+                        key = (brand_id, puffs)
+                    elif match_level == 'brand_puffs_series':
+                        key = (brand_id, series_id, puffs)
+                    else:
+                        key = name.upper().strip()
+
+                    if key not in unmapped:
+                        unmapped[key] = {
+                            'raw_name': name,
+                            'brand_id': brand_id,
+                            'brand_name': brand_names.get(brand_id),
+                            'series_id': series_id,
+                            'series_name': series_names.get(series_id),
+                            'puff_count': puffs,
+                            'flavor': flav,
+                            'total_qty': 0,
+                            'total_revenue': 0,
+                            'sources': set(),
+                            'product_count': 0,
+                            'raw_names': {}
+                        }
+                    unmapped[key]['total_qty'] += qty
+                    unmapped[key]['total_revenue'] += item_total
+                    unmapped[key]['sources'].add(source)
+                    unmapped[key]['product_count'] += 1
+                    rn_key = name.upper().strip()
+                    if rn_key not in unmapped[key]['raw_names']:
+                        unmapped[key]['raw_names'][rn_key] = {'name': name, 'qty': 0, 'revenue': 0}
+                    unmapped[key]['raw_names'][rn_key]['qty'] += qty
+                    unmapped[key]['raw_names'][rn_key]['revenue'] += item_total
+
+        result = []
+        for k, v in sorted(unmapped.items(), key=lambda x: -x[1]['total_revenue']):
+            v['sources'] = list(v['sources'])
+            v['raw_names'] = sorted(v['raw_names'].values(), key=lambda x: -x['qty'])
+            result.append(v)
+        return jsonify(result)
+    finally:
+        conn.close()
+
+
+def _match_cost_key(brand_id, series_id, puff_count, flavor, cost_keys):
+    """Match a product to a cost entry using priority fallback.
+
+    Priority (most specific first):
+    1. brand + series + puffs + flavor
+    2. brand + series + puffs
+    3. brand + puffs
+    4. brand only
+    """
+    if not brand_id:
+        return False
+    if (brand_id, series_id, puff_count, flavor) in cost_keys:
+        return True
+    if (brand_id, series_id, puff_count, None) in cost_keys:
+        return True
+    if (brand_id, None, puff_count, None) in cost_keys:
+        return True
+    if (brand_id, None, None, None) in cost_keys:
+        return True
+    return False
+
+
+def _find_cost_price(brand_id, series_id, puff_count, flavor, cost_lookup):
+    """Find the best matching cost price using priority fallback.
+
+    cost_lookup: dict keyed by (brand_id, series_id, puff_count, flavor) -> cost_price
+    Returns cost_price or None.
+    """
+    if not brand_id:
+        return None
+    key = (brand_id, series_id, puff_count, flavor)
+    if key in cost_lookup:
+        return cost_lookup[key]
+    key = (brand_id, series_id, puff_count, None)
+    if key in cost_lookup:
+        return cost_lookup[key]
+    key = (brand_id, None, puff_count, None)
+    if key in cost_lookup:
+        return cost_lookup[key]
+    key = (brand_id, None, None, None)
+    if key in cost_lookup:
+        return cost_lookup[key]
+    return None
+
+
+# ===== Sales Board Profit Settings API =====
+
+@app.route('/api/sales-board/profit-settings', methods=['GET'])
+@login_required
+def get_profit_settings():
+    """Get profit settings for a given month"""
+    import datetime
+    year_month = request.args.get('year_month')
+    if not year_month:
+        year_month = datetime.date.today().strftime('%Y-%m')
+
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            'SELECT * FROM sales_board_profit_settings WHERE year_month = ?',
+            (year_month,)
+        ).fetchone()
+        if row:
+            return jsonify(dict(row))
+        return jsonify({
+            'year_month': year_month,
+            'profit_mode': 'percentage',
+            'profit_percentage': 50.0
+        })
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/profit-settings', methods=['POST'])
+@login_required
+@admin_required
+def save_profit_settings():
+    """Save profit settings for a given month"""
+    data = request.get_json()
+    year_month = data.get('year_month')
+    profit_mode = data.get('profit_mode', 'percentage')
+    profit_percentage = data.get('profit_percentage', 50.0)
+    cp = data.get('country_percentages', {})
+    country_percentages_json = json.dumps(cp) if cp else '{}'
+
+    if not year_month:
+        return jsonify({'error': '缺少月份参数'}), 400
+    if profit_mode not in ('percentage', 'actual'):
+        return jsonify({'error': '无效的利润模式'}), 400
+
+    conn = get_db_connection()
+    try:
+        conn.execute('''
+            INSERT INTO sales_board_profit_settings (year_month, profit_mode, profit_percentage, country_percentages)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(year_month) DO UPDATE SET
+                profit_mode = excluded.profit_mode,
+                profit_percentage = excluded.profit_percentage,
+                country_percentages = excluded.country_percentages,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (year_month, profit_mode, profit_percentage, country_percentages_json))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/unmapped', methods=['GET'])
+@login_required
+def get_sales_board_unmapped():
+    """Return unmapped products for the sales board (actual cost mode)."""
+    import datetime as _dt
+    year_month = request.args.get('year_month') or _dt.date.today().strftime('%Y-%m')
+
+    conn = get_db_connection()
+    try:
+        cost_rows = conn.execute(
+            'SELECT brand_id, series_id, puff_count, flavor, country, cost_price, cost_currency FROM product_costs'
+        ).fetchall()
+        cost_lookup = {}
+        for cr in cost_rows:
+            key = (cr['brand_id'], cr['series_id'], cr['puff_count'], cr['flavor'], cr['country'])
+            cost_lookup[key] = {'price': cr['cost_price'], 'currency': cr['cost_currency']}
+
+        pm_rows = conn.execute('SELECT raw_name, source, brand_id, series_id, puff_count, flavor FROM product_mappings').fetchall()
+        product_mappings_cache = {}
+        for pm in pm_rows:
+            product_mappings_cache[(pm['raw_name'], pm['source'])] = pm
+
+        site_rows = conn.execute('SELECT url, country, manager FROM sites').fetchall()
+        site_country_map = {s['url']: s['country'] or 'PL' for s in site_rows}
+        site_manager_map = {s['url']: s['manager'] or '' for s in site_rows}
+
+        brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+        brands_cache = []
+        brand_names = {}
+        for row in brands_rows:
+            brand_name = row['name']
+            brand_names[row['id']] = brand_name
+            try:
+                aliases = json.loads(row['aliases']) if row['aliases'] else []
+            except:
+                aliases = []
+            brands_cache.append({
+                'id': row['id'], 'name': brand_name, 'aliases': aliases,
+                'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
+            })
+
+        orders = conn.execute(f'''
+            SELECT id, line_items, source, currency, total, shipping_total
+            FROM orders
+            WHERE strftime('%Y-%m', date_created) = ?
+            AND {_revenue_status_cond()}
+        ''', (year_month,)).fetchall()
+
+        # Get exchange rates for the month
+        from collections import defaultdict
+        profit_row = conn.execute(
+            'SELECT profit_mode, profit_percentage FROM sales_board_profit_settings WHERE year_month = ?',
+            (year_month,)
+        ).fetchone()
+        _board_overrides = {}
+        override_rows = conn.execute(
+            'SELECT currency, rate_to_cny FROM sales_board_exchange_rates WHERE year_month = ?',
+            (year_month,)
+        ).fetchall()
+        for ov in override_rows:
+            _board_overrides[ov['currency']] = ov['rate_to_cny']
+
+        rate_cache = {}
+        def _rate_for(cur):
+            if cur not in rate_cache:
+                r, _ = _get_board_cny_rate(cur, year_month, _board_overrides)
+                rate_cache[cur] = r or 0
+            return rate_cache[cur]
+
+        unmapped = {}
+        parsed_cache = {}
+        for order in orders:
+            items = parse_json_field(order['line_items'])
+            if not isinstance(items, list):
+                continue
+            source = order['source']
+            currency = order['currency'] or 'PLN'
+            country = site_country_map.get(source, 'PL')
+            manager = site_manager_map.get(source, '')
+            rate = _rate_for(currency)
+
+            for item in items:
+                name = item.get('name', '') or ''
+                qty = item.get('quantity', 0) or 0
+                item_total = float(item.get('total', 0) or 0)
+
+                pm = product_mappings_cache.get((name, source)) or product_mappings_cache.get((name, '')) or product_mappings_cache.get((name, None))
+                if pm:
+                    b_id = pm['brand_id']
+                    s_id = pm['series_id']
+                    p_cnt = pm['puff_count']
+                    flav = pm['flavor']
+                else:
+                    if name not in parsed_cache:
+                        parsed_cache[name] = parse_product_name(name, brands_cache)
+                    parsed_item = parsed_cache[name]
+                    b_id = None
+                    if parsed_item.get('brand'):
+                        for bc in brands_cache:
+                            if bc['name'].upper() == parsed_item['brand'].upper():
+                                b_id = bc['id']
+                                break
+                    s_id = None
+                    p_cnt = parsed_item.get('puffs')
+                    flav = parsed_item.get('flavor')
+
+                cost_entry = None
+                if b_id:
+                    for try_key in [
+                        (b_id, s_id, p_cnt, flav, country),
+                        (b_id, s_id, p_cnt, None, country),
+                        (b_id, None, p_cnt, None, country),
+                        (b_id, None, None, None, country),
+                    ]:
+                        if try_key in cost_lookup:
+                            cost_entry = cost_lookup[try_key]
+                            break
+
+                if not cost_entry:
+                    key = (brand_names.get(b_id, 'Unknown'), p_cnt, country)
+                    if key not in unmapped:
+                        unmapped[key] = {
+                            'brand': brand_names.get(b_id, 'Unknown'),
+                            'puffs': p_cnt,
+                            'country': country,
+                            'qty': 0,
+                            'revenue_cny': 0,
+                            'products': {},
+                            'managers': set(),
+                        }
+                    unmapped[key]['qty'] += qty
+                    unmapped[key]['revenue_cny'] += item_total * rate
+                    unmapped[key]['managers'].add(manager)
+                    pname_key = name.upper().strip()
+                    if pname_key not in unmapped[key]['products']:
+                        unmapped[key]['products'][pname_key] = {'name': name, 'qty': 0, 'revenue_cny': 0}
+                    unmapped[key]['products'][pname_key]['qty'] += qty
+                    unmapped[key]['products'][pname_key]['revenue_cny'] += item_total * rate
+
+        result = []
+        for v in sorted(unmapped.values(), key=lambda x: -x['revenue_cny']):
+            v['revenue_cny'] = round(v['revenue_cny'], 2)
+            v['managers'] = list(v['managers'])
+            prods = sorted(v['products'].values(), key=lambda x: -x['qty'])
+            for p in prods:
+                p['revenue_cny'] = round(p['revenue_cny'], 2)
+            v['products'] = prods
+            result.append(v)
+        return jsonify(result)
     finally:
         conn.close()
 

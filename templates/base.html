@@ -140,6 +140,14 @@
                             <i class="bi bi-box-seam me-1"></i>产品分析
                         </a>
                     </li>
+                    {% if current_user.can_manage_products() %}
+                    <li class="nav-item">
+                        <a class="nav-link {% if request.endpoint == 'product_manager' %}active{% endif %}"
+                            href="{{ url_for('product_manager') }}">
+                            <i class="bi bi-pencil-square me-1"></i>产品管理
+                        </a>
+                    </li>
+                    {% endif %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint == 'customers' else '' }}"
                             href="{{ url_for('customers') }}">
@@ -173,6 +181,14 @@
                         <a class="nav-link {{ 'active' if request.endpoint == 'sales_board' else '' }}"
                             href="{{ url_for('sales_board') }}">
                             <i class="bi bi-kanban me-1"></i>销售看板
+                        </a>
+                    </li>
+                    {% endif %}
+                    {% if current_user.can_view_costs() %}
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint == 'product_costs_page' else '' }}"
+                            href="{{ url_for('product_costs_page') }}">
+                            <i class="bi bi-calculator me-1"></i>成本管理
                         </a>
                     </li>
                     {% endif %}
