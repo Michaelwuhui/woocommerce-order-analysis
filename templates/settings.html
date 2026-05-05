@@ -605,6 +605,92 @@
 </div>
 
 <!-- Brand Management Card -->
+<!-- Warehouse Management Card -->
+<div class="card data-card mb-4">
+    <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
+        <h5 class="card-title text-white mb-0"><i class="bi bi-house-gear me-2"></i>仓库管理</h5>
+        <button class="btn btn-sm btn-primary" onclick="openWarehouseModal()">
+            <i class="bi bi-plus-lg me-1"></i>添加仓库
+        </button>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-dark table-hover align-middle mb-0" style="--bs-table-bg: transparent;">
+                <thead style="position: sticky; top: 0; z-index: 1; background: #1a1d21;">
+                    <tr>
+                        <th class="ps-4">名称</th>
+                        <th>编码</th>
+                        <th>国家</th>
+                        <th>默认货币</th>
+                        <th>状态</th>
+                        <th class="text-end pe-4">操作</th>
+                    </tr>
+                </thead>
+                <tbody id="warehousesTableBody">
+                    <tr><td colspan="6" class="text-center text-muted py-4">加载中...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Warehouse Add/Edit Modal -->
+<div class="modal fade" id="warehouseModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white" id="warehouseModalTitle">添加仓库</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="warehouseEditId">
+                <div class="mb-3">
+                    <label class="form-label text-white-50">仓库名称 <span class="text-danger">*</span></label>
+                    <input type="text" id="warehouseName" class="form-control bg-dark text-white border-secondary" placeholder="如：澳洲本地仓">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">编码 <span class="text-danger">*</span> <small class="text-muted">(唯一标识)</small></label>
+                    <input type="text" id="warehouseCode" class="form-control bg-dark text-white border-secondary" placeholder="如：AU-LOCAL">
+                </div>
+                <div class="row">
+                    <div class="col-md-6 mb-3">
+                        <label class="form-label text-white-50">所属国家 <span class="text-danger">*</span></label>
+                        <select id="warehouseCountry" class="form-select bg-dark text-white border-secondary">
+                            <option value="PL">波兰 PL</option>
+                            <option value="AU">澳洲 AU</option>
+                            <option value="AE">阿联酋 AE</option>
+                            <option value="DE">德国 DE</option>
+                            <option value="UK">英国 UK</option>
+                            <option value="US">美国 US</option>
+                            <option value="CN">中国 CN</option>
+                        </select>
+                    </div>
+                    <div class="col-md-6 mb-3">
+                        <label class="form-label text-white-50">默认货币</label>
+                        <select id="warehouseCurrency" class="form-select bg-dark text-white border-secondary">
+                            <option value="PLN">PLN</option>
+                            <option value="AUD">AUD</option>
+                            <option value="AED">AED</option>
+                            <option value="USD">USD</option>
+                            <option value="EUR">EUR</option>
+                            <option value="GBP">GBP</option>
+                            <option value="CNY">CNY</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">备注</label>
+                    <input type="text" id="warehouseNotes" class="form-control bg-dark text-white border-secondary">
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" onclick="saveWarehouse()">保存</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="card data-card mb-4">
     <div
         class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
@@ -2601,6 +2687,89 @@
         </div>
     </div>
 </div>
+
+<!-- Warehouse Management JavaScript -->
+<script>
+var warehousesData = [];
+document.addEventListener('DOMContentLoaded', function() { loadWarehouses(); });
+
+function loadWarehouses() {
+    fetch('/api/warehouses').then(r => r.json()).then(data => {
+        warehousesData = data;
+        var tbody = document.getElementById('warehousesTableBody');
+        if (!data.length) {
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-4">暂无仓库</td></tr>';
+            return;
+        }
+        tbody.innerHTML = data.map(w => `<tr>
+            <td class="ps-4 fw-bold">${w.name}</td>
+            <td><code>${w.code}</code></td>
+            <td>${w.country}</td>
+            <td>${w.default_currency}</td>
+            <td>${w.is_active ? '<span class="badge bg-success">启用</span>' : '<span class="badge bg-secondary">停用</span>'}</td>
+            <td class="text-end pe-4">
+                <button class="btn btn-sm btn-outline-info me-1" onclick="editWarehouse(${w.id})"><i class="bi bi-pencil"></i></button>
+                <button class="btn btn-sm btn-outline-danger" onclick="deleteWarehouse(${w.id},'${w.name}')"><i class="bi bi-trash"></i></button>
+            </td>
+        </tr>`).join('');
+    });
+}
+
+function openWarehouseModal(id) {
+    document.getElementById('warehouseEditId').value = '';
+    document.getElementById('warehouseName').value = '';
+    document.getElementById('warehouseCode').value = '';
+    document.getElementById('warehouseCountry').value = 'PL';
+    document.getElementById('warehouseCurrency').value = 'PLN';
+    document.getElementById('warehouseNotes').value = '';
+    document.getElementById('warehouseModalTitle').textContent = '添加仓库';
+    new bootstrap.Modal(document.getElementById('warehouseModal')).show();
+}
+
+function editWarehouse(id) {
+    var w = warehousesData.find(x => x.id === id);
+    if (!w) return;
+    document.getElementById('warehouseEditId').value = w.id;
+    document.getElementById('warehouseName').value = w.name;
+    document.getElementById('warehouseCode').value = w.code;
+    document.getElementById('warehouseCountry').value = w.country;
+    document.getElementById('warehouseCurrency').value = w.default_currency;
+    document.getElementById('warehouseNotes').value = w.notes || '';
+    document.getElementById('warehouseModalTitle').textContent = '编辑仓库';
+    new bootstrap.Modal(document.getElementById('warehouseModal')).show();
+}
+
+function saveWarehouse() {
+    var id = document.getElementById('warehouseEditId').value;
+    var payload = {
+        name: document.getElementById('warehouseName').value.trim(),
+        code: document.getElementById('warehouseCode').value.trim(),
+        country: document.getElementById('warehouseCountry').value,
+        default_currency: document.getElementById('warehouseCurrency').value,
+        notes: document.getElementById('warehouseNotes').value.trim(),
+        is_active: true
+    };
+    if (!payload.name || !payload.code) { alert('名称和编码为必填'); return; }
+    var url = id ? '/api/warehouses/' + id : '/api/warehouses';
+    var method = id ? 'PUT' : 'POST';
+    fetch(url, {method: method, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)})
+    .then(r => r.json()).then(data => {
+        if (data.success) {
+            bootstrap.Modal.getInstance(document.getElementById('warehouseModal')).hide();
+            loadWarehouses();
+        } else { alert(data.error || '保存失败'); }
+    });
+}
+
+function deleteWarehouse(id, name) {
+    if (!confirm('确定删除仓库 "' + name + '"？')) return;
+    fetch('/api/warehouses/' + id, {method: 'DELETE'})
+    .then(r => r.json()).then(data => {
+        if (data.success) loadWarehouses();
+        else alert(data.error || '删除失败');
+    });
+}
+</script>
 
 <!-- Brand Management JavaScript -->
 <script>

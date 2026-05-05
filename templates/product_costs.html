@@ -9,9 +9,9 @@
             <i class="bi bi-calculator me-2"></i>产品成本管理
         </h5>
         <div class="d-flex align-items-center gap-2">
-            <select id="countryFilter" class="form-select form-select-sm bg-dark text-white border-secondary" style="width:120px;" onchange="saveCountry(); loadCosts()">
+            <select id="countryFilter" class="form-select form-select-sm bg-dark text-white border-secondary" style="width:auto;min-width:120px;" onchange="saveCountryFilter(); loadCosts()">
                 {% for c in countries %}
-                <option value="{{ c.code }}">{{ c.label }} {{ c.code }}</option>
+                <option value="{{ c }}">{{ c }}</option>
                 {% endfor %}
             </select>
             <button class="btn btn-sm btn-outline-warning" onclick="showUnmapped()">
@@ -77,7 +77,7 @@
                             <th>系列</th>
                             <th>口数</th>
                             <th>口味</th>
-                            <th>国家</th>
+                            <th>仓库</th>
                             <th class="text-end">成本价</th>
                             <th>币种</th>
                             <th>生效日期</th>
@@ -128,12 +128,12 @@
                         <datalist id="flavorsList"></datalist>
                     </div>
                     <div class="col-md-4">
-                        <label class="form-label">国家 <span class="text-danger">*</span></label>
-                        <select id="costCountry" class="form-select form-select-sm bg-dark text-white border-secondary">
-                            {% for c in countries %}
-                            <option value="{{ c.code }}">{{ c.code }} {{ c.label }}</option>
-                            {% endfor %}
-                        </select>
+                        <label class="form-label">仓库 <span class="text-danger">*</span></label>
+                        <div class="d-flex gap-1">
+                            <select id="costWarehouse" class="form-select form-select-sm bg-dark text-white border-secondary">
+                            </select>
+                            <button type="button" class="btn btn-sm btn-outline-success flex-shrink-0" onclick="quickAddWarehouse()" title="新增仓库"><i class="bi bi-plus"></i></button>
+                        </div>
                     </div>
                     <div class="col-md-4">
                         <label class="form-label">成本价 <span class="text-danger">*</span></label>
@@ -312,8 +312,9 @@ let allCosts = [];
 let brandsData = [];
 let seriesData = {};
 let productCombos = [];
+let warehousesData = {{ warehouses | tojson }};
 
-function saveCountry() {
+function saveCountryFilter() {
     localStorage.setItem('productCostsCountry', document.getElementById('countryFilter').value);
 }
 
@@ -338,6 +339,67 @@ document.addEventListener('DOMContentLoaded', function() {
         loadSeriesForBrand();
         onFieldChange();
     });
+
+    // Deep-link entries used by the sales-board "未映射" modal:
+    //
+    //   /product-costs?add_cost=1&name=...&brand=...&puffs=...&country=...
+    //     → open the "添加成本" form pre-filled with the brand+puffs that the
+    //       sales-board flagged as unmapped, so user just fills cost+save.
+    //
+    //   /product-costs?map=<raw_name>&country=...    (legacy)
+    //     → open the brand/puffs/flavor mapping editor.
+    var params = new URLSearchParams(window.location.search);
+    var deepCountry = params.get('country');
+    if (deepCountry) {
+        var sel = document.getElementById('countryFilter');
+        if (sel) {
+            for (var i = 0; i < sel.options.length; i++) {
+                if (sel.options[i].value === deepCountry) {
+                    sel.value = deepCountry;
+                    localStorage.setItem('productCostsCountry', deepCountry);
+                    if (typeof loadCosts === 'function') loadCosts();
+                    if (typeof loadCostOptions === 'function') loadCostOptions();
+                    break;
+                }
+            }
+        }
+    }
+
+    var addCostFlag = params.get('add_cost');
+    var deepName = params.get('map');
+    if (addCostFlag === '1' || deepName) {
+        var brandName = params.get('brand') || '';
+        var puffsVal = params.get('puffs') || '';
+        var rawName = params.get('name') || deepName || '';
+        var tries = 0;
+        var waitForBrands = setInterval(function() {
+            tries++;
+            var ready = typeof brandsData !== 'undefined' && brandsData.length > 0;
+            if (!ready && tries < 40) return;  // 4s max
+            clearInterval(waitForBrands);
+
+            if (addCostFlag === '1') {
+                // Resolve brand name → id
+                var brandId = '';
+                if (brandName) {
+                    var match = brandsData.find(function(b) {
+                        return (b.name || '').toUpperCase() === brandName.toUpperCase();
+                    });
+                    if (match) brandId = match.id;
+                }
+                openAddModal();
+                if (brandId) document.getElementById('costBrand').value = brandId;
+                if (puffsVal) document.getElementById('costPuffs').value = puffsVal;
+                if (rawName) {
+                    document.getElementById('costNotes').value = '来源：' + rawName;
+                }
+                if (brandId && typeof loadSeriesForBrand === 'function') loadSeriesForBrand();
+                if (typeof onFieldChange === 'function') onFieldChange();
+            } else {
+                openCostMapping(deepName);
+            }
+        }, 100);
+    }
 });
 
 async function loadCostOptions() {
@@ -456,7 +518,8 @@ async function loadCosts() {
     try {
         const res = await fetch('/api/product-costs');
         const data = await res.json();
-        allCosts = data.filter(c => c.country === country);
+        const countryWhs = warehousesData.filter(w => w.country === country).map(w => w.id);
+        allCosts = data.filter(c => countryWhs.includes(c.warehouse_id));
         renderCosts();
         updateSummary();
     } catch(e) { console.error('加载成本失败', e); }
@@ -474,7 +537,7 @@ function renderCosts() {
             <td>${c.series_name || '<span class="text-muted">不限</span>'}</td>
             <td>${c.puff_count ? c.puff_count.toLocaleString() : '<span class="text-muted">不限</span>'}</td>
             <td>${c.flavor || '<span class="text-muted">不限</span>'}</td>
-            <td>${c.country}</td>
+            <td>${c.warehouse_name || c.country}</td>
             <td class="text-end fw-bold text-info">${parseFloat(c.cost_price).toFixed(2)}</td>
             <td>${c.cost_currency}</td>
             <td>${c.effective_date || '-'}</td>
@@ -493,6 +556,18 @@ function updateSummary() {
     document.getElementById('totalBrands').textContent = brands.size;
 }
 
+function refreshWarehouseSelect(country, selectedId) {
+    var whSel = document.getElementById('costWarehouse');
+    var filtered = warehousesData.filter(w => w.country === country);
+    whSel.innerHTML = filtered.map(w =>
+        '<option value="' + w.id + '" data-currency="' + w.default_currency + '">' + w.name + '</option>'
+    ).join('');
+    if (selectedId) whSel.value = selectedId;
+    if (!whSel.value && filtered.length > 0) whSel.value = filtered[0].id;
+    var selOpt = whSel.options[whSel.selectedIndex];
+    if (selOpt) document.getElementById('costCurrency').value = selOpt.dataset.currency || 'PLN';
+}
+
 function openAddModal() {
     document.getElementById('editCostId').value = '';
     document.getElementById('costModalTitle').innerHTML = '<i class="bi bi-plus-circle me-2"></i>添加产品成本';
@@ -500,18 +575,13 @@ function openAddModal() {
     document.getElementById('costFlavor').value = '';
     document.getElementById('costBrand').value = '';
     document.getElementById('costSeries').innerHTML = '<option value="">不限</option>';
-    document.getElementById('costCountry').value = document.getElementById('countryFilter').value;
+    var country = document.getElementById('countryFilter').value;
+    refreshWarehouseSelect(country);
     document.getElementById('costPrice').value = '';
-    document.getElementById('costCurrency').value = getCurrencyForCountry(document.getElementById('countryFilter').value);
     document.getElementById('costNotes').value = '';
     refreshBrandOptions();
     refreshDataLists();
     new bootstrap.Modal(document.getElementById('costModal')).show();
-}
-
-function getCurrencyForCountry(country) {
-    const map = {'PL':'PLN','AE':'AED','AU':'AUD','DE':'EUR','FR':'EUR','UK':'GBP','US':'USD','CN':'CNY'};
-    return map[country] || 'PLN';
 }
 
 async function editCost(id) {
@@ -525,7 +595,8 @@ async function editCost(id) {
     document.getElementById('costBrand').value = c.brand_id;
     await loadSeriesForBrand();
     document.getElementById('costSeries').value = c.series_id || '';
-    document.getElementById('costCountry').value = c.country;
+    var country = document.getElementById('countryFilter').value;
+    refreshWarehouseSelect(country, c.warehouse_id);
     document.getElementById('costPrice').value = c.cost_price;
     document.getElementById('costCurrency').value = c.cost_currency;
     document.getElementById('costEffectiveDate').value = c.effective_date || '';
@@ -541,7 +612,7 @@ async function saveCost() {
         series_id: parseInt(document.getElementById('costSeries').value) || null,
         puff_count: parseInt(document.getElementById('costPuffs').value) || null,
         flavor: document.getElementById('costFlavor').value.trim() || null,
-        country: document.getElementById('costCountry').value,
+        warehouse_id: parseInt(document.getElementById('costWarehouse').value) || null,
         cost_price: parseFloat(document.getElementById('costPrice').value),
         cost_currency: document.getElementById('costCurrency').value,
         effective_date: document.getElementById('costEffectiveDate').value,
@@ -844,6 +915,25 @@ function quickAddFromUnmapped(name, brandId, puffs, seriesId) {
     loadSeriesForBrand().then(() => {
         if (seriesId) document.getElementById('costSeries').value = seriesId;
     });
+}
+
+async function quickAddWarehouse() {
+    var country = document.getElementById('countryFilter').value;
+    var currencyMap = {'PL':'PLN','AU':'AUD','AE':'AED','GB':'GBP','US':'USD'};
+    var currency = currencyMap[country] || 'CNY';
+    var name = prompt('请输入新仓库名称（国家: ' + country + '）：');
+    if (!name || !name.trim()) return;
+    try {
+        var res = await fetch('/api/warehouses', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({name: name.trim(), code: name.trim(), country: country, default_currency: currency})
+        });
+        var result = await res.json();
+        if (result.error) { alert(result.error); return; }
+        warehousesData.push({id: result.id, name: name.trim(), code: name.trim(), country: country, default_currency: currency, is_active: 1});
+        refreshWarehouseSelect(country, result.id);
+    } catch(e) { alert('创建失败: ' + e.message); }
 }
 </script>
 {% endblock %}

@@ -409,7 +409,7 @@
                             <tbody>
                                 {% for product in top_products %}
                                 <tr style="cursor: pointer;"
-                                    onclick="openProductMapping('{{ product.name | e }}', '{{ product.brand | e }}', '{{ product.puffs | e }}', '{{ product.flavor | e }}')"
+                                    onclick="openProductMapping('{{ product.name | e }}', '{{ (product.brand or '') | e }}', '{{ (product.puffs or '') | e }}', '{{ (product.flavor or '') | e }}')"
                                     title="点击编辑产品映射">
                                     <td>
                                         {% if loop.index <= 3 %} <span
@@ -1232,5 +1232,6 @@
                 alert('请求失败: ' + err);
             });
     });
+
 </script>
 {% endblock %}

@@ -149,13 +149,7 @@
                             {{ 'checked' if profit_mode == 'actual' else '' }} onchange="switchProfitMode('actual')">
                         <label class="btn btn-outline-secondary" for="modeActual">实际成本模式</label>
                     </div>
-                    <div class="d-flex align-items-center gap-2" id="pctControl">
-                        <span class="text-secondary small">利润率：</span>
-                        <input type="number" id="profitPctInput" class="form-control form-control-sm bg-dark text-white border-secondary"
-                            style="width:80px;" value="{{ profit_percentage }}" min="0" max="100" step="1">
-                        <span class="text-secondary small">%</span>
-                        <button class="btn btn-sm btn-outline-info" onclick="saveProfitSettings()">保存</button>
-                    </div>
+                    <button class="btn btn-sm btn-outline-info" onclick="saveProfitSettings()">保存</button>
                 </div>
                 {% if profit_mode == 'actual' %}
                 <div class="w-100 mt-2">
@@ -168,8 +162,6 @@
                                 <th class="text-end text-white-50 fw-normal">实际利润(¥)</th>
                                 <th class="text-end text-white-50 fw-normal">未映射</th>
                                 <th class="text-end text-white-50 fw-normal">未送达/损失(¥)</th>
-                                <th class="text-end text-white-50 fw-normal">利润率%</th>
-                                <th class="text-end text-white-50 fw-normal">百分比利润(¥)</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -181,7 +173,7 @@
                                 <td class="text-end text-success fw-bold">¥{{ "{:,.0f}".format(cp.profit_actual_cny) }}</td>
                                 <td class="text-end">
                                     {% if cp.unmapped_count > 0 %}
-                                    <span class="text-warning" style="cursor:pointer;" onclick="showUnmappedDetail()">
+                                    <span class="text-warning" style="cursor:pointer;" onclick="showUnmappedDetail('{{ code }}')">
                                         {{ cp.unmapped_count }}个 / ¥{{ "{:,.0f}".format(cp.unmapped_revenue_cny) }}
                                     </span>
                                     {% else %}<span class="text-muted">-</span>{% endif %}
@@ -191,12 +183,6 @@
                                     <span class="text-danger">{{ cp.undelivered_count }}单 / ¥{{ "{:,.0f}".format(cp.shipping_loss_cny) }}</span>
                                     {% else %}<span class="text-muted">-</span>{% endif %}
                                 </td>
-                                <td class="text-end">
-                                    <input type="number" class="form-control form-control-sm bg-dark text-white border-secondary d-inline-block text-end country-pct-input"
-                                        data-country="{{ code }}" style="width:60px;padding:1px 4px;font-size:0.8rem;"
-                                        value="{{ cp.profit_pct }}" min="0" max="100" step="1">
-                                </td>
-                                <td class="text-end text-white-50">¥{{ "{:,.0f}".format(cp.profit_pct_cny) }}</td>
                             </tr>
                             {% endfor %}
                             <tr style="border-top:2px solid rgba(255,255,255,0.2);">
@@ -216,18 +202,42 @@
                                     <span class="text-danger">{{ team_totals.undelivered_count }}单 / ¥{{ "{:,.0f}".format(team_totals.shipping_loss_cny) }}</span>
                                     {% endif %}
                                 </td>
-                                <td></td>
-                                <td class="text-end text-white-50 fw-bold">¥{{ "{:,.0f}".format(team_totals.month_profit_pct_cny) }}</td>
                             </tr>
                         </tbody>
                     </table>
                 </div>
                 {% else %}
-                <div class="d-flex align-items-center gap-4">
-                    <div class="text-end">
-                        <div class="text-white-50 small">估算利润(¥) <span class="opacity-50">{{ profit_percentage }}%</span></div>
-                        <div class="text-success fw-bold fs-5">¥{{ "{:,.0f}".format(team_totals.month_profit_pct_cny) }}</div>
-                    </div>
+                <div class="w-100 mt-2">
+                    <table class="table table-sm table-dark mb-0" style="font-size:0.85rem;">
+                        <thead>
+                            <tr style="border-bottom:1px solid rgba(255,255,255,0.15);">
+                                <th class="text-white-50 fw-normal">国家</th>
+                                <th class="text-end text-white-50 fw-normal">净销售额(¥)</th>
+                                <th class="text-end text-white-50 fw-normal">利润率%</th>
+                                <th class="text-end text-white-50 fw-normal">估算利润(¥)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for code, cp in team_totals.country_profit.items() %}
+                            <tr style="border-bottom:1px solid rgba(255,255,255,0.08);">
+                                <td><span class="badge bg-secondary bg-opacity-50">{{ code }}</span></td>
+                                <td class="text-end">¥{{ "{:,.0f}".format(cp.net_cny) }}</td>
+                                <td class="text-end">
+                                    <input type="number" class="form-control form-control-sm bg-dark text-white border-secondary d-inline-block text-end country-pct-input"
+                                        data-country="{{ code }}" style="width:60px;padding:1px 4px;font-size:0.8rem;"
+                                        value="{{ cp.profit_pct }}" min="0" max="100" step="1">
+                                </td>
+                                <td class="text-end text-success fw-bold">¥{{ "{:,.0f}".format(cp.profit_pct_cny) }}</td>
+                            </tr>
+                            {% endfor %}
+                            <tr style="border-top:2px solid rgba(255,255,255,0.2);">
+                                <td class="fw-bold">合计</td>
+                                <td class="text-end fw-bold">¥{{ "{:,.0f}".format(team_totals.month_net_cny) }}</td>
+                                <td></td>
+                                <td class="text-end text-success fw-bold">¥{{ "{:,.0f}".format(team_totals.month_profit_pct_cny) }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
                 {% endif %}
             </div>
@@ -863,20 +873,18 @@ function updateMonth(value) {
 }
 
 function switchProfitMode(mode) {
-    var pct = parseFloat(document.getElementById('profitPctInput').value) || 50;
-    saveProfitSettingsInner(mode, pct);
+    saveProfitSettingsInner(mode);
 }
 
 function saveProfitSettings() {
     var mode = document.querySelector('input[name="profitMode"]:checked').value;
-    var pct = parseFloat(document.getElementById('profitPctInput').value) || 50;
-    saveProfitSettingsInner(mode, pct);
+    saveProfitSettingsInner(mode);
 }
 
-function saveProfitSettingsInner(mode, pct) {
+function saveProfitSettingsInner(mode) {
     var cp = {};
     document.querySelectorAll('.country-pct-input').forEach(function(el) {
-        cp[el.dataset.country] = parseFloat(el.value) || pct;
+        cp[el.dataset.country] = parseFloat(el.value) || 50;
     });
     fetch('/api/sales-board/profit-settings', {
         method: 'POST',
@@ -884,7 +892,7 @@ function saveProfitSettingsInner(mode, pct) {
         body: JSON.stringify({
             year_month: '{{ selected_month }}',
             profit_mode: mode,
-            profit_percentage: pct,
+            profit_percentage: 50,
             country_percentages: cp
         })
     }).then(function(res) { return res.json(); })
@@ -1405,14 +1413,23 @@ function deleteGroup() {
     });
 })();
 
-async function showUnmappedDetail() {
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, function(c) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+}
+
+async function showUnmappedDetail(country) {
     var modal = new bootstrap.Modal(document.getElementById('unmappedDetailModal'));
     modal.show();
     document.getElementById('unmappedDetailLoading').style.display = '';
     document.getElementById('unmappedDetailContent').style.display = 'none';
     try {
         var ym = document.querySelector('.flatpickr-month').value || new Date().toISOString().slice(0,7);
-        var res = await fetch('/api/sales-board/unmapped?year_month=' + ym);
+        var url = '/api/sales-board/unmapped?year_month=' + ym;
+        if (country) url += '&country=' + encodeURIComponent(country);
+        var res = await fetch(url);
         var data = await res.json();
         var totalQty = 0, totalCny = 0;
         data.forEach(function(d) { totalQty += d.qty; totalCny += d.revenue_cny; });
@@ -1425,7 +1442,7 @@ async function showUnmappedDetail() {
                 + '<td>' + (i+1) + '</td>'
                 + '<td>' + (d.brand || '<span class="text-muted">Unknown</span>') + '</td>'
                 + '<td class="text-end">' + (d.puffs || '-') + '</td>'
-                + '<td>' + d.country + '</td>'
+                + '<td>' + (d.country || '-') + '</td>'
                 + '<td class="text-end">' + d.qty + '</td>'
                 + '<td class="text-end text-warning">¥' + d.revenue_cny.toLocaleString('zh-CN', {minimumFractionDigits:0, maximumFractionDigits:0}) + '</td>'
                 + '<td><small class="text-white-50">' + d.managers.join(', ') + '</small></td>'
@@ -1433,11 +1450,25 @@ async function showUnmappedDetail() {
                 + '</tr>';
             html += '<tr id="' + rowId + '" style="display:none;"><td colspan="8" class="ps-4 py-1" style="background:rgba(255,255,255,0.03);">';
             html += '<table class="table table-sm table-dark mb-0" style="font-size:0.8rem;">';
-            html += '<thead><tr><th>产品名</th><th class="text-end">数量</th><th class="text-end">金额(¥)</th></tr></thead><tbody>';
+            html += '<thead><tr><th>产品名</th><th class="text-end">数量</th><th class="text-end">金额(¥)</th><th style="width:90px;"></th></tr></thead><tbody>';
+            var groupCountry = d.country || '';
+            var groupBrand = (d.brand && d.brand !== 'Unknown') ? d.brand : '';
+            var groupPuffs = d.puffs ? String(d.puffs) : '';
             d.products.forEach(function(p) {
-                html += '<tr><td class="text-white-50">' + p.name + '</td>'
+                // Sales-board "未映射" means there's no cost row matching this
+                // brand+series+puffs — so the right action is "add cost",
+                // pre-filled with the auto-detected brand/puffs and routed to
+                // the cost-add form on the cost-mgmt page.
+                var addCostUrl = '/product-costs?add_cost=1'
+                    + '&name=' + encodeURIComponent(p.name)
+                    + (groupBrand ? '&brand=' + encodeURIComponent(groupBrand) : '')
+                    + (groupPuffs ? '&puffs=' + encodeURIComponent(groupPuffs) : '')
+                    + (groupCountry ? '&country=' + encodeURIComponent(groupCountry) : '');
+                html += '<tr><td class="text-white-50">' + escapeHtml(p.name) + '</td>'
                     + '<td class="text-end">' + p.qty + '</td>'
-                    + '<td class="text-end">¥' + p.revenue_cny.toLocaleString('zh-CN', {minimumFractionDigits:0, maximumFractionDigits:0}) + '</td></tr>';
+                    + '<td class="text-end">¥' + p.revenue_cny.toLocaleString('zh-CN', {minimumFractionDigits:0, maximumFractionDigits:0}) + '</td>'
+                    + '<td class="text-end"><a href="' + addCostUrl + '" target="_blank" class="btn btn-sm btn-outline-warning py-0 px-2"><i class="bi bi-currency-dollar me-1"></i>添加成本</a></td>'
+                    + '</tr>';
             });
             html += '</tbody></table></td></tr>';
         });

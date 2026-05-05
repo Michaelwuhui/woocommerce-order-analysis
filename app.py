@@ -4,6 +4,7 @@ Flask application with user authentication and data visualization
 """
 import sqlite3
 import json
+import html
 from datetime import datetime
 from functools import wraps
 
@@ -1323,9 +1324,25 @@ def orders():
         conditions.append('date_created <= ?')
         params.append(date_to + 'T23:59:59')
     if search:
-        conditions.append('(number LIKE ? OR id LIKE ?)')
-        params.extend([f'%{search}%', f'%{search}%'])
-    
+        like_term = f'%{search}%'
+        # When the input is long enough to plausibly be a tracking number,
+        # also search inside JSON columns (AST plugin → meta_data, VillaTheme
+        # plugin → line_items, generic shipping_lines) and our shipping_logs.
+        # Short inputs stay on the fast number/id path to avoid false positives.
+        if len(search) >= 6:
+            conditions.append('''(
+                number LIKE ?
+                OR id LIKE ?
+                OR meta_data LIKE ?
+                OR line_items LIKE ?
+                OR shipping_lines LIKE ?
+                OR id IN (SELECT order_id FROM shipping_logs WHERE tracking_number LIKE ?)
+            )''')
+            params.extend([like_term] * 6)
+        else:
+            conditions.append('(number LIKE ? OR id LIKE ?)')
+            params.extend([like_term, like_term])
+
     where_clause = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
     
     # Summary statistics by source (with currency)
@@ -3508,12 +3525,14 @@ def get_order_details(order_id):
     site_row = conn.execute('SELECT manager, url, consumer_key, consumer_secret FROM sites WHERE url = ?', (order_dict.get('source', ''),)).fetchone()
     order_dict['site_manager'] = site_row['manager'] if site_row and site_row['manager'] else ''
     
-    # Fetch Order Notes from WooCommerce API
+    # Fetch Order Notes from WooCommerce API.
+    # Use orders.id (WC post ID); order['number'] can be a customer-facing
+    # sequential number that the REST API rejects with 404.
     order_dict['order_notes'] = []
     if site_row and site_row['consumer_key'] and site_row['consumer_secret']:
         try:
             import requests as req
-            api_url = f"{site_row['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+            api_url = f"{site_row['url']}/wp-json/wc/v3/orders/{order['id']}/notes"
             response = req.get(
                 api_url,
                 auth=(site_row['consumer_key'], site_row['consumer_secret']),
@@ -3522,9 +3541,9 @@ def get_order_details(order_id):
             if response.status_code == 200:
                 order_dict['order_notes'] = response.json()
             else:
-                print(f"Warning: Failed to fetch notes for order {order['number']}: {response.status_code} {response.text}")
+                print(f"Warning: Failed to fetch notes for order {order['id']}: {response.status_code} {response.text}")
         except Exception as e:
-            print(f"Error fetching notes for order {order['number']}: {e}")
+            print(f"Error fetching notes for order {order['id']}: {e}")
 
     # Get local shipping log if exists (for manually shipped orders not yet synced)
     shipping_log = conn.execute('SELECT tracking_number, carrier_slug, shipped_at FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
@@ -3535,6 +3554,10 @@ def get_order_details(order_id):
     if order_dict.get('is_undelivered') and order_dict.get('undelivered_by'):
         marker = conn.execute('SELECT name FROM users WHERE id = ?', (order_dict['undelivered_by'],)).fetchone()
         order_dict['undelivered_by_name'] = marker['name'] if marker else None
+
+    if order_dict.get('warehouse_id'):
+        wh = conn.execute('SELECT name FROM warehouses WHERE id=?', (order_dict['warehouse_id'],)).fetchone()
+        order_dict['warehouse_name'] = wh['name'] if wh else None
 
     conn.close()
 
@@ -4353,6 +4376,21 @@ def normalize_flavor(flavor):
     return s
 
 
+def normalize_raw_name(name):
+    """Canonical form of a product raw_name used as the key for product_mappings.
+
+    WooCommerce stores names with HTML entities (e.g. `&#8222;`); some UI paths
+    save the same product as already-decoded chars (e.g. `„`). Both should map
+    to the same row, so we always store and lookup the *decoded* form.
+    """
+    if not name:
+        return name
+    try:
+        return html.unescape(str(name))
+    except Exception:
+        return str(name)
+
+
 def parse_product_name(name, brands_cache=None, series_cache=None):
     """
     Parse product name to extract brand, series, puff count, and flavor.
@@ -4803,6 +4841,92 @@ def init_product_costs_tables():
     conn.close()
 
 
+def init_warehouses():
+    """Initialize warehouses table, add warehouse_id to product_costs and orders, migrate data."""
+    conn = get_db_connection()
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS warehouses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            code TEXT NOT NULL UNIQUE,
+            country TEXT NOT NULL,
+            default_currency TEXT NOT NULL DEFAULT 'PLN',
+            is_active INTEGER DEFAULT 1,
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # Seed default warehouses from existing site countries (only if table is empty)
+    existing = conn.execute('SELECT COUNT(*) FROM warehouses').fetchone()[0]
+    if existing == 0:
+        country_defaults = {
+            'PL': ('波兰仓库', 'PLN'),
+            'AU': ('澳洲仓库', 'AUD'),
+            'AE': ('阿联酋仓库', 'AED'),
+        }
+        countries = conn.execute("SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != ''").fetchall()
+        for row in countries:
+            c = row['country']
+            name, cur = country_defaults.get(c, (c + ' 仓库', 'PLN'))
+            try:
+                conn.execute('INSERT INTO warehouses (name, code, country, default_currency) VALUES (?, ?, ?, ?)',
+                             (name, c, c, cur))
+            except:
+                pass
+
+    # Add warehouse_id to product_costs
+    try:
+        conn.execute('ALTER TABLE product_costs ADD COLUMN warehouse_id INTEGER')
+    except:
+        pass
+    # Backfill product_costs.warehouse_id from country
+    conn.execute('''
+        UPDATE product_costs SET warehouse_id = (
+            SELECT w.id FROM warehouses w WHERE w.code = product_costs.country
+        ) WHERE warehouse_id IS NULL
+    ''')
+
+    # Rebuild unique index to use warehouse_id
+    conn.execute('DROP INDEX IF EXISTS idx_product_costs_match')
+    conn.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_product_costs_match
+        ON product_costs (brand_id, COALESCE(series_id, 0), COALESCE(puff_count, 0), COALESCE(flavor, ''), COALESCE(warehouse_id, 0))
+    ''')
+
+    # Add warehouse_id to orders
+    try:
+        conn.execute('ALTER TABLE orders ADD COLUMN warehouse_id INTEGER')
+    except:
+        pass
+    # Backfill orders.warehouse_id from site country -> first warehouse in that country.
+    # Earlier code joined on `w.code` (which holds the Chinese warehouse name) instead
+    # of `w.country`, so the backfill never matched and ~38% of orders ended up with
+    # NULL warehouse_id — which downstream cost lookups treat as "unmapped".
+    conn.execute('''
+        UPDATE orders SET warehouse_id = (
+            SELECT MIN(w.id) FROM warehouses w
+            JOIN sites s ON s.country = w.country
+            WHERE s.url = orders.source
+        ) WHERE warehouse_id IS NULL
+    ''')
+    try:
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_warehouse_id ON orders(warehouse_id)')
+    except:
+        pass
+
+    # Add country_percentages column to profit settings if missing
+    try:
+        conn.execute('ALTER TABLE sales_board_profit_settings ADD COLUMN country_percentages TEXT DEFAULT "{}"')
+    except:
+        pass
+
+    conn.commit()
+    conn.close()
+
+
 # Initialize tables on startup
 with app.app_context():
     init_sites_table()
@@ -4818,6 +4942,7 @@ with app.app_context():
     init_sales_groups_tables()
     init_partner_reconciliation_tables()
     init_product_costs_tables()
+    init_warehouses()
 
 @app.route('/settings')
 @login_required
@@ -9134,7 +9259,9 @@ def products():
     ''').fetchall()
     manual_mappings = {}
     for m in mappings_rows:
-        manual_mappings[m['raw_name']] = {
+        # Index by canonical form so HTML-entity vs decoded variants both match
+        key = normalize_raw_name(m['raw_name'])
+        manual_mappings[key] = {
             'brand': m['brand_name'],
             'puffs': m['puff_count'],
             'flavor': m['flavor'],
@@ -9185,17 +9312,21 @@ def products():
             # Extract flavor from WooCommerce variation meta_data
             meta_flavor = extract_flavor_from_meta(item)
             
-            # Check for manual mapping first (using full name with flavor)
+            # Check for manual mapping first (using full name with flavor).
+            # Canonicalize the lookup key so saved HTML-entity / decoded variants
+            # both hit the same mapping row.
             full_name, _, meta_puffs = get_full_product_name(item)
+            full_name_key = normalize_raw_name(full_name)
+            product_name_key = normalize_raw_name(product_name)
             series = ''
-            if full_name in manual_mappings:
-                mapping = manual_mappings[full_name]
+            if full_name_key in manual_mappings:
+                mapping = manual_mappings[full_name_key]
                 brand = mapping.get('brand') or 'Unknown'
                 puffs = mapping.get('puffs') or meta_puffs
                 flavor = mapping.get('flavor') or meta_flavor or ''
                 series = mapping.get('series') or ''
-            elif product_name in manual_mappings:
-                mapping = manual_mappings[product_name]
+            elif product_name_key in manual_mappings:
+                mapping = manual_mappings[product_name_key]
                 brand = mapping.get('brand') or 'Unknown'
                 puffs = mapping.get('puffs') or meta_puffs
                 flavor = mapping.get('flavor') or meta_flavor or ''
@@ -9467,9 +9598,10 @@ def products():
                     product_name = item.get('name', '')
                     full_name, flavor_only, _ = get_full_product_name(item)
                     
-                    # Check manual mappings
-                    if full_name in manual_mappings and manual_mappings[full_name].get('flavor'):
-                        flavor = manual_mappings[full_name]['flavor']
+                    # Check manual mappings (canonicalize for entity-safe lookup)
+                    full_name_key = normalize_raw_name(full_name)
+                    if full_name_key in manual_mappings and manual_mappings[full_name_key].get('flavor'):
+                        flavor = manual_mappings[full_name_key]['flavor']
                     elif flavor_only:
                         flavor = flavor_only
                     else:
@@ -9550,14 +9682,16 @@ def products():
                     # Get brand/puffs/flavor using the same logic as main aggregation
                     meta_flavor = extract_flavor_from_meta(item)
                     full_name, _, meta_puffs = get_full_product_name(item)
-                    
-                    if full_name in manual_mappings:
-                        mapping = manual_mappings[full_name]
+                    full_name_key = normalize_raw_name(full_name)
+                    product_name_key = normalize_raw_name(product_name)
+
+                    if full_name_key in manual_mappings:
+                        mapping = manual_mappings[full_name_key]
                         brand = mapping.get('brand') or 'Unknown'
                         puffs = mapping.get('puffs') or meta_puffs
                         flavor = mapping.get('flavor') or meta_flavor or ''
-                    elif product_name in manual_mappings:
-                        mapping = manual_mappings[product_name]
+                    elif product_name_key in manual_mappings:
+                        mapping = manual_mappings[product_name_key]
                         brand = mapping.get('brand') or 'Unknown'
                         puffs = mapping.get('puffs') or meta_puffs
                         flavor = mapping.get('flavor') or meta_flavor or ''
@@ -9955,13 +10089,18 @@ def product_mapping():
         if not raw_name:
             conn.close()
             return jsonify({'error': 'Name is required'}), 400
-        
-        mapping = conn.execute('''
-            SELECT pm.*, b.name as brand_name 
+
+        # Match against either the literal form OR the HTML-entity-decoded form
+        # (legacy rows may have either encoding; new rows are always decoded).
+        candidates = {raw_name, normalize_raw_name(raw_name)}
+        placeholders = ','.join(['?' for _ in candidates])
+        mapping = conn.execute(f'''
+            SELECT pm.*, b.name as brand_name
             FROM product_mappings pm
             LEFT JOIN brands b ON pm.brand_id = b.id
-            WHERE pm.raw_name = ?
-        ''', (raw_name,)).fetchone()
+            WHERE pm.raw_name IN ({placeholders})
+            ORDER BY pm.is_manual DESC, pm.id DESC LIMIT 1
+        ''', tuple(candidates)).fetchone()
         
         conn.close()
         
@@ -9990,6 +10129,10 @@ def product_mapping():
         if not raw_name:
             conn.close()
             return jsonify({'success': False, 'error': 'Product name is required'})
+
+        # Canonicalize: always store the HTML-entity-decoded form so the same
+        # product saved from different UIs ends up as a single row.
+        raw_name = normalize_raw_name(raw_name)
         
         brand_id = data.get('brand_id')
         series_id = data.get('series_id')
@@ -10027,26 +10170,31 @@ def product_mapping():
             flavor = ''
 
         try:
-            # Check if mapping exists
-            existing = conn.execute(
-                'SELECT id FROM product_mappings WHERE raw_name = ?',
-                (raw_name,)
-            ).fetchone()
+            # Find any pre-existing mapping for either the canonical form OR
+            # legacy HTML-entity-encoded variants. We collapse both onto the
+            # canonical row so future lookups find a single source of truth.
+            cur = conn.execute(
+                'SELECT id, raw_name FROM product_mappings WHERE raw_name = ? OR raw_name = ?',
+                (raw_name, html.escape(raw_name, quote=False))
+            ).fetchall()
 
-            if existing:
-                # Update existing
+            if cur:
+                # Update the first one to the canonical form, delete the rest.
+                primary_id = cur[0]['id']
                 conn.execute('''
                     UPDATE product_mappings
-                    SET brand_id = ?, series_id = ?, puff_count = ?, flavor = ?, is_manual = 1
-                    WHERE raw_name = ?
-                ''', (brand_id, series_id, puff_count, flavor, raw_name))
+                    SET raw_name = ?, brand_id = ?, series_id = ?, puff_count = ?, flavor = ?, is_manual = 1
+                    WHERE id = ?
+                ''', (raw_name, brand_id, series_id, puff_count, flavor, primary_id))
+                for row in cur[1:]:
+                    conn.execute('DELETE FROM product_mappings WHERE id = ?', (row['id'],))
             else:
                 # Insert new
                 conn.execute('''
                     INSERT INTO product_mappings (raw_name, brand_id, series_id, puff_count, flavor, is_manual)
                     VALUES (?, ?, ?, ?, ?, 1)
                 ''', (raw_name, brand_id, series_id, puff_count, flavor))
-            
+
             conn.commit()
             conn.close()
             return jsonify({'success': True})
@@ -10100,12 +10248,12 @@ def get_product_samples():
     ''').fetchall()
     manual_mappings = {}
     for m in mappings_rows:
-        manual_mappings[m['raw_name']] = {
+        manual_mappings[normalize_raw_name(m['raw_name'])] = {
             'brand': m['brand_name'],
             'puffs': m['puff_count'],
             'flavor': m['flavor']
         }
-    
+
     # Search for orders - increase limit to find more sources
     orders = conn.execute(f'''
         SELECT id, number, source, date_created, line_items
@@ -10139,15 +10287,17 @@ def get_product_samples():
                 # First, parse the product to get its brand/puffs/flavor
                 meta_flavor = extract_flavor_from_meta(item)
                 full_name, _, meta_puffs = get_full_product_name(item)
-                
+                full_name_key = normalize_raw_name(full_name)
+                item_name_key = normalize_raw_name(item_name)
+
                 # Check manual mapping first
-                if full_name in manual_mappings:
-                    mapping = manual_mappings[full_name]
+                if full_name_key in manual_mappings:
+                    mapping = manual_mappings[full_name_key]
                     item_brand = mapping.get('brand') or 'Unknown'
                     item_puffs = str(mapping.get('puffs') or meta_puffs or '')
                     item_flavor = mapping.get('flavor') or meta_flavor or ''
-                elif item_name in manual_mappings:
-                    mapping = manual_mappings[item_name]
+                elif item_name_key in manual_mappings:
+                    mapping = manual_mappings[item_name_key]
                     item_brand = mapping.get('brand') or 'Unknown'
                     item_puffs = str(mapping.get('puffs') or meta_puffs or '')
                     item_flavor = mapping.get('flavor') or meta_flavor or ''
@@ -10201,8 +10351,9 @@ def get_product_samples():
     parsed_brand = parsed.get('brand') or ''
     parsed_puffs = parsed.get('puffs') or ''
     parsed_flavor = parsed.get('flavor') or ''
-    if product_name in manual_mappings:
-        m = manual_mappings[product_name]
+    product_name_key = normalize_raw_name(product_name)
+    if product_name_key in manual_mappings:
+        m = manual_mappings[product_name_key]
         if m.get('brand'): parsed_brand = m['brand']
         if m.get('puffs'): parsed_puffs = m['puffs']
         if m.get('flavor'): parsed_flavor = m['flavor']
@@ -10422,8 +10573,9 @@ def get_pending_orders():
     country_filter = request.args.get('country', '')
     
     query = '''
-        SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, 
+        SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created,
                o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_total, o.shipping_lines,
+               o.customer_note,
                s.manager,
                n.note as latest_note, n.date_created as latest_note_date, n.author as latest_note_author
         FROM orders o
@@ -10534,6 +10686,7 @@ def get_pending_orders():
             'shipping_total': float(order['shipping_total'] or 0),
             'shipping_method': shipping_method,
             'product_count': sum(item.get('quantity', 1) for item in (line_items or [])),
+            'customer_note': order['customer_note'] or '',
             'latest_note': order['latest_note'] or '',
             'latest_note_date': order['latest_note_date'] or '',
             'latest_note_author': order['latest_note_author'] or ''
@@ -10556,12 +10709,16 @@ def get_shipped_orders():
     query = '''
         SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, o.date_modified,
                o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_lines, o.shipping_total,
+               o.customer_note,
+               o.is_undelivered, o.shipping_loss_amount, o.undelivered_at, o.undelivered_note,
                s.manager,
                sl.tracking_number, sl.carrier_slug, sl.shipped_at,
+               u.name AS undelivered_by_name,
                n.note as latest_note, n.date_created as latest_note_date, n.author as latest_note_author
         FROM orders o
         LEFT JOIN sites s ON o.source = s.url
         LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        LEFT JOIN users u ON o.undelivered_by = u.id
         LEFT JOIN (
             SELECT order_id, note, date_created, author
             FROM order_notes
@@ -10569,7 +10726,7 @@ def get_shipped_orders():
             GROUP BY order_id
             HAVING date_created = MAX(date_created)
         ) n ON o.id = n.order_id
-        WHERE o.status = 'on-hold'
+        WHERE o.status IN ('on-hold', 'shipped', 'partial-shipped')
     '''
     params = []
     
@@ -10606,10 +10763,20 @@ def get_shipped_orders():
     
     if search:
         search_term = f'%{search}%'
-        # For shipped orders, also search tracking number
-        query += ' AND (o.number LIKE ? OR o.billing LIKE ? OR o.shipping LIKE ? OR sl.tracking_number LIKE ?)'
-        params.extend([search_term, search_term, search_term, search_term])
-    
+        # Also match tracking numbers stored by external plugins (AST / VillaTheme / custom):
+        # they live in meta_data, shipping_lines or line_items as JSON. LIKE on the raw JSON
+        # is good enough for the typical case where tracking numbers are 10+ alphanumeric chars.
+        query += ''' AND (
+            o.number LIKE ?
+            OR o.billing LIKE ?
+            OR o.shipping LIKE ?
+            OR sl.tracking_number LIKE ?
+            OR o.meta_data LIKE ?
+            OR o.shipping_lines LIKE ?
+            OR o.line_items LIKE ?
+        )'''
+        params.extend([search_term] * 7)
+
     query += ' ORDER BY sl.shipped_at DESC, o.date_modified DESC, o.date_created DESC'
     
     orders = conn.execute(query, params).fetchall()
@@ -10633,297 +10800,512 @@ def get_shipped_orders():
         except Exception as e:
             print(f"Error processing shipped order {order['number']}: {e}")
             continue
-    
+
     return jsonify(result)
+
+
+@app.route('/api/shipping/find-by-tracking')
+@login_required
+@shipper_required
+def find_orders_by_tracking():
+    """Status-agnostic lookup by tracking number.
+
+    Tracking numbers can live in many places depending on which WooCommerce plugin
+    the site uses (Advanced Shipment Tracking Pro, Orders Tracking for WooCommerce,
+    custom shipping_lines meta, our own shipping_logs, etc.). This endpoint:
+      1. uses LIKE on number + every JSON column we know holds tracking data
+         to get a candidate list across ALL statuses,
+      2. runs each candidate through process_shipped_order() to extract the actual
+         tracking number, then keeps only rows where the extracted number matches
+         the user's query (substring, case-insensitive).
+    """
+    q = (request.args.get('q') or '').strip()
+    if not q or len(q) < 4:
+        return jsonify({'success': False, 'error': '请输入至少 4 位运单号', 'orders': []}), 400
+
+    conn = get_db_connection()
+
+    base_query = '''
+        SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, o.date_modified,
+               o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_lines, o.shipping_total,
+               o.customer_note,
+               o.is_undelivered, o.shipping_loss_amount, o.undelivered_at, o.undelivered_note,
+               s.manager,
+               sl.tracking_number, sl.carrier_slug, sl.shipped_at,
+               u.name AS undelivered_by_name,
+               n.note as latest_note, n.date_created as latest_note_date, n.author as latest_note_author
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        LEFT JOIN users u ON o.undelivered_by = u.id
+        LEFT JOIN (
+            SELECT order_id, note, date_created, author
+            FROM order_notes
+            WHERE customer_note = 0
+            GROUP BY order_id
+            HAVING date_created = MAX(date_created)
+        ) n ON o.id = n.order_id
+        WHERE (
+            o.number LIKE ?
+            OR sl.tracking_number LIKE ?
+            OR o.meta_data LIKE ?
+            OR o.line_items LIKE ?
+            OR o.shipping_lines LIKE ?
+        )
+    '''
+    like_term = f'%{q}%'
+    params = [like_term] * 5
+
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    if allowed_sources is not None:
+        if not allowed_sources:
+            conn.close()
+            return jsonify({'success': True, 'orders': [], 'count': 0})
+        placeholders = ','.join(['?' for _ in allowed_sources])
+        base_query += f' AND o.source IN ({placeholders})'
+        params.extend(allowed_sources)
+
+    # Limit candidates to keep the JSON-parsing post-filter cheap
+    base_query += ' ORDER BY o.date_modified DESC, o.date_created DESC LIMIT 200'
+
+    candidates = conn.execute(base_query, params).fetchall()
+
+    carriers = {c['slug']: c for c in conn.execute('SELECT * FROM shipping_carriers').fetchall()}
+    ast_provider_mapping = {
+        'inpost-paczkomaty': ('inpost', 'InPost'),
+        'inpost': ('inpost', 'InPost'),
+        'dpd': ('dpd', 'DPD'),
+        'dpd-pl': ('dpd', 'DPD'),
+    }
+
+    q_lower = q.lower()
+    results = []
+    for row in candidates:
+        try:
+            payload = process_shipped_order(row, conn, carriers, ast_provider_mapping)
+        except Exception as e:
+            print(f"Error parsing order {row['number']} for tracking lookup: {e}")
+            continue
+        # Confirm the LIKE match by checking either the order number or the
+        # extracted tracking number — drops false positives where the query
+        # string happens to appear elsewhere in the JSON blob.
+        order_no = str(payload.get('number') or '').lower()
+        tracking = str(payload.get('tracking_number') or '').lower()
+        if q_lower in order_no or (tracking and q_lower in tracking):
+            payload['status'] = row['status']
+            results.append(payload)
+
+    conn.close()
+    return jsonify({'success': True, 'orders': results, 'count': len(results)})
+
+
+# ============================================================================
+# Tracking format detection + payload builders
+#
+# WordPress sites we ship to use one of three plugins for the order-edit
+# tracking metabox. Each one stores the tracking in a different meta key, so
+# the only way to make our "发货" button mirror manual entry in WP-admin is
+# to detect which one a given site uses and write the correct shape.
+#
+#   ast              → meta_data['_wc_shipment_tracking_items']  (Advanced Shipment Tracking)
+#   villatheme       → line_items[*].meta_data['_vi_wot_order_item_tracking_data']
+#                       (Orders Tracking for WooCommerce by VillaTheme)
+#   custom_lineitem  → line_items[*].meta_data['tracking_number'] (poland.php / others)
+#
+# We always also write the generic '_tracking_number' / '_tracking_provider'
+# keys so legacy themes and `wc_get_order_tracking_number()` still find it.
+# ============================================================================
+
+def detect_site_tracking_format(conn, site_url):
+    """Look at recent shipped orders for this site to figure out which plugin
+    holds the tracking. Returns 'ast' | 'villatheme' | 'custom_lineitem' | 'unknown'."""
+    rows = conn.execute("""
+        SELECT meta_data, line_items FROM orders
+        WHERE source = ? AND status IN ('on-hold','shipped','completed')
+        ORDER BY date_modified DESC LIMIT 10
+    """, (site_url,)).fetchall()
+
+    ast = villa = custom = 0
+    for r in rows:
+        md = r['meta_data'] or ''
+        li = r['line_items'] or ''
+        if '_wc_shipment_tracking_items' in md:
+            ast += 1
+        if '_vi_wot_order_item_tracking_data' in li:
+            villa += 1
+        elif '"key":"tracking_number"' in li or '"key": "tracking_number"' in li:
+            custom += 1
+
+    if ast and ast >= max(villa, custom):
+        return 'ast'
+    if villa and villa >= custom:
+        return 'villatheme'
+    if custom:
+        return 'custom_lineitem'
+    return 'unknown'
+
+
+def _ast_provider_for_carrier(carrier_slug):
+    """Map our carrier slug to the AST plugin's tracking_provider value.
+
+    Most slugs already match AST's expected provider name (australia-post,
+    dhl-express, fedex, ups, ...). A few legacy short slugs need aliasing.
+    """
+    cs = (carrier_slug or '').lower().strip()
+    aliases = {
+        'inpost': 'inpost-paczkomaty',
+        'dpd': 'dpd-pl',  # our 'dpd' carrier row stores the PL tracking URL
+        'auspost': 'australia-post',
+        'australia_post': 'australia-post',
+    }
+    return aliases.get(cs, cs or 'custom')
+
+
+def build_ast_tracking_value(tracking_number, carrier_slug, line_items):
+    """Build the value for _wc_shipment_tracking_items (a list of one tracking record)."""
+    import time, hashlib
+    products = []
+    for it in line_items or []:
+        if isinstance(it, dict) and it.get('id'):
+            products.append({
+                'product': str(it.get('product_id', '')),
+                'item_id': str(it.get('id')),
+                'qty': str(it.get('quantity', 1))
+            })
+
+    return [{
+        'tracking_number': tracking_number,
+        'shipping_note': '',
+        'tracking_provider': _ast_provider_for_carrier(carrier_slug),
+        'custom_tracking_link': '',
+        'tracking_product_code': '',
+        'date_shipped': str(int(time.time())),
+        'products_list': products,
+        'status_shipped': '1',
+        'tracking_id': hashlib.md5(f"{tracking_number}{time.time()}".encode()).hexdigest(),
+    }]
+
+
+def build_villatheme_lineitem_payload(tracking_number, carrier_slug, carrier_name, tracking_url_template, line_items):
+    """Build line_items payload that adds _vi_wot_order_item_tracking_data to each item.
+
+    `tracking_url_template` is the carrier's URL with a `{tracking}` or
+    `{tracking_number}` placeholder (as stored in the shipping_carriers DB).
+    We normalize to VillaTheme's `{tracking_number}` placeholder.
+    """
+    import time, json as _json
+
+    url_template = (tracking_url_template or '').replace('{tracking}', '{tracking_number}')
+
+    carrier_data = {
+        'carrier_slug': carrier_slug or 'custom',
+        'carrier_name': carrier_name or (carrier_slug.title() if carrier_slug else 'Custom'),
+        'carrier_url': url_template,
+        'carrier_type': 'custom-carrier',
+    }
+
+    # VillaTheme stores the tracking record as a JSON-encoded string
+    tracking_value = _json.dumps([{
+        'tracking_number': tracking_number,
+        **carrier_data,
+        'time': int(time.time())
+    }])
+
+    out = []
+    for it in line_items or []:
+        if isinstance(it, dict) and it.get('id'):
+            out.append({
+                'id': it.get('id'),
+                'meta_data': [{'key': '_vi_wot_order_item_tracking_data', 'value': tracking_value}]
+            })
+    return out
+
+
+def _post_fallback_customer_note(req, site, order, carrier_name, tracking_number, tracking_url, api_headers, warnings):
+    """Last-resort fallback when the trigger-shipment-email endpoint is missing
+    on the site (mu-plugin not installed yet). Posts a customer_note=true so
+    WooCommerce sends its built-in 'Customer Note' email — uglier than the
+    plugin-native one but better than no notification at all."""
+    try:
+        note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes"
+        if tracking_url:
+            note_content = (
+                f"Order has been shipped via {carrier_name}. "
+                f"Tracking Number: <a href='{tracking_url}'>{tracking_number}</a>"
+                f"\n<br>Track your package: <a href='{tracking_url}'>{tracking_url}</a>"
+            )
+        else:
+            note_content = f"Order has been shipped via {carrier_name}. Tracking Number: {tracking_number}"
+        note_resp = req.post(
+            note_url,
+            json={'note': note_content, 'customer_note': True},
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=45,
+            headers=api_headers,
+        )
+        if note_resp.status_code not in (200, 201):
+            warnings.append(f"回退客户备注失败 HTTP {note_resp.status_code}")
+    except Exception as e:
+        warnings.append(f"回退客户备注异常: {e}")
+
+
+def target_status_for_format(fmt):
+    """Pick the order status that semantically means 'shipped' on this site.
+
+    AST plugin registers a custom 'shipped' status and uses it as the post-ship
+    state. VillaTheme/poland.php sites stay at the standard WC 'on-hold' status
+    after shipping (the user confirmed this is the expected behavior on those
+    sites). Mirroring what manual entry in WP-admin would do.
+    """
+    return 'shipped' if fmt == 'ast' else 'on-hold'
+
+
+def build_custom_lineitem_payload(tracking_number, carrier_slug, tracking_url, line_items):
+    """Build line_items payload for sites that store a bare 'tracking_number' meta per item."""
+    out = []
+    for it in line_items or []:
+        if isinstance(it, dict) and it.get('id'):
+            meta = [{'key': 'tracking_number', 'value': tracking_number}]
+            if tracking_url:
+                meta.append({'key': 'tracking_url', 'value': tracking_url})
+            if carrier_slug:
+                meta.append({'key': 'carrier_slug', 'value': carrier_slug})
+            out.append({'id': it.get('id'), 'meta_data': meta})
+    return out
 
 
 @app.route('/api/shipping/ship', methods=['POST'])
 @login_required
 @shipper_required
 def ship_order():
-    """Execute shipping: add tracking number and update order status
-    
-    Supports two shipping modes:
-    - 'api': Use woo-tracking REST API to write tracking directly to WordPress
-    - 'note': Use order notes to send tracking information (legacy method)
+    """Mirror manual tracking entry in WP-admin.
+
+    For the chosen site we detect which tracking plugin it uses, then PUT
+    /orders/{id} with the right meta_data shape AND status=on-hold in a single
+    request. After that we (optionally) post a customer-visible note so WC
+    sends the shipment email — same path the WP admin order-edit screen takes.
     """
     import requests as req
-    
-    data = request.json
+    import time
+
+    data = request.json or {}
     order_id = data.get('order_id')
-    tracking_number = data.get('tracking_number')
-    carrier_slug = data.get('carrier_slug')
+    tracking_number = (data.get('tracking_number') or '').strip()
+    carrier_slug = (data.get('carrier_slug') or '').strip()
     send_email = data.get('send_email', True)
-    shipping_mode = data.get('shipping_mode', 'api')  # 'api' or 'note'
-    
+
     if not all([order_id, tracking_number, carrier_slug]):
         return jsonify({'success': False, 'error': '缺少必填字段'}), 400
-    
+
     conn = get_db_connection()
-    
-    # Get order info including current status
-    order = conn.execute('SELECT id, number, source, status FROM orders WHERE id = ?', (order_id,)).fetchone()
+
+    order = conn.execute(
+        'SELECT id, number, source, status, line_items FROM orders WHERE id = ?',
+        (order_id,)
+    ).fetchone()
     if not order:
         conn.close()
         return jsonify({'success': False, 'error': '订单不存在'}), 404
-    
-    # Get site credentials
+
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
     if not site:
         conn.close()
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
 
-    # Get carrier info
     carrier = conn.execute('SELECT name, tracking_url FROM shipping_carriers WHERE slug = ?', (carrier_slug,)).fetchone()
     carrier_name = carrier['name'] if carrier else carrier_slug
-    
-    # Generate tracking URL
+    tracking_url_template = (carrier['tracking_url'] if carrier else '') or ''
+
+    # Customer-facing tracking URL — resolve placeholders from the DB template.
+    # No carrier-specific hardcoding here; if a new carrier needs a URL, add a
+    # row to shipping_carriers instead.
     tracking_url = ''
-    if carrier and carrier['tracking_url']:
-        tracking_url = carrier['tracking_url'].replace('{tracking}', tracking_number).replace('{tracking_number}', tracking_number)
-        
-    # Override for specific Polish carriers
-    if 'inpost' in carrier_slug.lower() and tracking_number:
-        tracking_url = f"https://inpost.pl/sledzenie-przesylek?number={tracking_number}"
-    elif 'dpd' in carrier_slug.lower() and tracking_number:
-        tracking_url = f"https://tracktrace.dpd.com.pl/parcelDetails?p1={tracking_number}"
-    
-    # Check if already has tracking log - update instead of insert
-    existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
-    
-    # Track any warnings during the process
-    warnings = []
-    used_mode = shipping_mode  # Track actual mode used (may fallback)
-    
-    # Define headers for all API calls
+    if tracking_url_template:
+        tracking_url = tracking_url_template.replace('{tracking}', tracking_number).replace('{tracking_number}', tracking_number)
+
+    line_items = parse_json_field(order['line_items']) or []
+    fmt = detect_site_tracking_format(conn, order['source'])
+    fmt_label = {'ast': 'AST', 'villatheme': 'VillaTheme', 'custom_lineitem': '自定义', 'unknown': '默认(AST)'}.get(fmt, fmt)
+    target_status = target_status_for_format(fmt)
+
     api_headers = {
         "User-Agent": "WooCommerce API Client-Python/3.0.0",
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
-    
-    # ===== API MODE: Use woo-tracking REST API =====
-    api_tracking_success = False
-    if shipping_mode == 'api':
-        # Use URL params for auth to avoid WordPress Basic Auth interception
-        tracking_api_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['id']}/tracking?consumer_key={site['consumer_key']}&consumer_secret={site['consumer_secret']}"
-        
-        print(f"[DEBUG] API Mode - URL: {site['url']}/wp-json/woo-tracking/v1/orders/{order['number']}/tracking")
-        print(f"[DEBUG] API Mode - Order Number: {order['number']}, Tracking: {tracking_number}")
-        
+
+    # Build the single PUT payload: status + correct tracking meta shape.
+    # Status varies by site: AST uses its custom 'shipped' status; VillaTheme
+    # and poland.php sites stay at the standard 'on-hold' status after shipping.
+    put_payload = {'status': target_status}
+    base_meta = [
+        {'key': '_tracking_number', 'value': tracking_number},
+        {'key': '_tracking_provider', 'value': carrier_slug},
+        {'key': '_date_shipped', 'value': str(int(time.time()))},
+    ]
+
+    if fmt == 'villatheme':
+        put_payload['meta_data'] = base_meta
+        put_payload['line_items'] = build_villatheme_lineitem_payload(
+            tracking_number, carrier_slug, carrier_name, tracking_url_template, line_items
+        )
+    elif fmt == 'custom_lineitem':
+        put_payload['meta_data'] = base_meta
+        put_payload['line_items'] = build_custom_lineitem_payload(tracking_number, carrier_slug, tracking_url, line_items)
+    else:
+        # ast or unknown — write AST format. Even if AST plugin isn't installed,
+        # the meta is harmless and other readers (legacy code, our own sync)
+        # already understand _wc_shipment_tracking_items.
+        put_payload['meta_data'] = base_meta + [
+            {'key': '_wc_shipment_tracking_items',
+             'value': build_ast_tracking_value(tracking_number, carrier_slug, line_items)},
+        ]
+
+    status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}"
+    warnings = []
+    remote_success = False
+
+    # PUT with retry. The same payload is idempotent so retrying after timeout is safe.
+    for attempt in range(3):
         try:
-            # Call woo-tracking plugin API (no Basic Auth, using URL params)
-            tracking_resp = req.post(
-                tracking_api_url,
-                json={
-                    'tracking_number': tracking_number,
-                    'carrier_slug': carrier_slug,
-                    'send_email': send_email,
-                    'change_order_status': 'on-hold'  # Also change status via plugin
-                },
-                timeout=45,
+            resp = req.put(
+                status_url,
+                json=put_payload,
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=60,
                 headers=api_headers
             )
-            
-            print(f"[DEBUG] API Response - Status: {tracking_resp.status_code}")
-            print(f"[DEBUG] API Response - Body: {tracking_resp.text[:500] if tracking_resp.text else 'empty'}")
-            
-            # Check if response is HTML (plugin not installed or auth error)
-            response_text = tracking_resp.text or ''
-            if response_text.strip().startswith('<!') or response_text.strip().startswith('<html'):
-                print(f"[DEBUG] API returned HTML instead of JSON - plugin may not be installed")
-                warnings.append("物流API返回HTML(插件未安装或认证失败)，已回退到备注模式")
-                used_mode = 'note'
-            elif tracking_resp.status_code in [200, 201]:
-                api_tracking_success = True
-                try:
-                    response_data = tracking_resp.json()
-                    print(f"API mode success: {response_data}")
-                except Exception as json_err:
-                    print(f"[DEBUG] JSON parse error: {json_err}")
-                    warnings.append(f"API响应解析失败，已回退到备注模式")
-                    used_mode = 'note'
-                    api_tracking_success = False
-            elif tracking_resp.status_code == 404:
-                # Plugin not installed, fallback to note mode
-                warnings.append(f"物流API不可用(404)，已回退到备注模式")
-                used_mode = 'note'
+            print(f"[SHIP] {site['url']} order {order['id']} fmt={fmt} attempt={attempt+1} status={resp.status_code}")
+            if resp.status_code in (200, 201):
+                remote_success = True
+                break
+            body = (resp.text or '')[:300]
+            if body.lstrip().startswith(('<!', '<html')):
+                warnings.append(f"WP 返回 HTML（疑似 WAF 拦截 / 认证失败），HTTP {resp.status_code}")
             else:
-                # API error, fallback to note mode
-                error_preview = response_text[:200] if response_text else 'no content'
-                warnings.append(f"物流API返回 {tracking_resp.status_code}: {error_preview}，已回退到备注模式")
-                used_mode = 'note'
-                
-        except req.exceptions.Timeout:
-            warnings.append("物流API超时，已回退到备注模式")
-            used_mode = 'note'
-        except Exception as e:
-            warnings.append(f"物流API异常: {str(e)}，已回退到备注模式")
-            used_mode = 'note'
-    
-    # ===== NOTE MODE: Add order note with tracking info =====
-    if used_mode == 'note' or (shipping_mode == 'api' and not api_tracking_success):
-        # Add order note with tracking information
-        try:
-            note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes"
-            
-            if tracking_url:
-                note_content = f"Order has been shipped via {carrier_name}. Tracking Number: <a href='{tracking_url}'>{tracking_number}</a>"
-                note_content += f"\n<br>Track your package: <a href='{tracking_url}'>{tracking_url}</a>"
-            else:
-                note_content = f"Order has been shipped via {carrier_name}. Tracking Number: {tracking_number}"
-            
-            # Retry logic with shorter timeout for problematic sites
-            max_retries = 2 if send_email else 1  # 发送邮件时重试，不发送时只尝试1次
-            timeout_seconds = 45 if send_email else 15  # 发送邮件时用更长超时
-            
-            for attempt in range(max_retries):
-                try:
-                    note_resp = req.post(
-                        note_url,
-                        json={
-                            'note': note_content, 
-                            'customer_note': send_email  # 关键：只在需要发邮件时设为 True
-                        },
-                        auth=(site['consumer_key'], site['consumer_secret']),
-                        timeout=timeout_seconds,
-                        headers=api_headers
-                    )
-                    if note_resp.status_code in [200, 201]:
-                        break
-                    elif attempt < max_retries - 1:
-                        print(f"Retry {attempt + 1}: Note API returned {note_resp.status_code}")
-                        import time
-                        time.sleep(1)
-                    else:
-                        error_msg = f"API returned {note_resp.status_code}: {note_resp.text}"
-                        print(f"Warning: Failed to add note: {error_msg}")
-                        warnings.append(f"添加备注失败: {error_msg}")
-                except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
-                    # Connection error handling
-                    if attempt < max_retries - 1:
-                        print(f"Connection error attempt {attempt + 1}, retrying: {str(e)}")
-                        import time
-                        time.sleep(1)
-                    else:
-                        print(f"Warning: Failed to add note due to connection issue: {str(e)}")
-                        warnings.append(f"添加备注连接超时")
-        except Exception as e:
-            print(f"Error adding note: {e}")
-            warnings.append(f"添加备注出错: {str(e)}")
-        
-        # Wait a bit before trying to update status if note failed
-        if warnings:
-            print("Note addition failed, waiting 5s before status update to avoid lock...")
-            import time
-            time.sleep(5)
-
-    # ===== STATUS UPDATE: Only needed if not using API mode successfully =====
-    # API mode already handles status change via plugin
-    remote_status_updated = api_tracking_success  # If API succeeded, status was already updated
-    status_verification_success = api_tracking_success
-    
-    # Only update status if API mode didn't already do it
-    if order['status'] != 'on-hold' and not api_tracking_success:
-        status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}"
-        # Retry logic for status update
-        max_retries = 3
-        
-        for attempt in range(max_retries):
+                warnings.append(f"远程返回 {resp.status_code}: {body}")
+        except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
+            print(f"[SHIP] {site['url']} order {order['id']} attempt {attempt+1} timed out: {e}")
+            # Verify by GET — the PUT may have actually applied even if the
+            # response never made it back.
             try:
-                status_resp = req.put(
-                    status_url,
-                    json={'status': 'on-hold'},
-                    auth=(site['consumer_key'], site['consumer_secret']),
-                    timeout=60,
-                    headers=api_headers
-                )
-                if status_resp.status_code in [200, 201]:
-                    remote_status_updated = True
-                    status_verification_success = True
+                check = req.get(status_url, auth=(site['consumer_key'], site['consumer_secret']), timeout=30)
+                if check.status_code == 200 and check.json().get('status') == target_status:
+                    remote_success = True
+                    warnings.append("PUT 响应超时，但二次查询确认状态已更新")
                     break
-                elif attempt < max_retries - 1:
-                    print(f"Retry {attempt + 1}: Status API returned {status_resp.status_code}")
-                    import time
-                    time.sleep(2)
-            except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
-                # CONNECTION FAILED: The request might have succeeded on server but response was lost
-                print(f"Connection error attempt {attempt + 1}: {str(e)}")
-                
-                # VERIFY STRATEGY: Wait and Check status
-                if attempt == max_retries - 1:
-                    print("Last attempt connection failed. Verifying actual status on server...")
-                    import time
-                    time.sleep(5) # Increased from 3s to 5s for slower servers
-                    
-                    try:
-                        # Try to GET the order status
-                        check_resp = req.get(
-                            status_url,
-                            auth=(site['consumer_key'], site['consumer_secret']),
-                            timeout=30 # Use shorter timeout for read
-                        )
-                        if check_resp.status_code == 200:
-                            current_remote_status = check_resp.json().get('status')
-                            if current_remote_status == 'on-hold':
-                                print("Verification Successful: Order is actualy on-hold!")
-                                remote_status_updated = True
-                                status_verification_success = True
-                                warnings.append("远程响应超时，但经验证状态已更新成功")
-                            else:
-                                print(f"Verification Failed: Order status is {current_remote_status}")
-                    except Exception as verify_e:
-                        print(f"Verification failed: {verify_e}")
-                
-                if not status_verification_success and attempt < max_retries - 1:
-                    import time
-                    time.sleep(2)
-        
-        if not remote_status_updated:
-            # If verification failed, DO NOT update local status to avoid inconsistency
-            # Unless we force it, but user wants consistency
-            conn.execute("UPDATE shipping_logs SET tracking_number = ?, carrier_slug = ?, shipped_by = ?, shipped_at = datetime('now') WHERE order_id = ?", 
-                        (tracking_number, carrier_slug, current_user.id, order_id))
-            conn.commit() # Save tracking number at least
-            conn.close()
-            
-            error_details = "; ".join(warnings) if warnings else "远程状态更新失败"
-            return jsonify({
-                'success': False, 
-                'error': f"发货连接失败: 无法确认远程状态已更新。为了保证数据一致性，本地状态未更改。已保存追踪号，请稍后重试。({error_details})"
-            }), 500
-        
-    # 4. Update local database ONLY if remote success or verified
-    try:
-        # Update local order status
-        conn.execute("UPDATE orders SET status = 'on-hold' WHERE id = ?", (order_id,))
-        
-        # Log shipping action - update if exists, insert if new
+            except Exception as verify_err:
+                print(f"[SHIP] verify after timeout failed: {verify_err}")
+            if attempt < 2:
+                time.sleep(2)
+        except Exception as e:
+            warnings.append(f"远程异常: {e}")
+            break
+
+    if not remote_success:
+        # Persist the tracking number locally so the user doesn't have to
+        # retype it on retry. Status stays as-is to avoid drift.
+        existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
         if existing_log:
-            conn.execute('''
-                UPDATE shipping_logs 
-                SET tracking_number = ?, carrier_slug = ?, shipped_by = ?, shipped_at = datetime('now')
-                WHERE order_id = ?
-            ''', (tracking_number, carrier_slug, current_user.id, order_id))
+            conn.execute(
+                "UPDATE shipping_logs SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now') WHERE order_id=?",
+                (tracking_number, carrier_slug, current_user.id, order_id)
+            )
         else:
-            conn.execute('''
-                INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id))
-        
+            conn.execute(
+                '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
+            )
         conn.commit()
         conn.close()
-        
-        if warnings:
-            warning_msg = "本地发货成功，但远程同步有警告: " + "; ".join(warnings)
-            return jsonify({'success': True, 'message': warning_msg, 'warning': True, 'mode': used_mode})
+        return jsonify({
+            'success': False,
+            'error': f"发货失败（{fmt_label}）：{'; '.join(warnings) or '远程未返回成功'}。运单号已暂存本地，请稍后重试。"
+        }), 500
+
+    # Trigger the site's native shipment email.
+    #
+    # Why this is a separate call (and not just the meta_data PUT above):
+    #   - AST hooks into the wc-shipped status transition, so its email is
+    #     already on its way the moment the PUT lands. Our trigger endpoint
+    #     is a no-op for AST.
+    #   - VillaTheme (Orders Tracking for WooCommerce) does NOT hook into
+    #     status changes — its admin save handler invokes
+    #     VI_WOO_ORDERS_TRACKING_ADMIN_IMPORT_CSV::send_mail() directly.
+    #     Setting meta via REST never triggers send_mail(), so VillaTheme
+    #     sites stopped emailing customers after the ship_order rewrite.
+    #     The trigger endpoint replicates the admin call.
+    # The endpoint itself decides which path applies; we just always call it
+    # and let it self-detect.
+    email_trigger_info = None
+    if send_email:
+        try:
+            trig_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['id']}/trigger-shipment-email"
+            trig_resp = req.post(
+                trig_url,
+                json={'tracking_number': tracking_number, 'carrier_slug': carrier_slug},
+                params={'consumer_key': site['consumer_key'], 'consumer_secret': site['consumer_secret']},
+                timeout=30,
+                headers=api_headers,
+            )
+            if trig_resp.status_code == 200:
+                td = trig_resp.json() if trig_resp.text else {}
+                email_trigger_info = td
+                # Surface a warning only if we KNOW the email failed; AST
+                # returns email_sent=null because it's async, that's fine.
+                if td.get('email_sent') is False and td.get('plugin') not in ('AST',):
+                    warnings.append(f"邮件触发失败（{td.get('plugin', '?')}）: {td.get('note', '')}")
+            elif trig_resp.status_code == 404:
+                # Plugin not installed on this site — fall back to the
+                # legacy customer_note approach so the buyer still gets
+                # *some* notification.
+                warnings.append("邮件触发端点未找到（请确认 woo-orders-tracking-rest-api mu-plugin 已安装）")
+                _post_fallback_customer_note(req, site, order, carrier_name, tracking_number, tracking_url, api_headers, warnings)
+            else:
+                warnings.append(f"邮件触发返回 {trig_resp.status_code}")
+        except Exception as e:
+            warnings.append(f"邮件触发异常: {e}")
+
+    # Local DB: status + shipping_logs (mirror the remote status we just set)
+    try:
+        conn.execute("UPDATE orders SET status=? WHERE id=?", (target_status, order_id))
+        existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id=?', (order_id,)).fetchone()
+        if existing_log:
+            conn.execute(
+                "UPDATE shipping_logs SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now') WHERE order_id=?",
+                (tracking_number, carrier_slug, current_user.id, order_id)
+            )
         else:
-            mode_label = 'API模式' if used_mode == 'api' and api_tracking_success else '备注模式'
-            return jsonify({'success': True, 'message': f'发货成功（{mode_label}）', 'mode': used_mode})
-            
+            conn.execute(
+                '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
+            )
+        conn.commit()
     except Exception as e:
         conn.close()
-        return jsonify({'success': False, 'error': f"本地数据库更新失败: {str(e)}"}), 500
+        return jsonify({'success': False, 'error': f"本地数据库更新失败: {e}"}), 500
+    conn.close()
+
+    # Annotate the success message with what the email trigger reported
+    msg = f"发货成功（{fmt_label} 格式）"
+    if email_trigger_info:
+        plugin = email_trigger_info.get('plugin', '?')
+        sent = email_trigger_info.get('email_sent')
+        if sent is True:
+            msg += f"，发货邮件已发送（{plugin}）"
+        elif sent is None and plugin == 'AST':
+            msg += "，AST 已自动安排发货邮件"
+        elif sent is False:
+            msg += f"，邮件未发送：{email_trigger_info.get('note', '未识别物流插件')}"
+    if warnings:
+        return jsonify({
+            'success': True, 'warning': True, 'format': fmt,
+            'message': msg + ' — 警告: ' + '; '.join(warnings),
+            'email_trigger': email_trigger_info,
+        })
+    return jsonify({'success': True, 'message': msg, 'format': fmt, 'email_trigger': email_trigger_info})
 
 
 @app.route('/api/shipping/debug/<int:order_id>', methods=['POST'])
@@ -11069,11 +11451,376 @@ def complete_order(order_id):
 @login_required
 @shipper_required
 def get_carriers():
-    """Get list of shipping carriers"""
+    """Carriers visible to the current user.
+
+    Admins / viewers see every active row in `shipping_carriers`.
+    Restricted users see only the carriers actually in use on sites they
+    have permission to ship from — so a PL-only user never sees Australia
+    Post in the dropdown, and an AU-only user never sees InPost / DPD.
+    Used by the ship modal as the fallback when a site has no shipping
+    history yet.
+    """
     conn = get_db_connection()
-    carriers = conn.execute('SELECT id, slug, name, tracking_url FROM shipping_carriers WHERE is_active = 1').fetchall()
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+
+    if allowed_sources is None:
+        # No restrictions
+        carriers = conn.execute(
+            'SELECT id, slug, name, tracking_url FROM shipping_carriers WHERE is_active = 1'
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(c) for c in carriers])
+
+    if not allowed_sources:
+        conn.close()
+        return jsonify([])
+
+    # Union of carriers detected across the user's authorized sites
+    by_slug = {}
+    for site_url in allowed_sources:
+        for c in detect_carriers_for_site(conn, site_url):
+            slug = c['slug']
+            if slug in by_slug:
+                by_slug[slug]['usage_count'] = by_slug[slug].get('usage_count', 0) + c.get('usage_count', 0)
+            else:
+                by_slug[slug] = dict(c)
     conn.close()
-    return jsonify([dict(c) for c in carriers])
+    # Sort by usage frequency so the most-used carrier surfaces first
+    return jsonify(sorted(by_slug.values(), key=lambda x: -x.get('usage_count', 0)))
+
+
+def detect_carriers_for_site(conn, site_url, lookback_orders=80):
+    """Return the carriers a specific site has actually used, by inspecting
+    recent shipped orders' tracking meta_data. Lets the ship modal show only
+    options that make sense for *this* site (PL site → InPost/DPD; AU site →
+    Australia Post) instead of one global cluttered dropdown.
+
+    Slugs are enriched with name + tracking_url from the shipping_carriers
+    table when available; otherwise we fall back to the slug itself as the
+    display name and an empty URL.
+    """
+    rows = conn.execute("""
+        SELECT meta_data, line_items FROM orders
+        WHERE source = ? AND status IN ('on-hold','shipped','partial-shipped','completed','delivered')
+        ORDER BY date_modified DESC LIMIT ?
+    """, (site_url, lookback_orders)).fetchall()
+
+    import re
+    # VillaTheme generates per-entry slugs like 'custom_1775723085' when the
+    # admin types a name freehand. Skip those and use carrier_name instead.
+    custom_slug_re = re.compile(r'^custom_\d+$')
+    # Lowercased carrier_name → canonical slug we want to surface.
+    name_to_slug = {
+        'inpost': 'inpost', 'inpost paczkomaty': 'inpost', 'paczkomaty': 'inpost',
+        'dpd': 'dpd', 'dpd polska': 'dpd', 'dpd poland': 'dpd', 'dpd-pl': 'dpd',
+        'australia post': 'australia-post', 'auspost': 'australia-post', 'australia-post': 'australia-post',
+    }
+    # Slug aliases — collapse AST's regional variants down to our shipping_carriers
+    # canonical slug so the URL lookup works in ship_order.
+    slug_aliases = {
+        'inpost-paczkomaty': 'inpost',
+        'inpost-pl': 'inpost',
+        'dpd-pl': 'dpd',
+        'dpd-polska': 'dpd',
+        'auspost': 'australia-post',
+    }
+
+    def _record_slug(slug, fallback_name):
+        """Normalize one tracking record's slug. Drop noise; map custom_NNN
+        to a real carrier via its display name; collapse regional aliases."""
+        s = (slug or '').strip().lower()
+        n = (fallback_name or '').strip().lower()
+        if not s and not n:
+            return None
+        if s and not custom_slug_re.match(s):
+            return slug_aliases.get(s, s)
+        # Custom_TIMESTAMP — recover a real carrier from carrier_name
+        return name_to_slug.get(n)
+
+    seen = {}  # slug → count
+    for r in rows:
+        # AST format: meta_data._wc_shipment_tracking_items[].tracking_provider
+        try:
+            md = json.loads(r['meta_data'] or '[]')
+            for m in md:
+                if isinstance(m, dict) and m.get('key') == '_wc_shipment_tracking_items':
+                    items = m.get('value', [])
+                    if isinstance(items, list):
+                        for it in items:
+                            if isinstance(it, dict):
+                                slug = _record_slug(it.get('tracking_provider'), '')
+                                if slug:
+                                    seen[slug] = seen.get(slug, 0) + 1
+        except Exception:
+            pass
+
+        # VillaTheme: line_items[*].meta_data._vi_wot_order_item_tracking_data
+        try:
+            li = json.loads(r['line_items'] or '[]')
+            for item in li:
+                if not isinstance(item, dict):
+                    continue
+                for m in item.get('meta_data', []):
+                    if not isinstance(m, dict):
+                        continue
+                    if m.get('key') == '_vi_wot_order_item_tracking_data':
+                        v = m.get('value')
+                        try:
+                            recs = json.loads(v) if isinstance(v, str) else v
+                        except Exception:
+                            recs = None
+                        if isinstance(recs, list):
+                            for rec in recs:
+                                if isinstance(rec, dict):
+                                    slug = _record_slug(rec.get('carrier_slug'), rec.get('carrier_name'))
+                                    if slug:
+                                        seen[slug] = seen.get(slug, 0) + 1
+        except Exception:
+            pass
+
+    if not seen:
+        return []
+
+    # Pull names + URLs for the slugs we found
+    db_carriers = {c['slug']: c for c in conn.execute(
+        'SELECT slug, name, tracking_url FROM shipping_carriers'
+    ).fetchall()}
+
+    out = []
+    for slug, count in sorted(seen.items(), key=lambda kv: -kv[1]):
+        c = db_carriers.get(slug)
+        # AST aliases: 'inpost-paczkomaty' → our DB row 'inpost'; 'dpd-pl' → 'dpd'
+        if not c:
+            alias = {'inpost-paczkomaty': 'inpost', 'dpd-pl': 'dpd', 'auspost': 'australia-post'}.get(slug)
+            if alias:
+                c = db_carriers.get(alias)
+        out.append({
+            'slug': slug,
+            'name': (c['name'] if c else slug.replace('-', ' ').title()),
+            'tracking_url': (c['tracking_url'] if c else ''),
+            'usage_count': count,
+        })
+    return out
+
+
+@app.route('/api/shipping/carriers-for-site')
+@login_required
+@shipper_required
+def get_carriers_for_site():
+    """Return the carriers actually in use on a given site (auto-detected
+    from recent shipped orders). Used by the ship modal so each site only
+    shows its own relevant carriers."""
+    source = request.args.get('source', '').strip()
+    if not source:
+        return jsonify({'error': 'missing source'}), 400
+
+    # Block probing of sites this user isn't authorized for — otherwise a
+    # restricted user could pass any site URL here and learn its carriers.
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    if allowed_sources is not None and source not in allowed_sources:
+        return jsonify({'error': '无权访问该站点'}), 403
+
+    conn = get_db_connection()
+    carriers = detect_carriers_for_site(conn, source)
+    conn.close()
+    return jsonify(carriers)
+
+
+@app.route('/api/order/<int:order_id>/emails', methods=['GET'])
+@login_required
+def get_order_emails(order_id):
+    """Fetch emails sent to this order's customer, by calling the source
+    site's woo-tracking plugin endpoint. The plugin auto-detects whichever
+    email-logging plugin is installed (FluentSMTP / WP Mail SMTP / Email Log)
+    and returns a unified shape, so we just relay it.
+    """
+    import requests as req
+
+    conn = get_db_connection()
+    order = conn.execute('SELECT id, number, source FROM orders WHERE id = ?', (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    conn.close()
+    if not site:
+        return jsonify({'success': False, 'error': '站点配置不存在'}), 404
+
+    url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['id']}/email-logs"
+    # Pass-through ?debug=1 surfaces the WP-side candidate-table list, so when
+    # nothing matches the user can see which logger plugin (and table name)
+    # the site actually has.
+    debug = '1' if request.args.get('debug') else None
+    try:
+        params = {'consumer_key': site['consumer_key'], 'consumer_secret': site['consumer_secret']}
+        if debug:
+            params['debug'] = '1'
+        r = req.get(
+            url,
+            params=params,
+            timeout=15,
+            headers={"User-Agent": "WooCommerce API Client-Python/3.0.0", "Accept": "application/json"},
+        )
+        if r.status_code == 200:
+            data = r.json() if r.text else {}
+            return jsonify({'success': True, **data})
+        if r.status_code == 404:
+            return jsonify({
+                'success': False,
+                'error': '该站点未安装 woo-tracking 插件（无法读取邮件日志）',
+                'plugin': 'none', 'logs': [], 'count': 0,
+            })
+        body = (r.text or '')[:200]
+        return jsonify({
+            'success': False, 'error': f'远程返回 {r.status_code}: {body}',
+            'plugin': 'none', 'logs': [], 'count': 0,
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False, 'error': f'请求失败: {e}',
+            'plugin': 'none', 'logs': [], 'count': 0,
+        })
+
+
+@app.route('/api/customer/emails', methods=['GET'])
+@login_required
+def get_customer_emails():
+    """All emails ever sent to this customer, aggregated across every site
+    where they have an order. Each row is tagged with site_id/site_url so
+    the frontend can fetch its detail (the log_id namespace is per-site).
+    Sites are queried in parallel because each WP round-trip is 1-3 s.
+    """
+    import requests as req
+    import concurrent.futures
+
+    email = (request.args.get('email') or '').strip()
+    if not email:
+        return jsonify({'success': False, 'error': 'missing email'}), 400
+
+    conn = get_db_connection()
+    rows = conn.execute("""
+        SELECT DISTINCT s.id AS site_id, s.url AS site_url, s.consumer_key, s.consumer_secret
+        FROM orders o
+        JOIN sites s ON s.url = o.source
+        WHERE json_extract(o.billing, '$.email') = ?
+          AND COALESCE(s.consumer_key, '') != '' AND COALESCE(s.consumer_secret, '') != ''
+    """, (email,)).fetchall()
+    conn.close()
+    sites = [dict(r) for r in rows]
+
+    def fetch(site):
+        url = f"{site['site_url']}/wp-json/woo-tracking/v1/customer-email-logs"
+        try:
+            r = req.get(
+                url,
+                params={'email': email, 'limit': 50,
+                        'consumer_key': site['consumer_key'],
+                        'consumer_secret': site['consumer_secret']},
+                timeout=15,
+                headers={"User-Agent": "WooCommerce API Client-Python/3.0.0", "Accept": "application/json"},
+            )
+            if r.status_code != 200:
+                return {'site_id': site['site_id'], 'site_url': site['site_url'], 'logs': [],
+                        'error': f"HTTP {r.status_code}", 'plugin': 'none'}
+            data = r.json() if r.text else {}
+            logs = data.get('logs', []) or []
+            for lg in logs:
+                lg['site_id'] = site['site_id']
+                lg['site_url'] = site['site_url']
+            return {'site_id': site['site_id'], 'site_url': site['site_url'],
+                    'logs': logs, 'plugin': data.get('plugin', 'none')}
+        except Exception as e:
+            return {'site_id': site['site_id'], 'site_url': site['site_url'], 'logs': [],
+                    'error': str(e), 'plugin': 'none'}
+
+    site_results = []
+    if sites:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(sites))) as ex:
+            site_results = list(ex.map(fetch, sites))
+
+    all_logs = []
+    for sr in site_results:
+        all_logs.extend(sr.get('logs', []))
+    # Sort newest first
+    all_logs.sort(key=lambda x: str(x.get('sent_at') or ''), reverse=True)
+
+    return jsonify({
+        'success': True,
+        'email': email,
+        'sites_queried': len(sites),
+        'site_summaries': [{'site_id': s['site_id'],
+                            'site_url': s['site_url'].replace('https://www.', '').replace('https://', ''),
+                            'count': len(s.get('logs', [])),
+                            'plugin': s.get('plugin', 'none'),
+                            'error': s.get('error', '')} for s in site_results],
+        'count': len(all_logs),
+        'logs': all_logs[:200],
+    })
+
+
+@app.route('/api/site/<int:site_id>/emails/<int:log_id>', methods=['GET'])
+@login_required
+def get_site_email_detail(site_id, log_id):
+    """Fetch full email detail by (site, log_id). Used by the customer modal
+    where there's no specific order to scope to."""
+    import requests as req
+
+    conn = get_db_connection()
+    site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
+    conn.close()
+    if not site:
+        return jsonify({'success': False, 'error': '站点不存在'}), 404
+
+    url = f"{site['url']}/wp-json/woo-tracking/v1/email-logs/{log_id}/detail"
+    try:
+        r = req.get(
+            url,
+            params={'consumer_key': site['consumer_key'], 'consumer_secret': site['consumer_secret']},
+            timeout=20,
+            headers={"User-Agent": "WooCommerce API Client-Python/3.0.0", "Accept": "application/json"},
+        )
+        if r.status_code == 200:
+            return jsonify(r.json())
+        if r.status_code == 404:
+            return jsonify({'success': False, 'error': '邮件记录未找到'}), 404
+        return jsonify({'success': False, 'error': f'远程返回 {r.status_code}'}), 502
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'请求失败: {e}'}), 502
+
+
+@app.route('/api/order/<int:order_id>/emails/<int:log_id>', methods=['GET'])
+@login_required
+def get_order_email_detail(order_id, log_id):
+    """Fetch full body / headers for one email log entry. Backed by the WP
+    plugin's /orders/{id}/email-logs/{log_id} route, which auto-detects
+    the site's logger plugin (FluentSMTP / WP Mail SMTP / etc)."""
+    import requests as req
+
+    conn = get_db_connection()
+    order = conn.execute('SELECT id, source FROM orders WHERE id = ?', (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    conn.close()
+    if not site:
+        return jsonify({'success': False, 'error': '站点配置不存在'}), 404
+
+    url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['id']}/email-logs/{log_id}"
+    try:
+        r = req.get(
+            url,
+            params={'consumer_key': site['consumer_key'], 'consumer_secret': site['consumer_secret']},
+            timeout=20,
+            headers={"User-Agent": "WooCommerce API Client-Python/3.0.0", "Accept": "application/json"},
+        )
+        if r.status_code == 200:
+            return jsonify(r.json())
+        if r.status_code == 404:
+            return jsonify({'success': False, 'error': '邮件记录未找到'}), 404
+        return jsonify({'success': False, 'error': f'远程返回 {r.status_code}: {(r.text or "")[:200]}'}), 502
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'请求失败: {e}'}), 502
 
 
 @app.route('/api/order/<int:order_id>/notes', methods=['GET'])
@@ -11147,7 +11894,7 @@ def add_order_note(order_id):
                 conn = get_db_connection()
                 conn.execute('''
                     INSERT OR REPLACE INTO order_notes (
-                        id, order_id, note, date_created, customer_note, author, added_by_user
+                        wc_note_id, order_id, note, date_created, customer_note, author, added_by_user
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     note_data.get('id'),
@@ -11236,12 +11983,15 @@ def update_order_status(order_id):
     }
     
     try:
-        # 1. Update order status via WooCommerce API
-        status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}"
-        
+        # 1. Update order status via WooCommerce API.
+        # Use orders.id (WC internal post ID), not order['number'], because sites
+        # using Sequential Order Numbers have number != id and the REST API only
+        # accepts the post ID.
+        status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}"
+
         print(f"[DEBUG] Update Status - URL: {status_url}")
-        print(f"[DEBUG] Update Status - Order Number: {order['number']}, New Status: {new_status}")
-        
+        print(f"[DEBUG] Update Status - Order ID: {order['id']}, Number: {order['number']}, New Status: {new_status}")
+
         status_resp = req.put(
             status_url,
             json={'status': new_status},
@@ -11249,20 +11999,20 @@ def update_order_status(order_id):
             timeout=60,
             headers=api_headers
         )
-        
+
         print(f"[DEBUG] Update Status - Response Code: {status_resp.status_code}")
-        
+
         # Check if response is HTML instead of JSON
         response_text = status_resp.text or ''
         if response_text.strip().startswith('<!') or response_text.strip().startswith('<html'):
             print(f"[DEBUG] API returned HTML: {response_text[:200]}")
             raise Exception(f"WordPress返回HTML而非JSON，可能是WAF阻止或认证问题")
-        
+
         if status_resp.status_code not in [200, 201]:
             raise Exception(f"远程API错误: {status_resp.status_code} - {response_text[:200]}")
-        
+
         # 2. Add order note documenting the change
-        note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes"
+        note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes"
         note_content = f"订单状态由 {current_user.name} 从 {status_labels.get(old_status, old_status)} 手动修改为 {status_labels.get(new_status, new_status)}"
         
         try:
@@ -11359,8 +12109,10 @@ def mark_order_undelivered(order_id):
     conn.close()
     if site and site['consumer_key'] and site['consumer_secret']:
         try:
+            # Use orders.id (WC post ID) — sites with Sequential Order Numbers
+            # have number != id and the REST API only accepts the post ID.
             req.post(
-                f"{site['url']}/wp-json/wc/v3/orders/{order['number']}/notes",
+                f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes",
                 json={'note': log_line, 'customer_note': False},
                 auth=(site['consumer_key'], site['consumer_secret']),
                 timeout=10,
@@ -11465,6 +12217,7 @@ def print_shipping_label(order_id):
         ])),
         'customer_inpost_id': extract_custom_billing_fields(parse_json_field(order['meta_data'])).get('customer_inpost_id', ''),
         'customer_social': extract_custom_billing_fields(parse_json_field(order['meta_data'])).get('customer_social', ''),
+        'customer_note': order['customer_note'] or '',
         'customer_address_2': addr.get('address_2', ''),
         'shipping_method': shipping_method,
         'products': [{'name': item.get('name', ''), 'qty': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (line_items or [])],
@@ -11498,6 +12251,8 @@ def print_shipping_list():
         try:
             order_date = datetime.fromisoformat(order['date_created'].replace('Z', '+00:00'))
             if order_date >= cutoff:
+                method_lower = (order.get('shipping_method') or '').lower()
+                is_inpost = 'inpost' in method_lower or 'paczkomat' in method_lower
                 result.append({
                     'order_number': order['number'],
                     'source': order['source'],
@@ -11507,8 +12262,9 @@ def print_shipping_list():
                     'customer_email': order.get('customer_email', ''),
                     'customer_address': order['customer_address'],
                     'customer_address_2': order.get('customer_address_2', ''),
-                    'customer_inpost_id': order.get('customer_inpost_id') or ('送货上门: ' + order['customer_address'] if 'inpost' in (order.get('shipping_method') or '').lower() else ''),
+                    'customer_inpost_id': order.get('customer_inpost_id') or ('送货上门: ' + order['customer_address'] if is_inpost else ''),
                     'customer_social': order.get('customer_social', ''),
+                    'customer_note': order.get('customer_note', ''),
                     'shipping_method': order.get('shipping_method', ''),
                     'total': f"{order['total']:.2f} {order['currency']}",
                     'products': [{'name': p['name'], 'qty': p['quantity']} for p in order['products']],
@@ -11517,7 +12273,7 @@ def print_shipping_list():
         except:
             # If date parsing fails, skip this order
             continue
-    
+
     today = datetime.now().strftime('%Y-%m-%d')
     return jsonify({'date': today, 'orders': result, 'count': len(result)})
 
@@ -11541,6 +12297,8 @@ def print_pending_list():
     # Format for print
     result = []
     for order in orders_data:
+        method_lower = (order.get('shipping_method') or '').lower()
+        is_inpost = 'inpost' in method_lower or 'paczkomat' in method_lower
         result.append({
             'order_number': order['number'],
             'source': order['source'],
@@ -11550,14 +12308,15 @@ def print_pending_list():
             'customer_email': order.get('customer_email', ''),
             'customer_address': order['customer_address'],
             'customer_address_2': order.get('customer_address_2', ''),
-            'customer_inpost_id': order.get('customer_inpost_id') or ('送货上门: ' + order['customer_address'] if 'inpost' in (order.get('shipping_method') or '').lower() else ''),
+            'customer_inpost_id': order.get('customer_inpost_id') or ('送货上门: ' + order['customer_address'] if is_inpost else ''),
             'customer_social': order.get('customer_social', ''),
+            'customer_note': order.get('customer_note', ''),
             'shipping_method': order.get('shipping_method', ''),
             'total': f"{order['total']:.2f} {order['currency']}",
             'products': [{'name': p['name'], 'qty': p['quantity']} for p in order['products']],
             'shipping_total': order.get('shipping_total', 0)
         })
-    
+
     today = datetime.now().strftime('%Y-%m-%d')
     return jsonify({'date': '截止 ' + today, 'orders': result, 'count': len(result)})
 
@@ -11582,8 +12341,8 @@ def export_shipping_list():
     si = io.StringIO()
     cw = csv.writer(si)
     si.write('\ufeff')
-    cw.writerow(['序号', '订单信息', '来源', '客户姓名', '电话', '邮箱', '配送方式', 'InPost ID/取货点', '收货地址', '商品明细', '运费', '总金额'])
-    
+    cw.writerow(['序号', '订单信息', '来源', '客户姓名', '电话', '邮箱', '配送方式', 'InPost ID/取货点', '收货地址', '客户留言', '商品明细', '运费', '总金额'])
+
     count = 1
     for order in all_orders:
         try:
@@ -11594,14 +12353,14 @@ def export_shipping_list():
                 isInPost = order.get('customer_inpost_id') or 'inpost' in method or 'paczkomat' in method
                 isDPD = 'dpd' in method
                 shipping_method = 'InPost' if isInPost else ('DPD' if isDPD else (order.get('shipping_method') or 'Standard'))
-                
+
                 inpost_details = order.get('customer_inpost_id', '')
                 if not inpost_details and order.get('customer_address_2'):
                      inpost_details = order.get('customer_address_2')
                 # Fallback to customer address if it's an InPost method but has no ID (typically courier/home delivery)
-                if not inpost_details and 'inpost' in method:
+                if not inpost_details and isInPost:
                      inpost_details = "送货上门: " + order.get('customer_address', '')
-                     
+
                 phone_social = " ".join(filter(None, [order.get('customer_phone', ''), order.get('customer_social', '')]))
 
                 cw.writerow([
@@ -11614,6 +12373,7 @@ def export_shipping_list():
                     shipping_method,
                     inpost_details,
                     order['customer_address'],
+                    order.get('customer_note', ''),
                     products_str,
                     f"{order.get('shipping_total', 0)}",
                     f"{order['total']} {order['currency']}"
@@ -11645,8 +12405,8 @@ def export_pending_list():
     si = io.StringIO()
     cw = csv.writer(si)
     si.write('\ufeff')
-    cw.writerow(['序号', '订单信息', '来源', '客户姓名', '电话', '邮箱', '配送方式', 'InPost ID/取货点', '收货地址', '商品明细', '运费', '总金额'])
-    
+    cw.writerow(['序号', '订单信息', '来源', '客户姓名', '电话', '邮箱', '配送方式', 'InPost ID/取货点', '收货地址', '客户留言', '商品明细', '运费', '总金额'])
+
     count = 1
     for order in orders_data:
         try:
@@ -11655,12 +12415,12 @@ def export_pending_list():
             isInPost = order.get('customer_inpost_id') or 'inpost' in method or 'paczkomat' in method
             isDPD = 'dpd' in method
             shipping_method = 'InPost' if isInPost else ('DPD' if isDPD else (order.get('shipping_method') or 'Standard'))
-            
+
             inpost_details = order.get('customer_inpost_id', '')
             if not inpost_details and order.get('customer_address_2'):
                  inpost_details = order.get('customer_address_2')
             # Fallback to customer address if it's an InPost method but has no ID
-            if not inpost_details and 'inpost' in method:
+            if not inpost_details and isInPost:
                  inpost_details = "送货上门: " + order.get('customer_address', '')
 
             phone_social = " ".join(filter(None, [order.get('customer_phone', ''), order.get('customer_social', '')]))
@@ -11675,6 +12435,7 @@ def export_pending_list():
                 shipping_method,
                 inpost_details,
                 order['customer_address'],
+                order.get('customer_note', ''),
                 products_str,
                 f"{order.get('shipping_total', 0)}",
                 f"{order['total']} {order['currency']}"
@@ -11877,7 +12638,11 @@ def process_shipped_order(order, conn, carriers, ast_provider_mapping):
     # Get carrier name from our database if not already set
     if not carrier_name and carrier_slug and carrier_slug in carriers:
         carrier_name = carriers[carrier_slug]['name']
-    
+
+    keys = order.keys() if hasattr(order, 'keys') else []
+    is_undelivered = bool(order['is_undelivered']) if 'is_undelivered' in keys else False
+    shipping_method = shipping_lines[0].get('method_title', '') if shipping_lines and len(shipping_lines) > 0 else ''
+
     return {
         'id': order['id'],
         'number': order['number'],
@@ -11892,15 +12657,25 @@ def process_shipped_order(order, conn, carriers, ast_provider_mapping):
         'customer_address_2': addr.get('address_2', ''),
         'customer_inpost_id': custom_fields['customer_inpost_id'],
         'customer_social': custom_fields['customer_social'],
+        'customer_note': (order['customer_note'] if 'customer_note' in keys else '') or '',
+        'shipping_method': shipping_method,
         'tracking_number': tracking_number,
         'carrier_slug': carrier_slug,
         'carrier_name': carrier_name,
         'tracking_url': tracking_url,
         'shipped_at': shipped_at,
         'has_tracking': bool(tracking_number),
+        'is_undelivered': is_undelivered,
+        'shipping_loss_amount': float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in keys else 0,
+        'undelivered_at': order['undelivered_at'] if 'undelivered_at' in keys else None,
+        'undelivered_note': order['undelivered_note'] if 'undelivered_note' in keys else None,
+        'undelivered_by_name': order['undelivered_by_name'] if 'undelivered_by_name' in keys else None,
         'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (parse_json_field(order['line_items']) or [])],
         'shipping_total': float(order['shipping_total'] or 0),
-        'product_count': sum(item.get('quantity', 1) for item in (parse_json_field(order['line_items']) or []))
+        'product_count': sum(item.get('quantity', 1) for item in (parse_json_field(order['line_items']) or [])),
+        'latest_note': (order['latest_note'] if 'latest_note' in keys else '') or '',
+        'latest_note_date': (order['latest_note_date'] if 'latest_note_date' in keys else '') or '',
+        'latest_note_author': (order['latest_note_author'] if 'latest_note_author' in keys else '') or ''
     }
 
 
@@ -12620,28 +13395,44 @@ def _compute_sales_board_data(selected_month):
     except:
         country_percentages = {}
 
-    # Load product costs lookup (for actual cost mode), keyed by (brand_id, series_id, puff_count, flavor, country)
+    # Build site->country map (for per-country profit tracking)
+    site_country_map = {}
+    sc_rows = conn.execute('SELECT url, country FROM sites').fetchall()
+    for sc in sc_rows:
+        site_country_map[sc['url']] = sc['country'] or 'PL'
+
+    # Load product costs lookup (for actual cost mode), keyed by (brand_id, series_id, puff_count, flavor, warehouse_id)
     cost_lookup = {}
+    country_default_wh_ids = {}
+    country_bps_costs = {}  # (country, brand_id, series_id, puff_count) -> list of cost entries
     if profit_mode == 'actual':
         cost_rows = conn.execute('''
-            SELECT brand_id, series_id, puff_count, flavor, country, cost_price, cost_currency
-            FROM product_costs
+            SELECT pc.brand_id, pc.series_id, pc.puff_count, pc.flavor, pc.warehouse_id,
+                   pc.cost_price, pc.cost_currency, w.country
+            FROM product_costs pc LEFT JOIN warehouses w ON pc.warehouse_id = w.id
         ''').fetchall()
         for cr in cost_rows:
-            key = (cr['brand_id'], cr['series_id'], cr['puff_count'], cr['flavor'], cr['country'])
+            key = (cr['brand_id'], cr['series_id'], cr['puff_count'], cr['flavor'], cr['warehouse_id'])
             cost_lookup[key] = {'price': cr['cost_price'], 'currency': cr['cost_currency']}
+            # Index by (country, brand, series, puffs) — cost-mgmt's
+            # "brand_puffs_series" match level. Series=NULL rows are stored as
+            # series_id=None and act as a generic catch-all for any series.
+            ckey = (cr['country'], cr['brand_id'], cr['series_id'], cr['puff_count'])
+            country_bps_costs.setdefault(ckey, []).append({
+                'price': cr['cost_price'], 'currency': cr['cost_currency']
+            })
 
-        # Load product_mappings for item->brand resolution
+        # Country -> ordered list of warehouse_ids (smallest id first), used as a
+        # fallback when an order has no warehouse_id assigned (legacy NULL data).
+        for w in conn.execute('SELECT id, country FROM warehouses ORDER BY country, id'):
+            country_default_wh_ids.setdefault(w['country'], []).append(w['id'])
+
+        # Load product_mappings for item->brand resolution. Index by canonical
+        # (entity-decoded) raw_name so HTML-entity vs decoded variants both hit.
         pm_rows = conn.execute('SELECT raw_name, source, brand_id, series_id, puff_count, flavor FROM product_mappings').fetchall()
         product_mappings_cache = {}
         for pm in pm_rows:
-            product_mappings_cache[(pm['raw_name'], pm['source'])] = pm
-
-        # Build site->country map
-        site_country_map = {}
-        sc_rows = conn.execute('SELECT url, country FROM sites').fetchall()
-        for sc in sc_rows:
-            site_country_map[sc['url']] = sc['country'] or 'PL'
+            product_mappings_cache[(normalize_raw_name(pm['raw_name']), pm['source'])] = pm
 
     # Calculate current week range (Monday to Sunday)
     today = datetime.date.today()
@@ -12658,7 +13449,7 @@ def _compute_sales_board_data(selected_month):
 
         # Current month successful orders
         month_orders = conn.execute(f'''
-            SELECT id, total, shipping_total, currency, line_items, source, date_created
+            SELECT id, total, shipping_total, currency, line_items, source, date_created, warehouse_id
             FROM orders
             WHERE source IN ({placeholders})
             AND strftime('%Y-%m', date_created) = ?
@@ -12702,7 +13493,7 @@ def _compute_sales_board_data(selected_month):
         month_cost_cny = 0               # Total product cost (in CNY, actual mode)
         month_unmapped_revenue_cny = 0   # Revenue of products without cost mapping
         month_unmapped_count = 0         # Number of unmapped product types
-        # Per-country profit tracking
+        # Per-country profit tracking (for reconciliation)
         country_profit = defaultdict(lambda: {'net_cny': 0, 'cost_cny': 0, 'unmapped_revenue_cny': 0, 'unmapped_count': 0, 'shipping_loss_cny': 0, 'undelivered_count': 0})
         # Per-brand exclusion breakdown: {brand: {qty, revenue_by_currency, revenue_cny}}
         excluded_brand_breakdown = defaultdict(lambda: {
@@ -12730,7 +13521,8 @@ def _compute_sales_board_data(selected_month):
             month_currency_amounts[currency]['shipping'] += shipping
 
             rate = _rate_for(currency)
-            order_country = site_country_map.get(order['source'], 'PL') if profit_mode == 'actual' else None
+            order_country = site_country_map.get(order['source'], 'PL')
+            order_wh_id = order['warehouse_id'] if profit_mode == 'actual' else None
 
             # Products count
             items = parse_json_field(order['line_items'])
@@ -12768,8 +13560,9 @@ def _compute_sales_board_data(selected_month):
                     # Actual cost calculation
                     if profit_mode == 'actual' and rate and qty > 0:
                         source = order['source']
-                        country = order_country
-                        pm = product_mappings_cache.get((product_name_raw, source)) or product_mappings_cache.get((product_name_raw, '')) or product_mappings_cache.get((product_name_raw, None))
+                        wh_id = order_wh_id
+                        pn_key = normalize_raw_name(product_name_raw)
+                        pm = product_mappings_cache.get((pn_key, source)) or product_mappings_cache.get((pn_key, '')) or product_mappings_cache.get((pn_key, None))
                         if pm:
                             b_id = pm['brand_id']
                             s_id = pm['series_id']
@@ -12792,37 +13585,53 @@ def _compute_sales_board_data(selected_month):
                             p_cnt = parsed_item.get('puffs')
                             flav = parsed_item.get('flavor')
 
-                        # Find cost entry matching this country (priority fallback)
+                        # Find cost entry matching this warehouse (priority fallback).
+                        # If the order has no warehouse_id, fall back to country defaults
+                        # rather than declaring the product unmapped.
+                        effective_wh_ids = [wh_id] if wh_id else country_default_wh_ids.get(order_country, [])
                         cost_entry = None
-                        if b_id:
-                            for try_key in [
-                                (b_id, s_id, p_cnt, flav, country),
-                                (b_id, s_id, p_cnt, None, country),
-                                (b_id, None, p_cnt, None, country),
-                                (b_id, None, None, None, country),
-                            ]:
-                                entry = cost_lookup.get(try_key)
-                                if entry:
-                                    cost_entry = entry
+                        if b_id and effective_wh_ids:
+                            for ewh in effective_wh_ids:
+                                for try_key in [
+                                    (b_id, s_id, p_cnt, flav, ewh),
+                                    (b_id, s_id, p_cnt, None, ewh),
+                                    (b_id, None, p_cnt, None, ewh),
+                                    (b_id, None, None, None, ewh),
+                                ]:
+                                    entry = cost_lookup.get(try_key)
+                                    if entry:
+                                        cost_entry = entry
+                                        break
+                                if cost_entry:
+                                    break
+
+                        # Cross-warehouse brand+series+puffs fallback (matches
+                        # cost-mgmt's "品牌+口数+系列" view): try the exact series
+                        # first, then fall back to a generic series=NULL cost row.
+                        if not cost_entry and b_id:
+                            for try_skey in [(order_country, b_id, s_id, p_cnt),
+                                             (order_country, b_id, None, p_cnt)]:
+                                bps_candidates = country_bps_costs.get(try_skey, [])
+                                if bps_candidates:
+                                    cost_entry = bps_candidates[0]
                                     break
 
                         if cost_entry:
                             cost_rate = _rate_for(cost_entry['currency'])
                             item_cost = cost_entry['price'] * qty * cost_rate
                             month_cost_cny += item_cost
-                            country_profit[country]['cost_cny'] += item_cost
+                            country_profit[order_country]['cost_cny'] += item_cost
                         else:
                             month_unmapped_revenue_cny += item_total * rate
                             month_unmapped_count += 1
-                            country_profit[country]['unmapped_revenue_cny'] += item_total * rate
-                            country_profit[country]['unmapped_count'] += 1
+                            country_profit[order_country]['unmapped_revenue_cny'] += item_total * rate
+                            country_profit[order_country]['unmapped_count'] += 1
 
             # CNY conversion for net amount & shipping
             if rate:
                 month_net_cny += net * rate
                 month_shipping_cny += shipping * rate
-                if order_country:
-                    country_profit[order_country]['net_cny'] += net * rate
+                country_profit[order_country]['net_cny'] += net * rate
 
         # Previous month CNY (uses prev-month board overrides if set)
         prev_net_cny = 0
@@ -14218,11 +15027,11 @@ def delete_sales_board_export(export_id):
 def product_costs_page():
     """Product costs management page"""
     conn = get_db_connection()
-    country_rows = conn.execute("SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != '' ORDER BY country").fetchall()
+    countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
+    countries = [r['country'] for r in countries]
+    warehouses = [dict(r) for r in conn.execute('SELECT * FROM warehouses WHERE is_active=1 ORDER BY country, name').fetchall()]
     conn.close()
-    country_map = {'PL': '波兰', 'AE': '阿联酋', 'AU': '澳洲', 'DE': '德国', 'FR': '法国', 'UK': '英国', 'US': '美国', 'CN': '中国'}
-    countries = [{'code': r['country'], 'label': country_map.get(r['country'], r['country'])} for r in country_rows]
-    return render_template('product_costs.html', countries=countries)
+    return render_template('product_costs.html', countries=countries, warehouses=warehouses)
 
 
 @app.route('/api/product-costs/options', methods=['GET'])
@@ -14255,15 +15064,17 @@ def get_product_cost_options():
 @login_required
 @costs_view_required
 def get_product_costs():
-    """Get all product costs with brand/series names"""
+    """Get all product costs with brand/series/warehouse names"""
     conn = get_db_connection()
     try:
         rows = conn.execute('''
             SELECT pc.*, b.name as brand_name,
-                   s.name as series_name
+                   s.name as series_name,
+                   w.name as warehouse_name, w.code as warehouse_code
             FROM product_costs pc
             LEFT JOIN brands b ON pc.brand_id = b.id
             LEFT JOIN series s ON pc.series_id = s.id
+            LEFT JOIN warehouses w ON pc.warehouse_id = w.id
             ORDER BY b.name, s.name, pc.puff_count
         ''').fetchall()
         return jsonify([dict(r) for r in rows])
@@ -14281,22 +15092,25 @@ def create_product_cost():
     series_id = data.get('series_id') or None
     puff_count = data.get('puff_count') or None
     flavor = data.get('flavor') or None
-    country = data.get('country', 'PL')
+    warehouse_id = data.get('warehouse_id')
     cost_price = data.get('cost_price')
     cost_currency = data.get('cost_currency', 'PLN')
     effective_date = data.get('effective_date', '2024-01-01')
     notes = data.get('notes', '')
 
-    if not brand_id or cost_price is None:
-        return jsonify({'error': '品牌和成本价为必填项'}), 400
+    if not brand_id or cost_price is None or not warehouse_id:
+        return jsonify({'error': '品牌、仓库和成本价为必填项'}), 400
 
     conn = get_db_connection()
     try:
+        # Get country from warehouse for backward compat
+        wh = conn.execute('SELECT country FROM warehouses WHERE id=?', (warehouse_id,)).fetchone()
+        country = wh['country'] if wh else 'PL'
         conn.execute('''
             INSERT INTO product_costs
-            (brand_id, series_id, puff_count, flavor, country, cost_price, cost_currency, effective_date, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (brand_id, series_id, puff_count, flavor, country, cost_price, cost_currency, effective_date, notes))
+            (brand_id, series_id, puff_count, flavor, country, warehouse_id, cost_price, cost_currency, effective_date, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (brand_id, series_id, puff_count, flavor, country, warehouse_id, cost_price, cost_currency, effective_date, notes))
         conn.commit()
         return jsonify({'success': True, 'id': conn.execute('SELECT last_insert_rowid()').fetchone()[0]})
     except Exception as e:
@@ -14317,16 +15131,19 @@ def update_product_cost(cost_id):
         if not existing:
             return jsonify({'error': '记录不存在'}), 404
 
+        wh_id = data.get('warehouse_id')
+        wh = conn.execute('SELECT country FROM warehouses WHERE id=?', (wh_id,)).fetchone() if wh_id else None
+        country = wh['country'] if wh else data.get('country', 'PL')
         conn.execute('''
             UPDATE product_costs SET
                 brand_id = ?, series_id = ?, puff_count = ?, flavor = ?,
-                country = ?, cost_price = ?, cost_currency = ?,
+                country = ?, warehouse_id = ?, cost_price = ?, cost_currency = ?,
                 effective_date = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
         ''', (
             data.get('brand_id'), data.get('series_id') or None,
             data.get('puff_count') or None, data.get('flavor') or None,
-            data.get('country', 'PL'), data.get('cost_price'),
+            country, wh_id, data.get('cost_price'),
             data.get('cost_currency', 'PLN'), data.get('effective_date', '2024-01-01'),
             data.get('notes', ''), cost_id
         ))
@@ -14397,9 +15214,14 @@ def get_unmapped_products():
         series_rows = conn.execute('SELECT id, name FROM series').fetchall()
         series_names = {r['id']: r['name'] for r in series_rows}
 
-        costs = conn.execute('''
-            SELECT brand_id, series_id, puff_count, flavor, country FROM product_costs WHERE country = ?
-        ''', (country,)).fetchall()
+        country_wh_ids = [r['id'] for r in conn.execute('SELECT id FROM warehouses WHERE country=?', (country,)).fetchall()]
+        if country_wh_ids:
+            wh_placeholders = ', '.join(['?' for _ in country_wh_ids])
+            costs = conn.execute(f'''
+                SELECT brand_id, series_id, puff_count, flavor FROM product_costs WHERE warehouse_id IN ({wh_placeholders})
+            ''', country_wh_ids).fetchall()
+        else:
+            costs = conn.execute('SELECT brand_id, series_id, puff_count, flavor FROM product_costs WHERE country=?', (country,)).fetchall()
 
         cost_keys_full = set()
         cost_keys_bps = set()
@@ -14412,7 +15234,7 @@ def get_unmapped_products():
         product_mappings = {}
         pm_rows = conn.execute('SELECT raw_name, source, brand_id, series_id, puff_count, flavor FROM product_mappings').fetchall()
         for pm in pm_rows:
-            product_mappings[(pm['raw_name'], pm['source'])] = pm
+            product_mappings[(normalize_raw_name(pm['raw_name']), pm['source'])] = pm
 
         unmapped = {}
         for order in orders:
@@ -14424,8 +15246,9 @@ def get_unmapped_products():
                 qty = item.get('quantity', 0) or 0
                 item_total = float(item.get('total', 0) or 0)
                 source = order['source']
+                name_key = normalize_raw_name(name)
 
-                pm = product_mappings.get((name, source)) or product_mappings.get((name, '')) or product_mappings.get((name, None))
+                pm = product_mappings.get((name_key, source)) or product_mappings.get((name_key, '')) or product_mappings.get((name_key, None))
                 if pm:
                     brand_id = pm['brand_id']
                     series_id = pm['series_id']
@@ -14605,31 +15428,129 @@ def save_profit_settings():
         conn.close()
 
 
+# ===== Warehouse Management API =====
+
+@app.route('/api/warehouses', methods=['GET'])
+@login_required
+def get_warehouses():
+    conn = get_db_connection()
+    rows = conn.execute('SELECT * FROM warehouses ORDER BY country, name').fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/warehouses', methods=['POST'])
+@login_required
+@admin_required
+def create_warehouse():
+    data = request.get_json()
+    name = (data.get('name') or '').strip()
+    code = (data.get('code') or '').strip()
+    country = (data.get('country') or '').strip()
+    default_currency = data.get('default_currency', 'PLN')
+    notes = data.get('notes', '')
+    if not name or not code or not country:
+        return jsonify({'error': '名称、编码和国家为必填项'}), 400
+    conn = get_db_connection()
+    try:
+        conn.execute('INSERT INTO warehouses (name, code, country, default_currency, notes) VALUES (?, ?, ?, ?, ?)',
+                     (name, code, country, default_currency, notes))
+        conn.commit()
+        return jsonify({'success': True, 'id': conn.execute('SELECT last_insert_rowid()').fetchone()[0]})
+    except Exception as e:
+        if 'UNIQUE' in str(e):
+            return jsonify({'error': '编码已存在'}), 400
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/warehouses/<int:wid>', methods=['PUT'])
+@login_required
+@admin_required
+def update_warehouse(wid):
+    data = request.get_json()
+    conn = get_db_connection()
+    try:
+        conn.execute('''UPDATE warehouses SET name=?, code=?, country=?, default_currency=?, notes=?, is_active=?,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?''',
+                     (data.get('name'), data.get('code'), data.get('country'),
+                      data.get('default_currency', 'PLN'), data.get('notes', ''),
+                      1 if data.get('is_active', True) else 0, wid))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/warehouses/<int:wid>', methods=['DELETE'])
+@login_required
+@admin_required
+def delete_warehouse(wid):
+    conn = get_db_connection()
+    try:
+        cost_count = conn.execute('SELECT COUNT(*) FROM product_costs WHERE warehouse_id=?', (wid,)).fetchone()[0]
+        order_count = conn.execute('SELECT COUNT(*) FROM orders WHERE warehouse_id=?', (wid,)).fetchone()[0]
+        if cost_count > 0 or order_count > 0:
+            return jsonify({'error': f'无法删除：有 {cost_count} 条成本记录和 {order_count} 个订单关联此仓库'}), 400
+        conn.execute('DELETE FROM warehouses WHERE id=?', (wid,))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
 @app.route('/api/sales-board/unmapped', methods=['GET'])
 @login_required
 def get_sales_board_unmapped():
     """Return unmapped products for the sales board (actual cost mode)."""
     import datetime as _dt
     year_month = request.args.get('year_month') or _dt.date.today().strftime('%Y-%m')
+    filter_country = request.args.get('country', '')
 
     conn = get_db_connection()
     try:
         cost_rows = conn.execute(
-            'SELECT brand_id, series_id, puff_count, flavor, country, cost_price, cost_currency FROM product_costs'
+            'SELECT brand_id, series_id, puff_count, flavor, warehouse_id, cost_price, cost_currency FROM product_costs'
         ).fetchall()
         cost_lookup = {}
         for cr in cost_rows:
-            key = (cr['brand_id'], cr['series_id'], cr['puff_count'], cr['flavor'], cr['country'])
+            key = (cr['brand_id'], cr['series_id'], cr['puff_count'], cr['flavor'], cr['warehouse_id'])
             cost_lookup[key] = {'price': cr['cost_price'], 'currency': cr['cost_currency']}
 
         pm_rows = conn.execute('SELECT raw_name, source, brand_id, series_id, puff_count, flavor FROM product_mappings').fetchall()
         product_mappings_cache = {}
         for pm in pm_rows:
-            product_mappings_cache[(pm['raw_name'], pm['source'])] = pm
+            product_mappings_cache[(normalize_raw_name(pm['raw_name']), pm['source'])] = pm
 
         site_rows = conn.execute('SELECT url, country, manager FROM sites').fetchall()
         site_country_map = {s['url']: s['country'] or 'PL' for s in site_rows}
         site_manager_map = {s['url']: s['manager'] or '' for s in site_rows}
+
+        # Country -> ordered list of warehouse_ids (smallest id first).
+        # Used as a fallback when an order has no warehouse_id assigned.
+        country_default_wh_ids = {}
+        for w in conn.execute('SELECT id, country FROM warehouses ORDER BY country, id'):
+            country_default_wh_ids.setdefault(w['country'], []).append(w['id'])
+
+        # Per-country (brand_id, series_id, puff_count) → list of cost entries.
+        # Mirrors cost-management's "品牌+口数+系列" match level: a product is
+        # considered "mapped" if ANY cost row in the same country has matching
+        # brand+series+puffs (or brand+puffs with series=NULL as a generic row).
+        country_bps_costs = {}
+        cost_with_country = conn.execute('''
+            SELECT pc.brand_id, pc.series_id, pc.puff_count, pc.flavor, pc.cost_price, pc.cost_currency,
+                   pc.warehouse_id, w.country
+            FROM product_costs pc LEFT JOIN warehouses w ON pc.warehouse_id = w.id
+        ''').fetchall()
+        for cr in cost_with_country:
+            ckey = (cr['country'], cr['brand_id'], cr['series_id'], cr['puff_count'])
+            country_bps_costs.setdefault(ckey, []).append({
+                'price': cr['cost_price'], 'currency': cr['cost_currency'],
+                'warehouse_id': cr['warehouse_id'], 'flavor': cr['flavor'],
+            })
 
         brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
         brands_cache = []
@@ -14647,7 +15568,7 @@ def get_sales_board_unmapped():
             })
 
         orders = conn.execute(f'''
-            SELECT id, line_items, source, currency, total, shipping_total
+            SELECT id, line_items, source, currency, total, shipping_total, warehouse_id
             FROM orders
             WHERE strftime('%Y-%m', date_created) = ?
             AND {_revenue_status_cond()}
@@ -14680,9 +15601,12 @@ def get_sales_board_unmapped():
             items = parse_json_field(order['line_items'])
             if not isinstance(items, list):
                 continue
+            if filter_country and site_country_map.get(order['source'], 'PL') != filter_country:
+                continue
             source = order['source']
             currency = order['currency'] or 'PLN'
             country = site_country_map.get(source, 'PL')
+            wh_id = order['warehouse_id']
             manager = site_manager_map.get(source, '')
             rate = _rate_for(currency)
 
@@ -14690,8 +15614,9 @@ def get_sales_board_unmapped():
                 name = item.get('name', '') or ''
                 qty = item.get('quantity', 0) or 0
                 item_total = float(item.get('total', 0) or 0)
+                name_key = normalize_raw_name(name)
 
-                pm = product_mappings_cache.get((name, source)) or product_mappings_cache.get((name, '')) or product_mappings_cache.get((name, None))
+                pm = product_mappings_cache.get((name_key, source)) or product_mappings_cache.get((name_key, '')) or product_mappings_cache.get((name_key, None))
                 if pm:
                     b_id = pm['brand_id']
                     s_id = pm['series_id']
@@ -14711,16 +15636,38 @@ def get_sales_board_unmapped():
                     p_cnt = parsed_item.get('puffs')
                     flav = parsed_item.get('flavor')
 
+                # Defense in depth: if the order is missing warehouse_id we still
+                # want to attempt cost matching using the country's default warehouse.
+                # (Old data had a broken backfill that left ~38% of orders NULL.)
+                effective_wh_ids = [wh_id] if wh_id else []
+                if not effective_wh_ids:
+                    effective_wh_ids = country_default_wh_ids.get(country, [])
+
                 cost_entry = None
-                if b_id:
-                    for try_key in [
-                        (b_id, s_id, p_cnt, flav, country),
-                        (b_id, s_id, p_cnt, None, country),
-                        (b_id, None, p_cnt, None, country),
-                        (b_id, None, None, None, country),
-                    ]:
-                        if try_key in cost_lookup:
-                            cost_entry = cost_lookup[try_key]
+                if b_id and effective_wh_ids:
+                    for ewh in effective_wh_ids:
+                        for try_key in [
+                            (b_id, s_id, p_cnt, flav, ewh),
+                            (b_id, s_id, p_cnt, None, ewh),
+                            (b_id, None, p_cnt, None, ewh),
+                            (b_id, None, None, None, ewh),
+                        ]:
+                            if try_key in cost_lookup:
+                                cost_entry = cost_lookup[try_key]
+                                break
+                        if cost_entry:
+                            break
+
+                # Brand+series+puffs cross-warehouse fallback to align with
+                # cost-mgmt's "品牌+口数+系列" view: a cost row with matching
+                # brand+series+puffs anywhere in this country (or generic
+                # series=NULL) counts as mapped.
+                if not cost_entry and b_id:
+                    for try_skey in [(country, b_id, s_id, p_cnt),
+                                     (country, b_id, None, p_cnt)]:
+                        bps_candidates = country_bps_costs.get(try_skey, [])
+                        if bps_candidates:
+                            cost_entry = bps_candidates[0]
                             break
 
                 if not cost_entry:
@@ -14754,6 +15701,28 @@ def get_sales_board_unmapped():
             v['products'] = prods
             result.append(v)
         return jsonify(result)
+    finally:
+        conn.close()
+
+
+@app.route('/api/order/<int:order_id>/warehouse', methods=['PUT'])
+@login_required
+@admin_required
+def set_order_warehouse(order_id):
+    data = request.get_json()
+    warehouse_id = data.get('warehouse_id')
+    conn = get_db_connection()
+    try:
+        order = conn.execute('SELECT id FROM orders WHERE id=?', (order_id,)).fetchone()
+        if not order:
+            return jsonify({'error': '订单不存在'}), 404
+        if warehouse_id:
+            wh = conn.execute('SELECT id FROM warehouses WHERE id=?', (warehouse_id,)).fetchone()
+            if not wh:
+                return jsonify({'error': '仓库不存在'}), 404
+        conn.execute('UPDATE orders SET warehouse_id=? WHERE id=?', (warehouse_id, order_id))
+        conn.commit()
+        return jsonify({'success': True})
     finally:
         conn.close()
 

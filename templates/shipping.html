@@ -69,7 +69,7 @@
                 </div>
                 <div class="col-md-2">
                     <input type="text" class="form-control form-select-sm bg-dark text-white border-secondary"
-                        id="searchInput" placeholder="搜索订单号...">
+                        id="searchInput" placeholder="订单号 / 运单号 / 客户...">
                 </div>
                 <div class="col-md-1">
                     <button class="btn btn-sm btn-primary w-100" onclick="loadOrders()">
@@ -79,6 +79,46 @@
                 <div class="col-md-1 text-end">
                     <span class="badge bg-warning text-dark d-block mb-1" id="pendingCount">待发货: 0</span>
                     <span class="badge bg-info d-block" id="shippedCount">已发货: 0</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tracking-number lookup (cross-status, cross-plugin) -->
+    <div class="card bg-dark border-danger border-opacity-25 mb-4">
+        <div class="card-body py-3 px-3">
+            <div class="d-flex align-items-center mb-2">
+                <i class="bi bi-search text-danger me-2"></i>
+                <span class="text-white fw-bold">运单号查找</span>
+                <small class="text-muted ms-2">用于退回包裹的客户拒收登记，跨所有状态、识别 AST / Orders Tracking 等插件字段</small>
+            </div>
+            <div class="row g-2 align-items-center">
+                <div class="col-md-6">
+                    <input type="text" class="form-control form-select-sm bg-dark text-white border-secondary"
+                        id="trackingLookupInput" placeholder="粘贴运单号 (≥4 位)，回车查找">
+                </div>
+                <div class="col-md-2">
+                    <button class="btn btn-sm btn-danger w-100" id="trackingLookupBtn">
+                        <i class="bi bi-search me-1"></i> 查找
+                    </button>
+                </div>
+                <div class="col-md-4 text-end" id="trackingLookupSummary"></div>
+            </div>
+            <div id="trackingLookupResults" class="mt-3" style="display:none;">
+                <div class="table-responsive">
+                    <table class="table table-dark table-hover align-middle mb-0" style="--bs-table-bg: transparent;">
+                        <thead>
+                            <tr>
+                                <th class="ps-3">订单</th>
+                                <th>客户</th>
+                                <th>商品</th>
+                                <th>运单</th>
+                                <th>状态</th>
+                                <th class="text-end pe-3">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="trackingLookupBody"></tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -114,8 +154,8 @@
                                     <th class="text-end">总数量</th>
                                     <th class="text-end">运费</th>
                                     <th class="text-end">订单金额</th>
+                                    <th>客户留言</th>
                                     <th>最新备注</th>
-                                    <th>备注</th>
                                     <th class="text-end pe-3">操作</th>
                                 </tr>
                             </thead>
@@ -145,13 +185,14 @@
                                     <th class="text-end">运费</th>
                                     <th class="text-end">订单金额</th>
                                     <th class="text-center">运单信息</th>
+                                    <th>客户留言</th>
                                     <th>最新备注</th>
                                     <th class="text-end pe-3">操作</th>
                                 </tr>
                             </thead>
                             <tbody id="shippedOrdersBody">
                                 <tr>
-                                    <td colspan="7" class="text-center py-4 text-muted">加载中...</td>
+                                    <td colspan="10" class="text-center py-4 text-muted">加载中...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -185,10 +226,8 @@
                     <label class="form-label text-white-50">物流商 *</label>
                     <select class="form-select bg-dark text-white border-secondary" id="shipCarrier" required>
                         <option value="">选择物流商</option>
-                        {% for carrier in carriers %}
-                        <option value="{{ carrier.slug }}">{{ carrier.name }}</option>
-                        {% endfor %}
                     </select>
+                    <small class="text-muted d-block mt-1">仅显示该站点实际使用过的物流商</small>
                 </div>
                 <div class="mb-3">
                     <label class="form-label text-white-50">追踪号码 *</label>
@@ -199,20 +238,10 @@
                     <input class="form-check-input" type="checkbox" id="shipSendEmail" checked>
                     <label class="form-check-label text-white-50" for="shipSendEmail">发送邮件通知客户</label>
                 </div>
-                <div class="mb-3">
-                    <label class="form-label text-white-50">发货模式</label>
-                    <div class="btn-group w-100" role="group">
-                        <input type="radio" class="btn-check" name="shipMode" id="modeAPI" value="api" checked>
-                        <label class="btn btn-outline-primary" for="modeAPI">
-                            <i class="bi bi-plug me-1"></i>API模式
-                        </label>
-                        <input type="radio" class="btn-check" name="shipMode" id="modeNote" value="note">
-                        <label class="btn btn-outline-secondary" for="modeNote">
-                            <i class="bi bi-chat-left-text me-1"></i>备注模式
-                        </label>
-                    </div>
-                    <small class="text-muted d-block mt-1">API模式直接写入物流信息，备注模式通过订单备注发送</small>
-                </div>
+                <small class="text-muted d-block mt-2">
+                    <i class="bi bi-info-circle me-1"></i>
+                    系统会自动识别站点使用的物流插件（AST / VillaTheme / 自定义），并以与 WordPress 后台手动录入相同的方式写入运单信息。
+                </small>
             </div>
             <div class="modal-footer border-top border-secondary border-opacity-25">
                 <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
@@ -224,43 +253,43 @@
     </div>
 </div>
 
-<!-- Add Note Modal -->
-<div class="modal fade" id="noteModal" tabindex="-1">
+<!-- noteModal markup is provided by base.html (shared with order detail modal) -->
+
+<!-- Mark Undelivered Modal -->
+<div class="modal fade" id="undeliveredModal" tabindex="-1">
     <div class="modal-dialog">
         <div class="modal-content bg-dark border border-secondary border-opacity-25">
             <div class="modal-header border-bottom border-secondary border-opacity-25">
-                <h5 class="modal-title text-white"><i class="bi bi-chat-left-text me-2"></i>添加备注</h5>
+                <h5 class="modal-title text-white"><i class="bi bi-arrow-return-left me-2"></i>标记客户拒收 / 包裹退回</h5>
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
-                <input type="hidden" id="noteOrderId">
+                <input type="hidden" id="undeliveredOrderId">
                 <div class="mb-3">
-                    <label class="form-label text-white-50">订单号: <span id="noteOrderNumber"
-                            class="text-white"></span></label>
-                </div>
-                <!-- History Notes -->
-                <div class="mb-3">
-                    <label class="form-label text-white-50">历史备注</label>
-                    <div id="noteHistoryList" class="bg-dark p-2 rounded border border-secondary border-opacity-25"
-                        style="max-height: 200px; overflow-y: auto;">
-                        <div class="text-center text-muted small py-2">加载中...</div>
-                    </div>
+                    <label class="form-label text-white-50">订单号</label>
+                    <div class="text-white" id="undeliveredOrderInfo"></div>
                 </div>
                 <div class="mb-3">
-                    <label class="form-label text-white-50">备注内容 *</label>
-                    <textarea class="form-control bg-dark text-white border-secondary" id="noteContent" rows="4"
-                        placeholder="输入备注内容..."></textarea>
+                    <label class="form-label text-white-50">运费损失金额 <span id="undeliveredCurrencyLabel" class="text-muted"></span></label>
+                    <input type="number" step="0.01" min="0" class="form-control bg-dark text-white border-secondary"
+                        id="undeliveredLossAmount" placeholder="默认填入订单运费">
+                    <small class="text-muted">已实际产生的运费损失，将计入退货统计；如已退还则填 0</small>
                 </div>
-                <div class="form-check mb-3">
-                    <input class="form-check-input" type="checkbox" id="noteNotifyCustomer">
-                    <label class="form-check-label text-white-50" for="noteNotifyCustomer">
-                        <i class="bi bi-envelope me-1"></i> 发送邮件通知客户
-                    </label>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">原因 / 备注</label>
+                    <textarea class="form-control bg-dark text-white border-secondary" id="undeliveredNote" rows="3"
+                        placeholder="例如：客户拒收 / 地址错误退回 / 无人签收..."></textarea>
+                </div>
+                <div class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25 mb-0">
+                    <i class="bi bi-exclamation-triangle me-1"></i>
+                    标记后该订单将从成交统计中扣除，并在月报中计入「未送达」损失。
                 </div>
             </div>
             <div class="modal-footer border-top border-secondary border-opacity-25">
                 <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
-                <button type="button" class="btn btn-primary" id="confirmNoteBtn">保存备注</button>
+                <button type="button" class="btn btn-danger" id="confirmUndeliveredBtn">
+                    <i class="bi bi-arrow-return-left me-1"></i> 确认标记
+                </button>
             </div>
         </div>
     </div>
@@ -388,8 +417,16 @@
             // Confirm ship button
             document.getElementById('confirmShipBtn').addEventListener('click', shipOrder);
 
-            // Confirm note button
-            document.getElementById('confirmNoteBtn').addEventListener('click', addNote);
+            // confirmNoteBtn is wired by base.html (the noteModal is shared)
+
+            // Confirm mark-undelivered button
+            document.getElementById('confirmUndeliveredBtn').addEventListener('click', confirmUndelivered);
+
+            // Tracking-number lookup
+            document.getElementById('trackingLookupBtn').addEventListener('click', runTrackingLookup);
+            document.getElementById('trackingLookupInput').addEventListener('keypress', function (e) {
+                if (e.key === 'Enter') runTrackingLookup();
+            });
 
             // Print list button
             document.getElementById('printListBtn').addEventListener('click', printTodayList);
@@ -428,7 +465,7 @@
                     document.getElementById('pendingCount').textContent = `待发货: ${orders.length}`;
                     const tbody = document.getElementById('pendingOrdersBody');
                     if (orders.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4 text-muted">暂无待发货订单</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">暂无待发货订单</td></tr>';
                         return;
                     }
                     tbody.innerHTML = orders.map(o => `
@@ -489,14 +526,14 @@
                     <td class="text-end text-white">${o.product_count}</td>
                     <td class="text-end text-info">${o.shipping_total.toFixed(2)}</td>
                     <td class="text-end"><strong>${o.total}</strong></td>
-                    <td class="text-center">
-                        ${o.tracking_number ? `
-                            <div><strong class="text-white">${o.carrier_name}</strong></div>
-                            ${o.tracking_url ?
-                                `<a href="${o.tracking_url}" target="_blank" class="text-info text-decoration-none small"><i class="bi bi-link-45deg"></i>${o.tracking_number}</a>` :
-                                `<small class="text-muted">${o.tracking_number}</small>`
-                            }
-                            <div class="text-muted small">${o.shipped_at || '-'}</div>
+                    <td>
+                        ${o.customer_note ? `
+                            <div class="d-flex align-items-start">
+                                <span class="badge bg-info text-dark me-2 mt-1" title="客户留言"><i class="bi bi-person-fill"></i></span>
+                                <div class="small" style="max-width: 15vw; white-space: pre-wrap; word-break: break-word;" title="${o.customer_note.replace(/"/g, '&quot;')}">
+                                    <span class="text-white">${o.customer_note}</span>
+                                </div>
+                            </div>
                         ` : '<span class="text-muted small">-</span>'}
                     </td>
                     <td>
@@ -517,7 +554,7 @@
                         <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="printLabel(${o.id})" title="打印">
                             <i class="bi bi-printer"></i>
                         </a>
-                        <button class="btn btn-sm btn-primary px-3" onclick="openShipModal(${o.id}, '${o.number}', '${o.customer_name}', '${o.customer_address.replace(/'/g, "\\'")}')">
+                        <button class="btn btn-sm btn-primary px-3" onclick="openShipModal(${o.id}, '${o.number}', '${o.customer_name}', '${o.customer_address.replace(/'/g, "\\'")}', '${(o.source || '').replace(/'/g, "\\'")}')">
                             <i class="bi bi-truck me-1"></i>发货
                         </button>
                     </td>
@@ -532,7 +569,7 @@
                     document.getElementById('shippedCount').textContent = `已发货: ${orders.length}`;
                     const tbody = document.getElementById('shippedOrdersBody');
                     if (orders.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-muted">暂无已发货订单</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="10" class="text-center py-4 text-muted">暂无已发货订单</td></tr>';
                         return;
                     }
                     tbody.innerHTML = orders.map(o => `
@@ -567,6 +604,23 @@
                             <div class="text-muted small">${o.shipped_at || '-'}</div>
                         ` : '<span class="text-muted small">-</span>') :
                             '<span class="text-warning small"><i class="bi bi-exclamation-triangle me-1"></i>无追踪号</span>'}
+                        ${o.is_undelivered ? `
+                            <div class="mt-2">
+                                <span class="badge bg-danger" title="${(o.undelivered_note || '').replace(/"/g, '&quot;')}"><i class="bi bi-arrow-return-left me-1"></i>已退回</span>
+                                <div class="text-danger small mt-1">运费损失 ${(o.shipping_loss_amount || 0).toFixed(2)} ${o.currency}</div>
+                                ${o.undelivered_by_name ? `<div class="text-muted" style="font-size:0.75em">${o.undelivered_by_name}${o.undelivered_at ? ' · ' + o.undelivered_at.replace('T',' ').substring(0,16) : ''}</div>` : ''}
+                            </div>
+                        ` : ''}
+                    </td>
+                    <td>
+                        ${o.customer_note ? `
+                            <div class="d-flex align-items-start">
+                                <span class="badge bg-info text-dark me-2 mt-1" title="客户留言"><i class="bi bi-person-fill"></i></span>
+                                <div class="small" style="max-width: 15vw; white-space: pre-wrap; word-break: break-word;" title="${o.customer_note.replace(/"/g, '&quot;')}">
+                                    <span class="text-white">${o.customer_note}</span>
+                                </div>
+                            </div>
+                        ` : '<span class="text-muted small">-</span>'}
                     </td>
                     <td>
                         ${o.latest_note ? `
@@ -580,26 +634,79 @@
                         ` : '<span class="text-muted small">-</span>'}
                     </td>
                     <td class="text-end pe-3 text-nowrap">
-                        <a href="javascript:void(0)" class="text-secondary text-decoration-none" onclick="openNoteModal(${o.id}, '${o.number}')" title="备注">
+                        <a href="javascript:void(0)" class="text-secondary me-3 text-decoration-none" onclick="openNoteModal(${o.id}, '${o.number}')" title="备注">
                             <i class="bi bi-chat-left-text"></i>
                         </a>
+                        ${o.is_undelivered ? `
+                            <a href="javascript:void(0)" class="text-warning text-decoration-none" onclick="unmarkUndelivered(${o.id}, '${o.number}')" title="撤销退回标记">
+                                <i class="bi bi-arrow-counterclockwise"></i>
+                            </a>
+                        ` : `
+                            <a href="javascript:void(0)" class="text-danger text-decoration-none" onclick="openUndeliveredModal(${o.id}, '${o.number}', ${o.shipping_total || 0}, '${(o.currency || '').replace(/'/g, "\\'")}', '${(o.tracking_number || '').replace(/'/g, "\\'")}')" title="标记客户拒收/包裹退回">
+                                <i class="bi bi-arrow-return-left"></i>
+                            </a>
+                        `}
                     </td>
                 </tr>
             `).join('');
                 });
         }
 
-        function openShipModal(orderId, orderNumber, customerName, customerAddress) {
+        function openShipModal(orderId, orderNumber, customerName, customerAddress, source) {
             document.getElementById('shipOrderId').value = orderId;
             document.getElementById('shipOrderNumber').value = '#' + orderNumber;
             document.getElementById('shipCustomerInfo').innerHTML = `
         <div class="fw-bold">${customerName}</div>
         <small class="text-muted">${customerAddress}</small>
     `;
-            document.getElementById('shipCarrier').value = '';
             document.getElementById('shipTrackingNumber').value = '';
             document.getElementById('shipSendEmail').checked = true;
+            loadCarriersForSite(source);
             bootstrap.Modal.getOrCreateInstance(document.getElementById('shipModal')).show();
+        }
+
+        // Populate the carrier dropdown with the carriers actually used on
+        // this order's site (so AU sites only show Australia Post, PL sites
+        // only show InPost / DPD, etc).
+        function loadCarriersForSite(source) {
+            const sel = document.getElementById('shipCarrier');
+            sel.innerHTML = '<option value="">加载中...</option>';
+            sel.disabled = true;
+
+            const url = source
+                ? `/api/shipping/carriers-for-site?source=${encodeURIComponent(source)}`
+                : '/api/shipping/carriers';
+
+            fetch(url)
+                .then(r => r.json())
+                .then(carriers => {
+                    sel.disabled = false;
+                    if (!Array.isArray(carriers) || carriers.length === 0) {
+                        // Site has no shipping history yet — fall back to global list
+                        return fetch('/api/shipping/carriers').then(r => r.json()).then(globalList => {
+                            renderCarrierOptions(sel, globalList, true);
+                        });
+                    }
+                    renderCarrierOptions(sel, carriers, false);
+                })
+                .catch(() => {
+                    sel.disabled = false;
+                    sel.innerHTML = '<option value="">加载失败 — 请手动输入</option>';
+                });
+        }
+
+        function renderCarrierOptions(sel, carriers, isFallback) {
+            const opts = ['<option value="">选择物流商</option>'];
+            carriers.forEach(c => {
+                const hint = c.usage_count ? ` · 该站已用 ${c.usage_count} 次` : '';
+                opts.push(`<option value="${c.slug}">${c.name}${hint}</option>`);
+            });
+            if (isFallback) {
+                opts.push('<option disabled>— 该站点暂无发货历史，显示全部 —</option>');
+            }
+            sel.innerHTML = opts.join('');
+            // Auto-select if there's only one option
+            if (carriers.length === 1) sel.value = carriers[0].slug;
         }
 
         // For orders already in on-hold status but without tracking
@@ -621,7 +728,6 @@
             const carrier = document.getElementById('shipCarrier').value;
             const trackingNumber = document.getElementById('shipTrackingNumber').value.trim();
             const sendEmail = document.getElementById('shipSendEmail').checked;
-            const shippingMode = document.querySelector('input[name="shipMode"]:checked').value;
 
             if (!carrier || !trackingNumber) {
                 alert('请填写物流商和追踪号码');
@@ -639,8 +745,7 @@
                     order_id: orderId,
                     carrier_slug: carrier,
                     tracking_number: trackingNumber,
-                    send_email: sendEmail,
-                    shipping_mode: shippingMode
+                    send_email: sendEmail
                 })
             })
                 .then(res => res.json())
@@ -683,84 +788,187 @@
                 });
         }
 
-        function openNoteModal(orderId, orderNumber) {
-            document.getElementById('noteOrderId').value = orderId;
-            document.getElementById('noteOrderNumber').textContent = '#' + orderNumber;
-            document.getElementById('noteContent').value = '';
-            document.getElementById('noteNotifyCustomer').checked = false;
+        // openNoteModal / addNote are defined in base.html so they're
+        // available on every page; the shipping page just calls them.
 
-            const historyContainer = document.getElementById('noteHistoryList');
-            historyContainer.innerHTML = '<div class="text-center text-muted small py-2"><span class="spinner-border spinner-border-sm me-1"></span>加载中...</div>';
+        // Active tracking-lookup query, kept so we can refresh after mark/unmark
+        let _activeTrackingQuery = '';
 
-            bootstrap.Modal.getOrCreateInstance(document.getElementById('noteModal')).show();
+        function runTrackingLookup() {
+            const input = document.getElementById('trackingLookupInput');
+            const q = input.value.trim();
+            const summary = document.getElementById('trackingLookupSummary');
+            const wrapper = document.getElementById('trackingLookupResults');
+            const tbody = document.getElementById('trackingLookupBody');
 
-            // Fetch history notes from local DB
-            fetch(`/api/order/${orderId}/notes`)
-                .then(res => res.json())
-                .then(notes => {
-                    if (notes.length === 0) {
-                        historyContainer.innerHTML = '<div class="text-center text-muted small py-2">暂无历史备注</div>';
-                        return;
-                    }
-
-                    historyContainer.innerHTML = notes.map(note => {
-                        const dateStr = note.date_created ? note.date_created.replace('T', ' ').substring(0, 16) : '';
-                        const badgeHtml = note.customer_note ? '<span class="badge bg-warning text-dark ms-2" style="font-size: 0.7em;">发给客户</span>' : '';
-                        const authorHtml = note.author ? `<span class="badge bg-secondary bg-opacity-25 text-light ms-2" style="font-size: 0.7em;"><i class="bi bi-person me-1"></i>${note.author}</span>` : '';
-
-                        return `
-                            <div class="mb-2 pb-2 border-bottom border-secondary border-opacity-25 last-border-0">
-                                <div class="d-flex justify-content-between mb-1">
-                                    <div><small class="text-muted"><i class="bi bi-clock me-1"></i>${dateStr}</small>${authorHtml}${badgeHtml}</div>
-                                </div>
-                                <div class="small text-light" style="word-break: break-word;">${note.note}</div>
-                            </div>
-                        `;
-                    }).join('');
-                })
-                .catch(err => {
-                    historyContainer.innerHTML = '<div class="text-danger small py-2">加载失败</div>';
-                });
-        }
-
-        function addNote() {
-            const orderId = document.getElementById('noteOrderId').value;
-            const note = document.getElementById('noteContent').value.trim();
-            const notifyCustomer = document.getElementById('noteNotifyCustomer').checked;
-
-            if (!note) {
-                alert('请输入备注内容');
+            if (q.length < 4) {
+                summary.innerHTML = '<span class="text-warning small">至少 4 位</span>';
+                wrapper.style.display = 'none';
+                _activeTrackingQuery = '';
                 return;
             }
 
-            const btn = document.getElementById('confirmNoteBtn');
-            const originalText = btn.innerHTML;
-            btn.disabled = true;
-            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>保存中...';
+            _activeTrackingQuery = q;
+            summary.innerHTML = '<span class="text-muted small"><span class="spinner-border spinner-border-sm me-1"></span>查找中...</span>';
+            wrapper.style.display = 'block';
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center py-3 text-muted">查找中...</td></tr>';
 
-            fetch(`/api/order/${orderId}/note`, {
+            fetch(`/api/shipping/find-by-tracking?q=${encodeURIComponent(q)}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (!data.success) {
+                        summary.innerHTML = `<span class="text-danger small">${data.error || '查找失败'}</span>`;
+                        tbody.innerHTML = `<tr><td colspan="6" class="text-center py-3 text-danger">${data.error || '查找失败'}</td></tr>`;
+                        return;
+                    }
+                    const orders = data.orders || [];
+                    summary.innerHTML = `<span class="text-info small">找到 ${orders.length} 条记录</span>`;
+                    if (!orders.length) {
+                        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-3 text-muted">未找到匹配的订单</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = orders.map(renderTrackingLookupRow).join('');
+                })
+                .catch(err => {
+                    summary.innerHTML = `<span class="text-danger small">请求失败</span>`;
+                    tbody.innerHTML = `<tr><td colspan="6" class="text-center py-3 text-danger">请求失败: ${err}</td></tr>`;
+                });
+        }
+
+        function statusBadge(status) {
+            const map = {
+                'processing': ['bg-warning text-dark', '处理中'],
+                'on-hold': ['bg-info', '已发货'],
+                'shipped': ['bg-info', '已发货'],
+                'completed': ['bg-success', '已完成'],
+                'delivered': ['bg-success', '已签收'],
+                'partial-shipped': ['bg-info bg-opacity-50', '部分发货'],
+                'failed': ['bg-danger', '失败'],
+                'cancelled': ['bg-secondary', '已取消'],
+                'refunded': ['bg-secondary', '已退款']
+            };
+            const [cls, label] = map[status] || ['bg-secondary', status || '-'];
+            return `<span class="badge ${cls}">${label}</span>`;
+        }
+
+        function renderTrackingLookupRow(o) {
+            const safeNum = String(o.number || '').replace(/'/g, "\\'");
+            const trackingHtml = o.tracking_number
+                ? (o.tracking_url
+                    ? `<a href="${o.tracking_url}" target="_blank" class="text-info text-decoration-none small"><i class="bi bi-link-45deg"></i>${o.tracking_number}</a>`
+                    : `<span class="font-monospace small text-light">${o.tracking_number}</span>`)
+                : '<span class="text-muted small">无</span>';
+            const carrierHtml = o.carrier_name ? `<div><strong class="text-white small">${o.carrier_name}</strong></div>` : '';
+            const undeliveredBadge = o.is_undelivered ? `
+                <div class="mt-1">
+                    <span class="badge bg-danger" title="${(o.undelivered_note || '').replace(/"/g, '&quot;')}"><i class="bi bi-arrow-return-left me-1"></i>已退回</span>
+                    <div class="text-danger small">运费损失 ${(o.shipping_loss_amount || 0).toFixed(2)} ${o.currency || ''}</div>
+                    ${o.undelivered_by_name ? `<div class="text-muted" style="font-size:0.75em">${o.undelivered_by_name}${o.undelivered_at ? ' · ' + o.undelivered_at.replace('T',' ').substring(0,16) : ''}</div>` : ''}
+                </div>
+            ` : '';
+            const action = o.is_undelivered
+                ? `<a href="javascript:void(0)" class="text-warning text-decoration-none" onclick="unmarkUndelivered(${o.id}, '${safeNum}')" title="撤销退回标记"><i class="bi bi-arrow-counterclockwise me-1"></i>撤销</a>`
+                : `<button class="btn btn-sm btn-outline-danger" onclick="openUndeliveredModal(${o.id}, '${safeNum}', ${o.shipping_total || 0}, '${(o.currency || '').replace(/'/g, "\\'")}', '${(o.tracking_number || '').replace(/'/g, "\\'")}')"><i class="bi bi-arrow-return-left me-1"></i>标记退回</button>`;
+
+            return `
+                <tr>
+                    <td class="ps-3">
+                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a></div>
+                        <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
+                    </td>
+                    <td>
+                        <div class="text-white small">${o.customer_name || '-'}</div>
+                        <small class="text-muted text-break">${o.customer_address || ''}</small>
+                    </td>
+                    <td>
+                        ${(o.products || []).slice(0, 4).map(p => `<div class="small text-light">${p.name} <span class="text-muted">×${p.quantity}</span></div>`).join('')}
+                        ${o.products && o.products.length > 4 ? `<div class="text-muted small">…还有 ${o.products.length - 4} 件</div>` : ''}
+                    </td>
+                    <td>
+                        ${carrierHtml}
+                        ${trackingHtml}
+                        ${o.shipped_at ? `<div class="text-muted small">${o.shipped_at}</div>` : ''}
+                        ${undeliveredBadge}
+                    </td>
+                    <td>${statusBadge(o.status)}</td>
+                    <td class="text-end pe-3 text-nowrap">${action}</td>
+                </tr>
+            `;
+        }
+
+        function refreshActiveViews() {
+            // Re-run tracking lookup (if any) and reload tabs
+            if (_activeTrackingQuery) {
+                runTrackingLookup();
+            }
+            loadOrders();
+        }
+
+        function openUndeliveredModal(orderId, orderNumber, shippingTotal, currency, trackingNumber) {
+            document.getElementById('undeliveredOrderId').value = orderId;
+            const trackingHtml = trackingNumber ? `<div class="text-muted small mt-1">运单号：<span class="font-monospace">${trackingNumber}</span></div>` : '';
+            document.getElementById('undeliveredOrderInfo').innerHTML = `<strong>#${orderNumber}</strong>${trackingHtml}`;
+            document.getElementById('undeliveredCurrencyLabel').textContent = currency ? `(${currency})` : '';
+            // Default to the order's shipping fee — most common case for a returned package
+            document.getElementById('undeliveredLossAmount').value = (shippingTotal || 0).toFixed(2);
+            document.getElementById('undeliveredNote').value = '';
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('undeliveredModal')).show();
+        }
+
+        function confirmUndelivered() {
+            const orderId = document.getElementById('undeliveredOrderId').value;
+            const lossRaw = document.getElementById('undeliveredLossAmount').value.trim();
+            const note = document.getElementById('undeliveredNote').value.trim();
+            const lossAmount = parseFloat(lossRaw || '0');
+
+            if (isNaN(lossAmount) || lossAmount < 0) {
+                alert('请输入合法的运费损失金额（≥ 0）');
+                return;
+            }
+
+            const btn = document.getElementById('confirmUndeliveredBtn');
+            const original = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>处理中...';
+
+            fetch(`/api/order/${orderId}/mark-undelivered`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ note, notify_customer: notifyCustomer })
+                body: JSON.stringify({ shipping_loss_amount: lossAmount, note: note })
             })
                 .then(res => res.json())
                 .then(data => {
                     btn.disabled = false;
-                    btn.innerHTML = originalText;
-
+                    btn.innerHTML = original;
                     if (data.success) {
-                        bootstrap.Modal.getInstance(document.getElementById('noteModal')).hide();
-                        showToast(data.message, 'success');
-                        loadOrders(); // 刷新列表以显示最新备注
+                        bootstrap.Modal.getInstance(document.getElementById('undeliveredModal')).hide();
+                        showToast(data.message || '已标记为未送达', 'success');
+                        refreshActiveViews();
                     } else {
-                        alert('添加备注失败: ' + (data.error || '未知错误'));
+                        alert('标记失败: ' + (data.error || '未知错误'));
                     }
                 })
                 .catch(err => {
                     btn.disabled = false;
-                    btn.innerHTML = originalText;
+                    btn.innerHTML = original;
                     alert('请求失败: ' + err);
                 });
+        }
+
+        function unmarkUndelivered(orderId, orderNumber) {
+            if (!confirm(`确认撤销 #${orderNumber} 的「未送达」标记？`)) return;
+
+            fetch(`/api/order/${orderId}/unmark-undelivered`, { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        showToast(data.message || '已撤销', 'success');
+                        refreshActiveViews();
+                    } else {
+                        alert('撤销失败: ' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(err => alert('请求失败: ' + err));
         }
 
         function printLabel(orderId) {
@@ -848,9 +1056,16 @@
                         <strong>收货地址:</strong>
                         <div class="ps-3 border-start border-3 border-secondary mt-2 py-2" style="white-space: pre-wrap;">${data.customer_address}</div>
                     </div>
-                    
+
+                    ${data.customer_note ? `
+                    <div class="mb-4 p-2 rounded" style="background-color: #fff3cd; border: 1px solid #ffeaa7;">
+                        <strong>📝 客户留言:</strong>
+                        <div class="ps-3 mt-1" style="white-space: pre-wrap; word-break: break-word;">${data.customer_note}</div>
+                    </div>
+                    ` : ''}
+
                     <hr class="my-3">
-                    
+
                     <!-- Products -->
                     <div class="mb-4">
                         <h5 class="mb-3">📦 商品清单</h5>
@@ -961,6 +1176,11 @@
                                         </div>
                                     ` : ''}
                                     ${!isInPost ? `<div class="text-muted" style="font-size: 0.75em; max-width: 180px; word-wrap: break-word;">${o.customer_address}</div>` : ''}
+                                    ${o.customer_note ? `
+                                        <div class="mt-1 p-1 rounded" style="background-color: #fff3cd; border: 1px solid #ffeaa7; font-size: 0.75em;">
+                                            <strong>📝 留言:</strong> <span style="white-space: pre-wrap; word-break: break-word;">${o.customer_note}</span>
+                                        </div>
+                                    ` : ''}
                                     ${o.shipping_total ? `<div class="mt-1"><small><strong>运费:</strong> ${o.shipping_total}</small></div>` : ''}
                                 </td>
                                 <td>
@@ -1048,6 +1268,11 @@
                                         </div>
                                     ` : ''}
                                     ${!isInPost ? `<div class="text-muted" style="font-size: 0.75em; max-width: 180px; word-wrap: break-word;">${o.customer_address}</div>` : ''}
+                                    ${o.customer_note ? `
+                                        <div class="mt-1 p-1 rounded" style="background-color: #fff3cd; border: 1px solid #ffeaa7; font-size: 0.75em;">
+                                            <strong>📝 留言:</strong> <span style="white-space: pre-wrap; word-break: break-word;">${o.customer_note}</span>
+                                        </div>
+                                    ` : ''}
                                     ${o.shipping_total ? `<div class="mt-1"><small><strong>运费:</strong> ${o.shipping_total}</small></div>` : ''}
                                 </td>
                                 <td>

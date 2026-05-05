@@ -270,6 +270,66 @@
         </div>
     </div>
 
+    <!-- Add Note Modal — shared by shipping page + order detail modal.
+         Reuses the same backend (/api/order/<id>/note) with notify_customer
+         flag → triggers WooCommerce's "Customer Note" email. -->
+    <div class="modal fade" id="noteModal" tabindex="-1" style="z-index: 1070;">
+        <div class="modal-dialog">
+            <div class="modal-content bg-dark border border-secondary border-opacity-25">
+                <div class="modal-header border-bottom border-secondary border-opacity-25">
+                    <h5 class="modal-title text-white"><i class="bi bi-chat-left-text me-2"></i>添加备注</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="noteOrderId">
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">订单号: <span id="noteOrderNumber" class="text-white"></span></label>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">历史备注</label>
+                        <div id="noteHistoryList" class="bg-dark p-2 rounded border border-secondary border-opacity-25"
+                            style="max-height: 200px; overflow-y: auto;">
+                            <div class="text-center text-muted small py-2">加载中...</div>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">备注内容 *</label>
+                        <textarea class="form-control bg-dark text-white border-secondary" id="noteContent" rows="4"
+                            placeholder="输入备注内容..."></textarea>
+                    </div>
+                    <div class="form-check mb-3">
+                        <input class="form-check-input" type="checkbox" id="noteNotifyCustomer">
+                        <label class="form-check-label text-white-50" for="noteNotifyCustomer">
+                            <i class="bi bi-envelope me-1"></i> 发送邮件通知客户（备注内容会作为 Customer Note 邮件发出）
+                        </label>
+                    </div>
+                </div>
+                <div class="modal-footer border-top border-secondary border-opacity-25">
+                    <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary" id="confirmNoteBtn">保存备注</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Email Detail Modal — shows the full body / headers of one log entry -->
+    <div class="modal fade" id="emailDetailModal" tabindex="-1" style="z-index: 1070;">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content bg-dark text-white border border-secondary border-opacity-25">
+                <div class="modal-header border-bottom border-secondary border-opacity-25">
+                    <h5 class="modal-title"><i class="bi bi-envelope-open me-2"></i>邮件详情</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="emailDetailBody">
+                    <div class="text-center py-5">
+                        <div class="spinner-border text-primary" role="status"></div>
+                        <p class="mt-2 text-muted">加载中...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Customer Detail Modal -->
     <div class="modal fade order-modal" id="customerDetailModal" tabindex="-1">
         <div class="modal-dialog modal-xl modal-dialog-scrollable">
@@ -426,6 +486,21 @@
             }
         });
 
+        (function() {
+            fetch('/api/warehouses').then(r => r.json()).then(data => { window._warehousesList = data; }).catch(() => { window._warehousesList = []; });
+        })();
+
+        function setOrderWarehouse(orderId, warehouseId) {
+            fetch('/api/order/' + orderId + '/warehouse', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({warehouse_id: warehouseId})
+            }).then(r => r.json()).then(data => {
+                if (data.success) { showOrderDetail(orderId); }
+                else { alert(data.error || '设置失败'); }
+            }).catch(e => alert('请求失败: ' + e.message));
+        }
+
         function showOrderDetail(orderId) {
             var modal = new bootstrap.Modal(document.getElementById('orderDetailModal'));
             document.getElementById('modalOrderNumber').textContent = orderId;
@@ -493,6 +568,23 @@
                     html += '<p><strong>付款时间:</strong> ' + (order.date_paid ? order.date_paid.replace('T', ' ').substring(0, 16) : '-') + '</p>';
                     html += '<p><strong>付款方式:</strong> ' + (order.payment_method_title || '-') + '</p>';
                     html += '<p><strong>来源网站:</strong> ' + (order.site_manager ? '<span style="background:rgba(23,162,184,0.3);color:#17a2b8;padding:2px 8px;border-radius:10px;font-size:12px;margin-right:6px;">' + order.site_manager + '</span>' : '') + '<span style="color: #a5b4fc;">' + (order.source || '-').replace('https://www.', '').replace('https://', '') + '</span></p>';
+                    {% if current_user.can_edit() %}
+                    html += '<p><strong>发货仓库:</strong> ';
+                    html += '<div class="dropdown d-inline-block">';
+                    html += '<button class="btn btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" style="background:rgba(108,117,125,0.3); padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600; color:#a5b4fc; border:1px solid rgba(108,117,125,0.5);">';
+                    html += (order.warehouse_name || '未分配');
+                    html += '</button>';
+                    html += '<ul class="dropdown-menu dropdown-menu-dark">';
+                    html += '<li><h6 class="dropdown-header">选择发货仓库</h6></li>';
+                    html += '<li><a class="dropdown-item' + (!order.warehouse_id ? ' active' : '') + '" href="#" onclick="setOrderWarehouse(' + order.id + ', null); return false;">未分配</a></li>';
+                    (window._warehousesList || []).forEach(function(w) {
+                        var activeClass = (order.warehouse_id == w.id) ? ' active' : '';
+                        html += '<li><a class="dropdown-item' + activeClass + '" href="#" onclick="setOrderWarehouse(' + order.id + ', ' + w.id + '); return false;">' + w.name + '</a></li>';
+                    });
+                    html += '</ul></div></p>';
+                    {% else %}
+                    html += '<p><strong>发货仓库:</strong> <span style="color:#a5b4fc;">' + (order.warehouse_name || '未分配') + '</span></p>';
+                    {% endif %}
                     html += '</div></div></div>';
 
                     // Undelivered (refused/returned) panel
@@ -527,6 +619,17 @@
                         html += '<button class="btn btn-sm" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);" onclick="openMarkUndeliveredDialog(' + order.id + ', \'' + (order.currency || '') + '\')"><i class="bi bi-flag me-1"></i>标记为未送达</button>';
                         html += '</div></div></div>';
                     }
+
+                    // Add-note action — every page that loads base.html now
+                    // has access to the noteModal, so the button works from
+                    // both /shipping and /orders.
+                    {% if current_user.can_edit() %}
+                    html += '<div class="col-12">';
+                    html += '<div class="info-card" style="border-color: rgba(96,165,250,0.25);"><div class="card-body d-flex align-items-center justify-content-between flex-wrap gap-2">';
+                    html += '<div><i class="bi bi-chat-left-text me-2" style="color:#60a5fa;"></i><span style="color:#e2e8f0;">添加订单备注（可选发邮件通知客户）</span></div>';
+                    html += '<button class="btn btn-sm" style="background:rgba(96,165,250,0.2); color:#60a5fa; border:1px solid rgba(96,165,250,0.4);" onclick="openNoteModal(' + order.id + ', \'' + order.number + '\')"><i class="bi bi-plus-circle me-1"></i>添加备注</button>';
+                    html += '</div></div></div>';
+                    {% endif %}
 
                     // Customer Info
                     html += '<div class="col-md-6">';
@@ -697,6 +800,18 @@
                         html += '</div></div></div></div>';
                     }
 
+                    // Email logs sent to the customer (filled lazily by AJAX
+                    // after the modal renders, so the modal opens immediately
+                    // without waiting on the remote site).
+                    html += '<div class="col-12">';
+                    html += '<div class="info-card"><div class="card-header d-flex align-items-center justify-content-between">';
+                    html += '<h6 class="mb-0"><i class="bi bi-envelope-paper me-2"></i>客户邮件记录 <span id="orderEmailLogsPlugin" class="badge bg-secondary bg-opacity-25 text-light ms-2" style="font-size:10px; display:none;"></span></h6>';
+                    html += '<button class="btn btn-sm btn-outline-light" onclick="loadOrderEmails(' + order.id + ', true)" id="orderEmailLogsRefreshBtn" title="刷新"><i class="bi bi-arrow-clockwise"></i></button>';
+                    html += '</div>';
+                    html += '<div class="card-body" style="max-height: 320px; overflow-y: auto;" id="orderEmailLogsBody">';
+                    html += '<div class="text-center py-3 text-muted small"><span class="spinner-border spinner-border-sm me-1"></span>正在拉取邮件记录...</div>';
+                    html += '</div></div></div>';
+
                     // --- TRACKING INFORMATION LOGIC ---
                     var allTracking = [];
 
@@ -839,10 +954,328 @@
                     html += '</div>';
 
                     document.getElementById('orderDetailContent').innerHTML = html;
+                    // Lazy-load customer email logs after the modal is on screen
+                    loadOrderEmails(order.id, false);
                 })
                 .catch(function (err) {
                     console.error(err);
                     document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger">加载失败: ' + err.message + '</div>';
+                });
+        }
+
+        // Load (or refresh) the customer email log for an order. The data
+        // comes from whichever email-logging plugin is installed on the
+        // source site (FluentSMTP / WP Mail SMTP / Email Log).
+        function loadOrderEmails(orderId, isRefresh) {
+            var bodyEl = document.getElementById('orderEmailLogsBody');
+            var pluginEl = document.getElementById('orderEmailLogsPlugin');
+            var btn = document.getElementById('orderEmailLogsRefreshBtn');
+            if (!bodyEl) return;
+            bodyEl.innerHTML = '<div class="text-center py-3 text-muted small"><span class="spinner-border spinner-border-sm me-1"></span>' + (isRefresh ? '刷新中...' : '正在拉取邮件记录...') + '</div>';
+            if (btn) btn.disabled = true;
+
+            fetch('/api/order/' + orderId + '/emails')
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (btn) btn.disabled = false;
+                    if (pluginEl) {
+                        if (data.plugin && data.plugin !== 'none') {
+                            pluginEl.style.display = 'inline-block';
+                            pluginEl.textContent = '来源: ' + data.plugin;
+                        } else {
+                            pluginEl.style.display = 'none';
+                        }
+                    }
+                    if (!data.success) {
+                        bodyEl.innerHTML = '<div class="alert alert-warning small mb-0"><i class="bi bi-exclamation-triangle me-1"></i>' + (data.error || '无法读取邮件日志') + '</div>';
+                        return;
+                    }
+                    if (!data.logs || data.logs.length === 0) {
+                        bodyEl.innerHTML = '<div class="text-center py-3 text-muted small">暂无与此订单关联的邮件记录</div>';
+                        return;
+                    }
+                    var rows = data.logs.map(function (e) {
+                        var ok = (String(e.status || '').toLowerCase() === 'sent');
+                        var statusBadge = ok
+                            ? '<span class="badge bg-success bg-opacity-25 text-success">已发送</span>'
+                            : '<span class="badge bg-danger bg-opacity-25 text-danger">' + (e.status || 'failed') + '</span>';
+                        var when = (e.sent_at || '').replace('T', ' ').substring(0, 16);
+                        var src = e.source ? '<span class="badge bg-secondary bg-opacity-25 text-light ms-1" style="font-size:10px;">' + e.source + '</span>' : '';
+                        var resp = e.response ? '<div class="small text-muted mt-1" style="word-break:break-word;">' + e.response + '</div>' : '';
+                        // Make the whole row clickable → open the email body modal.
+                        // We use cursor:pointer + a subtle hover via inline JS to keep it self-contained.
+                        var clickAttr = e.id
+                            ? 'role="button" style="cursor:pointer" onclick="showEmailDetail({order:' + orderId + ',logId:' + e.id + '})" title="点击查看邮件正文"'
+                            : 'style="opacity:0.7"';
+                        var openIcon = e.id ? '<i class="bi bi-box-arrow-up-right text-muted ms-2" style="font-size:11px;"></i>' : '';
+                        return '<div class="d-flex mb-2 pb-2 border-bottom border-secondary border-opacity-25" ' + clickAttr + '>'
+                             + '<div class="me-3 text-end" style="min-width: 110px;"><small class="text-muted">' + when + '</small><div class="mt-1">' + statusBadge + '</div></div>'
+                             + '<div class="flex-grow-1">'
+                             +   '<div class="text-light" style="font-size:13px;">' + (e.subject || '(无主题)') + src + openIcon + '</div>'
+                             +   '<div class="small text-muted" style="word-break:break-all;">→ ' + (e.to || '?') + '</div>'
+                             +   resp
+                             + '</div>'
+                             + '</div>';
+                    }).join('');
+                    bodyEl.innerHTML = rows;
+                })
+                .catch(function (err) {
+                    if (btn) btn.disabled = false;
+                    bodyEl.innerHTML = '<div class="alert alert-danger small mb-0">请求失败: ' + err.message + '</div>';
+                });
+        }
+
+        // Customer-wide email log loader. Aggregates across every site the
+        // customer has ordered on (parallel fetch on the backend). Each row
+        // is tagged with site_id so the detail click can route correctly.
+        function loadCustomerEmails(email, isRefresh) {
+            var bodyEl = document.getElementById('customerEmailLogsBody');
+            var summaryEl = document.getElementById('customerEmailLogsSummary');
+            var btn = document.getElementById('customerEmailLogsRefreshBtn');
+            if (!bodyEl) return;
+            bodyEl.innerHTML = '<div class="text-center py-3 text-muted small"><span class="spinner-border spinner-border-sm me-1"></span>' + (isRefresh ? '刷新中...' : '正在跨站点拉取邮件记录...') + '</div>';
+            if (btn) btn.disabled = true;
+
+            fetch('/api/customer/emails?email=' + encodeURIComponent(email))
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (btn) btn.disabled = false;
+                    if (!data.success) {
+                        bodyEl.innerHTML = '<div class="alert alert-warning small mb-0">' + (data.error || '加载失败') + '</div>';
+                        return;
+                    }
+                    if (summaryEl) {
+                        if (data.sites_queried) {
+                            summaryEl.style.display = 'inline-block';
+                            summaryEl.textContent = '查询了 ' + data.sites_queried + ' 个站点 · 共 ' + data.count + ' 封';
+                        } else {
+                            summaryEl.style.display = 'none';
+                        }
+                    }
+                    if (!data.logs || data.logs.length === 0) {
+                        var siteHint = '';
+                        if (data.site_summaries && data.site_summaries.length) {
+                            siteHint = '<div class="small text-muted mt-2">站点检查结果：';
+                            siteHint += data.site_summaries.map(function(s) {
+                                if (s.error) return '<div>· ' + s.site_url + ' — <span class="text-warning">' + s.error + '</span></div>';
+                                return '<div>· ' + s.site_url + ' — ' + (s.plugin === 'none' ? '<span class="text-muted">未识别日志插件</span>' : (s.plugin + '，共 ' + s.count + ' 封')) + '</div>';
+                            }).join('');
+                            siteHint += '</div>';
+                        }
+                        bodyEl.innerHTML = '<div class="text-center py-3 text-muted small">该客户暂无邮件记录</div>' + siteHint;
+                        return;
+                    }
+                    var rows = data.logs.map(function (e) {
+                        var ok = (String(e.status || '').toLowerCase() === 'sent');
+                        var statusBadge = ok
+                            ? '<span class="badge bg-success bg-opacity-25 text-success">已发送</span>'
+                            : '<span class="badge bg-danger bg-opacity-25 text-danger">' + (e.status || 'failed') + '</span>';
+                        var when = (e.sent_at || '').replace('T', ' ').substring(0, 16);
+                        var siteShort = (e.site_url || '').replace('https://www.', '').replace('https://', '');
+                        var src = e.source ? '<span class="badge bg-secondary bg-opacity-25 text-light ms-1" style="font-size:10px;">' + e.source + '</span>' : '';
+                        var resp = e.response ? '<div class="small text-muted mt-1" style="word-break:break-word;">' + e.response + '</div>' : '';
+                        var clickAttr = e.id
+                            ? 'role="button" style="cursor:pointer" onclick="showEmailDetail({site:' + e.site_id + ',logId:' + e.id + '})" title="点击查看邮件正文"'
+                            : 'style="opacity:0.7"';
+                        var openIcon = e.id ? '<i class="bi bi-box-arrow-up-right text-muted ms-2" style="font-size:11px;"></i>' : '';
+                        return '<div class="d-flex mb-2 pb-2 border-bottom border-secondary border-opacity-25" ' + clickAttr + '>'
+                             + '<div class="me-3 text-end" style="min-width: 110px;"><small class="text-muted">' + when + '</small><div class="mt-1">' + statusBadge + '</div></div>'
+                             + '<div class="flex-grow-1">'
+                             +   '<div class="text-light" style="font-size:13px;">' + (e.subject || '(无主题)') + src + openIcon + '</div>'
+                             +   '<div class="small text-muted" style="word-break:break-all;">→ ' + (e.to || '?') + ' <span class="ms-2 badge bg-info bg-opacity-10 text-info" style="font-size:10px;">' + siteShort + '</span></div>'
+                             +   resp
+                             + '</div>'
+                             + '</div>';
+                    }).join('');
+                    bodyEl.innerHTML = rows;
+                })
+                .catch(function (err) {
+                    if (btn) btn.disabled = false;
+                    bodyEl.innerHTML = '<div class="alert alert-danger small mb-0">请求失败: ' + err.message + '</div>';
+                });
+        }
+
+        // ---- Add-note modal — shared across pages ----
+        // Opens a modal pre-loaded with this order's note history. The
+        // "notify customer" checkbox makes the backend POST customer_note=true,
+        // which triggers WooCommerce's standard "Customer Note" email.
+        function openNoteModal(orderId, orderNumber) {
+            document.getElementById('noteOrderId').value = orderId;
+            document.getElementById('noteOrderNumber').textContent = '#' + orderNumber;
+            document.getElementById('noteContent').value = '';
+            document.getElementById('noteNotifyCustomer').checked = false;
+
+            var historyContainer = document.getElementById('noteHistoryList');
+            historyContainer.innerHTML = '<div class="text-center text-muted small py-2"><span class="spinner-border spinner-border-sm me-1"></span>加载中...</div>';
+
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('noteModal')).show();
+
+            fetch('/api/order/' + orderId + '/notes')
+                .then(function (res) { return res.json(); })
+                .then(function (notes) {
+                    if (!notes || notes.length === 0) {
+                        historyContainer.innerHTML = '<div class="text-center text-muted small py-2">暂无历史备注</div>';
+                        return;
+                    }
+                    historyContainer.innerHTML = notes.map(function (note) {
+                        var dateStr = note.date_created ? note.date_created.replace('T', ' ').substring(0, 16) : '';
+                        var badgeHtml = note.customer_note ? '<span class="badge bg-warning text-dark ms-2" style="font-size: 0.7em;">发给客户</span>' : '';
+                        var authorHtml = note.author ? '<span class="badge bg-secondary bg-opacity-25 text-light ms-2" style="font-size: 0.7em;"><i class="bi bi-person me-1"></i>' + note.author + '</span>' : '';
+                        return '<div class="mb-2 pb-2 border-bottom border-secondary border-opacity-25">'
+                            +   '<div class="d-flex justify-content-between mb-1">'
+                            +     '<div><small class="text-muted"><i class="bi bi-clock me-1"></i>' + dateStr + '</small>' + authorHtml + badgeHtml + '</div>'
+                            +   '</div>'
+                            +   '<div class="small text-light" style="word-break: break-word;">' + note.note + '</div>'
+                            + '</div>';
+                    }).join('');
+                })
+                .catch(function () {
+                    historyContainer.innerHTML = '<div class="text-danger small py-2">加载失败</div>';
+                });
+        }
+
+        function addNote() {
+            var orderId = document.getElementById('noteOrderId').value;
+            var note = document.getElementById('noteContent').value.trim();
+            var notifyCustomer = document.getElementById('noteNotifyCustomer').checked;
+
+            if (!note) { alert('请输入备注内容'); return; }
+
+            var btn = document.getElementById('confirmNoteBtn');
+            var originalText = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>保存中...';
+
+            fetch('/api/order/' + orderId + '/note', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ note: note, notify_customer: notifyCustomer })
+            })
+                .then(function (res) { return res.json(); })
+                .then(function (data) {
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+                    if (data.success) {
+                        bootstrap.Modal.getInstance(document.getElementById('noteModal')).hide();
+                        if (typeof showToast === 'function') {
+                            showToast(data.message, 'success');
+                        } else {
+                            alert(data.message);
+                        }
+                        // Refresh whatever's on screen — list page reloaders are
+                        // optional, only present on the shipping management page.
+                        if (typeof loadOrders === 'function') {
+                            try { loadOrders(); } catch (e) {}
+                        }
+                        // If the order detail modal is open for this order,
+                        // re-fetch it so the new note shows in the timeline.
+                        var orderModalEl = document.getElementById('orderDetailModal');
+                        if (orderModalEl && orderModalEl.classList.contains('show')) {
+                            try { showOrderDetail(orderId); } catch (e) {}
+                        }
+                    } else {
+                        alert('添加备注失败: ' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(function (err) {
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+                    alert('请求失败: ' + err);
+                });
+        }
+
+        // Wire the modal's confirm button once at page load (idempotent — the
+        // modal markup lives in base.html so it exists everywhere).
+        document.addEventListener('DOMContentLoaded', function () {
+            var btn = document.getElementById('confirmNoteBtn');
+            if (btn && !btn.dataset.bound) {
+                btn.dataset.bound = '1';
+                btn.addEventListener('click', addNote);
+            }
+        });
+
+        // Open the per-email detail modal. Loads body lazily.
+        // Supports two scoping modes:
+        //   showEmailDetail({order: orderId, logId: X}) — order modal context
+        //   showEmailDetail({site:  siteId,  logId: X}) — customer modal context
+        // Backward-compat: showEmailDetail(orderId, logId) — same as order mode.
+        function showEmailDetail(scopeOrOrderId, logIdOrUndef) {
+            var url;
+            if (typeof scopeOrOrderId === 'object' && scopeOrOrderId !== null) {
+                if (scopeOrOrderId.order) {
+                    url = '/api/order/' + scopeOrOrderId.order + '/emails/' + scopeOrOrderId.logId;
+                } else if (scopeOrOrderId.site) {
+                    url = '/api/site/' + scopeOrOrderId.site + '/emails/' + scopeOrOrderId.logId;
+                } else {
+                    return;
+                }
+            } else {
+                url = '/api/order/' + scopeOrOrderId + '/emails/' + logIdOrUndef;
+            }
+            var modalEl = document.getElementById('emailDetailModal');
+            var bodyEl = document.getElementById('emailDetailBody');
+            bodyEl.innerHTML = '<div class="text-center py-5"><div class="spinner-border text-primary"></div><p class="mt-2 text-muted">加载邮件...</p></div>';
+            var modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+            modal.show();
+
+            fetch(url)
+                .then(function (r) { return r.json(); })
+                .then(function (e) {
+                    if (!e || e.success === false) {
+                        bodyEl.innerHTML = '<div class="alert alert-danger">' + ((e && e.error) || '加载失败') + '</div>';
+                        return;
+                    }
+                    var statusBadge = (e.status === 'sent')
+                        ? '<span class="badge bg-success bg-opacity-25 text-success">已发送</span>'
+                        : '<span class="badge bg-danger bg-opacity-25 text-danger">' + (e.status || 'failed') + '</span>';
+                    var when = (e.sent_at || '').replace('T', ' ').substring(0, 19);
+                    var headersStr = '';
+                    if (e.headers) {
+                        if (typeof e.headers === 'object') {
+                            try { headersStr = JSON.stringify(e.headers, null, 2); } catch (_) { headersStr = String(e.headers); }
+                        } else { headersStr = String(e.headers); }
+                    }
+                    var html = '';
+                    html += '<div class="row g-2 mb-3">';
+                    html += '<div class="col-md-6"><strong>主题:</strong> <span style="color:#e2e8f0;">' + (e.subject || '(无主题)') + '</span></div>';
+                    html += '<div class="col-md-6 text-md-end">' + statusBadge + (e.plugin ? ' <span class="badge bg-secondary bg-opacity-25 text-light ms-1" style="font-size:10px;">' + e.plugin + '</span>' : '') + '</div>';
+                    html += '<div class="col-md-6"><strong>收件人:</strong> <span class="text-muted" style="word-break:break-all;">' + (e.to || '-') + '</span></div>';
+                    html += '<div class="col-md-6 text-md-end"><strong>发件人:</strong> <span class="text-muted">' + (e.from || '-') + '</span></div>';
+                    html += '<div class="col-md-6"><strong>发送时间:</strong> <span class="text-muted">' + when + '</span></div>';
+                    if (e.source) html += '<div class="col-md-6 text-md-end"><strong>SMTP:</strong> <span class="text-muted">' + e.source + '</span></div>';
+                    html += '</div>';
+
+                    if (e.response) {
+                        html += '<div class="alert alert-warning small" style="word-break:break-word;"><strong>响应/错误:</strong> ' + e.response + '</div>';
+                    }
+
+                    // Body — sandboxed iframe so any HTML/CSS in the email
+                    // is contained and can't run scripts or load remote
+                    // tracking pixels (sandbox without allow-scripts blocks both).
+                    if (e.body) {
+                        var srcdocEsc = String(e.body)
+                            .replace(/&/g, '&amp;')
+                            .replace(/"/g, '&quot;');
+                        html += '<div class="mt-3"><strong>正文:</strong></div>';
+                        html += '<div class="bg-white rounded mt-1" style="padding:0;">';
+                        html += '<iframe sandbox style="width:100%; min-height:480px; border:0; border-radius:4px;" srcdoc="' + srcdocEsc + '"></iframe>';
+                        html += '</div>';
+                        html += '<div class="text-end mt-2"><button class="btn btn-sm btn-outline-light" onclick="document.getElementById(\'emailRawBody\').classList.toggle(\'d-none\')"><i class="bi bi-code me-1"></i>查看 HTML 源码</button></div>';
+                        html += '<pre id="emailRawBody" class="d-none mt-2 p-2 bg-black text-light small rounded" style="max-height:300px; overflow:auto; white-space:pre-wrap; word-break:break-all;">' + String(e.body).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</pre>';
+                    } else {
+                        html += '<div class="text-muted small">该日志条目没有保存正文（部分插件只记录元数据）</div>';
+                    }
+
+                    if (headersStr) {
+                        html += '<details class="mt-3"><summary class="text-info" style="cursor:pointer;">邮件头</summary>';
+                        html += '<pre class="mt-2 p-2 bg-black text-light small rounded" style="max-height:200px; overflow:auto; white-space:pre-wrap;">' + headersStr.replace(/</g,'&lt;') + '</pre>';
+                        html += '</details>';
+                    }
+
+                    bodyEl.innerHTML = html;
+                })
+                .catch(function (err) {
+                    bodyEl.innerHTML = '<div class="alert alert-danger">请求失败: ' + err.message + '</div>';
                 });
         }
 
@@ -1099,9 +1532,22 @@
                     });
                     html += '</tbody></table></div></div></div></div>';
 
+                    // Customer-wide email log section (lazy-loaded after the
+                    // modal renders so the customer summary shows immediately).
+                    html += '<div class="col-12">';
+                    html += '<div class="info-card"><div class="card-header d-flex align-items-center justify-content-between">';
+                    html += '<h6 class="mb-0"><i class="bi bi-envelope-paper me-2"></i>客户邮件记录 <span id="customerEmailLogsSummary" class="badge bg-secondary bg-opacity-25 text-light ms-2" style="font-size:10px; display:none;"></span></h6>';
+                    html += '<button class="btn btn-sm btn-outline-light" id="customerEmailLogsRefreshBtn" onclick="loadCustomerEmails(\'' + customer.email.replace(/'/g, "\\'") + '\', true)" title="刷新"><i class="bi bi-arrow-clockwise"></i></button>';
+                    html += '</div>';
+                    html += '<div class="card-body" style="max-height: 360px; overflow-y: auto;" id="customerEmailLogsBody">';
+                    html += '<div class="text-center py-3 text-muted small"><span class="spinner-border spinner-border-sm me-1"></span>正在跨站点拉取邮件记录...</div>';
+                    html += '</div></div></div>';
+
                     html += '</div>';
 
                     document.getElementById('customerDetailContent').innerHTML = html;
+                    // Fire the email aggregator after the DOM is in place
+                    if (customer.email) loadCustomerEmails(customer.email, false);
                 })
                 .catch(function (err) {
                     document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-danger">加载失败: ' + err.message + '</div>';
