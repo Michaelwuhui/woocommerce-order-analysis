@@ -62,6 +62,13 @@ Thumbs.db
 
 # Log files
 *.log
+*.log.*.gz
+*.log.gz
+
+# Database WAL/SHM files
+*.db-shm
+*.db-wal
+*.db.backup*
 
 # Configuration files with sensitive data
 config.ini
