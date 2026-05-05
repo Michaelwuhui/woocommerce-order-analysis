@@ -86,4 +86,5 @@ secrets.json
 
 # Backup files
 *.bak
+*.bak_*
 *.backup
