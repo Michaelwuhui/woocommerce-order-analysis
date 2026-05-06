@@ -126,6 +126,7 @@
                             <th colspan="3" class="text-center border-start">总计</th>
                             <th colspan="4" class="text-center border-start text-success">成功订单</th>
                             <th colspan="2" class="text-center border-start text-danger">失败/取消</th>
+                            <th colspan="2" class="text-center border-start" style="color:#c084fc;">未送达</th>
                             <th rowspan="2" class="align-middle text-center">汇率</th>
                             <th rowspan="2" class="align-middle text-end text-warning">¥净金额</th>
                         </tr>
@@ -139,6 +140,8 @@
                             <th class="text-end">净金额</th>
                             <th class="text-end border-start">失败</th>
                             <th class="text-end">取消</th>
+                            <th class="text-end border-start" style="color:#c084fc;">订单数</th>
+                            <th class="text-end" style="color:#fbbf24;">运费损失</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -163,6 +166,8 @@
                                 stat.currency or '' }}</td>
                             <td class="text-end border-start text-danger">{{ stat.failed_orders }}</td>
                             <td class="text-end text-danger">{{ stat.cancelled_orders }}</td>
+                            <td class="text-end border-start" style="color:{{ '#c084fc' if (stat.undelivered_orders or 0) > 0 else '#6b7280' }};">{{ stat.undelivered_orders or 0 }}</td>
+                            <td class="text-end" style="color:{{ '#fbbf24' if (stat.shipping_loss or 0) > 0 else '#6b7280' }};">{{ "{:,.2f}".format(stat.shipping_loss or 0) }} {{ stat.currency if (stat.shipping_loss or 0) > 0 else '' }}</td>
                             <td class="text-center"><span class="badge bg-info bg-opacity-25 text-info">{{
                                     "%.4f"|format(stat.rate_to_cny) if stat.rate_to_cny else '-' }}</span></td>
                             <td class="text-end text-warning">{% if stat.success_net_amount_cny %}¥{{
@@ -186,6 +191,8 @@
                             <td class="text-end border-start text-danger"><strong>{{ totals.failed_orders }}</strong>
                             </td>
                             <td class="text-end text-danger"><strong>{{ totals.cancelled_orders }}</strong></td>
+                            <td class="text-end border-start" style="color:#c084fc;"><strong>{{ totals.undelivered_orders or 0 }}</strong></td>
+                            <td class="text-end" style="color:{{ '#fbbf24' if (totals.shipping_loss or 0) > 0 else '#6b7280' }};"><strong>{{ "{:,.2f}".format(totals.shipping_loss or 0) }}</strong></td>
                             <td class="text-center">-</td>
                             <td class="text-end text-warning"><strong>¥{{ "{:,.2f}".format(totals.success_net_amount_cny
                                     or 0) }}</strong></td>
@@ -239,6 +246,53 @@
                             <th class="text-center">汇率</th>
                             <th class="text-end">¥净额</th>
                         </tr>
+                        {% if displayed_totals and displayed_totals.order_count > 0 %}
+                        <tr style="background: rgba(99,102,241,0.08); font-weight:600;">
+                            <td colspan="6" class="text-end pe-3 align-middle">
+                                <span class="text-muted">本页合计</span>
+                                <span class="badge bg-info bg-opacity-25 text-info ms-2">{{ displayed_totals.order_count }} 单</span>
+                                {% if displayed_totals.undelivered_count > 0 %}
+                                <span class="badge ms-1" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);">含 {{ displayed_totals.undelivered_count }} 单未送达</span>
+                                {% endif %}
+                            </td>
+                            <td class="text-end align-middle text-info">{{ "{:,}".format(displayed_totals.product_count) }}</td>
+                            <td class="text-end align-middle text-info">
+                                {% for cur, t in displayed_totals.by_currency.items() %}
+                                <div>{{ "{:,.2f}".format(t.shipping) }} <span class="badge bg-secondary" style="font-size:0.65em;">{{ cur }}</span></div>
+                                {% endfor %}
+                            </td>
+                            <td class="text-end align-middle">
+                                {% for cur, t in displayed_totals.by_currency.items() %}
+                                <div><strong>{{ "{:,.2f}".format(t.amount) }}</strong> <span class="badge bg-secondary" style="font-size:0.65em;">{{ cur }}</span></div>
+                                {% endfor %}
+                            </td>
+                            <td class="text-end align-middle text-success">
+                                {% for cur, t in displayed_totals.by_currency.items() %}
+                                <div>
+                                    {{ "{:,.2f}".format(t.net) }} <span class="badge bg-secondary" style="font-size:0.65em;">{{ cur }}</span>
+                                    {% if t.shipping_loss > 0 %}
+                                    <div class="small" style="color:#fbbf24;" title="未送达订单的运费损失">
+                                        <i class="bi bi-arrow-return-left me-1"></i>−{{ "{:,.2f}".format(t.shipping_loss) }} 损失
+                                    </div>
+                                    {% endif %}
+                                </div>
+                                {% endfor %}
+                            </td>
+                            <td class="text-center align-middle text-muted">-</td>
+                            <td class="text-end align-middle text-warning">
+                                <div>¥{{ "{:,.2f}".format(displayed_totals.net_cny) }}</div>
+                                {% if displayed_totals.shipping_loss_cny > 0 %}
+                                <div class="small" style="color:#fbbf24;" title="跨币种汇总的运费损失">
+                                    −¥{{ "{:,.2f}".format(displayed_totals.shipping_loss_cny) }} 损失
+                                </div>
+                                <div class="small text-success border-top border-secondary border-opacity-25 mt-1 pt-1"
+                                     title="实际净金额 = 净额 − 运费损失（与月度统计一致）">
+                                    实际 ¥{{ "{:,.2f}".format(displayed_totals.final_net_cny) }}
+                                </div>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endif %}
                     </thead>
                     <tbody>
                         {% for order in orders %}
@@ -303,13 +357,41 @@
                                     "{:.2f}".format(order.shipping_total or 0) }}</span></td>
                             <td class="text-end align-middle"><strong>{{ order.total|format_currency }} {{
                                     order.currency or '' }}</strong></td>
-                            <td class="text-end align-middle text-success">{{ "{:,.2f}".format(order.net_total or 0) }}
-                                {{ order.currency or '' }}</td>
+                            <td class="text-end align-middle">
+                                {% if order.is_undelivered %}
+                                {# Undelivered → product revenue isn't earned; show the
+                                   would-be net as struck-through context, then the
+                                   real loss as the actual contribution. #}
+                                <div class="text-muted text-decoration-line-through small"
+                                     title="未送达 — 此金额未计入净额">
+                                    {{ "{:,.2f}".format(order.net_total or 0) }} {{ order.currency or '' }}
+                                </div>
+                                {% if (order.shipping_loss_amount or 0) > 0 %}
+                                <div style="color:#fbbf24;" title="实际损失：运费">
+                                    <i class="bi bi-arrow-return-left me-1"></i>−{{ "{:,.2f}".format(order.shipping_loss_amount) }} {{ order.currency or '' }}
+                                </div>
+                                {% else %}
+                                <div class="text-muted small">未计入净额</div>
+                                {% endif %}
+                                {% else %}
+                                <span class="text-success">{{ "{:,.2f}".format(order.net_total or 0) }} {{ order.currency or '' }}</span>
+                                {% endif %}
+                            </td>
                             <td class="text-center align-middle"><span
                                     class="badge bg-info bg-opacity-25 text-info small">{{
                                     "%.4f"|format(order.rate_to_cny) if order.rate_to_cny else '-' }}</span></td>
-                            <td class="text-end align-middle text-warning">{% if order.net_total_cny %}¥{{
-                                "{:,.2f}".format(order.net_total_cny) }}{% else %}-{% endif %}</td>
+                            <td class="text-end align-middle">
+                                {% if order.is_undelivered %}
+                                <div class="text-muted text-decoration-line-through small"
+                                     title="未送达 — 此金额未计入净额">{% if order.net_total_cny %}¥{{
+                                    "{:,.2f}".format(order.net_total_cny) }}{% else %}-{% endif %}</div>
+                                {% if (order.shipping_loss_amount or 0) > 0 and order.rate_to_cny %}
+                                <div style="color:#fbbf24;">−¥{{ "{:,.2f}".format(order.shipping_loss_amount * order.rate_to_cny) }}</div>
+                                {% endif %}
+                                {% else %}
+                                <span class="text-warning">{% if order.net_total_cny %}¥{{ "{:,.2f}".format(order.net_total_cny) }}{% else %}-{% endif %}</span>
+                                {% endif %}
+                            </td>
                         </tr>
                         {% else %}
                         <tr>

@@ -922,15 +922,22 @@ def dashboard():
     # Valid orders count (for AOV calculation)
     stats['valid_orders'] = conn.execute(f'SELECT COUNT(*) FROM orders {revenue_where}', params).fetchone()[0]
     
-    # Get revenue grouped by currency (total and net = total - shipping)
+    # Get revenue grouped by currency (total and net = total - shipping − shipping_loss)
+    # The revenue_where filter already excludes undelivered orders (so their
+    # totals don't get counted as revenue); shipping_loss for those orders
+    # is a real cost we ate, subtracted here so the net matches /monthly.
     revenue_by_currency_raw = conn.execute(f'''
         SELECT currency, SUM(total) as revenue, SUM(shipping_total) as shipping
         FROM orders {revenue_where}
         GROUP BY currency
     ''', params).fetchall()
     stats['total_revenue_by_currency'] = {row['currency']: row['revenue'] or 0 for row in revenue_by_currency_raw}
-    stats['net_revenue_by_currency'] = {row['currency']: (row['revenue'] or 0) - (row['shipping'] or 0) for row in revenue_by_currency_raw}
-    
+    stats['net_revenue_by_currency'] = {
+        row['currency']: (row['revenue'] or 0) - (row['shipping'] or 0)
+                       - stats['shipping_loss_by_currency'].get(row['currency'] or 'N/A', 0)
+        for row in revenue_by_currency_raw
+    }
+
     # Also keep a simple total for backward compatibility
     stats['total_revenue'] = sum(stats['total_revenue_by_currency'].values())
     stats['net_revenue'] = sum(stats['net_revenue_by_currency'].values())
@@ -974,16 +981,25 @@ def dashboard():
         FROM orders {source_success_where}
         GROUP BY source, currency
     ''', params).fetchall()
-    
+
+    # Per-source/per-currency shipping loss from undelivered orders. Same
+    # date filter as the revenue query so the deduction lines up.
+    source_loss_raw = conn.execute(f'''
+        SELECT source, currency, SUM(COALESCE(shipping_loss_amount, 0)) as loss
+        FROM orders {date_condition} AND is_undelivered = 1
+        GROUP BY source, currency
+    ''', params).fetchall()
+    source_loss_lookup = {(r['source'], r['currency']): float(r['loss'] or 0) for r in source_loss_raw}
+
     # Build success data lookup
     success_lookup = {}
     for row in source_success_raw:
         key = (row['source'], row['currency'])
         success_lookup[key] = {
             'success_revenue': row['success_revenue'] or 0,
-            'success_shipping': row['success_shipping'] or 0
+            'success_shipping': row['success_shipping'] or 0,
         }
-    
+
     # Group by source - combine all orders data with success-only data
     source_dict = {}
     for row in source_data_raw:
@@ -993,10 +1009,12 @@ def dashboard():
             source_dict[source] = {'source': source, 'count': 0, 'currency': currency, 'revenue': 0, 'net_revenue': 0}
         source_dict[source]['count'] += row['count']
         source_dict[source]['revenue'] += row['revenue'] or 0
-        
-        # Get success data for net revenue calculation
+
+        # Net revenue = success revenue − success shipping − this source's
+        # shipping_loss from undelivered orders. Mirrors the /monthly view.
         success_data = success_lookup.get((source, currency), {'success_revenue': 0, 'success_shipping': 0})
-        source_dict[source]['net_revenue'] += success_data['success_revenue'] - success_data['success_shipping']
+        loss = source_loss_lookup.get((source, currency), 0)
+        source_dict[source]['net_revenue'] += success_data['success_revenue'] - success_data['success_shipping'] - loss
     
     source_data = list(source_dict.values())
     
@@ -1355,7 +1373,9 @@ def orders():
             {_revenue_amount_case('total')} as success_amount,
             {_revenue_amount_case('shipping_total')} as success_shipping,
             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_orders,
-            SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled_orders
+            SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled_orders,
+            SUM(CASE WHEN is_undelivered = 1 THEN 1 ELSE 0 END) as undelivered_orders,
+            SUM(CASE WHEN is_undelivered = 1 THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END) as shipping_loss
         FROM orders {where_clause} GROUP BY source, currency
     '''
     summary_raw = conn.execute(stats_query, params).fetchall()
@@ -1387,8 +1407,12 @@ def orders():
         stat['success_products'] = prods.get('success', 0)
         stat['failed_products'] = prods.get('failed', 0)
         stat['cancelled_products'] = prods.get('cancelled', 0)
-        stat['success_net_amount'] = (stat['success_amount'] or 0) - (stat['success_shipping'] or 0)
-    
+        # Net = product revenue minus collected shipping fees minus
+        # shipping losses from undelivered orders. Mirrors the /monthly
+        # view's formula so the two summaries cross-validate.
+        stat['shipping_loss'] = float(stat.get('shipping_loss') or 0)
+        stat['success_net_amount'] = (stat['success_amount'] or 0) - (stat['success_shipping'] or 0) - stat['shipping_loss']
+
     totals = {
         'total_orders': sum(s['total_orders'] or 0 for s in summary_stats),
         'total_products': sum(s['total_products'] for s in summary_stats),
@@ -1399,6 +1423,8 @@ def orders():
         'success_net_amount': sum(s['success_net_amount'] for s in summary_stats),
         'failed_orders': sum(s['failed_orders'] or 0 for s in summary_stats),
         'cancelled_orders': sum(s['cancelled_orders'] or 0 for s in summary_stats),
+        'undelivered_orders': sum(s.get('undelivered_orders') or 0 for s in summary_stats),
+        'shipping_loss': sum(s.get('shipping_loss') or 0 for s in summary_stats),
     }
     
     # Get all available months for pagination
@@ -1552,7 +1578,83 @@ def orders():
         order['total_cny'] = round(float(order['total'] or 0) * rate, 2) if rate else None
         order['net_total'] = float(order['total'] or 0) - float(order.get('shipping_total') or 0)
         order['net_total_cny'] = round(order['net_total'] * rate, 2) if rate else None
-    
+
+    # Aggregate column totals over the orders currently rendered (the
+    # selected month tab). Mirrors the math in the /monthly view + the
+    # filter summary table at the top so all three numbers agree:
+    #
+    #   订单金额合计  = sum(total) over ALL orders (gross — includes undelivered)
+    #   运费合计     = sum(shipping_total) over ALL orders
+    #   净额合计     = sum(net_total = total - shipping) ONLY for orders we actually
+    #                  collect money on (excludes undelivered — their goods come back
+    #                  unsold; we never get the order amount)
+    #   运费损失合计 = sum(shipping_loss_amount) for undelivered orders
+    #                  (the carrier kept this even though the package returned)
+    #   实际净额    = 净额合计 - 运费损失合计
+    #
+    # Without the undelivered exclusion the per-row "would-be net" of
+    # returned packages was inflating 净额合计 — those numbers should
+    # never count as revenue, only their shipping cost is a real loss.
+    displayed_totals = {
+        'order_count': len(processed_orders),
+        'undelivered_count': 0,
+        'product_count': 0,
+        'by_currency': {},
+        'net_cny': 0.0,
+        'shipping_loss_cny': 0.0,
+        'final_net_cny': 0.0,  # net minus shipping_loss — matches monthly view
+    }
+    # Mirrors _revenue_status_cond() in SQL — same exclusion list so the
+    # order-list totals row matches the filter-summary "净金额" column.
+    def _is_revenue_order(o):
+        st = o.get('status') or ''
+        pm = (o.get('payment_method') or 'cod')
+        if st in ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat'):
+            return False
+        if st == 'pending' and pm != 'cod':
+            return False
+        if st == 'on-hold' and pm == 'bacs':
+            return False
+        if o.get('is_undelivered'):
+            return False
+        return True
+
+    for o in processed_orders:
+        cur = o.get('currency') or 'N/A'
+        bucket = displayed_totals['by_currency'].setdefault(cur, {
+            'amount': 0.0, 'shipping': 0.0, 'net': 0.0,
+            'shipping_loss': 0.0, 'undelivered_count': 0,
+            'order_count': 0,
+        })
+        bucket['order_count'] += 1
+        bucket['amount']   += float(o.get('total') or 0)
+        bucket['shipping'] += float(o.get('shipping_total') or 0)
+        displayed_totals['product_count'] += int(o.get('product_count') or 0)
+
+        if o.get('is_undelivered'):
+            # Undelivered: package came back, goods resellable, but carrier
+            # kept the shipping fee. Only the shipping_loss counts as a real
+            # impact — DON'T add net_total (would imply we earned the
+            # product revenue, which we didn't).
+            displayed_totals['undelivered_count'] += 1
+            bucket['undelivered_count'] += 1
+            loss = float(o.get('shipping_loss_amount') or 0)
+            bucket['shipping_loss'] += loss
+            if o.get('rate_to_cny'):
+                displayed_totals['shipping_loss_cny'] += loss * float(o['rate_to_cny'])
+        elif _is_revenue_order(o):
+            # Successful (or pending delivery from a paid order) — its
+            # product revenue counts.
+            bucket['net'] += float(o.get('net_total') or 0)
+            if o.get('net_total_cny'):
+                displayed_totals['net_cny'] += float(o['net_total_cny'])
+        # else: failed / cancelled / awaiting-bank-transfer — money never
+        # came in, so contributes nothing. Per-row 净额 display still shows
+        # the would-be number but it's not summed here.
+    displayed_totals['net_cny'] = round(displayed_totals['net_cny'], 2)
+    displayed_totals['shipping_loss_cny'] = round(displayed_totals['shipping_loss_cny'], 2)
+    displayed_totals['final_net_cny'] = round(displayed_totals['net_cny'] - displayed_totals['shipping_loss_cny'], 2)
+
     # Get customer attributes for the displayed orders
     customer_emails = list(set(o['customer_email'] for o in processed_orders if o.get('customer_email')))
     customer_attributes = {}
@@ -1652,6 +1754,7 @@ def orders():
                          statuses=statuses,
                          summary_stats=summary_stats,
                          totals=totals,
+                         displayed_totals=displayed_totals,
                          site_managers=site_managers,
                          customer_attributes=customer_attributes,
                          all_managers=all_managers,
@@ -1839,7 +1942,6 @@ def monthly():
         success_amount = gdf.loc[success_mask, 'total'].sum()
         success_products = gdf.loc[success_mask, 'product_qty'].sum()
         success_shipping = gdf.loc[success_mask, 'shipping_total'].sum()
-        success_net_amount = success_amount - success_shipping
 
         failed_mask = gdf['status'] == 'failed'
         failed_orders = int(failed_mask.sum())
@@ -1850,6 +1952,11 @@ def monthly():
         undelivered_mask = gdf['is_undelivered'].fillna(0) == 1
         undelivered_orders = int(undelivered_mask.sum())
         shipping_loss = float(gdf.loc[undelivered_mask, 'shipping_loss_amount'].fillna(0).sum())
+
+        # Net = product revenue (after deducting collected shipping fees)
+        # MINUS shipping losses from undelivered orders. Without this last
+        # term, returned-package losses were silently absorbed.
+        success_net_amount = success_amount - success_shipping - shipping_loss
 
         rows.append({
             'month': str(month),
@@ -2036,7 +2143,6 @@ def monthly_export():
         success_amount = gdf.loc[success_mask, 'total'].sum()
         success_products = gdf.loc[success_mask, 'product_qty'].sum()
         success_shipping = gdf.loc[success_mask, 'shipping_total'].sum()
-        success_net_amount = success_amount - success_shipping
 
         failed_orders = int((gdf['status'] == 'failed').sum())
         cancelled_orders = int((gdf['status'] == 'cancelled').sum())
@@ -2044,6 +2150,11 @@ def monthly_export():
         undelivered_mask = gdf['is_undelivered'].fillna(0) == 1
         undelivered_orders = int(undelivered_mask.sum())
         shipping_loss = float(gdf.loc[undelivered_mask, 'shipping_loss_amount'].fillna(0).sum())
+
+        # Net = product revenue minus collected shipping fees minus
+        # shipping losses from undelivered orders (kept consistent with the
+        # /monthly view).
+        success_net_amount = success_amount - success_shipping - shipping_loss
 
         # Get CNY rate
         rate, _ = get_cny_rate(currency, str(month))
@@ -7256,7 +7367,7 @@ def get_autosync_status():
     if enabled:
         import subprocess
         try:
-            result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+            result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
             if 'auto_sync.py' not in result.stdout:
                 enabled = False  # Cron was removed externally
         except:
@@ -7302,7 +7413,7 @@ def set_autosync_status():
     # Manage cron job
     try:
         # Get existing crontab
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
         existing_crontab = result.stdout if result.returncode == 0 else ''
         
         # Remove any existing auto_sync.py entries
@@ -7331,7 +7442,7 @@ def set_autosync_status():
         
         # Write new crontab
         new_crontab = '\n'.join(lines) + '\n' if lines else ''
-        process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+        process = subprocess.Popen(['/usr/bin/crontab', '-'], stdin=subprocess.PIPE, text=True)
         process.communicate(input=new_crontab)
         
     except Exception as e:
@@ -7434,7 +7545,7 @@ def get_sync_dashboard():
     # 2. 获取 Crontab 配置
     cron_info = {}
     try:
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
         crontab = result.stdout if result.returncode == 0 else ''
         for line in crontab.split('\n'):
             if 'auto_sync.py' in line and not line.startswith('#'):
@@ -7740,7 +7851,7 @@ def get_cron_status():
     import subprocess
     
     try:
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
         crontab_content = result.stdout
         
         # Check if our deep sync job exists
@@ -7781,7 +7892,7 @@ def setup_cron():
     
     try:
         # Get existing crontab
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
         existing_crontab = result.stdout if result.returncode == 0 else ''
         
         # Remove existing deep sync job if any
@@ -7794,7 +7905,7 @@ def setup_cron():
         
         # Write new crontab
         new_crontab = '\n'.join(lines) + '\n'
-        process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+        process = subprocess.Popen(['/usr/bin/crontab', '-'], stdin=subprocess.PIPE, text=True)
         process.communicate(input=new_crontab)
         
         if process.returncode == 0:
@@ -7813,7 +7924,7 @@ def remove_cron():
     import subprocess
     
     try:
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
         existing_crontab = result.stdout if result.returncode == 0 else ''
         
         # Remove deep sync job
@@ -7821,7 +7932,7 @@ def remove_cron():
                  if '1.wooorders_sqlite.py' not in line and line.strip()]
         
         new_crontab = '\n'.join(lines) + '\n' if lines else ''
-        process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+        process = subprocess.Popen(['/usr/bin/crontab', '-'], stdin=subprocess.PIPE, text=True)
         process.communicate(input=new_crontab)
         
         return jsonify({'success': True, 'message': 'Cron job removed'})
@@ -7836,7 +7947,7 @@ def get_clean_cron_status():
     import subprocess
     
     try:
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
         if result.returncode != 0:
             return jsonify({'enabled': False})
         
@@ -7880,7 +7991,7 @@ def setup_clean_cron():
     
     try:
         # Get existing crontab
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
         existing_crontab = result.stdout if result.returncode == 0 else ''
         
         # Remove existing clean sync job if any
@@ -7893,7 +8004,7 @@ def setup_clean_cron():
         
         # Write new crontab
         new_crontab = '\n'.join(lines) + '\n'
-        process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+        process = subprocess.Popen(['/usr/bin/crontab', '-'], stdin=subprocess.PIPE, text=True)
         process.communicate(input=new_crontab)
         
         days = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
@@ -7913,7 +8024,7 @@ def remove_clean_cron():
     import subprocess
     
     try:
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
         existing_crontab = result.stdout if result.returncode == 0 else ''
         
         # Remove clean sync job
@@ -7921,7 +8032,7 @@ def remove_clean_cron():
                  if '--clean' not in line and 'sync/clean/all' not in line and line.strip()]
         
         new_crontab = '\n'.join(lines) + '\n' if lines else ''
-        process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+        process = subprocess.Popen(['/usr/bin/crontab', '-'], stdin=subprocess.PIPE, text=True)
         process.communicate(input=new_crontab)
         
         return jsonify({'success': True, 'message': 'Clean sync cron job removed'})
@@ -8243,7 +8354,8 @@ def _is_reconciliation_admin():
 def _calc_partner_net_sales(partner_id, year, month):
     """Aggregate net sales for all sites bound to partner in given month.
     Uses the partner's configured currency to filter orders.
-    Net amount = success_amount - success_shipping (matches existing /monthly logic).
+    Net amount = success_amount − success_shipping − undelivered_shipping_loss
+    (matches /monthly + /orders summary).
     Field names use _pln suffix for historical reasons but values are in partner's native currency."""
     conn = get_db_connection()
     # Get partner currency
@@ -8258,22 +8370,29 @@ def _calc_partner_net_sales(partner_id, year, month):
     ''', (partner_id,)).fetchall()
     if not sites:
         conn.close()
-        return {'total_orders': 0, 'total_gross_pln': 0, 'total_net_pln': 0, 'currency': currency}
+        return {'total_orders': 0, 'total_gross_pln': 0, 'total_net_pln': 0,
+                'shipping_loss': 0, 'undelivered_orders': 0, 'currency': currency}
 
     site_urls = [s['url'] for s in sites]
     placeholders = ','.join(['?'] * len(site_urls))
     month_str = f'{year:04d}-{month:02d}'
 
-    # Aggregate from orders table — filtered by partner's currency
-    # Using the same "success" filter as /monthly (exclude failed/cancelled/etc.)
+    # Aggregate from orders table — filtered by partner's currency.
+    # Same "success" filter as /monthly. Net subtracts shipping_loss for
+    # undelivered orders so the partner's settlement reflects real revenue.
     success_cond = _revenue_status_cond()
     query = f'''
         SELECT
             COUNT(*) as total_orders,
             COALESCE(SUM(CASE WHEN {success_cond} THEN total ELSE 0 END), 0) as gross,
-            COALESCE(SUM(CASE WHEN {success_cond} THEN total ELSE 0 END), 0) -
-            COALESCE(SUM(CASE WHEN {success_cond} THEN shipping_total ELSE 0 END), 0) as net,
-            COUNT(CASE WHEN {success_cond} THEN 1 END) as success_orders
+            COALESCE(SUM(CASE WHEN {success_cond} THEN total ELSE 0 END), 0)
+              - COALESCE(SUM(CASE WHEN {success_cond} THEN shipping_total ELSE 0 END), 0)
+              - COALESCE(SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1
+                                   THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END), 0) as net,
+            COUNT(CASE WHEN {success_cond} THEN 1 END) as success_orders,
+            COALESCE(SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1
+                              THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END), 0) as shipping_loss,
+            SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 1 ELSE 0 END) as undelivered_orders
         FROM orders
         WHERE source IN ({placeholders})
         AND currency = ?
@@ -8286,7 +8405,9 @@ def _calc_partner_net_sales(partner_id, year, month):
         'total_orders': row['success_orders'] or 0,
         'total_gross_pln': round(row['gross'] or 0, 2),
         'total_net_pln': round(row['net'] or 0, 2),
-        'currency': currency
+        'shipping_loss': round(row['shipping_loss'] or 0, 2),
+        'undelivered_orders': row['undelivered_orders'] or 0,
+        'currency': currency,
     }
 
 
@@ -9477,34 +9598,58 @@ def products():
             if currency not in total_revenue_by_currency:
                 total_revenue_by_currency[currency] = 0
             total_revenue_by_currency[currency] += amount
-            
+
         for currency, amount in p.get('gross_revenue_by_currency', {}).items():
             if currency not in total_gross_revenue_by_currency:
                 total_gross_revenue_by_currency[currency] = 0
             total_gross_revenue_by_currency[currency] += amount
-    
+
+    # Shipping_loss for the same date/source/manager/country window. The
+    # main product query uses _revenue_status_cond() which already excludes
+    # undelivered orders, so loss isn't reflected in product revenue. Pull
+    # it separately and deduct from the net card so the value matches the
+    # /monthly + dashboard "实际净额" figure.
+    loss_conditions = list(conditions)
+    # Replace _revenue_status_cond() with is_undelivered=1 for this query
+    loss_conditions[0] = 'is_undelivered = 1'
+    loss_where = 'WHERE ' + ' AND '.join(loss_conditions)
+    shipping_loss_by_currency = {}
+    for r in conn.execute(
+        f"SELECT currency, SUM(COALESCE(shipping_loss_amount, 0)) AS loss FROM orders {loss_where} GROUP BY currency",
+        params,
+    ).fetchall():
+        cur = r['currency'] or 'N/A'
+        shipping_loss_by_currency[cur] = float(r['loss'] or 0)
+
+    # Subtract the loss from each currency's product revenue so the card
+    # represents real net (gross product revenue − shipping_loss).
+    for cur, loss in shipping_loss_by_currency.items():
+        if cur in total_revenue_by_currency and loss > 0:
+            total_revenue_by_currency[cur] -= loss
+
     # Calculate CNY total for products
     total_revenue_cny = 0
     total_gross_revenue_cny = 0
     from datetime import datetime
     current_month = datetime.now().strftime('%Y-%m')
-    
+
     for currency, amount in total_revenue_by_currency.items():
         rate, _ = get_cny_rate(currency, current_month)
         if rate:
             total_revenue_cny += amount * rate
-            
+
     for currency, amount in total_gross_revenue_by_currency.items():
         rate, _ = get_cny_rate(currency, current_month)
         if rate:
             total_gross_revenue_cny += amount * rate
-    
+
     totals = {
         'total_quantity': sum(p['quantity'] for p in product_stats.values()),
         'total_revenue_by_currency': total_revenue_by_currency,
         'total_gross_revenue_by_currency': total_gross_revenue_by_currency,
         'total_revenue_cny': round(total_revenue_cny, 2),
         'total_gross_revenue_cny': round(total_gross_revenue_cny, 2),
+        'shipping_loss_by_currency': {c: round(v, 2) for c, v in shipping_loss_by_currency.items() if v > 0},
         'brand_count': len(brand_stats),
         'product_count': len(product_stats)
     }
@@ -10422,7 +10567,7 @@ def settings_api():
                     sync_interval = int(interval_row['value']) if interval_row else 900
                     
                     # 获取现有 crontab
-                    result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+                    result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
                     existing_crontab = result.stdout if result.returncode == 0 else ''
                     
                     # 移除已有的 auto_sync.py 条目
@@ -10447,7 +10592,7 @@ def settings_api():
                     
                     # 写入新的 crontab
                     new_crontab = '\n'.join(lines) + '\n' if lines else ''
-                    process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+                    process = subprocess.Popen(['/usr/bin/crontab', '-'], stdin=subprocess.PIPE, text=True)
                     process.communicate(input=new_crontab)
                 except Exception as cron_err:
                     # cron 更新失败不影响设置保存的成功返回，但记录日志
@@ -11843,50 +11988,81 @@ def get_order_notes(order_id):
 @login_required
 @shipper_required
 def add_order_note(order_id):
-    """Add a note to an order, optionally notifying the customer"""
+    """Add a note to an order, optionally notifying the customer.
+
+    When notify_customer is True, WP runs the email send synchronously through
+    whatever SMTP plugin is installed (FluentSMTP, etc) BEFORE returning the
+    response. A slow SMTP relay can easily push that past the default 30 s
+    timeout. So we:
+      - bump the read timeout to 90 s when an email is involved
+      - on timeout, do a verify GET to see if the note actually landed
+        (the POST likely succeeded server-side; only the response was lost)
+    """
     import requests as req
-    
+
     data = request.json
     note = data.get('note', '')
     notify_customer = data.get('notify_customer', False)
-    
+
     if not note:
         return jsonify({'success': False, 'error': '备注内容不能为空'}), 400
-    
+
     conn = get_db_connection()
     order = conn.execute('SELECT number, source FROM orders WHERE id = ?', (order_id,)).fetchone()
     if not order:
         conn.close()
         return jsonify({'success': False, 'error': '订单不存在'}), 404
-    
+
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
     conn.close()
-    
+
     if not site:
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
-    
+
+    url = f"{site['url']}/wp-json/wc/v3/orders/{order_id}/notes"
+    headers = {
+        "User-Agent": "WooCommerce API Client-Python/3.0.0",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    auth = (site['consumer_key'], site['consumer_secret'])
+    # (connect, read) — connect should be fast; read needs to absorb SMTP latency
+    timeout = (10, 90 if notify_customer else 30)
+
     try:
-        url = f"{site['url']}/wp-json/wc/v3/orders/{order_id}/notes"
-        
-        # Headers to simulate official WooCommerce API client to bypass WAF
-        headers = {
-            "User-Agent": "WooCommerce API Client-Python/3.0.0",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        
-        resp = req.post(
-            url,
-            json={'note': note, 'customer_note': notify_customer},
-            auth=(site['consumer_key'], site['consumer_secret']),
-            timeout=30,
-            headers=headers
-        )
-        
-        if resp.status_code not in [200, 201]:
-            raise Exception(f"API错误: {resp.text}")
-            
-        # Parse response to get the note ID and details, save to local DB
+        try:
+            resp = req.post(
+                url,
+                json={'note': note, 'customer_note': notify_customer},
+                auth=auth, timeout=timeout, headers=headers,
+            )
+        except req.exceptions.ReadTimeout:
+            # The note POST likely succeeded but the response never arrived.
+            # Fetch the latest notes and look for ours by exact content match.
+            app.logger.warning(f"add_order_note: read timeout for order {order_id}, verifying via GET...")
+            try:
+                check = req.get(url, auth=auth, timeout=(10, 30), headers=headers)
+                if check.status_code == 200:
+                    for n in check.json() or []:
+                        if str(n.get('note', '')).strip() == note.strip():
+                            return jsonify({
+                                'success': True,
+                                'message': '备注已添加（远端响应超时，但已确认入库）'
+                                           + ('，邮件可能仍在发送中' if notify_customer else ''),
+                                'verified_by_get': True,
+                            })
+            except Exception as verify_err:
+                app.logger.warning(f"add_order_note verify GET failed: {verify_err}")
+            return jsonify({
+                'success': False,
+                'error': '请求超时（90s）。如果勾选了「发送邮件」，邮件服务器响应可能慢；'
+                         '请稍后到 WordPress 后台确认备注是否已添加。',
+            }), 504
+
+        if resp.status_code not in (200, 201):
+            return jsonify({'success': False, 'error': f"API错误 {resp.status_code}: {resp.text[:200]}"}), 502
+
+        # Save the new note locally so it shows up immediately without waiting for the next sync
         try:
             note_data = resp.json()
             if note_data and 'id' in note_data:
@@ -11903,16 +12079,15 @@ def add_order_note(order_id):
                     note_data.get('date_created', datetime.now().isoformat()),
                     1 if notify_customer else 0,
                     note_data.get('author', current_user.username if current_user.is_authenticated else ''),
-                    1 # Manually added
+                    1,
                 ))
                 conn.commit()
                 conn.close()
         except Exception as db_err:
             app.logger.error(f"Failed to save note to local DB: {db_err}")
-            pass # Non-fatal, will be synced later
-        
+
         return jsonify({'success': True, 'message': '备注已添加' + ('，已通知客户' if notify_customer else '')})
-        
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -12963,6 +13138,9 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
     else:  # month
         time_expr = "strftime('%Y-%m', date_created)"
     
+    # success_net excludes undelivered (via _revenue_status_cond) AND deducts
+    # the shipping_loss that those undelivered orders cost us — keeps the
+    # report's net column consistent with /monthly and /orders summary views.
     query = f'''
         SELECT
             source,
@@ -12972,7 +13150,9 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
             SUM(total - shipping_total) as net_amount,
             currency,
             SUM(CASE WHEN {_revenue_status_cond()}
-                THEN total - shipping_total ELSE 0 END) as success_net
+                THEN total - shipping_total ELSE 0 END)
+            - SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1
+                THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END) as success_net
         FROM orders
         WHERE date_created >= ? AND date_created <= ?
           AND status NOT IN ('checkout-draft', 'trash')
@@ -13483,6 +13663,17 @@ def _compute_sales_board_data(selected_month):
             AND is_undelivered = 1
         ''', site_urls + [selected_month]).fetchall()
 
+        # Previous-month shipping_loss — needed so the 上月销售 card on the
+        # board uses the same net definition as the current month (and as
+        # /monthly / dashboard).
+        prev_undelivered_rows = conn.execute(f'''
+            SELECT shipping_loss_amount, currency
+            FROM orders
+            WHERE source IN ({placeholders})
+            AND strftime('%Y-%m', date_created) = ?
+            AND is_undelivered = 1
+        ''', site_urls + [prev_month]).fetchall()
+
         # Calculate month amounts by currency and total products
         month_currency_amounts = defaultdict(lambda: {'net_amount': 0, 'amount': 0, 'shipping': 0})
         month_total_products = 0
@@ -13633,20 +13824,32 @@ def _compute_sales_board_data(selected_month):
                 month_shipping_cny += shipping * rate
                 country_profit[order_country]['net_cny'] += net * rate
 
-        # Previous month CNY (uses prev-month board overrides if set)
+        # Previous month CNY (uses prev-month board overrides if set).
+        # Net definition mirrors current month: gross product revenue minus
+        # collected shipping minus shipping_loss from undelivered orders.
         prev_net_cny = 0
         _prev_rate_cache = {}
+        def _prev_rate(cur):
+            if cur not in _prev_rate_cache:
+                r, _src = _get_board_cny_rate(cur, prev_month, _board_overrides_prev)
+                _prev_rate_cache[cur] = r or 0
+            return _prev_rate_cache[cur]
+
         for order in prev_orders:
             currency = order['currency'] or 'PLN'
             total = float(order['total'] or 0)
             shipping = float(order['shipping_total'] or 0)
             net = total - shipping
-            if currency not in _prev_rate_cache:
-                r, _src = _get_board_cny_rate(currency, prev_month, _board_overrides_prev)
-                _prev_rate_cache[currency] = r or 0
-            rate = _prev_rate_cache[currency]
+            rate = _prev_rate(currency)
             if rate:
                 prev_net_cny += net * rate
+        # Subtract prev-month shipping_loss so 上月销售 card matches /monthly.
+        for u in prev_undelivered_rows:
+            cur = u['currency'] or 'PLN'
+            amt = float(u['shipping_loss_amount'] or 0)
+            r = _prev_rate(cur)
+            if r:
+                prev_net_cny -= amt * r
 
         # Current week amounts by currency
         week_currency_amounts = defaultdict(lambda: {'net_amount': 0})
@@ -13679,6 +13882,17 @@ def _compute_sales_board_data(selected_month):
                 u_country = site_country_map.get(u['source'], 'PL')
                 country_profit[u_country]['shipping_loss_cny'] += amt * r
                 country_profit[u_country]['undelivered_count'] += 1
+
+        # Subtract shipping_loss from net so 完成率 / 利润 / per-country net
+        # match the rest of the system. Per-currency totals get the loss
+        # baked in too — same pattern as /monthly.
+        month_net_cny = month_net_cny - shipping_loss_cny
+        for cur, loss_amt in shipping_loss_by_currency.items():
+            month_currency_amounts[cur]['net_amount'] -= loss_amt
+        # Per-country net was incremented above (line ~13757) without the
+        # loss; now subtract each country's loss to get the true net.
+        for c, v in country_profit.items():
+            v['net_cny'] = v['net_cny'] - v['shipping_loss_cny']
 
         # Get target info
         target = targets.get(manager, {})

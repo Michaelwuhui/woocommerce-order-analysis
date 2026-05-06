@@ -497,6 +497,95 @@
     </div>
 </div>
 
+<!-- Sync Status Overview Card -->
+<div class="card data-card mb-4">
+    <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
+        <h5 class="card-title text-white mb-0"><i class="bi bi-activity me-2"></i>同步状态总览</h5>
+        <div class="d-flex gap-2">
+            <button class="btn btn-sm btn-outline-light" id="refreshSyncOverviewBtn" title="刷新">
+                <i class="bi bi-arrow-clockwise"></i>
+            </button>
+            <button class="btn btn-sm btn-info" id="openFullSyncLogsBtn">
+                <i class="bi bi-journal-text me-1"></i>查看完整日志中心
+            </button>
+        </div>
+    </div>
+    <div class="card-body">
+        <p class="text-white-50 mb-3 small">实时显示三类定时任务的启用状态、最近 24 小时统计与最近同步记录。点击右上角"查看完整日志中心"可查看每个任务的完整日志文件与历史明细。</p>
+
+        <!-- 状态卡片行 -->
+        <div class="row g-3 mb-3">
+            <div class="col-md-3">
+                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                    <div class="card-body text-center py-3">
+                        <div class="text-primary mb-1"><i class="bi bi-arrow-repeat" style="font-size:1.4rem;"></i></div>
+                        <div class="text-white-50 small">自动同步</div>
+                        <div id="ovAutoStatus" class="mt-1"><span class="badge bg-secondary">加载中...</span></div>
+                        <div id="ovAutoSchedule" class="text-muted small mt-1"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                    <div class="card-body text-center py-3">
+                        <div class="text-info mb-1"><i class="bi bi-cloud-download" style="font-size:1.4rem;"></i></div>
+                        <div class="text-white-50 small">深度同步</div>
+                        <div id="ovDeepStatus" class="mt-1"><span class="badge bg-secondary">加载中...</span></div>
+                        <div id="ovDeepSchedule" class="text-muted small mt-1"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                    <div class="card-body text-center py-3">
+                        <div class="text-warning mb-1"><i class="bi bi-trash2" style="font-size:1.4rem;"></i></div>
+                        <div class="text-white-50 small">清理同步</div>
+                        <div id="ovCleanStatus" class="mt-1"><span class="badge bg-secondary">加载中...</span></div>
+                        <div id="ovCleanSchedule" class="text-muted small mt-1"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                    <div class="card-body text-center py-3">
+                        <div class="text-success mb-1"><i class="bi bi-graph-up" style="font-size:1.4rem;"></i></div>
+                        <div class="text-white-50 small">最近 24 小时</div>
+                        <div id="ovStats24h" class="mt-1"><span class="badge bg-secondary">加载中...</span></div>
+                        <div id="ovStatsDetail" class="text-muted small mt-1"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 最近同步记录表格 -->
+        <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25">
+            <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 py-2 d-flex justify-content-between align-items-center">
+                <span class="text-white-50"><i class="bi bi-clock-history me-1"></i>最近同步记录</span>
+                <span class="text-muted small" id="ovRecentSyncMeta"></span>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive" style="max-height:300px; overflow-y:auto;">
+                    <table class="table table-dark table-hover align-middle mb-0" style="--bs-table-bg:transparent;">
+                        <thead style="position:sticky; top:0; z-index:1; background:#1a1d21;">
+                            <tr>
+                                <th class="ps-3">站点</th>
+                                <th>时间</th>
+                                <th>状态</th>
+                                <th>新订单</th>
+                                <th>更新</th>
+                                <th class="pe-3">耗时</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ovRecentSyncBody">
+                            <tr><td colspan="6" class="text-center text-muted py-4">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Exchange Rates Card -->
 <div class="card data-card mb-4">
     <div
@@ -3288,6 +3377,122 @@ function deleteWarehouse(id, name) {
     const apiLogFilterSite = document.getElementById('apiLogFilterSite');
     if (apiLogFilterSite) {
         apiLogFilterSite.addEventListener('change', loadApiSyncLogs);
+    }
+
+    // ============================================================
+    // Sync Status Overview Card (settings page in-line view)
+    // ============================================================
+    function setOverviewBadge(elId, scheduleElId, enabled, scheduleCron) {
+        const el = document.getElementById(elId);
+        const schEl = document.getElementById(scheduleElId);
+        if (!el) return;
+        if (enabled) {
+            el.innerHTML = '<span class="badge bg-success">已启用</span>';
+            if (schEl) schEl.textContent = scheduleCron ? cronToReadable(scheduleCron) : '';
+        } else {
+            el.innerHTML = '<span class="badge bg-secondary">未启用</span>';
+            if (schEl) schEl.textContent = '';
+        }
+    }
+
+    function formatSyncTime(ts) {
+        if (!ts) return '';
+        // ts can be ISO or "YYYY-MM-DD HH:MM:SS"
+        const s = String(ts).replace('T', ' ').slice(0, 19);
+        return s;
+    }
+
+    function loadSyncOverview() {
+        const tbody = document.getElementById('ovRecentSyncBody');
+        if (tbody) tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3"><span class="spinner-border spinner-border-sm me-2"></span>加载中...</td></tr>';
+
+        // Status cards from /api/sync/dashboard
+        fetch('/api/sync/dashboard')
+            .then(r => r.json())
+            .then(data => {
+                const auto = data.autosync || {};
+                setOverviewBadge('ovAutoStatus', 'ovAutoSchedule', !!auto.enabled, auto.cron_schedule);
+
+                const deep = data.deep_sync || {};
+                setOverviewBadge('ovDeepStatus', 'ovDeepSchedule', !!deep.cron_schedule, deep.cron_schedule);
+
+                const clean = data.clean_sync || {};
+                setOverviewBadge('ovCleanStatus', 'ovCleanSchedule', !!clean.cron_schedule, clean.cron_schedule);
+
+                const stats = data.stats_24h || {};
+                const total = stats.total || 0;
+                const success = stats.success || 0;
+                const failed = stats.failed || 0;
+                const stEl = document.getElementById('ovStats24h');
+                const detailEl = document.getElementById('ovStatsDetail');
+                if (stEl) {
+                    stEl.innerHTML = `<span class="badge bg-success">${success} 成功</span>` +
+                        (failed > 0 ? ` <span class="badge bg-danger">${failed} 失败</span>` : '');
+                }
+                if (detailEl) {
+                    detailEl.textContent = `共 ${total} 次，新增 ${stats.new_orders || 0}，更新 ${stats.updated_orders || 0}`;
+                }
+            })
+            .catch(() => {
+                ['ovAutoStatus', 'ovDeepStatus', 'ovCleanStatus', 'ovStats24h'].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el) el.innerHTML = '<span class="badge bg-danger">读取失败</span>';
+                });
+            });
+
+        // Recent sync records
+        fetch('/api/sync/logs?limit=5')
+            .then(r => r.json())
+            .then(logs => {
+                if (!tbody) return;
+                if (!Array.isArray(logs) || logs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">暂无同步记录</td></tr>';
+                    const meta = document.getElementById('ovRecentSyncMeta');
+                    if (meta) meta.textContent = '';
+                    return;
+                }
+                tbody.innerHTML = logs.map(log => {
+                    const siteName = (log.site_url || '-').replace(/^https?:\/\//, '');
+                    const statusBadge = log.status === 'success'
+                        ? '<span class="badge bg-success">成功</span>'
+                        : '<span class="badge bg-danger">失败</span>';
+                    const dur = log.duration_seconds != null ? `${log.duration_seconds}s` : '-';
+                    return `<tr>
+                        <td class="ps-3 small">${siteName || '-'}</td>
+                        <td class="small text-white-50">${formatSyncTime(log.sync_time)}</td>
+                        <td>${statusBadge}</td>
+                        <td class="small">${log.new_orders ?? 0}</td>
+                        <td class="small">${log.updated_orders ?? 0}</td>
+                        <td class="pe-3 small">${dur}</td>
+                    </tr>`;
+                }).join('');
+                const meta = document.getElementById('ovRecentSyncMeta');
+                if (meta) meta.textContent = `显示最近 ${logs.length} 条`;
+            })
+            .catch(() => {
+                if (tbody) tbody.innerHTML = '<tr><td colspan="6" class="text-center text-danger py-3">加载失败，请刷新</td></tr>';
+            });
+    }
+
+    // 初始加载
+    if (document.getElementById('ovAutoStatus')) {
+        loadSyncOverview();
+    }
+
+    // 刷新按钮
+    const refreshSyncOverviewBtn = document.getElementById('refreshSyncOverviewBtn');
+    if (refreshSyncOverviewBtn) {
+        refreshSyncOverviewBtn.addEventListener('click', loadSyncOverview);
+    }
+
+    // "查看完整日志中心" 按钮 → 复用现有 modal
+    const openFullSyncLogsBtn = document.getElementById('openFullSyncLogsBtn');
+    if (openFullSyncLogsBtn) {
+        openFullSyncLogsBtn.addEventListener('click', function () {
+            const modal = new bootstrap.Modal(document.getElementById('syncLogsDashboardModal'));
+            modal.show();
+            if (typeof loadSyncDashboard === 'function') loadSyncDashboard();
+        });
     }
 
     // ============================================================

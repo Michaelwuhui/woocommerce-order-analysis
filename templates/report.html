@@ -179,6 +179,22 @@
                 <small style="color:#ffffff !important;"><i class="bi bi-info-circle me-1"></i>图表显示筛选范围内所有选中站点的<span
                         id="chartGranularityInfo">月度</span>汇总数据</small>
             </div>
+            <!-- Per-period totals — sums every visible site so you can read off
+                 each month's UV and order count at a glance without hovering. -->
+            <div class="table-responsive mt-3" id="trendSummaryWrapper" style="display: none;">
+                <table class="table table-dark table-sm table-bordered mb-0" id="trendSummaryTable"
+                       style="font-size: 13px; --bs-table-bg: rgba(255,255,255,0.02);">
+                    <thead>
+                        <tr style="background: rgba(99,102,241,0.12);">
+                            <th class="text-muted" style="min-width:120px;">指标 \ 周期</th>
+                            <!-- period columns injected at runtime -->
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- rows injected at runtime -->
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
 
@@ -900,6 +916,9 @@
             trendChart.destroy();
         }
 
+        // Refresh the per-period totals table alongside the chart
+        updateTrendSummary(activeSites, months, allData, activeMetrics);
+
         // Site Colors Palette
         const SITE_COLORS = [
             '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6',
@@ -1084,6 +1103,135 @@
                 }
             }
         });
+    }
+
+    /**
+     * Build the per-period summary table below the trend chart. Sums every
+     * active metric across all visible sites per period, plus a "总计" column.
+     * Mirrors the report-table column logic so what you see on the chart is
+     * what you read off the bottom row.
+     */
+    function updateTrendSummary(activeSites, months, allData, activeMetrics) {
+        const wrapper = document.getElementById('trendSummaryWrapper');
+        const table = document.getElementById('trendSummaryTable');
+        if (!wrapper || !table) return;
+
+        if (!activeMetrics.length || !months.length) {
+            wrapper.style.display = 'none';
+            return;
+        }
+
+        // Pre-aggregate raw sums per period (additive metrics only). Derived
+        // metrics (转化率 / 客单价) are computed from these on the fly.
+        const sums = {};   // period → { uv, pv, order_count, total_amount, net_cny }
+        const grand = { uv: 0, pv: 0, order_count: 0, total_amount: 0, net_cny: 0 };
+        months.forEach(m => {
+            const s = { uv: 0, pv: 0, order_count: 0, total_amount: 0, net_cny: 0 };
+            activeSites.forEach(site => {
+                const cell = (allData[site] && allData[site][m]) || {};
+                s.uv          += (cell.uv || 0);
+                s.pv          += (cell.pv || 0);
+                s.order_count += (cell.order_count || 0);
+                s.total_amount += (cell.total_amount || 0);
+                s.net_cny     += (cell.net_cny || 0);
+            });
+            sums[m] = s;
+            grand.uv          += s.uv;
+            grand.pv          += s.pv;
+            grand.order_count += s.order_count;
+            grand.total_amount += s.total_amount;
+            grand.net_cny     += s.net_cny;
+        });
+
+        // Compute the value of one metric for a given period sums bucket
+        function valueOf(metricKey, b) {
+            switch (metricKey) {
+                case 'uv':              return b.uv;
+                case 'pv':              return b.pv;
+                case 'order_count':     return b.order_count;
+                case 'total_amount':    return b.total_amount;
+                case 'net_cny':         return b.net_cny;
+                case 'conversion_rate': return b.uv > 0 ? (b.order_count * 100 / b.uv) : null;
+                case 'aov_cny':         return b.order_count > 0 ? (b.net_cny / b.order_count) : null;
+                default:                return 0;
+            }
+        }
+
+        // Per-metric visual styling — keeps the row instantly readable
+        const STYLES = {
+            uv:              { bg: 'rgba(59,130,246,0.2)',  fg: '#60a5fa', icon: 'bi-people-fill' },
+            pv:              { bg: 'rgba(34,211,238,0.2)',  fg: '#22d3ee', icon: 'bi-eye-fill' },
+            order_count:     { bg: 'rgba(16,185,129,0.2)',  fg: '#34d399', icon: 'bi-bag-check' },
+            total_amount:    { bg: 'rgba(168,85,247,0.2)',  fg: '#c084fc', icon: 'bi-cash-stack' },
+            net_cny:         { bg: 'rgba(245,158,11,0.2)',  fg: '#fbbf24', icon: 'bi-cash-coin' },
+            conversion_rate: { bg: 'rgba(251,191,36,0.15)', fg: '#fde68a', icon: 'bi-percent' },
+            aov_cny:         { bg: 'rgba(244,114,182,0.2)', fg: '#f472b6', icon: 'bi-tag' },
+        };
+
+        // Build header row
+        const thead = table.querySelector('thead');
+        thead.innerHTML = '';
+        const headRow = document.createElement('tr');
+        headRow.style.background = 'rgba(99,102,241,0.12)';
+        const labelTh = document.createElement('th');
+        labelTh.className = 'text-muted';
+        labelTh.style.minWidth = '130px';
+        labelTh.textContent = '指标 \\ 周期';
+        headRow.appendChild(labelTh);
+        months.forEach(m => {
+            const th = document.createElement('th');
+            th.className = 'text-end text-nowrap';
+            th.textContent = formatPeriod(m);
+            headRow.appendChild(th);
+        });
+        const totalTh = document.createElement('th');
+        totalTh.className = 'text-end text-warning border-start';
+        totalTh.style.minWidth = '100px';
+        totalTh.textContent = '总计';
+        headRow.appendChild(totalTh);
+        thead.appendChild(headRow);
+
+        // Build body rows — one per active metric, in the order user selected
+        const tbody = table.querySelector('tbody');
+        tbody.innerHTML = '';
+
+        activeMetrics.forEach(metric => {
+            const style = STYLES[metric.key] || { bg: 'rgba(255,255,255,0.08)', fg: '#cbd5e1', icon: 'bi-graph-up' };
+            const tr = document.createElement('tr');
+
+            const labelTd = document.createElement('td');
+            labelTd.innerHTML = `<span class="badge" style="background:${style.bg}; color:${style.fg};">`
+                + `<i class="bi ${style.icon} me-1"></i>${metric.label}</span>`;
+            tr.appendChild(labelTd);
+
+            // Per-period values
+            months.forEach(m => {
+                const td = document.createElement('td');
+                td.className = 'text-end fw-bold';
+                td.style.color = style.fg;
+                const v = valueOf(metric.key, sums[m]);
+                td.textContent = (v === null || v === 0) ? '-' : formatValue(v, metric.format);
+                tr.appendChild(td);
+            });
+
+            // Total / average
+            const totalTd = document.createElement('td');
+            totalTd.className = 'text-end fw-bold border-start text-warning';
+            let totalVal;
+            if (metric.key === 'conversion_rate') {
+                totalVal = grand.uv > 0 ? (grand.order_count * 100 / grand.uv) : null;
+            } else if (metric.key === 'aov_cny') {
+                totalVal = grand.order_count > 0 ? (grand.net_cny / grand.order_count) : null;
+            } else {
+                totalVal = valueOf(metric.key, grand);
+            }
+            totalTd.textContent = (totalVal === null || totalVal === 0) ? '-' : formatValue(totalVal, metric.format);
+            tr.appendChild(totalTd);
+
+            tbody.appendChild(tr);
+        });
+
+        wrapper.style.display = '';
     }
 
     function formatPeriod(periodStr) {
