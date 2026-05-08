@@ -146,8 +146,8 @@ class User(UserMixin):
 
     def can_view_costs(self):
         """Check if user can view the cost management page (read-only gate).
-        Must have can_view_costs flag OR be super admin. Editing costs still
-        requires admin role (enforced separately via @admin_required)."""
+        Must have can_view_costs flag OR be super admin. Editing costs is
+        gated separately by can_edit_costs."""
         if self.username == 'admin':
             return True
         conn = get_db_connection()
@@ -155,6 +155,21 @@ class User(UserMixin):
             user = conn.execute('SELECT can_view_costs FROM users WHERE id = ?', (self.id,)).fetchone()
             conn.close()
             return bool(user and user['can_view_costs'] == 1)
+        except:
+            return False
+
+    def can_edit_costs(self):
+        """Check if user can EDIT (add/update/delete) product costs.
+        Super admin always passes. Otherwise requires the can_edit_costs flag.
+        Implies can_view_costs (no point editing what you can't see — the UI
+        respects this, but this method itself doesn't auto-grant view)."""
+        if self.username == 'admin':
+            return True
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_edit_costs FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return bool(user and user['can_edit_costs'] == 1)
         except:
             return False
 
@@ -654,6 +669,80 @@ h1{color:#ef4444;margin:0 0 16px;}p{color:#9ca3af;line-height:1.6;}a{color:#a78b
 '''), 403
         return f(*args, **kwargs)
     return decorated_function
+
+
+def costs_edit_required(f):
+    """Decorator to require cost-edit permission (POST/PUT/DELETE on product_costs).
+    Super admin passes through. Otherwise requires can_edit_costs flag."""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return jsonify({'error': '未登录'}), 401
+        if not current_user.can_edit_costs():
+            return jsonify({'error': '无成本管理编辑权限', 'permission': 'edit_costs'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def _user_allowed_warehouse_ids():
+    """Return the list of warehouse_ids the current user is allowed to manage
+    costs in. Drives the country/warehouse scope for partner-bound users.
+
+    Returns:
+      None  → unrestricted (super admin, or admin role)
+      [...] → restricted to these warehouse ids (non-admin with partner bindings)
+      []    → no access (non-admin without any partner binding)
+
+    Logic:
+      • super admin (username 'admin')                → None
+      • admin role (e.g. internal finance)            → None
+      • non-admin with partner_users binding(s)       → warehouses in the
+        countries of all bound partners' bound sites
+      • non-admin without partner binding             → []
+    """
+    if not current_user.is_authenticated:
+        return []
+    if current_user.username == 'admin':
+        return None
+    conn = get_db_connection()
+    try:
+        u = conn.execute('SELECT role FROM users WHERE id = ?', (current_user.id,)).fetchone()
+        if u and u['role'] == 'admin':
+            return None
+        partner_ids = [r['partner_id'] for r in conn.execute(
+            'SELECT partner_id FROM partner_users WHERE user_id = ?', (current_user.id,)
+        ).fetchall()]
+        if not partner_ids:
+            return []
+        placeholders = ','.join(['?'] * len(partner_ids))
+        countries = [r['country'] for r in conn.execute(f'''
+            SELECT DISTINCT s.country FROM partner_sites ps
+            JOIN sites s ON s.id = ps.site_id
+            WHERE ps.partner_id IN ({placeholders})
+              AND s.country IS NOT NULL AND s.country != ''
+        ''', partner_ids).fetchall()]
+        if not countries:
+            return []
+        cph = ','.join(['?'] * len(countries))
+        return [r['id'] for r in conn.execute(
+            f'SELECT id FROM warehouses WHERE country IN ({cph})', countries
+        ).fetchall()]
+    finally:
+        conn.close()
+
+
+def _check_warehouse_scope(warehouse_id):
+    """Returns True if current user can manage costs for this warehouse_id."""
+    if warehouse_id is None:
+        return False
+    allowed = _user_allowed_warehouse_ids()
+    if allowed is None:
+        return True
+    try:
+        return int(warehouse_id) in allowed
+    except (TypeError, ValueError):
+        return False
 
 
 def report_viewer_required(f):
@@ -4892,6 +4981,79 @@ def init_partner_reconciliation_tables():
     except sqlite3.OperationalError:
         pass  # column already exists
 
+    # Add can_edit_costs column — gates write access to product_costs (POST/PUT/DELETE).
+    # Separated from can_view_costs so we can have read-only viewers (e.g. partners
+    # who need to verify costs) AND distinct editors. Super admin always passes.
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_edit_costs INTEGER DEFAULT 0')
+        # Migration: previously, only admin-role users could write costs (the old
+        # @admin_required decorator). Preserve that behavior — auto-grant
+        # can_edit_costs to existing admin-role users so nothing breaks.
+        conn.execute('UPDATE users SET can_edit_costs = 1 WHERE role = ?', ('admin',))
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # ---------- P2: AUDIT LOG ----------
+    # Every state change / edit / dispute / confirm / receipt-attach lands here.
+    # Append-only; never delete rows. Powers the timeline shown in the
+    # statement detail modal so partners and admins can see what changed,
+    # when, by whom, and (for disputes) why.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS reconciliation_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            statement_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            actor_id INTEGER,
+            actor_username TEXT,
+            actor_role TEXT,
+            field TEXT,
+            old_value TEXT,
+            new_value TEXT,
+            note TEXT,
+            ip TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (statement_id) REFERENCES reconciliation_statements(id) ON DELETE CASCADE
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_audit_stmt ON reconciliation_audit_log(statement_id, created_at DESC)')
+
+    # ---------- P2: ORDER SNAPSHOT ----------
+    # When a statement is generated, we freeze the list of order IDs that
+    # contributed. If the underlying order is later edited (status / total /
+    # is_undelivered), the saved statement totals stay correct AND we can
+    # show a diff "this order was X at generation, is Y now".
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS reconciliation_statement_orders (
+            statement_id INTEGER NOT NULL,
+            order_id TEXT NOT NULL,
+            order_number TEXT,
+            status_at_gen TEXT,
+            total_at_gen REAL,
+            shipping_at_gen REAL,
+            shipping_loss_at_gen REAL,
+            is_undelivered_at_gen INTEGER,
+            currency_at_gen TEXT,
+            date_created TEXT,
+            PRIMARY KEY (statement_id, order_id),
+            FOREIGN KEY (statement_id) REFERENCES reconciliation_statements(id) ON DELETE CASCADE
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_stmt_orders_stmt ON reconciliation_statement_orders(statement_id)')
+
+    # ---------- P2: extra columns on reconciliation_statements ----------
+    # confirmed_name: typed by partner when confirming (e-signature)
+    # confirmed_ip:   recorded for audit
+    # actual_cost_pln_snapshot: real product-cost number frozen at gen time
+    for col_def in [
+        ('confirmed_name', 'TEXT'),
+        ('confirmed_ip', 'TEXT'),
+        ('actual_cost_pln_snapshot', 'REAL'),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE reconciliation_statements ADD COLUMN {col_def[0]} {col_def[1]}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     # Seed default partner: 金谷金毅（波兰）
     existing = conn.execute("SELECT id FROM partners WHERE code = 'poland_jin'").fetchone()
     if not existing:
@@ -5000,11 +5162,19 @@ def init_warehouses():
         ) WHERE warehouse_id IS NULL
     ''')
 
-    # Rebuild unique index to use warehouse_id
+    # Rebuild index to include effective_date — same product can have multiple
+    # cost prices over time (e.g. Feb 28元, Mar 30元). Must keep ALL versions
+    # so historical orders use the cost effective on their order date.
+    # Unique constraint now requires effective_date to be different.
     conn.execute('DROP INDEX IF EXISTS idx_product_costs_match')
     conn.execute('''
         CREATE UNIQUE INDEX IF NOT EXISTS idx_product_costs_match
-        ON product_costs (brand_id, COALESCE(series_id, 0), COALESCE(puff_count, 0), COALESCE(flavor, ''), COALESCE(warehouse_id, 0))
+        ON product_costs (brand_id, COALESCE(series_id, 0), COALESCE(puff_count, 0), COALESCE(flavor, ''), COALESCE(warehouse_id, 0), effective_date)
+    ''')
+    # Lookup index: scan-by-product + effective_date DESC for "cost at date" queries
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_product_costs_lookup
+        ON product_costs (brand_id, warehouse_id, effective_date DESC)
     ''')
 
     # Add warehouse_id to orders
@@ -8057,26 +8227,36 @@ def users_page():
 def get_users():
     """Get all users"""
     conn = get_db_connection()
-    try:
-        users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, created_at FROM users').fetchall()
-    except sqlite3.OperationalError:
-        # Older schema fallbacks. Provide missing columns as 0.
+    # We try progressively older schemas — newest column set first, then fall
+    # back if columns are missing. The init_*_tables() functions always add
+    # them on startup, so in practice the first SELECT succeeds.
+    SCHEMAS = [
+        # 0: latest — both can_view_costs and can_edit_costs
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, created_at FROM users',
+        # 1: missing can_edit_costs
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        # 2: missing can_view_costs
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        # 3: missing can_manage_products
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        # 4: missing can_edit_reconciliation
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        # 5: missing can_view_reconciliation
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        # 6: missing can_manage_users
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        # 7: oldest — only can_ship
+        'SELECT id, username, name, role, can_ship, 0 as can_view_report, 0 as can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+    ]
+    users = None
+    for sql in SCHEMAS:
         try:
-            users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
+            users = conn.execute(sql).fetchall()
+            break
         except sqlite3.OperationalError:
-            try:
-                users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
-            except sqlite3.OperationalError:
-                try:
-                    users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
-                except sqlite3.OperationalError:
-                    try:
-                        users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
-                    except sqlite3.OperationalError:
-                        try:
-                            users = conn.execute('SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
-                        except sqlite3.OperationalError:
-                            users = conn.execute('SELECT id, username, name, role, can_ship, 0 as can_view_report, 0 as can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, created_at FROM users').fetchall()
+            continue
+    if users is None:
+        users = []
     conn.close()
     is_super_admin = (current_user.username == 'admin')
     result = []
@@ -8169,21 +8349,24 @@ def update_user(user_id):
             return jsonify({'error': '超级管理员角色不可更改'}), 403
 
         # Only the 'admin' superuser can grant/revoke can_manage_users,
-        # can_view_reconciliation, can_edit_reconciliation, can_view_costs
+        # can_view_reconciliation, can_edit_reconciliation, can_view_costs, can_edit_costs
         if is_super_admin:
             can_manage_users_val = 1 if data.get('can_manage_users') else 0
             can_view_reconciliation_val = 1 if data.get('can_view_reconciliation') else 0
             can_edit_reconciliation_val = 1 if data.get('can_edit_reconciliation') else 0
             can_view_costs_val = 1 if data.get('can_view_costs') else 0
+            can_edit_costs_val = 1 if data.get('can_edit_costs') else 0
             # Edit permission requires view permission (can't edit what you can't see)
             if can_edit_reconciliation_val and not can_view_reconciliation_val:
                 can_view_reconciliation_val = 1
+            if can_edit_costs_val and not can_view_costs_val:
+                can_view_costs_val = 1
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=? WHERE id=?',
+                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, user_id))
         else:
             # Non-superadmin: cannot change can_manage_users, can_view_sales_board, or set role to admin
             # but CAN grant can_manage_products (a regular operator-level permission)
@@ -8351,6 +8534,137 @@ def _is_reconciliation_admin():
     return current_user.can_edit_reconciliation()
 
 
+# ============================================================================
+# TIME-AWARE PRODUCT COST LOOKUP
+# ============================================================================
+# product_costs has effective_date — costs change over time. Same product can
+# have 2/28 entry @ 28 PLN and 3/15 entry @ 30 PLN. When valuing an order made
+# on 3/20, we need the 30 PLN row (latest effective_date <= order_date).
+
+def _build_dated_cost_index(conn=None, only_warehouse_ids=None):
+    """Load all product_costs rows into a structure that supports
+    'cost at order date' lookups.
+
+    Returns a dict mapping
+      key = (brand_id, series_id_or_0, puff_count_or_0, flavor_or_blank, warehouse_id)
+      value = list of {effective_date, price, currency} sorted by effective_date DESC
+
+    Plus a coarse-match index keyed by (warehouse_id, brand_id, series_id, puff_count)
+    for the 'brand+puffs+series' fallback (drops flavor).
+
+    Plus an even coarser brand-only fallback by (warehouse_id, brand_id).
+
+    Caller passes a connection if reusing one, or None to open a fresh one.
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = get_db_connection()
+    try:
+        sql = '''SELECT brand_id, series_id, puff_count, flavor, warehouse_id,
+                        cost_price, cost_currency, effective_date
+                 FROM product_costs'''
+        params = []
+        if only_warehouse_ids:
+            placeholders = ','.join(['?'] * len(only_warehouse_ids))
+            sql += f' WHERE warehouse_id IN ({placeholders})'
+            params = list(only_warehouse_ids)
+        sql += ' ORDER BY effective_date DESC, id DESC'
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        if own_conn:
+            conn.close()
+
+    exact = {}            # (b, s, p, f, w) -> [{date, price, currency}, ...]
+    by_bspw = {}          # (w, b, s, p) -> [...]
+    by_bpw = {}           # (w, b, p) -> [...]    (drop series + flavor)
+    by_bw = {}            # (w, b) -> [...]       (brand only)
+    for r in rows:
+        b = r['brand_id']
+        s = r['series_id']
+        p = r['puff_count']
+        f = (r['flavor'] or '').strip() or None
+        w = r['warehouse_id']
+        entry = {
+            'effective_date': r['effective_date'] or '0000-00-00',
+            'price': float(r['cost_price'] or 0),
+            'currency': r['cost_currency'] or 'PLN',
+        }
+        exact.setdefault((b, s, p, f, w), []).append(entry)
+        by_bspw.setdefault((w, b, s, p), []).append(entry)
+        by_bpw.setdefault((w, b, p), []).append(entry)
+        by_bw.setdefault((w, b), []).append(entry)
+    return {'exact': exact, 'bspw': by_bspw, 'bpw': by_bpw, 'bw': by_bw}
+
+
+def _cost_at_date(idx, brand_id, series_id, puff_count, flavor, warehouse_id, order_date):
+    """Look up cost effective on a given order_date. Returns dict
+    {price, currency, effective_date, match_level} or None.
+
+    Tries match levels in order:
+      1. exact: brand+series+puffs+flavor+warehouse
+      2. bspw : brand+series+puffs+warehouse (drop flavor)
+      3. bpw  : brand+puffs+warehouse        (drop series)
+      4. bw   : brand+warehouse              (any puffs)
+
+    Within a level, picks the entry with the largest effective_date <= order_date.
+    """
+    if not brand_id or not warehouse_id:
+        return None
+    flavor_key = (flavor or '').strip() or None
+
+    candidates = [
+        ('exact', idx['exact'].get((brand_id, series_id, puff_count, flavor_key, warehouse_id))),
+        ('bspw',  idx['bspw'].get((warehouse_id, brand_id, series_id, puff_count))),
+        ('bpw',   idx['bpw'].get((warehouse_id, brand_id, puff_count))),
+        ('bw',    idx['bw'].get((warehouse_id, brand_id))),
+    ]
+    od = order_date or '9999-99-99'  # if no date, treat as "now" — pick latest cost
+    for level, entries in candidates:
+        if not entries:
+            continue
+        # entries already sorted by effective_date DESC; pick first <= od
+        for e in entries:
+            if e['effective_date'] <= od:
+                return {
+                    'price': e['price'],
+                    'currency': e['currency'],
+                    'effective_date': e['effective_date'],
+                    'match_level': level,
+                }
+        # If all entries are AFTER order_date (e.g. cost was first set 2026-04
+        # but order is from 2025-12), fall back to oldest known cost as a best
+        # effort and tag it accordingly so the UI can warn.
+        oldest = entries[-1]
+        return {
+            'price': oldest['price'],
+            'currency': oldest['currency'],
+            'effective_date': oldest['effective_date'],
+            'match_level': level + '_future',  # cost record is newer than order
+        }
+    return None
+
+
+def _resolve_product_to_brand(product_name, source, brands_cache, product_mappings_cache):
+    """Resolve a product line item to (brand_id, series_id, puff_count, flavor).
+
+    First tries product_mappings (manual override), then falls back to
+    parse_product_name. Returns None for missing fields if unresolvable."""
+    pn_key = normalize_raw_name(product_name)
+    pm = (product_mappings_cache.get((pn_key, source))
+          or product_mappings_cache.get((pn_key, ''))
+          or product_mappings_cache.get((pn_key, None)))
+    if pm:
+        return pm['brand_id'], pm['series_id'], pm['puff_count'], pm['flavor']
+    parsed = parse_product_name(product_name, brands_cache)
+    b_id = None
+    if parsed.get('brand'):
+        for bc in brands_cache:
+            if bc['name'].upper() == parsed['brand'].upper():
+                b_id = bc['id']
+                break
+    return b_id, None, parsed.get('puffs'), parsed.get('flavor')
+
+
 def _calc_partner_net_sales(partner_id, year, month):
     """Aggregate net sales for all sites bound to partner in given month.
     Uses the partner's configured currency to filter orders.
@@ -8409,6 +8723,474 @@ def _calc_partner_net_sales(partner_id, year, month):
         'undelivered_orders': row['undelivered_orders'] or 0,
         'currency': currency,
     }
+
+
+def _calc_partner_recon_detail(partner_id, year, month):
+    """Comprehensive monthly aggregation for the partner reconciliation drill-down.
+
+    Returns the same numbers as _calc_partner_net_sales (so existing callers stay
+    consistent) plus per-status breakdown, per-site breakdown, per-product
+    breakdown using DATE-AWARE actual product costs. Everything is in the
+    partner's native currency unless explicitly suffixed.
+    """
+    conn = get_db_connection()
+    try:
+        partner = conn.execute(
+            'SELECT id, name, currency, cost_ratio, partner_profit_ratio, our_profit_ratio FROM partners WHERE id = ?',
+            (partner_id,)
+        ).fetchone()
+        if not partner:
+            return None
+        currency = partner['currency'] or 'PLN'
+
+        # Bound site URLs (and ids -> for warehouse mapping)
+        sites = conn.execute('''
+            SELECT s.id, s.url, s.country, s.manager
+            FROM partner_sites ps
+            JOIN sites s ON s.id = ps.site_id
+            WHERE ps.partner_id = ?
+        ''', (partner_id,)).fetchall()
+        if not sites:
+            return _empty_recon_detail(partner, currency, year, month)
+
+        site_urls = [s['url'] for s in sites]
+        site_meta = {s['url']: {'country': s['country'] or '', 'manager': s['manager'] or '', 'id': s['id']} for s in sites}
+        placeholders = ','.join(['?'] * len(site_urls))
+        month_str = f'{year:04d}-{month:02d}'
+
+        # Pull every order in scope (partner sites + currency + month). We keep
+        # ALL statuses so we can break them out (success / failed / cancelled /
+        # undelivered / pending). Loaders downstream filter for revenue.
+        all_orders = conn.execute(f'''
+            SELECT id, number, status, payment_method, total, shipping_total, currency,
+                   line_items, source, date_created, warehouse_id,
+                   is_undelivered, shipping_loss_amount,
+                   billing
+            FROM orders
+            WHERE source IN ({placeholders})
+            AND currency = ?
+            AND strftime('%Y-%m', date_created) = ?
+            ORDER BY date_created DESC
+        ''', site_urls + [currency, month_str]).fetchall()
+
+        # Build cost index (warehouses scoped to partner sites' countries — narrows the load)
+        partner_countries = {s['country'] for s in sites if s['country']}
+        wh_scope = []
+        if partner_countries:
+            qmarks = ','.join(['?'] * len(partner_countries))
+            wh_scope = [r['id'] for r in conn.execute(
+                f'SELECT id FROM warehouses WHERE country IN ({qmarks})', list(partner_countries)
+            ).fetchall()]
+        cost_idx = _build_dated_cost_index(conn=conn, only_warehouse_ids=wh_scope or None)
+
+        # Country -> default warehouse id list (for orders missing warehouse_id)
+        country_default_wh_ids = {}
+        for w in conn.execute('SELECT id, country FROM warehouses ORDER BY country, id').fetchall():
+            country_default_wh_ids.setdefault(w['country'], []).append(w['id'])
+
+        # Brands + product_mappings cache for line-item resolution
+        brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+        brands_cache = []
+        brand_names_by_id = {}
+        for row in brands_rows:
+            brand_name = row['name']
+            brand_names_by_id[row['id']] = brand_name
+            try:
+                aliases = json.loads(row['aliases']) if row['aliases'] else []
+            except Exception:
+                aliases = []
+            brands_cache.append({
+                'id': row['id'], 'name': brand_name, 'aliases': aliases,
+                'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
+            })
+        pm_rows = conn.execute('SELECT raw_name, source, brand_id, series_id, puff_count, flavor FROM product_mappings').fetchall()
+        product_mappings_cache = {}
+        for pm in pm_rows:
+            product_mappings_cache[(normalize_raw_name(pm['raw_name']), pm['source'])] = pm
+
+    finally:
+        conn.close()
+
+    # ---- Aggregate ----
+    by_status = {  # status_label -> {orders, gross, shipping, net}
+        'success':     {'orders': 0, 'gross': 0.0, 'shipping': 0.0, 'net': 0.0},
+        'failed':      {'orders': 0, 'gross': 0.0, 'shipping': 0.0, 'net': 0.0},
+        'cancelled':   {'orders': 0, 'gross': 0.0, 'shipping': 0.0, 'net': 0.0},
+        'undelivered': {'orders': 0, 'gross': 0.0, 'shipping': 0.0, 'net': 0.0, 'shipping_loss': 0.0},
+        'pending':     {'orders': 0, 'gross': 0.0, 'shipping': 0.0, 'net': 0.0},
+    }
+    by_site = {}      # site_url -> {orders, success_orders, gross, shipping, net, shipping_loss, undelivered}
+    by_product = {}   # key -> { brand, series, puffs, flavor, qty, revenue, cost, has_cost, items_count, mapped }
+
+    total_gross = 0.0       # successful gross only
+    total_shipping = 0.0    # successful shipping only
+    total_shipping_loss = 0.0
+    total_actual_cost = 0.0
+    unmapped_revenue = 0.0
+    unmapped_qty = 0
+
+    success_count = 0
+    failed_count = 0
+    cancelled_count = 0
+    undelivered_count = 0
+    pending_count = 0
+    total_count = len(all_orders)
+
+    for o in all_orders:
+        status = o['status'] or ''
+        pm_method = o['payment_method']
+        is_undel = bool(o['is_undelivered'])
+        gross = float(o['total'] or 0)
+        ship = float(o['shipping_total'] or 0)
+        loss = float(o['shipping_loss_amount'] or 0)
+
+        # Classification
+        is_failed = status == 'failed'
+        is_cancelled = status == 'cancelled'
+        # 'success' uses the same condition the SQL helper does — see _revenue_status_cond
+        is_pending_unsuccessful = (
+            (status == 'pending' and (pm_method or 'cod') != 'cod')
+            or (status == 'on-hold' and pm_method == 'bacs')
+        )
+        is_success = (
+            status not in ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat')
+            and not is_pending_unsuccessful
+            and not is_undel
+        )
+
+        bucket_key = None
+        if is_undel:
+            bucket_key = 'undelivered'
+            undelivered_count += 1
+            by_status[bucket_key]['shipping_loss'] += loss
+            total_shipping_loss += loss
+        elif is_failed:
+            bucket_key = 'failed'
+            failed_count += 1
+        elif is_cancelled:
+            bucket_key = 'cancelled'
+            cancelled_count += 1
+        elif is_pending_unsuccessful:
+            bucket_key = 'pending'
+            pending_count += 1
+        elif is_success:
+            bucket_key = 'success'
+            success_count += 1
+
+        if bucket_key:
+            b = by_status[bucket_key]
+            b['orders'] += 1
+            b['gross'] += gross
+            b['shipping'] += ship
+            b['net'] += (gross - ship)
+
+        # Site bucket
+        url = o['source']
+        if url not in by_site:
+            by_site[url] = {
+                'site_url': url,
+                'country': site_meta.get(url, {}).get('country', ''),
+                'manager': site_meta.get(url, {}).get('manager', ''),
+                'orders': 0, 'success_orders': 0, 'undelivered_orders': 0,
+                'gross': 0.0, 'shipping': 0.0, 'net': 0.0, 'shipping_loss': 0.0,
+            }
+        s = by_site[url]
+        s['orders'] += 1
+        if is_success:
+            s['success_orders'] += 1
+            s['gross'] += gross
+            s['shipping'] += ship
+            s['net'] += (gross - ship)
+            total_gross += gross
+            total_shipping += ship
+        if is_undel:
+            s['undelivered_orders'] += 1
+            s['shipping_loss'] += loss
+
+        # Per-product cost & sales — only for SUCCESSFUL orders (those that
+        # actually generate revenue and consume inventory).
+        if not is_success:
+            continue
+        items = parse_json_field(o['line_items'])
+        if not isinstance(items, list):
+            continue
+        order_date = (o['date_created'] or '')[:10]
+        order_country = site_meta.get(url, {}).get('country') or 'PL'
+        order_wh_id = o['warehouse_id']
+
+        for item in items:
+            qty = int(item.get('quantity', 0) or 0)
+            if qty <= 0:
+                continue
+            raw_name = item.get('name', '') or ''
+            item_total = float(item.get('total', 0) or 0)
+
+            b_id, s_id, p_cnt, flav = _resolve_product_to_brand(
+                raw_name, url, brands_cache, product_mappings_cache
+            )
+
+            # Lookup cost effective on this order's date
+            cost_entry = None
+            if b_id:
+                effective_wh_ids = [order_wh_id] if order_wh_id else country_default_wh_ids.get(order_country, [])
+                for ewh in effective_wh_ids:
+                    cost_entry = _cost_at_date(cost_idx, b_id, s_id, p_cnt, flav, ewh, order_date)
+                    if cost_entry:
+                        break
+
+            # Determine cost in partner's currency
+            line_cost_partner_curr = None
+            if cost_entry:
+                if cost_entry['currency'] == currency:
+                    line_cost_partner_curr = cost_entry['price'] * qty
+                else:
+                    # Convert via CNY: cost_currency -> CNY -> partner_currency
+                    rate_cost_cny, _ = _lookup_partner_rate(cost_entry['currency'], year, month)
+                    rate_partner_cny, _ = _lookup_partner_rate(currency, year, month)
+                    if rate_cost_cny and rate_partner_cny:
+                        line_cost_partner_curr = cost_entry['price'] * qty * (rate_cost_cny / rate_partner_cny)
+
+            if line_cost_partner_curr is not None:
+                total_actual_cost += line_cost_partner_curr
+            else:
+                unmapped_revenue += item_total
+                unmapped_qty += qty
+
+            # Build product key — group by mapped (brand, series, puffs, flavor),
+            # falling back to the raw_name if we can't resolve.
+            if b_id:
+                pkey = ('mapped', b_id, s_id or 0, p_cnt or 0, (flav or '').lower())
+            else:
+                pkey = ('raw', raw_name)
+
+            if pkey not in by_product:
+                if pkey[0] == 'mapped':
+                    name_parts = [brand_names_by_id.get(b_id, '')]
+                    if p_cnt:
+                        name_parts.append(f"{p_cnt}口")
+                    if flav:
+                        name_parts.append(flav)
+                    label = ' / '.join(p for p in name_parts if p) or raw_name
+                else:
+                    label = raw_name
+                by_product[pkey] = {
+                    'label': label,
+                    'brand_id': b_id,
+                    'brand': brand_names_by_id.get(b_id, '') if b_id else None,
+                    'series_id': s_id,
+                    'puff_count': p_cnt,
+                    'flavor': flav,
+                    'qty': 0,
+                    'revenue': 0.0,
+                    'cost': 0.0,
+                    'has_cost': False,
+                    'cost_unit': None,
+                    'cost_currency': cost_entry['currency'] if cost_entry else None,
+                    'cost_effective_date': cost_entry['effective_date'] if cost_entry else None,
+                    'cost_match_level': cost_entry['match_level'] if cost_entry else None,
+                    'line_count': 0,
+                    'mapped': bool(b_id),
+                }
+            row = by_product[pkey]
+            row['qty'] += qty
+            row['revenue'] += item_total
+            row['line_count'] += 1
+            if line_cost_partner_curr is not None:
+                row['cost'] += line_cost_partner_curr
+                row['has_cost'] = True
+                if cost_entry:
+                    row['cost_unit'] = cost_entry['price']
+                    row['cost_currency'] = cost_entry['currency']
+                    row['cost_effective_date'] = cost_entry['effective_date']
+                    row['cost_match_level'] = cost_entry['match_level']
+
+    # Normalize / sort
+    products_list = sorted(by_product.values(), key=lambda r: (-r['revenue']))
+    sites_list = sorted(by_site.values(), key=lambda r: (-r['net']))
+    for p in products_list:
+        p['cost'] = round(p['cost'], 2)
+        p['revenue'] = round(p['revenue'], 2)
+        p['margin'] = round(p['revenue'] - p['cost'], 2) if p['has_cost'] else None
+        p['margin_pct'] = round((p['revenue'] - p['cost']) / p['revenue'] * 100, 2) if (p['has_cost'] and p['revenue'] > 0) else None
+    for s in sites_list:
+        for k in ('gross', 'shipping', 'net', 'shipping_loss'):
+            s[k] = round(s[k], 2)
+    for k, v in by_status.items():
+        for fk in ('gross', 'shipping', 'net'):
+            v[fk] = round(v[fk], 2)
+        if 'shipping_loss' in v:
+            v['shipping_loss'] = round(v['shipping_loss'], 2)
+
+    total_net = total_gross - total_shipping - total_shipping_loss
+    cost_ratio = float(partner['cost_ratio'] or 0.5)
+    pp_ratio = float(partner['partner_profit_ratio'] or 0.25)
+    op_ratio = float(partner['our_profit_ratio'] or 0.25)
+
+    result = {
+        'partner_id': partner['id'],
+        'partner_name': partner['name'],
+        'period_year': year,
+        'period_month': month,
+        'currency': currency,
+        # Counts
+        'total_count': total_count,
+        'success_orders': success_count,
+        'failed_orders': failed_count,
+        'cancelled_orders': cancelled_count,
+        'undelivered_orders': undelivered_count,
+        'pending_orders': pending_count,
+        # Top-line numbers (in partner currency, *_pln suffix kept for legacy compat)
+        'total_orders': success_count,                  # legacy: success only
+        'total_gross_pln': round(total_gross, 2),
+        'total_shipping_pln': round(total_shipping, 2),
+        'shipping_loss': round(total_shipping_loss, 2),
+        'total_net_pln': round(total_net, 2),
+        # Cost (two ways)
+        'cost_amount_pln': round(total_net * cost_ratio, 2),         # ratio-based (current contract logic)
+        'actual_cost_pln': round(total_actual_cost, 2),              # real product_costs lookup
+        'cost_unmapped_revenue_pln': round(unmapped_revenue, 2),
+        'cost_unmapped_qty': unmapped_qty,
+        # Profit breakdown
+        'partner_profit_pln': round(total_net * pp_ratio, 2),
+        'our_receivable_pln': round(total_net * op_ratio, 2),
+        # Ratios echoed for UI
+        'cost_ratio': cost_ratio,
+        'partner_profit_ratio': pp_ratio,
+        'our_profit_ratio': op_ratio,
+        # Drill-down breakdowns
+        'by_status': by_status,
+        'by_site': sites_list,
+        'by_product': products_list,
+    }
+    _enrich_statement_cny(result, currency)
+    return result
+
+
+def _empty_recon_detail(partner, currency, year, month):
+    """Empty skeleton when partner has no sites bound yet."""
+    return {
+        'partner_id': partner['id'],
+        'partner_name': partner['name'],
+        'period_year': year,
+        'period_month': month,
+        'currency': currency,
+        'total_count': 0,
+        'success_orders': 0,
+        'failed_orders': 0,
+        'cancelled_orders': 0,
+        'undelivered_orders': 0,
+        'pending_orders': 0,
+        'total_orders': 0,
+        'total_gross_pln': 0,
+        'total_shipping_pln': 0,
+        'shipping_loss': 0,
+        'total_net_pln': 0,
+        'cost_amount_pln': 0,
+        'actual_cost_pln': 0,
+        'cost_unmapped_revenue_pln': 0,
+        'cost_unmapped_qty': 0,
+        'partner_profit_pln': 0,
+        'our_receivable_pln': 0,
+        'cost_ratio': float(partner['cost_ratio'] or 0.5),
+        'partner_profit_ratio': float(partner['partner_profit_ratio'] or 0.25),
+        'our_profit_ratio': float(partner['our_profit_ratio'] or 0.25),
+        'by_status': {},
+        'by_site': [],
+        'by_product': [],
+    }
+
+
+# ============================================================================
+# P2: AUDIT LOG + ORDER SNAPSHOT helpers
+# ============================================================================
+def _audit_log(statement_id, action, field=None, old=None, new=None, note=None, conn=None):
+    """Write one entry to reconciliation_audit_log.
+
+    Always idempotent — caller passes whatever `action` makes sense
+    ('create', 'regenerate', 'edit_notes', 'edit_rate', 'lock', 'unlock',
+     'confirm', 'dispute', 'resolve_dispute', 'settle',
+     'attach_receipt', 'detach_receipt', 'edit_receipt', 'delete_receipt').
+    Captures current_user + IP automatically.
+
+    Caller may pass an existing connection to coalesce with the same
+    transaction; otherwise we open a fresh one.
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = get_db_connection()
+    try:
+        actor_id = current_user.id if current_user.is_authenticated else None
+        actor_username = current_user.username if current_user.is_authenticated else None
+        actor_role = current_user.role if (current_user.is_authenticated and hasattr(current_user, 'role')) else None
+        ip = None
+        try:
+            if request:
+                ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+                if ip and ',' in ip:
+                    ip = ip.split(',')[0].strip()
+        except Exception:
+            pass
+        conn.execute('''
+            INSERT INTO reconciliation_audit_log
+                (statement_id, action, actor_id, actor_username, actor_role,
+                 field, old_value, new_value, note, ip)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            statement_id, action, actor_id, actor_username, actor_role,
+            field,
+            None if old is None else str(old)[:500],
+            None if new is None else str(new)[:500],
+            (note or '')[:1000] if note else None,
+            ip,
+        ))
+        if own_conn:
+            conn.commit()
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def _snapshot_statement_orders(statement_id, partner_id, year, month, conn):
+    """Freeze the list of orders that contributed to this statement.
+
+    Stores a snapshot of (status, total, shipping, shipping_loss, ...) so the
+    saved statement remains stable even if the underlying orders are later
+    edited. Replaces any previous snapshot for the same statement (re-generate
+    case). Caller must pass an open connection — we don't commit.
+    """
+    # Use partner's currency + bound sites to identify the orders
+    p = conn.execute('SELECT currency FROM partners WHERE id = ?', (partner_id,)).fetchone()
+    currency = (p['currency'] if p else 'PLN') or 'PLN'
+    sites = conn.execute('''SELECT s.url FROM partner_sites ps
+        JOIN sites s ON s.id = ps.site_id WHERE ps.partner_id = ?''', (partner_id,)).fetchall()
+    if not sites:
+        return 0
+    site_urls = [s['url'] for s in sites]
+    placeholders = ','.join(['?'] * len(site_urls))
+    month_str = f'{year:04d}-{month:02d}'
+    rows = conn.execute(f'''
+        SELECT id, number, status, total, shipping_total, shipping_loss_amount,
+               is_undelivered, currency, date_created
+        FROM orders
+        WHERE source IN ({placeholders})
+          AND currency = ?
+          AND strftime('%Y-%m', date_created) = ?
+    ''', site_urls + [currency, month_str]).fetchall()
+
+    # Wipe + replace
+    conn.execute('DELETE FROM reconciliation_statement_orders WHERE statement_id = ?', (statement_id,))
+    for r in rows:
+        conn.execute('''INSERT INTO reconciliation_statement_orders
+            (statement_id, order_id, order_number, status_at_gen, total_at_gen,
+             shipping_at_gen, shipping_loss_at_gen, is_undelivered_at_gen,
+             currency_at_gen, date_created)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (statement_id, r['id'], r['number'], r['status'],
+             float(r['total'] or 0), float(r['shipping_total'] or 0),
+             float(r['shipping_loss_amount'] or 0),
+             1 if r['is_undelivered'] else 0,
+             r['currency'], r['date_created']))
+    return len(rows)
 
 
 def _lookup_partner_rate(currency, year, month):
@@ -8699,7 +9481,13 @@ def api_list_statements():
 @login_required
 @reconciliation_api_required
 def api_preview_statement():
-    """Preview a statement without saving (aggregates live from orders)"""
+    """Preview a statement without saving — full drill-down detail.
+
+    Returns the same top-level numbers as before (total_orders / gross / net /
+    cost / partner_profit / our_receivable) for backward compat, plus new
+    fields: actual_cost_pln, by_status, by_site, by_product. Drill-down UI
+    can render all sections from this single response.
+    """
     partner_id = request.args.get('partner_id', type=int)
     year = request.args.get('year', type=int)
     month = request.args.get('month', type=int)
@@ -8708,28 +9496,993 @@ def api_preview_statement():
     if not _check_partner_access(partner_id):
         return jsonify({'error': '无权查看此合伙人'}), 403
 
-    conn = get_db_connection()
-    partner = conn.execute('SELECT * FROM partners WHERE id = ?', (partner_id,)).fetchone()
-    conn.close()
-    if not partner:
+    detail = _calc_partner_recon_detail(partner_id, year, month)
+    if detail is None:
         return jsonify({'error': '合伙人不存在'}), 404
+    return jsonify(detail)
 
-    stats = _calc_partner_net_sales(partner_id, year, month)
-    net = stats['total_net_pln']
-    result = dict(stats)
-    result.update({
+
+@app.route('/api/reconciliation/orders')
+@login_required
+@reconciliation_api_required
+def api_recon_orders():
+    """Order list filtered by partner (their bound sites + currency + period).
+
+    Replicates the data-shape of /orders for embedding inside the partner
+    reconciliation page, INCLUDING the page-totals summary row used by the
+    "本页合计" header. When a year+month filter is set, returns ALL orders
+    for that month (capped at 5000) — no internal pagination, matching the
+    /orders page behavior where one month = one page.
+    """
+    partner_id = request.args.get('partner_id', type=int)
+    year = request.args.get('year', type=int)
+    month = request.args.get('month', type=int)
+    status_filter = (request.args.get('status') or '').strip()
+    source_filter = (request.args.get('source') or '').strip()
+    search = (request.args.get('search') or '').strip()
+    # Pagination — only kicks in when a month filter is NOT set. With a month
+    # filter, we dump the entire month in one response (5000-row safety cap).
+    requested_page = max(1, request.args.get('page', 1, type=int))
+    requested_per_page = min(5000, max(20, request.args.get('per_page', 200, type=int)))
+    use_pagination = not (year and month)
+
+    if not partner_id:
+        return jsonify({'error': '缺少 partner_id 参数'}), 400
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权查看此合伙人'}), 403
+
+    conn = get_db_connection()
+    try:
+        partner = conn.execute('SELECT id, currency FROM partners WHERE id = ?', (partner_id,)).fetchone()
+        if not partner:
+            return jsonify({'error': '合伙人不存在'}), 404
+        currency = partner['currency'] or 'PLN'
+
+        sites = conn.execute('''
+            SELECT s.url FROM partner_sites ps
+            JOIN sites s ON s.id = ps.site_id
+            WHERE ps.partner_id = ?
+        ''', (partner_id,)).fetchall()
+        if not sites:
+            return jsonify({'orders': [], 'total': 0, 'page': requested_page,
+                            'per_page': requested_per_page, 'currency': currency,
+                            'displayed_totals': _empty_displayed_totals(currency)})
+        site_urls = [s['url'] for s in sites]
+        if source_filter:
+            if source_filter not in site_urls:
+                return jsonify({'error': '该站点不在合伙人范围内'}), 403
+            allowed_urls = [source_filter]
+        else:
+            allowed_urls = site_urls
+
+        placeholders = ','.join(['?'] * len(allowed_urls))
+        conditions = [f'source IN ({placeholders})', 'currency = ?']
+        params = list(allowed_urls) + [currency]
+        if year and month:
+            conditions.append("strftime('%Y-%m', date_created) = ?")
+            params.append(f'{year:04d}-{month:02d}')
+        elif year:
+            conditions.append("strftime('%Y', date_created) = ?")
+            params.append(str(year))
+        if status_filter:
+            if status_filter == 'undelivered':
+                conditions.append('COALESCE(is_undelivered, 0) = 1')
+            elif status_filter == 'success':
+                conditions.append(_revenue_status_cond())
+            else:
+                conditions.append('status = ?')
+                params.append(status_filter)
+        if search:
+            conditions.append("(number LIKE ? OR id LIKE ? OR billing LIKE ?)")
+            like = f'%{search}%'
+            params.extend([like, like, like])
+        where_sql = ' AND '.join(conditions)
+
+        total = conn.execute(f'SELECT COUNT(*) FROM orders WHERE {where_sql}', params).fetchone()[0]
+
+        # Fetch rows — paginated only if no month filter
+        if use_pagination:
+            offset = (requested_page - 1) * requested_per_page
+            limit_sql = f'LIMIT {requested_per_page} OFFSET {offset}'
+            page_returned = requested_page
+            per_page_returned = requested_per_page
+        else:
+            # All-in-one-page mode: cap at 5000 rows for safety
+            limit_sql = 'LIMIT 5000'
+            page_returned = 1
+            per_page_returned = max(total, 1)
+
+        rows = conn.execute(f'''
+            SELECT id, number, status, payment_method, currency, date_created,
+                   total, shipping_total, line_items, source, billing,
+                   is_undelivered, shipping_loss_amount
+            FROM orders WHERE {where_sql}
+            ORDER BY date_created DESC
+            {limit_sql}
+        ''', params).fetchall()
+
+        site_managers = {s['url']: s['manager'] for s in conn.execute('SELECT url, manager FROM sites').fetchall()}
+        site_country_map = {s['url']: s['country'] for s in conn.execute('SELECT url, country FROM sites').fetchall()}
+
+        # Lookup CNY rate for the period (used per-order net_cny conversion).
+        # Fall back to month-of-order if no period rate, so multi-month dumps
+        # still get correct conversions.
+        period_rate = None
+        if year and month:
+            period_rate, _ = _lookup_partner_rate(currency, year, month)
+
+        # ---------- per-order COST machinery ----------
+        # Build the date-aware cost index + brand/product-mappings caches once
+        # per request. Then for each order's line items, look up the cost that
+        # was effective on the order date and sum to a per-order cost.
+        # Cost is in partner's native currency (we convert from cost_currency
+        # via CNY when they differ).
+        cost_idx = _build_dated_cost_index(conn=conn)
+        country_default_wh_ids = {}
+        for w in conn.execute('SELECT id, country FROM warehouses ORDER BY country, id').fetchall():
+            country_default_wh_ids.setdefault(w['country'], []).append(w['id'])
+        brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+        brands_cache = []
+        for row in brands_rows:
+            try:
+                aliases = json.loads(row['aliases']) if row['aliases'] else []
+            except Exception:
+                aliases = []
+            brands_cache.append({
+                'id': row['id'], 'name': row['name'], 'aliases': aliases,
+                'patterns': [row['name'].upper()] + [a.upper() for a in aliases]
+            })
+        pm_rows = conn.execute('SELECT raw_name, source, brand_id, series_id, puff_count, flavor FROM product_mappings').fetchall()
+        product_mappings_cache = {}
+        for pm in pm_rows:
+            product_mappings_cache[(normalize_raw_name(pm['raw_name']), pm['source'])] = pm
+
+        # Aggregator for "本页合计" — mirrors the orders.html displayed_totals.
+        totals = {
+            'order_count': 0,
+            'undelivered_count': 0,
+            'product_count': 0,
+            'currency': currency,
+            'amount': 0.0,
+            'shipping': 0.0,
+            'net': 0.0,                # gross-shipping for revenue-status orders only
+            'shipping_loss': 0.0,      # loss from undelivered orders
+            # ── new cost / margin aggregates ──
+            'cost': 0.0,               # total actual product cost (revenue orders only)
+            'margin': 0.0,             # net − cost
+            'unmapped_qty': 0,         # qty of line items without cost mapping
+            'rate_to_cny': period_rate,
+            'net_cny': 0.0,
+            'shipping_loss_cny': 0.0,
+            'final_net_cny': 0.0,
+            'cost_cny': 0.0,
+            'margin_cny': 0.0,
+        }
+
+        def _is_revenue(status, pm, is_undel):
+            if status in ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat'):
+                return False
+            if status == 'pending' and (pm or 'cod') != 'cod':
+                return False
+            if status == 'on-hold' and pm == 'bacs':
+                return False
+            if is_undel:
+                return False
+            return True
+
+        # Per-request cache for warehouse-lookup-by-source (avoids repeat DB hits).
+        # Each order needs to know which warehouse(s) to look up costs against.
+        order_warehouse_cache = {}  # source_url -> [warehouse_ids]
+
+        # Cache for partner-currency conversion of cost-currency (avoids
+        # repeat _lookup_partner_rate calls for the same currency in a request)
+        _cost_rate_cache = {}
+        def _convert_cost_to_partner(price, cost_currency, year, month):
+            """Convert a single-unit cost price from cost_currency to partner currency."""
+            if cost_currency == currency:
+                return price
+            cache_key = (cost_currency, year, month)
+            if cache_key not in _cost_rate_cache:
+                rcost, _ = _lookup_partner_rate(cost_currency, year, month)
+                rpart, _ = _lookup_partner_rate(currency, year, month)
+                _cost_rate_cache[cache_key] = (rcost, rpart)
+            rcost, rpart = _cost_rate_cache[cache_key]
+            if rcost and rpart:
+                return price * (rcost / rpart)
+            return None  # rate unavailable — caller treats as unmapped
+
+        result_orders = []
+        for r in rows:
+            items = parse_json_field(r['line_items']) or []
+            products = []
+            qty_total = 0
+            for it in items if isinstance(items, list) else []:
+                qty = int(it.get('quantity', 0) or 0)
+                qty_total += qty
+                products.append({
+                    'name': it.get('name', ''),
+                    'quantity': qty,
+                    'total': float(it.get('total', 0) or 0),
+                })
+            billing = parse_json_field(r['billing']) or {}
+            customer_name = ''
+            customer_email = ''
+            if isinstance(billing, dict):
+                customer_name = ((billing.get('first_name') or '') + ' ' + (billing.get('last_name') or '')).strip()
+                customer_email = billing.get('email', '') or ''
+
+            shipping_loss = float(r['shipping_loss_amount'] or 0)
+            is_undel = bool(r['is_undelivered'])
+            gross = float(r['total'] or 0)
+            ship = float(r['shipping_total'] or 0)
+            net = max(0, gross - ship)
+            order_rate = period_rate
+            if order_rate is None:
+                # multi-month dump: look up the order's own month
+                if r['date_created']:
+                    try:
+                        y, m = r['date_created'][:7].split('-')
+                        order_rate, _ = _lookup_partner_rate(currency, int(y), int(m))
+                    except Exception:
+                        order_rate = None
+            net_cny = round(net * order_rate, 2) if (order_rate and net) else None
+
+            # ── COST CALCULATION (per-order, line-item level, date-aware) ──
+            order_is_revenue = _is_revenue(r['status'] or '', r['payment_method'], is_undel)
+            order_cost = 0.0
+            order_unmapped_qty = 0
+            cost_eligible = order_is_revenue and not is_undel  # only revenue orders consume inventory
+            if cost_eligible and isinstance(items, list):
+                order_date = (r['date_created'] or '')[:10]
+                order_country = site_country_map.get(r['source'], 'PL') or 'PL'
+                # Get year/month from order date for cost-currency conversion
+                try:
+                    od_y, od_m = (r['date_created'] or '0000-00')[:7].split('-')
+                    od_y, od_m = int(od_y), int(od_m)
+                except Exception:
+                    od_y, od_m = (year or 0), (month or 0)
+                effective_wh_ids = country_default_wh_ids.get(order_country, [])
+                for it in items:
+                    qty = int(it.get('quantity', 0) or 0)
+                    if qty <= 0:
+                        continue
+                    raw_name = it.get('name', '') or ''
+                    b_id, s_id, p_cnt, flav = _resolve_product_to_brand(
+                        raw_name, r['source'], brands_cache, product_mappings_cache
+                    )
+                    cost_entry = None
+                    if b_id and effective_wh_ids:
+                        for ewh in effective_wh_ids:
+                            cost_entry = _cost_at_date(cost_idx, b_id, s_id, p_cnt, flav, ewh, order_date)
+                            if cost_entry:
+                                break
+                    if cost_entry:
+                        unit_in_partner = _convert_cost_to_partner(
+                            cost_entry['price'], cost_entry['currency'], od_y, od_m
+                        )
+                        if unit_in_partner is not None:
+                            order_cost += unit_in_partner * qty
+                        else:
+                            order_unmapped_qty += qty
+                    else:
+                        order_unmapped_qty += qty
+
+            order_cost = round(order_cost, 2)
+            order_margin = round(net - order_cost, 2) if cost_eligible else None
+            order_margin_pct = None
+            if cost_eligible and net > 0:
+                order_margin_pct = round((net - order_cost) / net * 100, 1)
+            order_cost_cny = round(order_cost * order_rate, 2) if (order_rate and cost_eligible) else None
+            order_margin_cny = round(order_margin * order_rate, 2) if (order_rate and order_margin is not None) else None
+
+            result_orders.append({
+                'id': r['id'],
+                'number': r['number'],
+                'date_created': r['date_created'],
+                'status': r['status'],
+                'payment_method': r['payment_method'],
+                'currency': r['currency'],
+                'source': r['source'],
+                'manager': site_managers.get(r['source'], ''),
+                'total': gross,
+                'shipping_total': ship,
+                'net_total': net,
+                'net_total_cny': net_cny,
+                'rate_to_cny': order_rate,
+                'product_count': qty_total,
+                'products': products,
+                'customer_name': customer_name,
+                'customer_email': customer_email,
+                'is_undelivered': is_undel,
+                'shipping_loss_amount': shipping_loss,
+                # ── new cost/margin fields ──
+                'cost_eligible': cost_eligible,
+                'cost': order_cost if cost_eligible else None,
+                'cost_cny': order_cost_cny,
+                'margin': order_margin,
+                'margin_cny': order_margin_cny,
+                'margin_pct': order_margin_pct,
+                'unmapped_qty': order_unmapped_qty,
+            })
+
+            # Aggregate totals row
+            totals['order_count'] += 1
+            totals['product_count'] += qty_total
+            totals['amount'] += gross
+            totals['shipping'] += ship
+            if is_undel:
+                totals['undelivered_count'] += 1
+                totals['shipping_loss'] += shipping_loss
+                if order_rate:
+                    totals['shipping_loss_cny'] += shipping_loss * order_rate
+            elif order_is_revenue:
+                totals['net'] += net
+                if net_cny is not None:
+                    totals['net_cny'] += net_cny
+                totals['cost'] += order_cost
+                totals['margin'] += (net - order_cost)
+                if order_rate:
+                    totals['cost_cny'] += order_cost * order_rate
+                    totals['margin_cny'] += (net - order_cost) * order_rate
+                totals['unmapped_qty'] += order_unmapped_qty
+
+        # Round totals for display
+        for k in ('amount', 'shipping', 'net', 'shipping_loss',
+                  'cost', 'margin', 'net_cny', 'shipping_loss_cny',
+                  'cost_cny', 'margin_cny'):
+            totals[k] = round(totals[k], 2)
+        totals['final_net_cny'] = round(totals['net_cny'] - totals['shipping_loss_cny'], 2)
+        totals['margin_pct'] = round(totals['margin'] / totals['net'] * 100, 1) if totals['net'] > 0 else None
+
+        return jsonify({
+            'orders': result_orders,
+            'total': total,
+            'page': page_returned,
+            'per_page': per_page_returned,
+            'use_pagination': use_pagination,
+            'currency': currency,
+            'partner_id': partner_id,
+            'displayed_totals': totals,
+        })
+    finally:
+        conn.close()
+
+
+def _empty_displayed_totals(currency):
+    return {
+        'order_count': 0, 'undelivered_count': 0, 'product_count': 0,
+        'currency': currency,
+        'amount': 0.0, 'shipping': 0.0, 'net': 0.0, 'shipping_loss': 0.0,
+        'cost': 0.0, 'margin': 0.0, 'unmapped_qty': 0,
+        'rate_to_cny': None, 'net_cny': 0.0, 'shipping_loss_cny': 0.0, 'final_net_cny': 0.0,
+        'cost_cny': 0.0, 'margin_cny': 0.0, 'margin_pct': None,
+    }
+
+
+@app.route('/api/reconciliation/summary-stats')
+@login_required
+@reconciliation_api_required
+def api_recon_summary_stats():
+    """Per-site summary statistics for the partner — replicates the
+    "筛选结果统计" table from /orders, scoped to partner-bound sites."""
+    partner_id = request.args.get('partner_id', type=int)
+    year = request.args.get('year', type=int)
+    month = request.args.get('month', type=int)
+    if not partner_id:
+        return jsonify({'error': '缺少 partner_id'}), 400
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权查看此合伙人'}), 403
+
+    conn = get_db_connection()
+    try:
+        partner = conn.execute('SELECT id, currency FROM partners WHERE id = ?', (partner_id,)).fetchone()
+        if not partner:
+            return jsonify({'error': '合伙人不存在'}), 404
+        currency = partner['currency'] or 'PLN'
+
+        sites = conn.execute('''
+            SELECT s.url, s.country, s.manager
+            FROM partner_sites ps
+            JOIN sites s ON s.id = ps.site_id
+            WHERE ps.partner_id = ?
+        ''', (partner_id,)).fetchall()
+        if not sites:
+            return jsonify({'rows': [], 'totals': {}, 'currency': currency})
+
+        site_urls = [s['url'] for s in sites]
+        site_meta = {s['url']: {'country': s['country'], 'manager': s['manager']} for s in sites}
+        placeholders = ','.join(['?'] * len(site_urls))
+
+        params = list(site_urls) + [currency]
+        date_cond = ''
+        if year and month:
+            date_cond = " AND strftime('%Y-%m', date_created) = ?"
+            params.append(f'{year:04d}-{month:02d}')
+        elif year:
+            date_cond = " AND strftime('%Y', date_created) = ?"
+            params.append(str(year))
+
+        # Per-site aggregation
+        success_cond = _revenue_status_cond()
+        rows = conn.execute(f'''
+            SELECT
+                source,
+                COUNT(*) as total_orders,
+                COALESCE(SUM(total), 0) as total_amount,
+                SUM(CASE WHEN {success_cond} THEN 1 ELSE 0 END) as success_orders,
+                COALESCE(SUM(CASE WHEN {success_cond} THEN total ELSE 0 END), 0) as success_amount,
+                COALESCE(SUM(CASE WHEN {success_cond} THEN shipping_total ELSE 0 END), 0) as success_shipping,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_orders,
+                SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_orders,
+                SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 1 ELSE 0 END) as undelivered_orders,
+                COALESCE(SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1
+                                  THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END), 0) as shipping_loss
+            FROM orders
+            WHERE source IN ({placeholders}) AND currency = ? {date_cond}
+            GROUP BY source
+            ORDER BY success_amount DESC
+        ''', params).fetchall()
+
+        rate, _ = _lookup_partner_rate(currency, year or 0, month or 0)
+
+        result_rows = []
+        totals = {
+            'total_orders': 0, 'total_amount': 0, 'success_orders': 0,
+            'success_amount': 0, 'success_shipping': 0, 'success_net': 0,
+            'failed_orders': 0, 'cancelled_orders': 0,
+            'undelivered_orders': 0, 'shipping_loss': 0,
+            'success_net_cny': 0,
+        }
+        for r in rows:
+            success_net = float(r['success_amount']) - float(r['success_shipping']) - float(r['shipping_loss'])
+            success_net_cny = success_net * rate if rate else None
+            row = {
+                'source': r['source'],
+                'country': site_meta.get(r['source'], {}).get('country', ''),
+                'manager': site_meta.get(r['source'], {}).get('manager', ''),
+                'currency': currency,
+                'total_orders': r['total_orders'],
+                'total_amount': float(r['total_amount'] or 0),
+                'success_orders': r['success_orders'],
+                'success_amount': float(r['success_amount'] or 0),
+                'success_shipping': float(r['success_shipping'] or 0),
+                'success_net': round(success_net, 2),
+                'failed_orders': r['failed_orders'],
+                'cancelled_orders': r['cancelled_orders'],
+                'undelivered_orders': r['undelivered_orders'],
+                'shipping_loss': float(r['shipping_loss'] or 0),
+                'rate_to_cny': rate,
+                'success_net_cny': round(success_net_cny, 2) if success_net_cny is not None else None,
+            }
+            result_rows.append(row)
+            totals['total_orders'] += row['total_orders']
+            totals['total_amount'] += row['total_amount']
+            totals['success_orders'] += row['success_orders']
+            totals['success_amount'] += row['success_amount']
+            totals['success_shipping'] += row['success_shipping']
+            totals['success_net'] += row['success_net']
+            totals['failed_orders'] += row['failed_orders']
+            totals['cancelled_orders'] += row['cancelled_orders']
+            totals['undelivered_orders'] += row['undelivered_orders']
+            totals['shipping_loss'] += row['shipping_loss']
+            if success_net_cny is not None:
+                totals['success_net_cny'] += success_net_cny
+        for k in totals:
+            totals[k] = round(totals[k], 2) if isinstance(totals[k], float) else totals[k]
+
+        return jsonify({
+            'rows': result_rows,
+            'totals': totals,
+            'currency': currency,
+            'rate_to_cny': rate,
+        })
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/products')
+@login_required
+@reconciliation_api_required
+def api_recon_products():
+    """Per-product breakdown for the period: qty, revenue, cost (date-aware), margin."""
+    partner_id = request.args.get('partner_id', type=int)
+    year = request.args.get('year', type=int)
+    month = request.args.get('month', type=int)
+    if not all([partner_id, year, month]):
+        return jsonify({'error': '缺少 partner_id/year/month'}), 400
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权查看此合伙人'}), 403
+
+    detail = _calc_partner_recon_detail(partner_id, year, month)
+    if detail is None:
+        return jsonify({'error': '合伙人不存在'}), 404
+    return jsonify({
         'partner_id': partner_id,
-        'partner_name': partner['name'],
         'period_year': year,
         'period_month': month,
-        'currency': partner['currency'],
-        'cost_amount_pln': round(net * partner['cost_ratio'], 2),
-        'partner_profit_pln': round(net * partner['partner_profit_ratio'], 2),
-        'our_receivable_pln': round(net * partner['our_profit_ratio'], 2),
+        'currency': detail['currency'],
+        'products': detail['by_product'],
+        'totals': {
+            'revenue': detail['total_gross_pln'] - detail['total_shipping_pln'],
+            'actual_cost': detail['actual_cost_pln'],
+            'unmapped_revenue': detail['cost_unmapped_revenue_pln'],
+            'unmapped_qty': detail['cost_unmapped_qty'],
+        },
     })
-    # Attach CNY fields using system-configured rate
-    _enrich_statement_cny(result, partner['currency'])
-    return jsonify(result)
+
+
+@app.route('/api/reconciliation/unmapped-products')
+@login_required
+@reconciliation_api_required
+def api_recon_unmapped_products():
+    """Aggregate unmapped products (no cost row matching brand+series+puffs at
+    order date) for the partner's bound sites in the given month.
+
+    Returns one row per (brand, puffs, country, flavor) group, with raw
+    product names underneath. Mirrors /api/sales-board/unmapped's shape so
+    the frontend modal stays familiar.
+    """
+    partner_id = request.args.get('partner_id', type=int)
+    year = request.args.get('year', type=int)
+    month = request.args.get('month', type=int)
+    if not all([partner_id, year, month]):
+        return jsonify({'error': '缺少 partner_id/year/month'}), 400
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权查看此合伙人'}), 403
+
+    conn = get_db_connection()
+    try:
+        partner = conn.execute('SELECT id, currency FROM partners WHERE id = ?', (partner_id,)).fetchone()
+        if not partner:
+            return jsonify({'error': '合伙人不存在'}), 404
+        currency = partner['currency'] or 'PLN'
+
+        sites = conn.execute('''
+            SELECT s.url, s.country, s.manager
+            FROM partner_sites ps
+            JOIN sites s ON s.id = ps.site_id
+            WHERE ps.partner_id = ?
+        ''', (partner_id,)).fetchall()
+        if not sites:
+            return jsonify({'partner_id': partner_id, 'currency': currency, 'unmapped': []})
+        site_urls = [s['url'] for s in sites]
+        site_country_map = {s['url']: s['country'] or 'PL' for s in sites}
+        site_manager_map = {s['url']: s['manager'] or '' for s in sites}
+
+        placeholders = ','.join(['?'] * len(site_urls))
+        month_str = f'{year:04d}-{month:02d}'
+
+        # Pull line_items from this period's revenue orders only
+        orders = conn.execute(f'''
+            SELECT id, line_items, source, currency, warehouse_id, date_created
+            FROM orders
+            WHERE source IN ({placeholders})
+            AND currency = ?
+            AND strftime('%Y-%m', date_created) = ?
+            AND {_revenue_status_cond()}
+        ''', site_urls + [currency, month_str]).fetchall()
+
+        # Build cost index + brand/product-mappings caches
+        cost_idx = _build_dated_cost_index(conn=conn)
+        country_default_wh_ids = {}
+        for w in conn.execute('SELECT id, country FROM warehouses ORDER BY country, id').fetchall():
+            country_default_wh_ids.setdefault(w['country'], []).append(w['id'])
+        brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+        brands_cache = []
+        for row in brands_rows:
+            try:
+                aliases = json.loads(row['aliases']) if row['aliases'] else []
+            except Exception:
+                aliases = []
+            brands_cache.append({
+                'id': row['id'], 'name': row['name'], 'aliases': aliases,
+                'patterns': [row['name'].upper()] + [a.upper() for a in aliases]
+            })
+        pm_rows = conn.execute('SELECT raw_name, source, brand_id, series_id, puff_count, flavor FROM product_mappings').fetchall()
+        product_mappings_cache = {}
+        for pm in pm_rows:
+            product_mappings_cache[(normalize_raw_name(pm['raw_name']), pm['source'])] = pm
+
+        # CNY rate for the period — for revenue conversion
+        rate_cny, _ = _lookup_partner_rate(currency, year, month)
+
+        # Group unmapped by (brand, puffs, country, flavor)
+        unmapped = {}  # key -> {brand, puffs, country, flavor, qty, revenue, revenue_cny, managers, products{name -> {qty, revenue}}}
+        for o in orders:
+            items = parse_json_field(o['line_items'])
+            if not isinstance(items, list):
+                continue
+            order_country = site_country_map.get(o['source'], 'PL') or 'PL'
+            order_manager = site_manager_map.get(o['source'], '')
+            order_date = (o['date_created'] or '')[:10]
+            effective_wh_ids = country_default_wh_ids.get(order_country, [])
+
+            for item in items:
+                qty = int(item.get('quantity', 0) or 0)
+                if qty <= 0:
+                    continue
+                raw_name = item.get('name', '') or ''
+                item_total = float(item.get('total', 0) or 0)
+                b_id, s_id, p_cnt, flav = _resolve_product_to_brand(
+                    raw_name, o['source'], brands_cache, product_mappings_cache
+                )
+                cost_entry = None
+                if b_id and effective_wh_ids:
+                    for ewh in effective_wh_ids:
+                        cost_entry = _cost_at_date(cost_idx, b_id, s_id, p_cnt, flav, ewh, order_date)
+                        if cost_entry:
+                            break
+                if cost_entry:
+                    continue  # mapped — skip
+
+                # ── unmapped ──
+                brand_label = None
+                if b_id:
+                    for bc in brands_cache:
+                        if bc['id'] == b_id:
+                            brand_label = bc['name']
+                            break
+                brand_label = brand_label or 'Unknown'
+                key = (brand_label, p_cnt or 0, order_country, (flav or '').lower())
+                if key not in unmapped:
+                    unmapped[key] = {
+                        'brand': brand_label, 'puffs': p_cnt, 'flavor': flav,
+                        'country': order_country,
+                        'qty': 0, 'revenue': 0.0, 'revenue_cny': 0.0,
+                        'managers': set(),
+                        'products': {},
+                    }
+                u = unmapped[key]
+                u['qty'] += qty
+                u['revenue'] += item_total
+                if rate_cny:
+                    u['revenue_cny'] += item_total * rate_cny
+                if order_manager:
+                    u['managers'].add(order_manager)
+                # raw product names with qty / revenue
+                if raw_name not in u['products']:
+                    u['products'][raw_name] = {'name': raw_name, 'qty': 0, 'revenue': 0.0, 'revenue_cny': 0.0}
+                p = u['products'][raw_name]
+                p['qty'] += qty
+                p['revenue'] += item_total
+                if rate_cny:
+                    p['revenue_cny'] += item_total * rate_cny
+
+        # Flatten to list, sort by revenue desc
+        result = []
+        for u in unmapped.values():
+            u['managers'] = sorted(u['managers'])
+            u['products'] = sorted(u['products'].values(), key=lambda p: -p['revenue'])
+            for p in u['products']:
+                p['revenue'] = round(p['revenue'], 2)
+                p['revenue_cny'] = round(p['revenue_cny'], 2)
+            u['revenue'] = round(u['revenue'], 2)
+            u['revenue_cny'] = round(u['revenue_cny'], 2)
+            result.append(u)
+        result.sort(key=lambda u: -u['revenue'])
+
+        return jsonify({
+            'partner_id': partner_id,
+            'currency': currency,
+            'rate_to_cny': rate_cny,
+            'period': month_str,
+            'unmapped': result,
+        })
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# DASHBOARD APIs (P1)
+# ============================================================================
+# These power the "数据看板" tab. Each is per-partner and reuses
+# _calc_partner_recon_detail / _calc_partner_net_sales for the heavy lifting.
+
+@app.route('/api/reconciliation/dashboard/monthly-trend')
+@login_required
+@reconciliation_api_required
+def api_recon_dashboard_monthly_trend():
+    """Per-partner trend across the last N months.
+
+    Returns one row per month with: net sales, contract cost, actual cost
+    (date-aware), our receivable, money received, success/failed/cancelled/
+    undelivered counts, shipping_loss. The frontend renders this as a
+    multi-line chart.
+    """
+    partner_id = request.args.get('partner_id', type=int)
+    months = max(3, min(24, request.args.get('months', 12, type=int)))
+    if not partner_id:
+        return jsonify({'error': '缺少 partner_id'}), 400
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权查看此合伙人'}), 403
+
+    conn = get_db_connection()
+    try:
+        partner = conn.execute('SELECT id, currency, cost_ratio, partner_profit_ratio, our_profit_ratio FROM partners WHERE id = ?', (partner_id,)).fetchone()
+        if not partner:
+            return jsonify({'error': '合伙人不存在'}), 404
+        currency = partner['currency'] or 'PLN'
+
+        sites = conn.execute('''SELECT s.url FROM partner_sites ps
+            JOIN sites s ON s.id = ps.site_id WHERE ps.partner_id = ?''', (partner_id,)).fetchall()
+        if not sites:
+            return jsonify({'partner_id': partner_id, 'currency': currency, 'months': []})
+        site_urls = [s['url'] for s in sites]
+        placeholders = ','.join(['?'] * len(site_urls))
+
+        # Build month list [today_back_to N months ago]
+        from datetime import date
+        today = date.today()
+        month_list = []
+        y, m = today.year, today.month
+        for _ in range(months):
+            month_list.append((y, m))
+            m -= 1
+            if m == 0:
+                m = 12
+                y -= 1
+        month_list.reverse()  # oldest first
+
+        # Single grouped SQL — one trip to DB instead of N queries
+        # (returns gross / shipping / shipping_loss / counts per (year, month))
+        success_cond = _revenue_status_cond()
+        ym_min = f'{month_list[0][0]:04d}-{month_list[0][1]:02d}'
+        ym_max = f'{month_list[-1][0]:04d}-{month_list[-1][1]:02d}'
+        rows = conn.execute(f'''
+            SELECT
+                strftime('%Y-%m', date_created) AS ym,
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN {success_cond} THEN 1 ELSE 0 END) AS success_count,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+                SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
+                SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 1 ELSE 0 END) AS undel_count,
+                COALESCE(SUM(CASE WHEN {success_cond} THEN total ELSE 0 END), 0) AS gross,
+                COALESCE(SUM(CASE WHEN {success_cond} THEN shipping_total ELSE 0 END), 0) AS ship,
+                COALESCE(SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1
+                                  THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END), 0) AS loss
+            FROM orders
+            WHERE source IN ({placeholders})
+              AND currency = ?
+              AND strftime('%Y-%m', date_created) BETWEEN ? AND ?
+            GROUP BY ym
+            ORDER BY ym
+        ''', site_urls + [currency, ym_min, ym_max]).fetchall()
+        agg = {r['ym']: r for r in rows}
+
+        # Receipts per month (sum of partner_receipts.amount_pln by year-month)
+        rcpt_rows = conn.execute(f'''
+            SELECT strftime('%Y-%m', receipt_date) AS ym,
+                   COALESCE(SUM(amount_pln), 0) AS received
+            FROM partner_receipts
+            WHERE partner_id = ?
+              AND strftime('%Y-%m', receipt_date) BETWEEN ? AND ?
+            GROUP BY ym
+        ''', (partner_id, ym_min, ym_max)).fetchall()
+        rcpt_map = {r['ym']: float(r['received'] or 0) for r in rcpt_rows}
+
+        cr  = float(partner['cost_ratio'] or 0.5)
+        opr = float(partner['our_profit_ratio'] or 0.25)
+
+        # Build full series — fill 0s for empty months. Actual cost computation
+        # is expensive (per-line product lookup) so we only call the detail
+        # function for months that actually have orders.
+        series = []
+        for (yy, mm) in month_list:
+            ym = f'{yy:04d}-{mm:02d}'
+            r = agg.get(ym)
+            if r is None or (r['success_count'] or 0) == 0:
+                series.append({
+                    'year_month': ym, 'year': yy, 'month': mm,
+                    'success_orders': 0, 'failed_orders': 0,
+                    'cancelled_orders': 0, 'undelivered_orders': 0,
+                    'gross': 0, 'shipping': 0, 'shipping_loss': 0,
+                    'net': 0, 'contract_cost': 0, 'actual_cost': 0,
+                    'our_receivable': 0, 'received': round(rcpt_map.get(ym, 0), 2),
+                    'undelivered_rate': 0.0, 'failed_rate': 0.0,
+                })
+                continue
+            gross = float(r['gross'] or 0)
+            ship = float(r['ship'] or 0)
+            loss = float(r['loss'] or 0)
+            net = gross - ship - loss
+            total = int(r['total_count'] or 0)
+            undel_rate = (int(r['undel_count'] or 0) / total * 100) if total > 0 else 0
+            failed_rate = (int(r['failed_count'] or 0) / total * 100) if total > 0 else 0
+            # actual_cost_pln from full detail calc (date-aware)
+            detail = _calc_partner_recon_detail(partner_id, yy, mm)
+            actual_cost = detail['actual_cost_pln'] if detail else 0
+            series.append({
+                'year_month': ym, 'year': yy, 'month': mm,
+                'success_orders': int(r['success_count'] or 0),
+                'failed_orders': int(r['failed_count'] or 0),
+                'cancelled_orders': int(r['cancelled_count'] or 0),
+                'undelivered_orders': int(r['undel_count'] or 0),
+                'gross': round(gross, 2),
+                'shipping': round(ship, 2),
+                'shipping_loss': round(loss, 2),
+                'net': round(net, 2),
+                'contract_cost': round(net * cr, 2),
+                'actual_cost': round(actual_cost, 2),
+                'our_receivable': round(net * opr, 2),
+                'received': round(rcpt_map.get(ym, 0), 2),
+                'undelivered_rate': round(undel_rate, 2),
+                'failed_rate': round(failed_rate, 2),
+            })
+
+        return jsonify({
+            'partner_id': partner_id,
+            'currency': currency,
+            'months': series,
+        })
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/dashboard/aging')
+@login_required
+@reconciliation_api_required
+def api_recon_dashboard_aging():
+    """Aging analysis for unpaid statements.
+
+    Each statement that has outstanding balance (our_receivable - received > 0)
+    is bucketed by days since the period end:
+        0-30, 30-60, 60-90, 90+ days.
+    Frontend renders as a bar chart + drilldown table.
+    """
+    partner_id = request.args.get('partner_id', type=int)
+    if not partner_id:
+        return jsonify({'error': '缺少 partner_id'}), 400
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权查看此合伙人'}), 403
+
+    conn = get_db_connection()
+    try:
+        partner = conn.execute('SELECT id, name, currency FROM partners WHERE id = ?', (partner_id,)).fetchone()
+        if not partner:
+            return jsonify({'error': '合伙人不存在'}), 404
+        currency = partner['currency'] or 'PLN'
+
+        # Each statement + sum of its receipts
+        rows = conn.execute('''
+            SELECT s.id, s.period_year, s.period_month, s.our_receivable_pln,
+                   s.exchange_rate_cny, s.status, s.created_at,
+                   COALESCE(SUM(pr.amount_pln), 0) AS received
+            FROM reconciliation_statements s
+            LEFT JOIN partner_receipts pr ON pr.statement_id = s.id
+            WHERE s.partner_id = ?
+            GROUP BY s.id
+            ORDER BY s.period_year, s.period_month
+        ''', (partner_id,)).fetchall()
+
+        from datetime import date
+        today = date.today()
+        buckets = {
+            '0-30':  {'count': 0, 'amount': 0.0, 'amount_cny': 0.0, 'statements': []},
+            '30-60': {'count': 0, 'amount': 0.0, 'amount_cny': 0.0, 'statements': []},
+            '60-90': {'count': 0, 'amount': 0.0, 'amount_cny': 0.0, 'statements': []},
+            '90+':   {'count': 0, 'amount': 0.0, 'amount_cny': 0.0, 'statements': []},
+        }
+        total_outstanding = 0.0
+        total_outstanding_cny = 0.0
+
+        for r in rows:
+            owed = float(r['our_receivable_pln'] or 0) - float(r['received'] or 0)
+            if owed <= 0.01:  # already settled
+                continue
+            # Period end date = last day of the month
+            import calendar
+            last_day = calendar.monthrange(r['period_year'], r['period_month'])[1]
+            period_end = date(r['period_year'], r['period_month'], last_day)
+            age_days = (today - period_end).days
+            if age_days < 0:
+                # Period not over yet — bucket as 0-30 (or skip; we keep it for visibility)
+                age_days = 0
+            if age_days <= 30:
+                bk = '0-30'
+            elif age_days <= 60:
+                bk = '30-60'
+            elif age_days <= 90:
+                bk = '60-90'
+            else:
+                bk = '90+'
+
+            rate = r['exchange_rate_cny']
+            if not rate:
+                rate, _ = _lookup_partner_rate(currency, r['period_year'], r['period_month'])
+            owed_cny = owed * rate if rate else 0
+
+            buckets[bk]['count'] += 1
+            buckets[bk]['amount'] += owed
+            buckets[bk]['amount_cny'] += owed_cny
+            buckets[bk]['statements'].append({
+                'id': r['id'],
+                'period': f"{r['period_year']}-{r['period_month']:02d}",
+                'our_receivable': float(r['our_receivable_pln'] or 0),
+                'received': float(r['received'] or 0),
+                'outstanding': round(owed, 2),
+                'outstanding_cny': round(owed_cny, 2) if rate else None,
+                'age_days': age_days,
+                'status': r['status'],
+            })
+            total_outstanding += owed
+            total_outstanding_cny += owed_cny
+
+        for bk in buckets.values():
+            bk['amount'] = round(bk['amount'], 2)
+            bk['amount_cny'] = round(bk['amount_cny'], 2)
+
+        return jsonify({
+            'partner_id': partner_id,
+            'currency': currency,
+            'today': today.isoformat(),
+            'buckets': buckets,
+            'total_outstanding': round(total_outstanding, 2),
+            'total_outstanding_cny': round(total_outstanding_cny, 2),
+        })
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/dashboard/comparison')
+@login_required
+@reconciliation_api_required
+def api_recon_dashboard_comparison():
+    """Current month vs previous month vs same-month-last-year.
+
+    Returns side-by-side metrics for trend-arrow display in the dashboard.
+    """
+    partner_id = request.args.get('partner_id', type=int)
+    year = request.args.get('year', type=int)
+    month = request.args.get('month', type=int)
+    if not all([partner_id, year, month]):
+        return jsonify({'error': '缺少 partner_id/year/month'}), 400
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权查看此合伙人'}), 403
+
+    def shift_month(y, m, delta):
+        idx = (y * 12 + (m - 1)) + delta
+        return idx // 12, (idx % 12) + 1
+
+    cur_y, cur_m = year, month
+    prev_y, prev_m = shift_month(cur_y, cur_m, -1)
+    yoy_y, yoy_m = cur_y - 1, cur_m
+
+    cur = _calc_partner_recon_detail(partner_id, cur_y, cur_m)
+    if cur is None:
+        return jsonify({'error': '合伙人不存在'}), 404
+    prev = _calc_partner_recon_detail(partner_id, prev_y, prev_m) or {}
+    yoy = _calc_partner_recon_detail(partner_id, yoy_y, yoy_m) or {}
+
+    def metric_block(d):
+        return {
+            'success_orders': d.get('success_orders', 0),
+            'undelivered_orders': d.get('undelivered_orders', 0),
+            'total_gross_pln': d.get('total_gross_pln', 0),
+            'total_net_pln':   d.get('total_net_pln', 0),
+            'actual_cost_pln': d.get('actual_cost_pln', 0),
+            'our_receivable_pln': d.get('our_receivable_pln', 0),
+        }
+
+    def diff(a, b):
+        if not b:
+            return {'abs': a, 'pct': None}
+        return {'abs': round(a - b, 2), 'pct': round((a - b) / b * 100, 1) if b else None}
+
+    return jsonify({
+        'partner_id': partner_id,
+        'currency': cur['currency'],
+        'current':  {'period': f'{cur_y}-{cur_m:02d}',  'metrics': metric_block(cur)},
+        'previous': {'period': f'{prev_y}-{prev_m:02d}', 'metrics': metric_block(prev)},
+        'yoy':      {'period': f'{yoy_y}-{yoy_m:02d}',  'metrics': metric_block(yoy)},
+        'mom_diff': {  # current vs previous-month
+            k: diff(metric_block(cur)[k], metric_block(prev).get(k, 0))
+            for k in metric_block(cur).keys()
+        },
+        'yoy_diff': {  # current vs same-month-last-year
+            k: diff(metric_block(cur)[k], metric_block(yoy).get(k, 0))
+            for k in metric_block(cur).keys()
+        },
+    })
 
 
 @app.route('/api/reconciliation/statements/generate', methods=['POST'])
@@ -8758,38 +10511,56 @@ def api_generate_statement():
         conn.close()
         return jsonify({'error': '该月份对账单已锁定，无法重新生成'}), 400
 
-    stats = _calc_partner_net_sales(partner_id, year, month)
-    net = stats['total_net_pln']
+    # Use the full detail aggregator so we also capture actual_cost_pln_snapshot
+    detail = _calc_partner_recon_detail(partner_id, year, month)
+    if detail is None:
+        conn.close()
+        return jsonify({'error': '合伙人数据计算失败'}), 500
+    net = detail['total_net_pln']
     cost = round(net * partner['cost_ratio'], 2)
     p_profit = round(net * partner['partner_profit_ratio'], 2)
     our_recv = round(net * partner['our_profit_ratio'], 2)
+    actual_cost_snapshot = detail['actual_cost_pln']
 
     # Auto-lookup exchange rate from system settings
     rate, _ = _lookup_partner_rate(partner['currency'], year, month)
     our_recv_cny = round(our_recv * rate, 2) if rate else None
 
     try:
+        is_regenerate = bool(existing)
         if existing:
             conn.execute('''UPDATE reconciliation_statements
                 SET total_orders=?, total_gross_pln=?, total_net_pln=?,
                     cost_amount_pln=?, partner_profit_pln=?, our_receivable_pln=?,
                     exchange_rate_cny=?, our_receivable_cny=?,
+                    actual_cost_pln_snapshot=?,
                     status='generated', updated_at=CURRENT_TIMESTAMP
                 WHERE id=?''',
-                (stats['total_orders'], stats['total_gross_pln'], net,
-                 cost, p_profit, our_recv, rate, our_recv_cny, existing['id']))
+                (detail['total_orders'], detail['total_gross_pln'], net,
+                 cost, p_profit, our_recv, rate, our_recv_cny,
+                 actual_cost_snapshot, existing['id']))
             stmt_id = existing['id']
         else:
             cursor = conn.execute('''INSERT INTO reconciliation_statements
                 (partner_id, period_year, period_month, total_orders, total_gross_pln, total_net_pln,
                  cost_amount_pln, partner_profit_pln, our_receivable_pln,
-                 exchange_rate_cny, our_receivable_cny, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generated')''',
-                (partner_id, year, month, stats['total_orders'], stats['total_gross_pln'], net,
-                 cost, p_profit, our_recv, rate, our_recv_cny))
+                 exchange_rate_cny, our_receivable_cny, actual_cost_pln_snapshot, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generated')''',
+                (partner_id, year, month, detail['total_orders'], detail['total_gross_pln'], net,
+                 cost, p_profit, our_recv, rate, our_recv_cny,
+                 actual_cost_snapshot))
             stmt_id = cursor.lastrowid
+
+        # P2: snapshot the orders that contributed to this statement
+        snapshot_count = _snapshot_statement_orders(stmt_id, partner_id, year, month, conn)
+
+        # P2: audit log
+        _audit_log(stmt_id, 'regenerate' if is_regenerate else 'create',
+                   note=f'净销售={net} {partner["currency"] or "PLN"}, 实际成本={actual_cost_snapshot}, 快照订单 {snapshot_count} 条', conn=conn)
+
         conn.commit()
-        return jsonify({'success': True, 'id': stmt_id, 'exchange_rate_cny': rate})
+        return jsonify({'success': True, 'id': stmt_id, 'exchange_rate_cny': rate,
+                        'snapshot_orders': snapshot_count, 'actual_cost_pln': actual_cost_snapshot})
     finally:
         conn.close()
 
@@ -8870,6 +10641,34 @@ def api_get_statement(stmt_id):
     if rate:
         result['total_received_cny'] = round(result['total_received_pln'] * rate, 2)
         result['outstanding_cny'] = round(result['outstanding_pln'] * rate, 2)
+
+    # Attach live drill-down detail (status / site / product breakdown) so the
+    # detail modal can show how the saved totals were composed. The saved
+    # *_pln fields above are the locked snapshot — drill-down is recomputed
+    # from current data; if orders changed since generation the live numbers
+    # may differ, which is intentional (user wants to see what's there now).
+    if not stmt['is_manual']:
+        try:
+            live_detail = _calc_partner_recon_detail(
+                stmt['partner_id'], stmt['period_year'], stmt['period_month']
+            )
+            if live_detail:
+                result['live_detail'] = {
+                    'success_orders': live_detail['success_orders'],
+                    'failed_orders': live_detail['failed_orders'],
+                    'cancelled_orders': live_detail['cancelled_orders'],
+                    'undelivered_orders': live_detail['undelivered_orders'],
+                    'pending_orders': live_detail['pending_orders'],
+                    'shipping_loss': live_detail['shipping_loss'],
+                    'actual_cost_pln': live_detail['actual_cost_pln'],
+                    'cost_unmapped_revenue_pln': live_detail['cost_unmapped_revenue_pln'],
+                    'cost_unmapped_qty': live_detail['cost_unmapped_qty'],
+                    'by_status': live_detail['by_status'],
+                    'by_site': live_detail['by_site'],
+                    'by_product': live_detail['by_product'],
+                }
+        except Exception as e:
+            app.logger.warning(f"live_detail failed for stmt {stmt_id}: {e}")
     return jsonify(result)
 
 
@@ -8877,7 +10676,8 @@ def api_get_statement(stmt_id):
 @login_required
 @reconciliation_api_required
 def api_update_statement(stmt_id):
-    """Update statement (exchange rate, notes, status)"""
+    """Update statement (exchange rate, notes, status). Every change is logged
+    to reconciliation_audit_log for traceability."""
     data = request.json
     conn = get_db_connection()
     stmt = conn.execute('SELECT * FROM reconciliation_statements WHERE id = ?', (stmt_id,)).fetchone()
@@ -8890,17 +10690,35 @@ def api_update_statement(stmt_id):
 
     is_admin = _is_reconciliation_admin()
     try:
-        # Partner member can only confirm their own statement
+        # ----- Partner-only actions (confirm) -----
         if not is_admin:
             if data.get('action') == 'confirm' and stmt['status'] == 'generated':
+                # P2: e-signature — typed name required, must match partner display name
+                typed_name = (data.get('confirm_name') or '').strip()
+                if not typed_name:
+                    return jsonify({'error': '请输入您的姓名以确认对账单'}), 400
+                # Verify against the partner's name (relaxed: substring match — partner names
+                # often have parentheses / regions; we accept any substring of length >= 2)
+                partner = conn.execute('SELECT name FROM partners WHERE id = ?', (stmt['partner_id'],)).fetchone()
+                ref_name = (partner['name'] if partner else '').strip()
+                if len(typed_name) < 2:
+                    return jsonify({'error': '姓名至少 2 个字符'}), 400
+                if typed_name not in ref_name and ref_name not in typed_name:
+                    return jsonify({'error': f'姓名不匹配（请输入合伙人名称中的姓名部分，参考：{ref_name}）'}), 400
+                ip = request.headers.get('X-Forwarded-For', request.remote_addr) or ''
+                if ip and ',' in ip:
+                    ip = ip.split(',')[0].strip()
                 conn.execute('''UPDATE reconciliation_statements
-                    SET status='confirmed', confirmed_at=CURRENT_TIMESTAMP, confirmed_by=?, updated_at=CURRENT_TIMESTAMP
-                    WHERE id=?''', (current_user.id, stmt_id))
+                    SET status='confirmed', confirmed_at=CURRENT_TIMESTAMP, confirmed_by=?,
+                        confirmed_name=?, confirmed_ip=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?''', (current_user.id, typed_name, ip, stmt_id))
+                _audit_log(stmt_id, 'confirm', field='status', old='generated', new='confirmed',
+                           note=f'电子确认：{typed_name} ({ip})', conn=conn)
                 conn.commit()
                 return jsonify({'success': True})
             return jsonify({'error': '无权执行此操作'}), 403
 
-        # Admin can update exchange rate, notes, status
+        # ----- Admin actions: rate / notes / lock / unlock / settle / confirm -----
         if stmt['status'] in ('locked', 'settled') and data.get('action') != 'unlock':
             return jsonify({'error': '对账单已锁定'}), 400
 
@@ -8910,37 +10728,233 @@ def api_update_statement(stmt_id):
 
         updates = []
         params = []
+        audit_entries = []  # list of (action, field, old, new, note) tuples
+
         if exchange_rate is not None:
             rate = float(exchange_rate)
-            updates.append('exchange_rate_cny=?')
-            params.append(rate)
-            updates.append('our_receivable_cny=?')
-            params.append(round((stmt['our_receivable_pln'] or 0) * rate, 2))
-        if notes is not None:
+            old_rate = stmt['exchange_rate_cny']
+            if old_rate != rate:  # only log if actually changed
+                updates.append('exchange_rate_cny=?')
+                params.append(rate)
+                updates.append('our_receivable_cny=?')
+                params.append(round((stmt['our_receivable_pln'] or 0) * rate, 2))
+                audit_entries.append(('edit_rate', 'exchange_rate_cny', old_rate, rate, None))
+        if notes is not None and (notes or '') != (stmt['notes'] or ''):
             updates.append('notes=?')
             params.append(notes)
+            audit_entries.append(('edit_notes', 'notes', stmt['notes'], notes, None))
         if action == 'lock':
             updates.append("status='locked'")
             updates.append('locked_at=CURRENT_TIMESTAMP')
+            audit_entries.append(('lock', 'status', stmt['status'], 'locked', None))
         elif action == 'unlock':
             updates.append("status='generated'")
             updates.append('locked_at=NULL')
+            audit_entries.append(('unlock', 'status', stmt['status'], 'generated', None))
         elif action == 'settle':
             updates.append("status='settled'")
+            audit_entries.append(('settle', 'status', stmt['status'], 'settled', None))
         elif action == 'confirm':
             updates.append("status='confirmed'")
             updates.append('confirmed_at=CURRENT_TIMESTAMP')
             updates.append('confirmed_by=?')
             params.append(current_user.id)
+            audit_entries.append(('confirm', 'status', stmt['status'], 'confirmed', '管理员代确认'))
 
         if updates:
             updates.append('updated_at=CURRENT_TIMESTAMP')
             params.append(stmt_id)
             conn.execute(f'UPDATE reconciliation_statements SET {", ".join(updates)} WHERE id=?', params)
+            for (a, f, o, n, note) in audit_entries:
+                _audit_log(stmt_id, a, field=f, old=o, new=n, note=note, conn=conn)
             conn.commit()
         return jsonify({'success': True})
     finally:
         conn.close()
+
+
+# ============================================================================
+# P2: DISPUTE WORKFLOW
+# ============================================================================
+# Status transitions powered by these endpoints:
+#   generated → disputed  (partner clicks "提出异议", types reason)
+#   disputed  → generated (admin clicks "已处理", types resolution note,
+#                          optionally regenerates from current order data)
+# Both transitions write a normal audit_log entry with the message in `note`,
+# so the timeline shows the full conversation.
+
+@app.route('/api/reconciliation/statements/<int:stmt_id>/dispute', methods=['POST'])
+@login_required
+@reconciliation_api_required
+def api_dispute_statement(stmt_id):
+    """Partner raises a dispute on a statement.
+
+    Caller can be partner OR admin. Body must include `note` (the dispute
+    reason, ≥ 5 chars). Status flips to 'disputed' if currently 'generated'
+    or 'confirmed'. Locked/settled statements cannot be disputed (would need
+    admin to unlock first).
+    """
+    data = request.json or {}
+    note = (data.get('note') or '').strip()
+    if len(note) < 5:
+        return jsonify({'error': '请说明异议内容（至少 5 个字符）'}), 400
+
+    conn = get_db_connection()
+    stmt = conn.execute('SELECT * FROM reconciliation_statements WHERE id = ?', (stmt_id,)).fetchone()
+    if not stmt:
+        conn.close()
+        return jsonify({'error': '对账单不存在'}), 404
+    if not _check_partner_access(stmt['partner_id']):
+        conn.close()
+        return jsonify({'error': '无权操作'}), 403
+    if stmt['status'] in ('locked', 'settled'):
+        conn.close()
+        return jsonify({'error': '已锁定/已结清的对账单无法提出异议，请联系管理员先解锁'}), 400
+    try:
+        old_status = stmt['status']
+        conn.execute('''UPDATE reconciliation_statements
+            SET status='disputed', updated_at=CURRENT_TIMESTAMP WHERE id=?''', (stmt_id,))
+        _audit_log(stmt_id, 'dispute', field='status', old=old_status, new='disputed',
+                   note=note, conn=conn)
+        conn.commit()
+        return jsonify({'success': True, 'new_status': 'disputed'})
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/statements/<int:stmt_id>/resolve-dispute', methods=['POST'])
+@login_required
+@reconciliation_api_required
+def api_resolve_dispute(stmt_id):
+    """Admin resolves a dispute. Optional `regenerate=true` re-runs the
+    aggregation from current order data (re-snapshots).
+    """
+    if not _is_reconciliation_admin():
+        return jsonify({'error': '无权处理异议'}), 403
+    data = request.json or {}
+    note = (data.get('note') or '').strip()
+    if len(note) < 3:
+        return jsonify({'error': '请说明处理说明（至少 3 个字符）'}), 400
+    do_regen = bool(data.get('regenerate'))
+
+    conn = get_db_connection()
+    stmt = conn.execute('SELECT * FROM reconciliation_statements WHERE id = ?', (stmt_id,)).fetchone()
+    if not stmt:
+        conn.close()
+        return jsonify({'error': '对账单不存在'}), 404
+    if stmt['status'] != 'disputed':
+        conn.close()
+        return jsonify({'error': '对账单当前不是异议中状态'}), 400
+    try:
+        partner_id = stmt['partner_id']
+        year = stmt['period_year']
+        month = stmt['period_month']
+        partner = conn.execute('SELECT * FROM partners WHERE id = ?', (partner_id,)).fetchone()
+
+        if do_regen:
+            # Recalculate from current order data and update the statement totals
+            detail = _calc_partner_recon_detail(partner_id, year, month)
+            if detail is None:
+                return jsonify({'error': '重生成失败：无法计算'}), 500
+            net = detail['total_net_pln']
+            cost = round(net * partner['cost_ratio'], 2)
+            p_profit = round(net * partner['partner_profit_ratio'], 2)
+            our_recv = round(net * partner['our_profit_ratio'], 2)
+            actual_cost_snapshot = detail['actual_cost_pln']
+            rate, _ = _lookup_partner_rate(partner['currency'], year, month)
+            our_recv_cny = round(our_recv * rate, 2) if rate else None
+            conn.execute('''UPDATE reconciliation_statements
+                SET status='generated', total_orders=?, total_gross_pln=?, total_net_pln=?,
+                    cost_amount_pln=?, partner_profit_pln=?, our_receivable_pln=?,
+                    exchange_rate_cny=?, our_receivable_cny=?, actual_cost_pln_snapshot=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?''',
+                (detail['total_orders'], detail['total_gross_pln'], net,
+                 cost, p_profit, our_recv, rate, our_recv_cny, actual_cost_snapshot,
+                 stmt_id))
+            snapshot_count = _snapshot_statement_orders(stmt_id, partner_id, year, month, conn)
+            _audit_log(stmt_id, 'resolve_dispute', field='status', old='disputed', new='generated',
+                       note=f'已处理并重新生成：{note} (新净销售={net}, 快照 {snapshot_count} 单)', conn=conn)
+        else:
+            conn.execute('''UPDATE reconciliation_statements
+                SET status='generated', updated_at=CURRENT_TIMESTAMP WHERE id=?''', (stmt_id,))
+            _audit_log(stmt_id, 'resolve_dispute', field='status', old='disputed', new='generated',
+                       note=f'已处理：{note}', conn=conn)
+        conn.commit()
+        return jsonify({'success': True, 'new_status': 'generated'})
+    finally:
+        conn.close()
+
+
+@app.route('/api/reconciliation/statements/<int:stmt_id>/audit-log')
+@login_required
+@reconciliation_api_required
+def api_get_statement_audit_log(stmt_id):
+    """Return the timeline of changes for a statement."""
+    conn = get_db_connection()
+    stmt = conn.execute('SELECT partner_id FROM reconciliation_statements WHERE id = ?', (stmt_id,)).fetchone()
+    if not stmt:
+        conn.close()
+        return jsonify({'error': '对账单不存在'}), 404
+    if not _check_partner_access(stmt['partner_id']):
+        conn.close()
+        return jsonify({'error': '无权查看'}), 403
+    rows = conn.execute('''
+        SELECT id, action, actor_id, actor_username, actor_role,
+               field, old_value, new_value, note, ip, created_at
+        FROM reconciliation_audit_log
+        WHERE statement_id = ?
+        ORDER BY created_at DESC, id DESC
+    ''', (stmt_id,)).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/reconciliation/statements/<int:stmt_id>/snapshot-orders')
+@login_required
+@reconciliation_api_required
+def api_get_statement_snapshot_orders(stmt_id):
+    """Return the frozen order list (with optional comparison to current state)."""
+    conn = get_db_connection()
+    stmt = conn.execute('SELECT partner_id FROM reconciliation_statements WHERE id = ?', (stmt_id,)).fetchone()
+    if not stmt:
+        conn.close()
+        return jsonify({'error': '对账单不存在'}), 404
+    if not _check_partner_access(stmt['partner_id']):
+        conn.close()
+        return jsonify({'error': '无权查看'}), 403
+    snap = conn.execute('''
+        SELECT * FROM reconciliation_statement_orders
+        WHERE statement_id = ? ORDER BY date_created
+    ''', (stmt_id,)).fetchall()
+    out = []
+    drift_count = 0
+    for s in snap:
+        d = dict(s)
+        cur = conn.execute('''SELECT status, total, shipping_total,
+                                     COALESCE(shipping_loss_amount,0) AS sla,
+                                     COALESCE(is_undelivered, 0) AS undel
+                              FROM orders WHERE id = ?''', (s['order_id'],)).fetchone()
+        if cur:
+            d['status_now'] = cur['status']
+            d['total_now'] = cur['total']
+            d['shipping_now'] = cur['shipping_total']
+            d['shipping_loss_now'] = cur['sla']
+            d['is_undelivered_now'] = bool(cur['undel'])
+            d['drifted'] = (
+                (cur['status'] != s['status_at_gen']) or
+                (abs(float(cur['total'] or 0) - float(s['total_at_gen'] or 0)) > 0.01) or
+                (abs(float(cur['shipping_total'] or 0) - float(s['shipping_at_gen'] or 0)) > 0.01) or
+                (bool(cur['undel']) != bool(s['is_undelivered_at_gen']))
+            )
+        else:
+            d['drifted'] = True  # order deleted from DB
+            d['status_now'] = '_DELETED_'
+        if d.get('drifted'):
+            drift_count += 1
+        out.append(d)
+    conn.close()
+    return jsonify({'orders': out, 'count': len(out), 'drift_count': drift_count})
 
 
 @app.route('/api/reconciliation/statements/<int:stmt_id>', methods=['DELETE'])
@@ -9034,7 +11048,7 @@ def api_create_receipt():
 
     conn = get_db_connection()
     try:
-        conn.execute('''INSERT INTO partner_receipts
+        cursor = conn.execute('''INSERT INTO partner_receipts
             (partner_id, statement_id, receipt_date, amount_pln, exchange_rate_cny, amount_cny,
              payment_method, reference_no, receipt_url, notes, created_by)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
@@ -9047,8 +11061,16 @@ def api_create_receipt():
              data.get('receipt_url', ''),
              data.get('notes', ''),
              current_user.id))
+        receipt_id = cursor.lastrowid
+        # P2 audit: if linked to a statement, record on its timeline
+        stmt_id = data.get('statement_id')
+        if stmt_id:
+            curr = data.get('currency') or 'PLN'
+            _audit_log(int(stmt_id), 'attach_receipt', field='receipt',
+                       new=f'#{receipt_id}',
+                       note=f'新增收款 {amount_pln} (rate {rate_val}, ref {data.get("reference_no", "-")})', conn=conn)
         conn.commit()
-        return jsonify({'success': True})
+        return jsonify({'success': True, 'id': receipt_id})
     finally:
         conn.close()
 
@@ -9076,11 +11098,14 @@ def api_update_receipt(receipt_id):
     amount_cny = round(amount_pln * rate_val, 2) if rate_val else None
 
     try:
+        old_stmt_id = receipt['statement_id']
+        new_stmt_id = data.get('statement_id') or None
+        old_amount = receipt['amount_pln']
         conn.execute('''UPDATE partner_receipts SET
             statement_id=?, receipt_date=?, amount_pln=?, exchange_rate_cny=?, amount_cny=?,
             payment_method=?, reference_no=?, receipt_url=?, notes=?
             WHERE id=?''',
-            (data.get('statement_id') or None,
+            (new_stmt_id,
              data.get('receipt_date', receipt['receipt_date']),
              amount_pln, rate_val, amount_cny,
              data.get('payment_method', ''),
@@ -9088,6 +11113,17 @@ def api_update_receipt(receipt_id):
              data.get('receipt_url', ''),
              data.get('notes', ''),
              receipt_id))
+        # P2 audit: receipt edits show up on linked statements' timeline
+        if old_stmt_id:
+            _audit_log(int(old_stmt_id), 'edit_receipt', field='receipt',
+                       old=f'#{receipt_id} {old_amount}', new=f'#{receipt_id} {amount_pln}',
+                       note='修改收款记录', conn=conn)
+        if new_stmt_id and new_stmt_id != old_stmt_id:
+            _audit_log(int(new_stmt_id), 'attach_receipt', field='receipt',
+                       new=f'#{receipt_id}', note=f'关联收款 {amount_pln}', conn=conn)
+        if old_stmt_id and old_stmt_id != new_stmt_id:
+            _audit_log(int(old_stmt_id), 'detach_receipt', field='receipt',
+                       old=f'#{receipt_id}', note='移除关联', conn=conn)
         conn.commit()
         return jsonify({'success': True})
     finally:
@@ -9103,6 +11139,12 @@ def api_delete_receipt(receipt_id):
         return jsonify({'error': '无权删除'}), 403
     conn = get_db_connection()
     try:
+        # P2 audit: log deletion on linked statement before deleting
+        receipt = conn.execute('SELECT statement_id, amount_pln FROM partner_receipts WHERE id = ?', (receipt_id,)).fetchone()
+        if receipt and receipt['statement_id']:
+            _audit_log(int(receipt['statement_id']), 'delete_receipt', field='receipt',
+                       old=f'#{receipt_id} {receipt["amount_pln"]}',
+                       note='删除收款记录', conn=conn)
         conn.execute('DELETE FROM partner_receipts WHERE id = ?', (receipt_id,))
         conn.commit()
         return jsonify({'success': True})
@@ -13581,26 +15623,15 @@ def _compute_sales_board_data(selected_month):
     for sc in sc_rows:
         site_country_map[sc['url']] = sc['country'] or 'PL'
 
-    # Load product costs lookup (for actual cost mode), keyed by (brand_id, series_id, puff_count, flavor, warehouse_id)
-    cost_lookup = {}
+    # Load product costs lookup (for actual cost mode). The cost index is
+    # date-aware: a product can have multiple cost entries with different
+    # effective_dates (e.g. 2/28 @ 28 PLN, 3/15 @ 30 PLN). Lookup at order time
+    # picks the latest cost <= order_date so historical orders use historical
+    # costs.
+    cost_idx = None  # None when not in actual mode
     country_default_wh_ids = {}
-    country_bps_costs = {}  # (country, brand_id, series_id, puff_count) -> list of cost entries
     if profit_mode == 'actual':
-        cost_rows = conn.execute('''
-            SELECT pc.brand_id, pc.series_id, pc.puff_count, pc.flavor, pc.warehouse_id,
-                   pc.cost_price, pc.cost_currency, w.country
-            FROM product_costs pc LEFT JOIN warehouses w ON pc.warehouse_id = w.id
-        ''').fetchall()
-        for cr in cost_rows:
-            key = (cr['brand_id'], cr['series_id'], cr['puff_count'], cr['flavor'], cr['warehouse_id'])
-            cost_lookup[key] = {'price': cr['cost_price'], 'currency': cr['cost_currency']}
-            # Index by (country, brand, series, puffs) — cost-mgmt's
-            # "brand_puffs_series" match level. Series=NULL rows are stored as
-            # series_id=None and act as a generic catch-all for any series.
-            ckey = (cr['country'], cr['brand_id'], cr['series_id'], cr['puff_count'])
-            country_bps_costs.setdefault(ckey, []).append({
-                'price': cr['cost_price'], 'currency': cr['cost_currency']
-            })
+        cost_idx = _build_dated_cost_index(conn=conn)
 
         # Country -> ordered list of warehouse_ids (smallest id first), used as a
         # fallback when an order has no warehouse_id assigned (legacy NULL data).
@@ -13748,63 +15779,25 @@ def _compute_sales_board_data(selected_month):
                         if rate:
                             month_commission_base_cny += item_total * rate
 
-                    # Actual cost calculation
-                    if profit_mode == 'actual' and rate and qty > 0:
+                    # Actual cost calculation — uses date-aware lookup so that
+                    # historical orders use cost prices that were effective on
+                    # their order date (not whatever the current price is).
+                    if profit_mode == 'actual' and rate and qty > 0 and cost_idx is not None:
                         source = order['source']
+                        order_date = (order['date_created'] or '')[:10]  # YYYY-MM-DD
                         wh_id = order_wh_id
-                        pn_key = normalize_raw_name(product_name_raw)
-                        pm = product_mappings_cache.get((pn_key, source)) or product_mappings_cache.get((pn_key, '')) or product_mappings_cache.get((pn_key, None))
-                        if pm:
-                            b_id = pm['brand_id']
-                            s_id = pm['series_id']
-                            p_cnt = pm['puff_count']
-                            flav = pm['flavor']
-                        else:
-                            if not hasattr(parse_product_name, '_parsed_cache'):
-                                parse_product_name._parsed_cache = {}
-                            cache_key = product_name_raw
-                            if cache_key not in parse_product_name._parsed_cache:
-                                parse_product_name._parsed_cache[cache_key] = parse_product_name(product_name_raw, brands_cache)
-                            parsed_item = parse_product_name._parsed_cache[cache_key]
-                            b_id = None
-                            if parsed_item.get('brand'):
-                                for bc in brands_cache:
-                                    if bc['name'].upper() == parsed_item['brand'].upper():
-                                        b_id = bc['id']
-                                        break
-                            s_id = None
-                            p_cnt = parsed_item.get('puffs')
-                            flav = parsed_item.get('flavor')
-
+                        b_id, s_id, p_cnt, flav = _resolve_product_to_brand(
+                            product_name_raw, source, brands_cache, product_mappings_cache
+                        )
                         # Find cost entry matching this warehouse (priority fallback).
-                        # If the order has no warehouse_id, fall back to country defaults
-                        # rather than declaring the product unmapped.
+                        # If the order has no warehouse_id, fall back to country
+                        # defaults rather than declaring the product unmapped.
                         effective_wh_ids = [wh_id] if wh_id else country_default_wh_ids.get(order_country, [])
                         cost_entry = None
                         if b_id and effective_wh_ids:
                             for ewh in effective_wh_ids:
-                                for try_key in [
-                                    (b_id, s_id, p_cnt, flav, ewh),
-                                    (b_id, s_id, p_cnt, None, ewh),
-                                    (b_id, None, p_cnt, None, ewh),
-                                    (b_id, None, None, None, ewh),
-                                ]:
-                                    entry = cost_lookup.get(try_key)
-                                    if entry:
-                                        cost_entry = entry
-                                        break
+                                cost_entry = _cost_at_date(cost_idx, b_id, s_id, p_cnt, flav, ewh, order_date)
                                 if cost_entry:
-                                    break
-
-                        # Cross-warehouse brand+series+puffs fallback (matches
-                        # cost-mgmt's "品牌+口数+系列" view): try the exact series
-                        # first, then fall back to a generic series=NULL cost row.
-                        if not cost_entry and b_id:
-                            for try_skey in [(order_country, b_id, s_id, p_cnt),
-                                             (order_country, b_id, None, p_cnt)]:
-                                bps_candidates = country_bps_costs.get(try_skey, [])
-                                if bps_candidates:
-                                    cost_entry = bps_candidates[0]
                                     break
 
                         if cost_entry:
@@ -15245,7 +17238,14 @@ def product_costs_page():
     countries = [r['country'] for r in countries]
     warehouses = [dict(r) for r in conn.execute('SELECT * FROM warehouses WHERE is_active=1 ORDER BY country, name').fetchall()]
     conn.close()
-    return render_template('product_costs.html', countries=countries, warehouses=warehouses)
+    # Pass scope info: allowed_warehouse_ids tells JS which rows the user can
+    # edit/delete. None = unrestricted.
+    allowed_wh = _user_allowed_warehouse_ids()
+    return render_template('product_costs.html',
+                           countries=countries,
+                           warehouses=warehouses,
+                           can_edit_costs=current_user.can_edit_costs(),
+                           allowed_warehouse_ids=allowed_wh)
 
 
 @app.route('/api/product-costs/options', methods=['GET'])
@@ -15278,19 +17278,113 @@ def get_product_cost_options():
 @login_required
 @costs_view_required
 def get_product_costs():
-    """Get all product costs with brand/series/warehouse names"""
+    """Get product costs.
+
+    By default, returns the LATEST cost per (brand, series, puff, flavor,
+    warehouse) tuple — that's the price effective right now. Each row also
+    carries `history_count` so the UI can show "N 个历史价格" badge.
+
+    Pass ?include_history=1 to get every row instead — useful for the
+    "import from CSV" / "raw view" workflow.
+    """
+    include_history = request.args.get('include_history') in ('1', 'true', 'yes')
     conn = get_db_connection()
     try:
+        if include_history:
+            rows = conn.execute('''
+                SELECT pc.*, b.name as brand_name,
+                       s.name as series_name,
+                       w.name as warehouse_name, w.code as warehouse_code,
+                       1 as history_count
+                FROM product_costs pc
+                LEFT JOIN brands b ON pc.brand_id = b.id
+                LEFT JOIN series s ON pc.series_id = s.id
+                LEFT JOIN warehouses w ON pc.warehouse_id = w.id
+                ORDER BY b.name, s.name, pc.puff_count, pc.effective_date DESC
+            ''').fetchall()
+            return jsonify([dict(r) for r in rows])
+
+        # Latest per product-key (using window-function style via subquery —
+        # SQLite supports ROW_NUMBER() since 3.25, but we keep it simple).
         rows = conn.execute('''
-            SELECT pc.*, b.name as brand_name,
-                   s.name as series_name,
-                   w.name as warehouse_name, w.code as warehouse_code
-            FROM product_costs pc
-            LEFT JOIN brands b ON pc.brand_id = b.id
-            LEFT JOIN series s ON pc.series_id = s.id
-            LEFT JOIN warehouses w ON pc.warehouse_id = w.id
-            ORDER BY b.name, s.name, pc.puff_count
+            WITH ranked AS (
+                SELECT
+                    pc.*,
+                    b.name AS brand_name,
+                    s.name AS series_name,
+                    w.name AS warehouse_name, w.code AS warehouse_code,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY pc.brand_id, COALESCE(pc.series_id, 0), COALESCE(pc.puff_count, 0),
+                                     COALESCE(pc.flavor, ''), COALESCE(pc.warehouse_id, 0)
+                        ORDER BY pc.effective_date DESC, pc.id DESC
+                    ) AS rn,
+                    COUNT(*) OVER (
+                        PARTITION BY pc.brand_id, COALESCE(pc.series_id, 0), COALESCE(pc.puff_count, 0),
+                                     COALESCE(pc.flavor, ''), COALESCE(pc.warehouse_id, 0)
+                    ) AS history_count
+                FROM product_costs pc
+                LEFT JOIN brands b ON pc.brand_id = b.id
+                LEFT JOIN series s ON pc.series_id = s.id
+                LEFT JOIN warehouses w ON pc.warehouse_id = w.id
+            )
+            SELECT * FROM ranked WHERE rn = 1
+            ORDER BY brand_name, series_name, puff_count
         ''').fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d.pop('rn', None)
+            result.append(d)
+        return jsonify(result)
+    finally:
+        conn.close()
+
+
+@app.route('/api/product-costs/history', methods=['GET'])
+@login_required
+@costs_view_required
+def get_product_cost_history():
+    """List ALL price versions for a single product (brand+series+puffs+flavor+warehouse).
+
+    Query params: brand_id (required), series_id, puff_count, flavor, warehouse_id (required)
+    Returns rows sorted by effective_date DESC.
+    """
+    brand_id = request.args.get('brand_id', type=int)
+    warehouse_id = request.args.get('warehouse_id', type=int)
+    if not brand_id or not warehouse_id:
+        return jsonify({'error': 'brand_id 和 warehouse_id 必填'}), 400
+
+    series_id = request.args.get('series_id', type=int)
+    puff_count = request.args.get('puff_count', type=int)
+    flavor = request.args.get('flavor', '').strip() or None
+
+    conn = get_db_connection()
+    try:
+        sql = '''SELECT pc.*, b.name as brand_name, s.name as series_name,
+                        w.name as warehouse_name, w.code as warehouse_code
+                 FROM product_costs pc
+                 LEFT JOIN brands b ON pc.brand_id = b.id
+                 LEFT JOIN series s ON pc.series_id = s.id
+                 LEFT JOIN warehouses w ON pc.warehouse_id = w.id
+                 WHERE pc.brand_id = ? AND pc.warehouse_id = ?'''
+        params = [brand_id, warehouse_id]
+        if series_id is None:
+            sql += ' AND pc.series_id IS NULL'
+        else:
+            sql += ' AND pc.series_id = ?'
+            params.append(series_id)
+        if puff_count is None:
+            sql += ' AND pc.puff_count IS NULL'
+        else:
+            sql += ' AND pc.puff_count = ?'
+            params.append(puff_count)
+        if flavor is None:
+            sql += " AND (pc.flavor IS NULL OR pc.flavor = '')"
+        else:
+            sql += ' AND pc.flavor = ?'
+            params.append(flavor)
+        sql += ' ORDER BY pc.effective_date DESC, pc.id DESC'
+        rows = conn.execute(sql, params).fetchall()
         return jsonify([dict(r) for r in rows])
     finally:
         conn.close()
@@ -15298,9 +17392,15 @@ def get_product_costs():
 
 @app.route('/api/product-costs', methods=['POST'])
 @login_required
-@admin_required
+@costs_edit_required
 def create_product_cost():
-    """Create a new product cost entry"""
+    """Create a new product cost entry.
+
+    Multiple rows for the same (brand, series, puff, flavor, warehouse) tuple
+    are allowed AS LONG AS they have different effective_date — that's how a
+    cost change over time is recorded (e.g. Feb @ 28 PLN, Mar @ 30 PLN).
+    Same product + same date → conflict (uniqueness violation).
+    """
     data = request.get_json()
     brand_id = data.get('brand_id')
     series_id = data.get('series_id') or None
@@ -15315,16 +17415,29 @@ def create_product_cost():
     if not brand_id or cost_price is None or not warehouse_id:
         return jsonify({'error': '品牌、仓库和成本价为必填项'}), 400
 
+    # Scope check — partner-bound users may only edit their own country's
+    # warehouses. Super admin and admin-role users bypass this.
+    if not _check_warehouse_scope(warehouse_id):
+        return jsonify({'error': '无权管理此仓库的成本（仅限您所属合伙人国家的仓库）',
+                        'permission': 'warehouse_scope'}), 403
+
     conn = get_db_connection()
     try:
         # Get country from warehouse for backward compat
         wh = conn.execute('SELECT country FROM warehouses WHERE id=?', (warehouse_id,)).fetchone()
         country = wh['country'] if wh else 'PL'
-        conn.execute('''
-            INSERT INTO product_costs
-            (brand_id, series_id, puff_count, flavor, country, warehouse_id, cost_price, cost_currency, effective_date, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (brand_id, series_id, puff_count, flavor, country, warehouse_id, cost_price, cost_currency, effective_date, notes))
+        try:
+            conn.execute('''
+                INSERT INTO product_costs
+                (brand_id, series_id, puff_count, flavor, country, warehouse_id, cost_price, cost_currency, effective_date, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (brand_id, series_id, puff_count, flavor, country, warehouse_id, cost_price, cost_currency, effective_date, notes))
+        except sqlite3.IntegrityError:
+            # Same product + same effective_date already exists. Tell the user
+            # to either pick a different date or edit the existing row.
+            return jsonify({
+                'error': '该产品在此生效日期已有成本记录，如需修改请编辑现有记录，或选择不同的生效日期来新增一个版本。'
+            }), 409
         conn.commit()
         return jsonify({'success': True, 'id': conn.execute('SELECT last_insert_rowid()').fetchone()[0]})
     except Exception as e:
@@ -15335,17 +17448,27 @@ def create_product_cost():
 
 @app.route('/api/product-costs/<int:cost_id>', methods=['PUT'])
 @login_required
-@admin_required
+@costs_edit_required
 def update_product_cost(cost_id):
     """Update a product cost entry"""
     data = request.get_json()
     conn = get_db_connection()
     try:
-        existing = conn.execute('SELECT id FROM product_costs WHERE id = ?', (cost_id,)).fetchone()
+        existing = conn.execute('SELECT id, warehouse_id FROM product_costs WHERE id = ?', (cost_id,)).fetchone()
         if not existing:
             return jsonify({'error': '记录不存在'}), 404
 
+        # Scope check on BOTH the existing warehouse (otherwise a partner could
+        # "edit" foreign rows) AND the target warehouse (otherwise they could
+        # move a row out of their scope).
+        if not _check_warehouse_scope(existing['warehouse_id']):
+            return jsonify({'error': '无权修改此仓库的成本',
+                            'permission': 'warehouse_scope'}), 403
+
         wh_id = data.get('warehouse_id')
+        if wh_id and not _check_warehouse_scope(wh_id):
+            return jsonify({'error': '无权将成本移到该仓库',
+                            'permission': 'warehouse_scope'}), 403
         wh = conn.execute('SELECT country FROM warehouses WHERE id=?', (wh_id,)).fetchone() if wh_id else None
         country = wh['country'] if wh else data.get('country', 'PL')
         conn.execute('''
@@ -15371,11 +17494,17 @@ def update_product_cost(cost_id):
 
 @app.route('/api/product-costs/<int:cost_id>', methods=['DELETE'])
 @login_required
-@admin_required
+@costs_edit_required
 def delete_product_cost(cost_id):
     """Delete a product cost entry"""
     conn = get_db_connection()
     try:
+        existing = conn.execute('SELECT warehouse_id FROM product_costs WHERE id = ?', (cost_id,)).fetchone()
+        if not existing:
+            return jsonify({'error': '记录不存在'}), 404
+        if not _check_warehouse_scope(existing['warehouse_id']):
+            return jsonify({'error': '无权删除此仓库的成本',
+                            'permission': 'warehouse_scope'}), 403
         conn.execute('DELETE FROM product_costs WHERE id = ?', (cost_id,))
         conn.commit()
         return jsonify({'success': True})

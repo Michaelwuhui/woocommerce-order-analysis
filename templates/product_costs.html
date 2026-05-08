@@ -17,9 +17,15 @@
             <button class="btn btn-sm btn-outline-warning" onclick="showUnmapped()">
                 <i class="bi bi-exclamation-triangle me-1"></i>未映射产品
             </button>
+            {% if can_edit_costs %}
             <button class="btn btn-sm btn-primary" onclick="openAddModal()">
                 <i class="bi bi-plus-lg me-1"></i>添加成本
             </button>
+            {% else %}
+            <span class="badge" style="background:rgba(148,163,184,0.25);color:#cbd5e1;padding:6px 12px;" title="您当前为只读权限，请联系超级管理员授予「成本管理 · 编辑」权限">
+                <i class="bi bi-eye me-1"></i>只读模式
+            </span>
+            {% endif %}
         </div>
     </div>
 
@@ -162,6 +168,73 @@
             <div class="modal-footer border-secondary">
                 <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">取消</button>
                 <button type="button" class="btn btn-sm btn-primary" onclick="saveCost()">保存</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Price History Modal -->
+<div class="modal fade" id="histModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content text-light" style="background-color: var(--bg-card);">
+            <div class="modal-header border-secondary">
+                <h5 class="modal-title">
+                    <i class="bi bi-clock-history me-2"></i>价格历史 ·
+                    <span id="histProductTitle" class="text-info"></span>
+                    <span class="text-white-50 small ms-2">@ <span id="histWarehouse"></span></span>
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-info py-2 small mb-3" style="background:rgba(13,202,240,0.08);border-color:rgba(13,202,240,0.2);">
+                    <i class="bi bi-info-circle me-1"></i>同一产品可以有多个不同生效日期的价格版本。系统会根据订单日期自动选用对应时段有效的价格——例如 2/28 的进价 28 元，3/15 涨到 30 元，那 3/14 的订单按 28 算，3/16 之后的按 30 算。
+                </div>
+                <h6 class="text-white-50 small mb-2"><i class="bi bi-list-ul me-1"></i>历史版本（最新在最上）</h6>
+                <table class="table table-dark table-sm mb-3">
+                    <thead><tr>
+                        <th>生效日期</th>
+                        <th class="text-end">成本价</th>
+                        <th>币种</th>
+                        <th>备注</th>
+                        <th class="text-end">操作</th>
+                    </tr></thead>
+                    <tbody id="histTableBody"></tbody>
+                </table>
+
+                {% if can_edit_costs %}
+                <hr class="border-secondary">
+                <h6 class="text-white-50 small mb-2"><i class="bi bi-plus-circle me-1"></i>新增价格版本</h6>
+                <div class="row g-2">
+                    <div class="col-md-3">
+                        <label class="form-label small text-white-50 mb-1">生效日期 *</label>
+                        <input type="date" id="histNewDate" class="form-control form-control-sm bg-dark text-white border-secondary">
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label small text-white-50 mb-1">成本价 *</label>
+                        <input type="number" step="0.01" id="histNewPrice" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="如 30.00">
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label small text-white-50 mb-1">币种</label>
+                        <select id="histNewCurrency" class="form-select form-select-sm bg-dark text-white border-secondary">
+                            <option value="PLN">PLN</option>
+                            <option value="AED">AED</option>
+                            <option value="AUD">AUD</option>
+                            <option value="GBP">GBP</option>
+                            <option value="CNY">CNY</option>
+                        </select>
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label small text-white-50 mb-1">备注</label>
+                        <input type="text" id="histNewNotes" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="如：涨价 / 第二批进货">
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+            <div class="modal-footer border-secondary">
+                <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">关闭</button>
+                {% if can_edit_costs %}
+                <button type="button" class="btn btn-sm btn-primary" onclick="addCostVersion()"><i class="bi bi-check-lg me-1"></i>添加新版本</button>
+                {% endif %}
             </div>
         </div>
     </div>
@@ -313,12 +386,44 @@ let brandsData = [];
 let seriesData = {};
 let productCombos = [];
 let warehousesData = {{ warehouses | tojson }};
+const CAN_EDIT_COSTS = {{ 'true' if can_edit_costs else 'false' }};
+// null = unrestricted; array = whitelist of warehouse_ids the user can edit/delete
+const ALLOWED_WAREHOUSE_IDS = {{ allowed_warehouse_ids | tojson if allowed_warehouse_ids is not none else 'null' }};
+
+function canEditWarehouse(whId) {
+    if (!CAN_EDIT_COSTS) return false;
+    if (ALLOWED_WAREHOUSE_IDS === null) return true;
+    return ALLOWED_WAREHOUSE_IDS.includes(parseInt(whId));
+}
+function isWarehouseInScope(whId) {
+    // Used for filtering visible costs: super-admin sees all, others scoped.
+    if (ALLOWED_WAREHOUSE_IDS === null) return true;
+    return ALLOWED_WAREHOUSE_IDS.includes(parseInt(whId));
+}
 
 function saveCountryFilter() {
     localStorage.setItem('productCostsCountry', document.getElementById('countryFilter').value);
 }
 
 document.addEventListener('DOMContentLoaded', function() {
+    // For partner-scoped users, filter the country dropdown to ONLY their
+    // allowed countries. Computed from ALLOWED_WAREHOUSE_IDS via warehousesData.
+    if (ALLOWED_WAREHOUSE_IDS !== null) {
+        var allowedCountries = new Set(
+            warehousesData
+                .filter(function(w) { return ALLOWED_WAREHOUSE_IDS.includes(parseInt(w.id)); })
+                .map(function(w) { return w.country; })
+        );
+        var sel = document.getElementById('countryFilter');
+        if (sel) {
+            // Drop any option that isn't allowed
+            Array.from(sel.options).forEach(function(opt) {
+                if (!allowedCountries.has(opt.value)) opt.remove();
+            });
+            // If nothing left, leave empty (page will show empty state)
+        }
+    }
+
     var saved = localStorage.getItem('productCostsCountry');
     if (saved) {
         var sel = document.getElementById('countryFilter');
@@ -528,26 +633,39 @@ async function loadCosts() {
 function renderCosts() {
     const tbody = document.getElementById('costsTableBody');
     if (allCosts.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-4">暂无数据，点击右上角"添加成本"开始录入</td></tr>';
+        const emptyMsg = CAN_EDIT_COSTS
+            ? '暂无数据，点击右上角"添加成本"开始录入'
+            : '暂无数据（您当前为只读权限）';
+        tbody.innerHTML = `<tr><td colspan="10" class="text-center text-muted py-4">${emptyMsg}</td></tr>`;
         return;
     }
-    tbody.innerHTML = allCosts.map(c => `
+    tbody.innerHTML = allCosts.map(c => {
+        const histCount = c.history_count || 1;
+        const histBadge = histCount > 1
+            ? `<span class="badge bg-warning bg-opacity-25 text-warning ms-1" title="该产品有 ${histCount} 个历史价格版本">×${histCount}</span>`
+            : '';
+        // Edit/delete buttons require BOTH global edit permission AND that the
+        // row's warehouse is in user's scope (e.g. PL partner can't edit AU rows).
+        const canEditRow = canEditWarehouse(c.warehouse_id);
+        const writeBtns = canEditRow ? `
+                <button class="btn btn-sm btn-outline-info me-1" onclick="editCost(${c.id})" title="编辑此条"><i class="bi bi-pencil"></i></button>
+                <button class="btn btn-sm btn-outline-danger" onclick="deleteCost(${c.id})" title="删除此条"><i class="bi bi-trash"></i></button>` : '';
+        return `
         <tr>
             <td><span class="badge bg-primary bg-opacity-25 text-primary">${c.brand_name || '-'}</span></td>
             <td>${c.series_name || '<span class="text-muted">不限</span>'}</td>
             <td>${c.puff_count ? c.puff_count.toLocaleString() : '<span class="text-muted">不限</span>'}</td>
             <td>${c.flavor || '<span class="text-muted">不限</span>'}</td>
             <td>${c.warehouse_name || c.country}</td>
-            <td class="text-end fw-bold text-info">${parseFloat(c.cost_price).toFixed(2)}</td>
+            <td class="text-end fw-bold text-info">${parseFloat(c.cost_price).toFixed(2)}${histBadge}</td>
             <td>${c.cost_currency}</td>
             <td>${c.effective_date || '-'}</td>
             <td class="text-muted small">${c.notes || ''}</td>
             <td class="text-end">
-                <button class="btn btn-sm btn-outline-info btn-sm me-1" onclick="editCost(${c.id})"><i class="bi bi-pencil"></i></button>
-                <button class="btn btn-sm btn-outline-danger btn-sm" onclick="deleteCost(${c.id})"><i class="bi bi-trash"></i></button>
+                <button class="btn btn-sm btn-outline-warning me-1" onclick="showCostHistory(${c.id})" title="${CAN_EDIT_COSTS ? '价格历史 / 新增价格版本' : '查看价格历史'}"><i class="bi bi-clock-history"></i></button>${writeBtns}
             </td>
         </tr>
-    `).join('');
+    `;}).join('');
 }
 
 function updateSummary() {
@@ -559,6 +677,10 @@ function updateSummary() {
 function refreshWarehouseSelect(country, selectedId) {
     var whSel = document.getElementById('costWarehouse');
     var filtered = warehousesData.filter(w => w.country === country);
+    // For partner-scoped users, drop warehouses outside their allowed set
+    if (ALLOWED_WAREHOUSE_IDS !== null) {
+        filtered = filtered.filter(w => ALLOWED_WAREHOUSE_IDS.includes(parseInt(w.id)));
+    }
     whSel.innerHTML = filtered.map(w =>
         '<option value="' + w.id + '" data-currency="' + w.default_currency + '">' + w.name + '</option>'
     ).join('');
@@ -568,7 +690,16 @@ function refreshWarehouseSelect(country, selectedId) {
     if (selOpt) document.getElementById('costCurrency').value = selOpt.dataset.currency || 'PLN';
 }
 
+function _ensureCanEdit() {
+    if (!CAN_EDIT_COSTS) {
+        alert('您当前为只读权限，请联系超级管理员授予「成本管理 · 编辑」权限');
+        return false;
+    }
+    return true;
+}
+
 function openAddModal() {
+    if (!_ensureCanEdit()) return;
     document.getElementById('editCostId').value = '';
     document.getElementById('costModalTitle').innerHTML = '<i class="bi bi-plus-circle me-2"></i>添加产品成本';
     document.getElementById('costPuffs').value = '';
@@ -585,6 +716,7 @@ function openAddModal() {
 }
 
 async function editCost(id) {
+    if (!_ensureCanEdit()) return;
     const c = allCosts.find(x => x.id === id);
     if (!c) return;
     document.getElementById('editCostId').value = id;
@@ -636,11 +768,148 @@ async function saveCost() {
 }
 
 async function deleteCost(id) {
+    if (!_ensureCanEdit()) return;
     if (!confirm('确定删除此成本记录？')) return;
     try {
         await fetch(`/api/product-costs/${id}`, {method:'DELETE'});
         loadCosts();
     } catch(e) { alert('删除失败'); }
+}
+
+// ============================================================
+// PRICE HISTORY — same product, multiple effective dates.
+// E.g. 2/28 @ 28元, 3/15 @ 30元: orders before 3/15 use 28, after use 30.
+// ============================================================
+let currentHistContext = null;  // { brand_id, series_id, puff_count, flavor, warehouse_id }
+
+async function showCostHistory(currentRowId) {
+    const c = allCosts.find(x => x.id === currentRowId);
+    if (!c) return;
+    currentHistContext = {
+        brand_id: c.brand_id,
+        series_id: c.series_id || null,
+        puff_count: c.puff_count || null,
+        flavor: c.flavor || null,
+        warehouse_id: c.warehouse_id,
+        brand_name: c.brand_name,
+        series_name: c.series_name,
+        warehouse_name: c.warehouse_name,
+        cost_currency: c.cost_currency,
+    };
+    const params = new URLSearchParams();
+    params.set('brand_id', c.brand_id);
+    params.set('warehouse_id', c.warehouse_id);
+    if (c.series_id) params.set('series_id', c.series_id);
+    if (c.puff_count) params.set('puff_count', c.puff_count);
+    if (c.flavor) params.set('flavor', c.flavor);
+    try {
+        const res = await fetch(`/api/product-costs/history?${params}`);
+        const rows = await res.json();
+        renderCostHistoryModal(rows);
+    } catch(e) { alert('加载历史失败: ' + e.message); }
+}
+
+function renderCostHistoryModal(rows) {
+    const ctx = currentHistContext;
+    const titleParts = [ctx.brand_name];
+    if (ctx.series_name) titleParts.push(ctx.series_name);
+    if (ctx.puff_count) titleParts.push(ctx.puff_count + ' 口');
+    if (ctx.flavor) titleParts.push(ctx.flavor);
+    document.getElementById('histProductTitle').textContent = titleParts.join(' / ');
+    document.getElementById('histWarehouse').textContent = ctx.warehouse_name || '-';
+
+    const tbody = document.getElementById('histTableBody');
+    if (rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">暂无价格记录</td></tr>';
+    } else {
+        tbody.innerHTML = rows.map((r, idx) => {
+            const isLatest = idx === 0;
+            const badge = isLatest ? '<span class="badge bg-success bg-opacity-25 text-success ms-1">当前</span>' : '';
+            const writeBtns = CAN_EDIT_COSTS ? `
+                    <button class="btn btn-sm btn-outline-info me-1" onclick="editCost(${r.id}); bootstrap.Modal.getInstance(document.getElementById('histModal')).hide();"><i class="bi bi-pencil"></i></button>
+                    <button class="btn btn-sm btn-outline-danger" onclick="deleteHistRow(${r.id})"><i class="bi bi-trash"></i></button>` : '<span class="text-muted small">只读</span>';
+            return `<tr>
+                <td>${r.effective_date}${badge}</td>
+                <td class="text-end fw-bold ${isLatest ? 'text-info' : 'text-muted'}">${parseFloat(r.cost_price).toFixed(2)}</td>
+                <td>${r.cost_currency}</td>
+                <td class="text-muted small">${r.notes || ''}</td>
+                <td class="text-end">${writeBtns}</td>
+            </tr>`;
+        }).join('');
+    }
+
+    // Pre-fill the "add new version" form (only present when can_edit_costs is true)
+    const histDateEl = document.getElementById('histNewDate');
+    if (histDateEl) {
+        histDateEl.value = new Date().toISOString().slice(0, 10);
+        document.getElementById('histNewPrice').value = '';
+        document.getElementById('histNewNotes').value = '';
+        document.getElementById('histNewCurrency').value = ctx.cost_currency || 'PLN';
+    }
+
+    new bootstrap.Modal(document.getElementById('histModal')).show();
+}
+
+async function deleteHistRow(id) {
+    if (!confirm('删除该历史价格？')) return;
+    try {
+        await fetch(`/api/product-costs/${id}`, {method:'DELETE'});
+        // reload history
+        showCostHistory(id);  // id is the row to lookup — will fail since deleted
+        // safer: just reload history with current context
+        if (currentHistContext) {
+            const params = new URLSearchParams();
+            params.set('brand_id', currentHistContext.brand_id);
+            params.set('warehouse_id', currentHistContext.warehouse_id);
+            if (currentHistContext.series_id) params.set('series_id', currentHistContext.series_id);
+            if (currentHistContext.puff_count) params.set('puff_count', currentHistContext.puff_count);
+            if (currentHistContext.flavor) params.set('flavor', currentHistContext.flavor);
+            const res = await fetch(`/api/product-costs/history?${params}`);
+            renderCostHistoryModal(await res.json());
+        }
+        loadCosts();
+    } catch(e) { alert('删除失败: ' + e.message); }
+}
+
+async function addCostVersion() {
+    if (!_ensureCanEdit()) return;
+    const ctx = currentHistContext;
+    if (!ctx) return;
+    const date = document.getElementById('histNewDate').value;
+    const price = parseFloat(document.getElementById('histNewPrice').value);
+    const currency = document.getElementById('histNewCurrency').value;
+    const notes = document.getElementById('histNewNotes').value.trim();
+    if (!date || isNaN(price)) { alert('请填写日期和成本价'); return; }
+    const data = {
+        brand_id: ctx.brand_id,
+        series_id: ctx.series_id || null,
+        puff_count: ctx.puff_count || null,
+        flavor: ctx.flavor || null,
+        warehouse_id: ctx.warehouse_id,
+        cost_price: price,
+        cost_currency: currency,
+        effective_date: date,
+        notes: notes
+    };
+    try {
+        const res = await fetch('/api/product-costs', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(data)
+        });
+        const result = await res.json();
+        if (result.error) { alert(result.error); return; }
+        // Reload history
+        const params = new URLSearchParams();
+        params.set('brand_id', ctx.brand_id);
+        params.set('warehouse_id', ctx.warehouse_id);
+        if (ctx.series_id) params.set('series_id', ctx.series_id);
+        if (ctx.puff_count) params.set('puff_count', ctx.puff_count);
+        if (ctx.flavor) params.set('flavor', ctx.flavor);
+        const histRes = await fetch(`/api/product-costs/history?${params}`);
+        renderCostHistoryModal(await histRes.json());
+        loadCosts();  // refresh main list to show new latest
+    } catch(e) { alert('添加失败: ' + e.message); }
 }
 
 async function showUnmapped() {

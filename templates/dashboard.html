@@ -165,6 +165,9 @@
                 <div class="card-header">
                     <h5><i class="bi bi-bar-chart-line me-2"></i>
                         {% if trend_type == 'daily' %}日销售趋势{% else %}月度销售趋势{% endif %}
+                        <span class="badge ms-2"
+                              style="background:rgba(240,147,251,0.18); color:#f093fb; font-size:0.65em; vertical-align:middle;"
+                              title="GMV = Gross Merchandise Value，订单总成交额（含运费，未扣退款/未送达）">GMV</span>
                         {% if source_filter %}<small class="text-muted ms-2">({{
                             source_filter.replace('https://www.',
                             '').replace('https://', '') }})</small>{% endif %}
@@ -360,7 +363,7 @@
                 borderRadius: trendType === 'daily' ? 4 : 8,
                 yAxisID: 'y'
             }, {
-                label: '销售额',
+                label: '销售额 (GMV)',
                 data: trendData.map(function (d) { return d.revenue; }),
                 type: 'line',
                 borderColor: '#f093fb',
@@ -381,7 +384,7 @@
                         label: function (context) {
                             var label = context.dataset.label || '';
                             var value = context.parsed.y;
-                            if (label === '销售额') {
+                            if (label === '销售额 (GMV)') {
                                 var cnyValue = value * cnyRate;
                                 return label + ': ' + value.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ' (≈ ¥' + cnyValue.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ')';
                             }
@@ -425,7 +428,7 @@
                     position: 'right',
                     grid: { drawOnChartArea: false },
                     ticks: { color: '#aaa' },
-                    title: { display: true, text: '销售额', color: '#aaa' }
+                    title: { display: true, text: '销售额 (GMV)', color: '#aaa' }
                 }
             }
         }

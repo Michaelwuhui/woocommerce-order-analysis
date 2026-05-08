@@ -196,7 +196,13 @@
                         <div class="form-check mt-2">
                             <input class="form-check-input" type="checkbox" id="editCanViewCosts">
                             <label class="form-check-label text-white-50" for="editCanViewCosts">
-                                <i class="bi bi-calculator me-1"></i>成本管理 · 查看 <small class="text-muted">（可访问产品成本管理页面；编辑成本仍需管理员）</small>
+                                <i class="bi bi-calculator me-1"></i>成本管理 · 查看 <small class="text-muted">（可访问产品成本管理页面）</small>
+                            </label>
+                        </div>
+                        <div class="form-check mt-1 ms-4">
+                            <input class="form-check-input" type="checkbox" id="editCanEditCosts">
+                            <label class="form-check-label text-white-50" for="editCanEditCosts">
+                                <i class="bi bi-pencil-square me-1"></i>成本管理 · 编辑 <small class="text-muted">（可新增/修改/删除产品成本及历史价格版本）</small>
                             </label>
                         </div>
                         <div class="form-check mt-2" id="wrapCanManageUsers">
@@ -280,7 +286,7 @@
             } else if (btn.classList.contains('btn-edit')) {
                 const user = window._usersData && window._usersData[userId];
                 if (user) {
-                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_view_costs || 0);
+                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0);
                 }
             } else if (btn.classList.contains('btn-delete')) {
                 deleteUser(userId);
@@ -377,7 +383,7 @@
         });
 
         // Edit User
-        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs) {
+        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs) {
             document.getElementById('editUserId').value = id;
             document.getElementById('editUsername').value = username;
             document.getElementById('editName').value = name;
@@ -394,11 +400,14 @@
             if (recEl) recEl.checked = can_edit_reconciliation == 1;
             var costsEl = document.getElementById('editCanViewCosts');
             if (costsEl) costsEl.checked = can_view_costs == 1;
+            var costsEditEl = document.getElementById('editCanEditCosts');
+            if (costsEditEl) costsEditEl.checked = can_edit_costs == 1;
             var cmEl = document.getElementById('editCanManageUsers');
             if (cmEl) cmEl.checked = can_manage_users == 1;
             document.getElementById('editPassword').value = '';
             // Enforce: edit implies view. If view is unchecked, disable edit.
             updateReconEditState();
+            updateCostsEditState();
             bootstrap.Modal.getOrCreateInstance(document.getElementById('editUserModal')).show();
         };
 
@@ -414,6 +423,18 @@
                 eEl.disabled = false;
             }
         }
+        // Same gate for costs: editing requires viewing
+        function updateCostsEditState() {
+            var vEl = document.getElementById('editCanViewCosts');
+            var eEl = document.getElementById('editCanEditCosts');
+            if (!vEl || !eEl) return;
+            if (!vEl.checked) {
+                eEl.checked = false;
+                eEl.disabled = true;
+            } else {
+                eEl.disabled = false;
+            }
+        }
         (function wireReconPerms() {
             var vEl = document.getElementById('editCanViewReconciliation');
             var eEl = document.getElementById('editCanEditReconciliation');
@@ -421,6 +442,13 @@
             if (eEl) eEl.addEventListener('change', function () {
                 // If enabling edit, auto-enable view
                 if (eEl.checked && vEl && !vEl.checked) vEl.checked = true;
+            });
+            // Costs: same wiring
+            var cvEl = document.getElementById('editCanViewCosts');
+            var ceEl = document.getElementById('editCanEditCosts');
+            if (cvEl) cvEl.addEventListener('change', updateCostsEditState);
+            if (ceEl) ceEl.addEventListener('change', function () {
+                if (ceEl.checked && cvEl && !cvEl.checked) cvEl.checked = true;
             });
         })();
 
@@ -441,6 +469,7 @@
                     can_view_reconciliation: (document.getElementById('editCanViewReconciliation') || {}).checked ? 1 : 0,
                     can_edit_reconciliation: (document.getElementById('editCanEditReconciliation') || {}).checked ? 1 : 0,
                     can_view_costs: (document.getElementById('editCanViewCosts') || {}).checked ? 1 : 0,
+                    can_edit_costs: (document.getElementById('editCanEditCosts') || {}).checked ? 1 : 0,
                     can_manage_users: (document.getElementById('editCanManageUsers') || {}).checked ? 1 : 0
                 })
             })
