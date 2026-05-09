@@ -1160,27 +1160,72 @@ def dashboard():
     # Trend data based on filter - daily for single month, monthly for longer periods
     trend_type = 'daily' if quick_date in ['this_month', 'last_month'] else 'monthly'
     
-    if trend_type == 'daily':
-        # Daily trend for this_month or last_month
-        trend_data_raw = conn.execute(f'''
-            SELECT strftime('%Y-%m-%d', date_created) as period, 
-                   COUNT(*) as orders,
-                   SUM(total) as revenue
-            FROM orders {date_condition} AND status NOT IN ('checkout-draft', 'trash')
-            GROUP BY period
-            ORDER BY period
-        ''', params).fetchall()
-    else:
-        # Monthly trend - use same date_condition or default
-        trend_data_raw = conn.execute(f'''
-            SELECT strftime('%Y-%m', date_created) as period, 
-                   COUNT(*) as orders,
-                   SUM(total) as revenue
-            FROM orders {date_condition} AND status NOT IN ('checkout-draft', 'trash')
-            GROUP BY period
-            ORDER BY period
-        ''', params).fetchall()
-    trend_data = [dict(row) for row in trend_data_raw]
+    # Trend data — historically SUM(total) mixed currencies (e.g. AUD+PLN)
+    # producing a meaningless aggregate. Now we GROUP BY (period, currency)
+    # and convert each bucket to CNY using the period's per-currency rate,
+    # then sum to a single CNY number — same approach /monthly uses.
+    success_cond = _revenue_status_cond()
+    period_fmt = '%Y-%m-%d' if trend_type == 'daily' else '%Y-%m'
+    trend_data_raw = conn.execute(f'''
+        SELECT strftime('{period_fmt}', date_created) as period,
+               COALESCE(currency, '') as currency,
+               COUNT(*) as orders,
+               COALESCE(SUM(total), 0) as revenue,
+               COALESCE(SUM(CASE WHEN {success_cond} THEN total ELSE 0 END), 0)
+                 - COALESCE(SUM(CASE WHEN {success_cond} THEN shipping_total ELSE 0 END), 0)
+                 - COALESCE(SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1
+                                     THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END), 0) as net,
+               SUM(CASE WHEN {success_cond} THEN 1 ELSE 0 END) as success_orders
+        FROM orders {date_condition} AND status NOT IN ('checkout-draft', 'trash')
+        GROUP BY period, currency
+        ORDER BY period
+    ''', params).fetchall()
+
+    # Aggregate to CNY per period using each currency's month-specific rate.
+    # Per-currency raw amounts are also kept for tooltip drill-down.
+    _trend_periods = {}
+    _rate_cache = {}
+    def _rate_for(curr, period):
+        ym = period[:7] if period else None
+        key = (curr, ym)
+        if key not in _rate_cache:
+            r, _ = get_cny_rate(curr, ym) if ym else (None, None)
+            _rate_cache[key] = r
+        return _rate_cache[key]
+
+    for r in trend_data_raw:
+        p = r['period']
+        rec = _trend_periods.get(p)
+        if rec is None:
+            rec = {
+                'period': p,
+                'orders': 0,
+                'success_orders': 0,
+                'revenue_cny': 0.0,
+                'net_cny': 0.0,
+                'by_currency': {},
+            }
+            _trend_periods[p] = rec
+        rec['orders'] += int(r['orders'] or 0)
+        rec['success_orders'] += int(r['success_orders'] or 0)
+        cur = r['currency'] or '-'
+        rate = _rate_for(cur, p)
+        rec['by_currency'][cur] = {
+            'revenue': float(r['revenue'] or 0),
+            'net': float(r['net'] or 0),
+            'rate': rate,
+        }
+        if rate:
+            rec['revenue_cny'] += float(r['revenue'] or 0) * rate
+            rec['net_cny']     += float(r['net'] or 0) * rate
+    trend_data = sorted(_trend_periods.values(), key=lambda d: d['period'])
+    for rec in trend_data:
+        rec['revenue_cny'] = round(rec['revenue_cny'], 2)
+        rec['net_cny']     = round(rec['net_cny'], 2)
+        # Back-compat: keep `revenue` field — mixed-currency value reserved
+        # ONLY for legacy callers. New chart code MUST use revenue_cny / net_cny.
+        rec['revenue'] = round(sum(c['revenue'] for c in rec['by_currency'].values()), 2)
+        rec['net']     = round(sum(c['net']     for c in rec['by_currency'].values()), 2)
     
     # Get site managers mapping
     sites = conn.execute('SELECT url, manager FROM sites').fetchall()
@@ -8725,13 +8770,18 @@ def _calc_partner_net_sales(partner_id, year, month):
     }
 
 
-def _calc_partner_recon_detail(partner_id, year, month):
+def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manager_filter=None):
     """Comprehensive monthly aggregation for the partner reconciliation drill-down.
 
     Returns the same numbers as _calc_partner_net_sales (so existing callers stay
     consistent) plus per-status breakdown, per-site breakdown, per-product
     breakdown using DATE-AWARE actual product costs. Everything is in the
     partner's native currency unless explicitly suffixed.
+
+    Optional filters (used by 产品明细 tab to slice by site or manager):
+      site_filter    — single site URL; only that site's orders contribute
+      manager_filter — manager name; only sites with that manager contribute
+    Both are AND-applied. None means no filter.
     """
     conn = get_db_connection()
     try:
@@ -8750,6 +8800,13 @@ def _calc_partner_recon_detail(partner_id, year, month):
             JOIN sites s ON s.id = ps.site_id
             WHERE ps.partner_id = ?
         ''', (partner_id,)).fetchall()
+        # Apply optional site / manager filters BEFORE building site_urls.
+        # Both checks done on the partner-bound subset, so users can never
+        # see data for sites outside their partner scope.
+        if site_filter:
+            sites = [s for s in sites if s['url'] == site_filter]
+        if manager_filter:
+            sites = [s for s in sites if (s['manager'] or '') == manager_filter]
         if not sites:
             return _empty_recon_detail(partner, currency, year, month)
 
@@ -8918,6 +8975,18 @@ def _calc_partner_recon_detail(partner_id, year, month):
         order_country = site_meta.get(url, {}).get('country') or 'PL'
         order_wh_id = o['warehouse_id']
 
+        # SHIPPING ALLOCATION (per item): split this order's shipping_total
+        # across line items by quantity. Industry standard for product-margin
+        # analysis: shipping correlates with package size, which correlates
+        # with item count. So a 25 PLN shipping order with 3 units → 8.33/unit.
+        # The product detail tab uses this to compute "true margin" (excluding
+        # shipping cost), helping the partner make product-selection decisions.
+        order_total_qty = 0
+        for it in items:
+            order_total_qty += int(it.get('quantity', 0) or 0)
+        order_ship_total = float(o['shipping_total'] or 0)
+        per_unit_shipping = (order_ship_total / order_total_qty) if order_total_qty > 0 else 0.0
+
         for item in items:
             qty = int(item.get('quantity', 0) or 0)
             if qty <= 0:
@@ -8938,23 +9007,29 @@ def _calc_partner_recon_detail(partner_id, year, month):
                     if cost_entry:
                         break
 
-            # Determine cost in partner's currency
+            # Determine cost in partner's currency.
+            # POLICY (rolled back from v24/v25): if a product is unmapped
+            # (not in product_costs) or currency conversion fails, the line
+            # contributes 0 to actual_cost. This intentionally inflates the
+            # displayed margin% so the team is forced to fill in real costs
+            # — i.e. it's a forcing function for cost data quality, NOT an
+            # accidental mis-estimate. The "未匹配产品" warning continues to
+            # flag the affected rows.
             line_cost_partner_curr = None
             if cost_entry:
                 if cost_entry['currency'] == currency:
                     line_cost_partner_curr = cost_entry['price'] * qty
                 else:
-                    # Convert via CNY: cost_currency -> CNY -> partner_currency
                     rate_cost_cny, _ = _lookup_partner_rate(cost_entry['currency'], year, month)
                     rate_partner_cny, _ = _lookup_partner_rate(currency, year, month)
                     if rate_cost_cny and rate_partner_cny:
                         line_cost_partner_curr = cost_entry['price'] * qty * (rate_cost_cny / rate_partner_cny)
-
-            if line_cost_partner_curr is not None:
-                total_actual_cost += line_cost_partner_curr
-            else:
+            if line_cost_partner_curr is None:
+                # Unmapped — track as warning, do NOT add to total_actual_cost
                 unmapped_revenue += item_total
                 unmapped_qty += qty
+            else:
+                total_actual_cost += line_cost_partner_curr
 
             # Build product key — group by mapped (brand, series, puffs, flavor),
             # falling back to the raw_name if we can't resolve.
@@ -8983,11 +9058,16 @@ def _calc_partner_recon_detail(partner_id, year, month):
                     'qty': 0,
                     'revenue': 0.0,
                     'cost': 0.0,
+                    'cost_mapped': 0.0,      # portion from real product_costs
+                    'cost_estimated': 0.0,   # portion from 50% fallback
+                    'qty_mapped': 0,
+                    'qty_estimated': 0,
+                    'allocated_shipping': 0.0,  # shipping share allocated by qty
                     'has_cost': False,
                     'cost_unit': None,
-                    'cost_currency': cost_entry['currency'] if cost_entry else None,
-                    'cost_effective_date': cost_entry['effective_date'] if cost_entry else None,
-                    'cost_match_level': cost_entry['match_level'] if cost_entry else None,
+                    'cost_currency': None,
+                    'cost_effective_date': None,
+                    'cost_match_level': None,
                     'line_count': 0,
                     'mapped': bool(b_id),
                 }
@@ -8995,23 +9075,47 @@ def _calc_partner_recon_detail(partner_id, year, month):
             row['qty'] += qty
             row['revenue'] += item_total
             row['line_count'] += 1
+            row['allocated_shipping'] += per_unit_shipping * qty
             if line_cost_partner_curr is not None:
+                # Real cost from product_costs
                 row['cost'] += line_cost_partner_curr
+                row['cost_mapped'] += line_cost_partner_curr
+                row['qty_mapped'] += qty
                 row['has_cost'] = True
-                if cost_entry:
-                    row['cost_unit'] = cost_entry['price']
-                    row['cost_currency'] = cost_entry['currency']
-                    row['cost_effective_date'] = cost_entry['effective_date']
-                    row['cost_match_level'] = cost_entry['match_level']
+                row['cost_unit'] = cost_entry['price']
+                row['cost_currency'] = cost_entry['currency']
+                row['cost_effective_date'] = cost_entry['effective_date']
+                row['cost_match_level'] = cost_entry['match_level']
+            else:
+                # Unmapped — count qty in the "estimated" bucket so the UI can
+                # flag the row, but do NOT add to row['cost']. Keeps margin%
+                # artificially inflated as a forcing function.
+                row['qty_estimated'] += qty
 
     # Normalize / sort
     products_list = sorted(by_product.values(), key=lambda r: (-r['revenue']))
     sites_list = sorted(by_site.values(), key=lambda r: (-r['net']))
     for p in products_list:
         p['cost'] = round(p['cost'], 2)
+        p['cost_mapped'] = round(p.get('cost_mapped', 0), 2)
+        p['cost_estimated'] = round(p.get('cost_estimated', 0), 2)
         p['revenue'] = round(p['revenue'], 2)
-        p['margin'] = round(p['revenue'] - p['cost'], 2) if p['has_cost'] else None
-        p['margin_pct'] = round((p['revenue'] - p['cost']) / p['revenue'] * 100, 2) if (p['has_cost'] and p['revenue'] > 0) else None
+        p['allocated_shipping'] = round(p.get('allocated_shipping', 0), 2)
+        p['shipping_unit'] = round(p['allocated_shipping'] / p['qty'], 4) if p['qty'] > 0 else 0
+        # 毛利 = revenue − cost (cost includes both real and 50%-fallback estimated).
+        # has_cost is now always True (estimated cost is still a cost).
+        p['margin'] = round(p['revenue'] - p['cost'], 2)
+        p['margin_pct'] = round(p['margin'] / p['revenue'] * 100, 2) if p['revenue'] > 0 else None
+        # Aliases — kept for legacy frontend that may still reference them.
+        p['net_profit'] = p['margin']
+        p['net_margin_pct'] = p['margin_pct']
+        # Shipping ratio: informational. High ratio = product often in small orders.
+        p['shipping_ratio_pct'] = round(p['allocated_shipping'] / p['revenue'] * 100, 2) if p['revenue'] > 0 else None
+        # Estimation ratio — what % of this row's revenue used the 50% fallback
+        p['estimated_ratio_pct'] = round(p['qty_estimated'] / p['qty'] * 100, 1) if p['qty'] > 0 else 0
+        # is_fully_estimated → entire row is from fallback; UI flags it specially
+        p['is_fully_estimated'] = (p['qty_mapped'] == 0 and p['qty_estimated'] > 0)
+        p['is_partially_estimated'] = (p['qty_mapped'] > 0 and p['qty_estimated'] > 0)
     for s in sites_list:
         for k in ('gross', 'shipping', 'net', 'shipping_loss'):
             s[k] = round(s[k], 2)
@@ -9025,6 +9129,14 @@ def _calc_partner_recon_detail(partner_id, year, month):
     cost_ratio = float(partner['cost_ratio'] or 0.5)
     pp_ratio = float(partner['partner_profit_ratio'] or 0.25)
     op_ratio = float(partner['our_profit_ratio'] or 0.25)
+
+    # Actual margin = net − actual cost (50%-fallback already inside total_actual_cost)
+    actual_margin = total_net - total_actual_cost
+    actual_margin_pct = round(actual_margin / total_net * 100, 2) if total_net > 0 else None
+    # Sum mapped vs estimated cost from product rows for transparency in UI
+    total_cost_mapped = round(sum(p.get('cost_mapped', 0) or 0 for p in products_list), 2)
+    total_cost_estimated = round(sum(p.get('cost_estimated', 0) or 0 for p in products_list), 2)
+    estimated_ratio_pct = round(total_cost_estimated / total_actual_cost * 100, 1) if total_actual_cost > 0 else None
 
     result = {
         'partner_id': partner['id'],
@@ -9047,9 +9159,15 @@ def _calc_partner_recon_detail(partner_id, year, month):
         'total_net_pln': round(total_net, 2),
         # Cost (two ways)
         'cost_amount_pln': round(total_net * cost_ratio, 2),         # ratio-based (current contract logic)
-        'actual_cost_pln': round(total_actual_cost, 2),              # real product_costs lookup
+        'actual_cost_pln': round(total_actual_cost, 2),              # real product_costs lookup (incl. 50% fallback)
+        'cost_mapped_pln': total_cost_mapped,                        # portion from real product_costs
+        'cost_estimated_pln': total_cost_estimated,                  # portion from 50% fallback
+        'estimated_ratio_pct': estimated_ratio_pct,                  # cost_estimated / actual_cost × 100
         'cost_unmapped_revenue_pln': round(unmapped_revenue, 2),
         'cost_unmapped_qty': unmapped_qty,
+        # Actual margin (key new field — for 实际毛利 / 实际毛利率 cards)
+        'actual_margin_pln': round(actual_margin, 2),
+        'actual_margin_pct': actual_margin_pct,
         # Profit breakdown
         'partner_profit_pln': round(total_net * pp_ratio, 2),
         'our_receivable_pln': round(total_net * op_ratio, 2),
@@ -9087,8 +9205,13 @@ def _empty_recon_detail(partner, currency, year, month):
         'total_net_pln': 0,
         'cost_amount_pln': 0,
         'actual_cost_pln': 0,
+        'cost_mapped_pln': 0,
+        'cost_estimated_pln': 0,
+        'estimated_ratio_pct': None,
         'cost_unmapped_revenue_pln': 0,
         'cost_unmapped_qty': 0,
+        'actual_margin_pln': 0,
+        'actual_margin_pct': None,
         'partner_profit_pln': 0,
         'our_receivable_pln': 0,
         'cost_ratio': float(partner['cost_ratio'] or 0.5),
@@ -9224,6 +9347,10 @@ def _enrich_statement_cny(stmt_dict, partner_currency='PLN'):
             ('total_gross_pln', 'total_gross_cny'),
             ('total_net_pln', 'total_net_cny'),
             ('cost_amount_pln', 'cost_amount_cny'),
+            ('actual_cost_pln', 'actual_cost_cny'),
+            ('cost_mapped_pln', 'cost_mapped_cny'),
+            ('cost_estimated_pln', 'cost_estimated_cny'),
+            ('actual_margin_pln', 'actual_margin_cny'),
             ('partner_profit_pln', 'partner_profit_cny'),
             ('our_receivable_pln', 'our_receivable_cny'),
         ]:
@@ -9728,6 +9855,10 @@ def api_recon_orders():
             net_cny = round(net * order_rate, 2) if (order_rate and net) else None
 
             # ── COST CALCULATION (per-order, line-item level, date-aware) ──
+            # When a line item has no real cost in product_costs, fall back to
+            # 50% of revenue. Same logic as _calc_partner_recon_detail so the
+            # 订单明细 tab and 产品明细 tab agree on totals.
+            UNMAPPED_FALLBACK_RATIO = 0.5
             order_is_revenue = _is_revenue(r['status'] or '', r['payment_method'], is_undel)
             order_cost = 0.0
             order_unmapped_qty = 0
@@ -9747,6 +9878,7 @@ def api_recon_orders():
                     if qty <= 0:
                         continue
                     raw_name = it.get('name', '') or ''
+                    line_total = float(it.get('total', 0) or 0)
                     b_id, s_id, p_cnt, flav = _resolve_product_to_brand(
                         raw_name, r['source'], brands_cache, product_mappings_cache
                     )
@@ -9756,16 +9888,21 @@ def api_recon_orders():
                             cost_entry = _cost_at_date(cost_idx, b_id, s_id, p_cnt, flav, ewh, order_date)
                             if cost_entry:
                                 break
+                    line_cost = None
                     if cost_entry:
                         unit_in_partner = _convert_cost_to_partner(
                             cost_entry['price'], cost_entry['currency'], od_y, od_m
                         )
                         if unit_in_partner is not None:
-                            order_cost += unit_in_partner * qty
-                        else:
-                            order_unmapped_qty += qty
-                    else:
+                            line_cost = unit_in_partner * qty
+                    if line_cost is None:
+                        # POLICY: unmapped lines contribute 0 to order_cost.
+                        # Margin% will be inflated for these orders, which is
+                        # the intended forcing function to drive cost data
+                        # quality. The unmapped warning still flags them.
                         order_unmapped_qty += qty
+                    else:
+                        order_cost += line_cost
 
             order_cost = round(order_cost, 2)
             order_margin = round(net - order_cost, 2) if cost_eligible else None
@@ -9795,7 +9932,8 @@ def api_recon_orders():
                 'customer_email': customer_email,
                 'is_undelivered': is_undel,
                 'shipping_loss_amount': shipping_loss,
-                # ── new cost/margin fields ──
+                # ── cost/margin fields (margin% may be inflated for orders
+                #     with unmapped products — by design, see policy comment) ──
                 'cost_eligible': cost_eligible,
                 'cost': order_cost if cost_eligible else None,
                 'cost_cny': order_cost_cny,
@@ -9984,27 +10122,43 @@ def api_recon_summary_stats():
 @login_required
 @reconciliation_api_required
 def api_recon_products():
-    """Per-product breakdown for the period: qty, revenue, cost (date-aware), margin."""
+    """Per-product breakdown for the period: qty, revenue, cost (date-aware), margin.
+    Optional ?source=<site_url> and ?manager=<name> narrow the scope to a
+    single site or a single team member (for selection-decision analysis)."""
     partner_id = request.args.get('partner_id', type=int)
     year = request.args.get('year', type=int)
     month = request.args.get('month', type=int)
+    source_filter = (request.args.get('source') or '').strip() or None
+    manager_filter = (request.args.get('manager') or '').strip() or None
     if not all([partner_id, year, month]):
         return jsonify({'error': '缺少 partner_id/year/month'}), 400
     if not _check_partner_access(partner_id):
         return jsonify({'error': '无权查看此合伙人'}), 403
 
-    detail = _calc_partner_recon_detail(partner_id, year, month)
+    detail = _calc_partner_recon_detail(partner_id, year, month,
+                                        site_filter=source_filter,
+                                        manager_filter=manager_filter)
     if detail is None:
         return jsonify({'error': '合伙人不存在'}), 404
+    # Sum allocated shipping across all products — should equal the sum of
+    # shipping_total for the period's successful orders. Useful as a reference
+    # so partners can sanity-check the allocation.
+    products = detail['by_product']
+    total_allocated_shipping = round(sum(p.get('allocated_shipping', 0) or 0 for p in products), 2)
+    total_cost_mapped = round(sum(p.get('cost_mapped', 0) or 0 for p in products), 2)
+    total_cost_estimated = round(sum(p.get('cost_estimated', 0) or 0 for p in products), 2)
     return jsonify({
         'partner_id': partner_id,
         'period_year': year,
         'period_month': month,
         'currency': detail['currency'],
-        'products': detail['by_product'],
+        'products': products,
         'totals': {
             'revenue': detail['total_gross_pln'] - detail['total_shipping_pln'],
             'actual_cost': detail['actual_cost_pln'],
+            'cost_mapped': total_cost_mapped,        # real product_costs portion
+            'cost_estimated': total_cost_estimated,  # 50% fallback portion
+            'allocated_shipping': total_allocated_shipping,
             'unmapped_revenue': detail['cost_unmapped_revenue_pln'],
             'unmapped_qty': detail['cost_unmapped_qty'],
         },

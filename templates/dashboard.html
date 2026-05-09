@@ -162,16 +162,26 @@
         <!-- Trend Chart -->
         <div class="col-xl-8">
             <div class="card chart-card">
-                <div class="card-header">
-                    <h5><i class="bi bi-bar-chart-line me-2"></i>
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <h5 class="mb-0"><i class="bi bi-bar-chart-line me-2"></i>
                         {% if trend_type == 'daily' %}日销售趋势{% else %}月度销售趋势{% endif %}
-                        <span class="badge ms-2"
-                              style="background:rgba(240,147,251,0.18); color:#f093fb; font-size:0.65em; vertical-align:middle;"
-                              title="GMV = Gross Merchandise Value，订单总成交额（含运费，未扣退款/未送达）">GMV</span>
                         {% if source_filter %}<small class="text-muted ms-2">({{
                             source_filter.replace('https://www.',
                             '').replace('https://', '') }})</small>{% endif %}
                     </h5>
+                    <!-- Metric toggle: switch the line series between GMV and 净额 -->
+                    <div class="btn-group btn-group-sm" role="group" aria-label="trend metric switch">
+                        <input type="radio" class="btn-check" name="trendMetric" id="trendMetricGmv" value="gmv" checked>
+                        <label class="btn btn-outline-info" for="trendMetricGmv"
+                               title="GMV = 订单总成交额（含运费，未扣退款/未送达）">
+                            <i class="bi bi-cash-stack me-1"></i>GMV (总销售)
+                        </label>
+                        <input type="radio" class="btn-check" name="trendMetric" id="trendMetricNet" value="net">
+                        <label class="btn btn-outline-success" for="trendMetricNet"
+                               title="净额 = 成功订单金额 − 运费 − 未送达订单运费损失">
+                            <i class="bi bi-check-circle me-1"></i>净额 (实际成功)
+                        </label>
+                    </div>
                 </div>
                 <div class="card-body">
                     <canvas id="trendChart" height="300"></canvas>
@@ -350,88 +360,164 @@
         return;
     }
 
-    // Trend Chart
+    // Trend Chart — supports two metric modes:
+    //   gmv → 销售额 (GMV)，用 d.revenue（订单总额，含运费、含未送达）
+    //   net → 净额（实际成功销量），用 d.net（成功订单 − 运费 − 未送达运费损失）
+    // 切换由顶部 trendMetric 单选按钮触发，重渲染同一个 chart 实例。
     var trendCtx = document.getElementById('trendChart').getContext('2d');
-    new Chart(trendCtx, {
-        type: 'bar',
-        data: {
-            labels: trendData.map(function (d) { return d.period; }),
-            datasets: [{
-                label: '订单数',
-                data: trendData.map(function (d) { return d.orders; }),
-                backgroundColor: 'rgba(102, 126, 234, 0.8)',
+    var trendChart = null;
+    // localStorage 持久化，刷新后保留上次选择
+    var savedMetric = (function () {
+        try { return localStorage.getItem('dashboardTrendMetric') || 'gmv'; }
+        catch (e) { return 'gmv'; }
+    })();
+
+    function buildTrendDatasets(metric) {
+        // Money values are pre-aggregated as CNY on the backend (each
+        // currency × its month rate, then summed). The dataset value IS the
+        // CNY number — no further multiplication needed. Tooltip shows the
+        // per-currency breakdown for transparency.
+        if (metric === 'net') {
+            return [{
+                label: '订单数 (成功)',
+                data: trendData.map(function (d) { return d.success_orders || 0; }),
+                backgroundColor: 'rgba(110, 231, 183, 0.7)',
                 borderRadius: trendType === 'daily' ? 4 : 8,
                 yAxisID: 'y'
             }, {
-                label: '销售额 (GMV)',
-                data: trendData.map(function (d) { return d.revenue; }),
+                label: '净额 (¥)',
+                data: trendData.map(function (d) { return d.net_cny || 0; }),
                 type: 'line',
-                borderColor: '#f093fb',
-                backgroundColor: 'rgba(240, 147, 251, 0.1)',
+                borderColor: '#6ee7b7',
+                backgroundColor: 'rgba(110, 231, 183, 0.12)',
                 tension: 0.4,
                 fill: true,
                 yAxisID: 'y1'
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: { intersect: false, mode: 'index' },
-            plugins: {
-                legend: { labels: { color: '#fff' } },
-                tooltip: {
-                    callbacks: {
-                        label: function (context) {
-                            var label = context.dataset.label || '';
-                            var value = context.parsed.y;
-                            if (label === '销售额 (GMV)') {
-                                var cnyValue = value * cnyRate;
-                                return label + ': ' + value.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ' (≈ ¥' + cnyValue.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + ')';
+            }];
+        }
+        // default: gmv
+        return [{
+            label: '订单数',
+            data: trendData.map(function (d) { return d.orders; }),
+            backgroundColor: 'rgba(102, 126, 234, 0.8)',
+            borderRadius: trendType === 'daily' ? 4 : 8,
+            yAxisID: 'y'
+        }, {
+            label: '销售额 GMV (¥)',
+            data: trendData.map(function (d) { return d.revenue_cny || 0; }),
+            type: 'line',
+            borderColor: '#f093fb',
+            backgroundColor: 'rgba(240, 147, 251, 0.1)',
+            tension: 0.4,
+            fill: true,
+            yAxisID: 'y1'
+        }];
+    }
+
+    function buildTrendChart(metric) {
+        if (trendChart) trendChart.destroy();
+        var isNet = metric === 'net';
+        trendChart = new Chart(trendCtx, {
+            type: 'bar',
+            data: {
+                labels: trendData.map(function (d) { return d.period; }),
+                datasets: buildTrendDatasets(metric)
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { intersect: false, mode: 'index' },
+                plugins: {
+                    legend: { labels: { color: '#fff' } },
+                    tooltip: {
+                        callbacks: {
+                            label: function (context) {
+                                var label = context.dataset.label || '';
+                                var value = context.parsed.y;
+                                // Money series are already CNY-denominated.
+                                // Show ¥ value + per-currency breakdown if mixed.
+                                if (label.indexOf('GMV') >= 0 || label.indexOf('净额') >= 0) {
+                                    var idx = context.dataIndex;
+                                    var d = trendData[idx] || {};
+                                    var lines = [label + ': ¥' + value.toLocaleString('zh-CN', { minimumFractionDigits: 2 })];
+                                    var byc = d.by_currency || {};
+                                    var keys = Object.keys(byc).filter(function (c) { return c && c !== '-'; });
+                                    if (keys.length > 1) {
+                                        // Mixed currency — show breakdown
+                                        var fieldKey = label.indexOf('净额') >= 0 ? 'net' : 'revenue';
+                                        keys.forEach(function (c) {
+                                            var v = byc[c][fieldKey] || 0;
+                                            lines.push('  ' + c + ': ' + v.toLocaleString('zh-CN', { minimumFractionDigits: 2 }) + (byc[c].rate ? ' × ' + byc[c].rate.toFixed(4) : ''));
+                                        });
+                                    }
+                                    return lines;
+                                }
+                                return label + ': ' + value.toLocaleString('zh-CN');
                             }
-                            return label + ': ' + value;
                         }
                     }
-                }
-            },
-            scales: {
-                x: {
-                    grid: { color: 'rgba(255,255,255,0.1)' },
-                    ticks: {
-                        color: '#aaa',
-                        maxRotation: 0,
-                        callback: function (value, index) {
-                            if (trendType === 'daily') {
-                                var label = this.getLabelForValue(value);
-                                // Simple date parsing
-                                var parts = label.split('-');
-                                if (parts.length === 3) {
-                                    var date = new Date(label);
-                                    var day = parts[2];
-                                    var weekdays = ['日', '一', '二', '三', '四', '五', '六'];
-                                    var weekday = weekdays[date.getDay()];
-                                    if (weekday) {
-                                        return [day, weekday];
+                },
+                scales: {
+                    x: {
+                        grid: { color: 'rgba(255,255,255,0.1)' },
+                        ticks: {
+                            color: '#aaa',
+                            maxRotation: 0,
+                            callback: function (value, index) {
+                                if (trendType === 'daily') {
+                                    var label = this.getLabelForValue(value);
+                                    var parts = label.split('-');
+                                    if (parts.length === 3) {
+                                        var date = new Date(label);
+                                        var day = parts[2];
+                                        var weekdays = ['日', '一', '二', '三', '四', '五', '六'];
+                                        var weekday = weekdays[date.getDay()];
+                                        if (weekday) {
+                                            return [day, weekday];
+                                        }
                                     }
                                 }
+                                return this.getLabelForValue(value);
                             }
-                            return this.getLabelForValue(value);
                         }
+                    },
+                    y: {
+                        position: 'left',
+                        grid: { color: 'rgba(255,255,255,0.1)' },
+                        ticks: { color: '#aaa' },
+                        title: { display: true, text: isNet ? '订单数 (成功)' : '订单数', color: '#aaa' }
+                    },
+                    y1: {
+                        position: 'right',
+                        grid: { drawOnChartArea: false },
+                        ticks: {
+                            color: '#aaa',
+                            callback: function (v) {
+                                // Format Y axis in CNY with k/M abbreviation
+                                if (Math.abs(v) >= 1000000) return '¥' + (v / 1000000).toFixed(1) + 'M';
+                                if (Math.abs(v) >= 1000) return '¥' + (v / 1000).toFixed(1) + 'k';
+                                return '¥' + v;
+                            }
+                        },
+                        title: { display: true, text: isNet ? '净额 (CNY)' : '销售额 GMV (CNY)', color: '#aaa' }
                     }
-                },
-                y: {
-                    position: 'left',
-                    grid: { color: 'rgba(255,255,255,0.1)' },
-                    ticks: { color: '#aaa' },
-                    title: { display: true, text: '订单数', color: '#aaa' }
-                },
-                y1: {
-                    position: 'right',
-                    grid: { drawOnChartArea: false },
-                    ticks: { color: '#aaa' },
-                    title: { display: true, text: '销售额 (GMV)', color: '#aaa' }
                 }
             }
-        }
+        });
+    }
+
+    // Initial render — apply saved metric (or default to GMV)
+    var initialBtn = document.getElementById(savedMetric === 'net' ? 'trendMetricNet' : 'trendMetricGmv');
+    if (initialBtn) initialBtn.checked = true;
+    buildTrendChart(savedMetric);
+
+    // Wire the radio buttons
+    document.querySelectorAll('input[name="trendMetric"]').forEach(function (rb) {
+        rb.addEventListener('change', function () {
+            if (!rb.checked) return;
+            buildTrendChart(rb.value);
+            try { localStorage.setItem('dashboardTrendMetric', rb.value); } catch (e) { /* ignore */ }
+        });
     });
 
     // Status Chart

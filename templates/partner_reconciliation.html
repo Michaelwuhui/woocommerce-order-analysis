@@ -116,10 +116,217 @@
 }
 
 /* ====================================================================
+   "本月实时预估" — section containers + tile-style metric cards
+   Three sections (订单分布 / 销售构成 / 成本与分账) each get a tinted
+   container; every metric is a tile with a colored accent bar.
+   ==================================================================== */
+.preview-section {
+    position: relative;
+    padding: 14px 16px 16px;
+    border-radius: 12px;
+    margin-bottom: 14px;
+    border: 1px solid rgba(148, 163, 184, 0.08);
+}
+.preview-section:last-child { margin-bottom: 0; }
+.preview-section-orders {
+    background: linear-gradient(135deg, rgba(99,102,241,0.05), rgba(59,130,246,0.03));
+    border-color: rgba(99,102,241,0.18);
+}
+.preview-section-sales {
+    background: linear-gradient(135deg, rgba(6,182,212,0.05), rgba(8,145,178,0.03));
+    border-color: rgba(6,182,212,0.18);
+}
+.preview-section-split {
+    background: linear-gradient(135deg, rgba(217,119,6,0.05), rgba(248,113,113,0.03));
+    border-color: rgba(217,119,6,0.18);
+}
+
+.preview-section-title {
+    font-size: 0.78rem;
+    color: #cbd5e1;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.preview-section-title::before {
+    content: '';
+    width: 3px;
+    height: 14px;
+    border-radius: 2px;
+    background: linear-gradient(180deg, currentColor, transparent);
+    opacity: 0.6;
+}
+.preview-section-orders .preview-section-title { color: #a5b4fc; }
+.preview-section-sales  .preview-section-title { color: #5dd0e6; }
+.preview-section-split  .preview-section-title { color: #fcd34d; }
+.preview-section-title .pst-icon {
+    width: 22px; height: 22px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,0.06); border-radius: 6px;
+    font-size: 12px;
+}
+.preview-section-title .pst-hint {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 400;
+    color: #94a3b8;
+    letter-spacing: 0;
+}
+
+.preview-tile {
+    background: rgba(15, 23, 42, 0.55);
+    border: 1px solid rgba(148, 163, 184, 0.1);
+    border-left: 3px solid rgba(148, 163, 184, 0.4);
+    border-radius: 8px;
+    padding: 10px 12px;
+    height: 100%;
+    transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+    display: flex; flex-direction: column;
+}
+.preview-tile:hover {
+    background: rgba(15, 23, 42, 0.85);
+    transform: translateY(-1px);
+}
+.preview-tile-label {
+    font-size: 0.72rem;
+    color: #94a3b8;
+    font-weight: 500;
+    margin-bottom: 4px;
+    display: flex; align-items: center; gap: 5px;
+    line-height: 1.2;
+}
+.preview-tile-label .ptl-icon { opacity: 0.75; font-size: 0.78rem; }
+.preview-tile-value {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: #e2e8f0;
+    line-height: 1.3;
+    margin-top: auto;
+}
+.preview-tile-value.big { font-size: 1.2rem; }
+.preview-tile-suffix {
+    font-size: 0.7rem;
+    color: #93c5fd;
+    margin-top: 2px;
+    font-weight: 400;
+}
+
+/* Color variants — left bar matches the metric's semantic color */
+.preview-tile-success    { border-left-color: #6ee7b7; }
+.preview-tile-success    .preview-tile-value { color: #6ee7b7; }
+.preview-tile-failed     { border-left-color: #f87171; }
+.preview-tile-failed     .preview-tile-value { color: #fca5a5; }
+.preview-tile-cancelled  { border-left-color: #94a3b8; }
+.preview-tile-undelivered{ border-left-color: #c084fc; }
+.preview-tile-undelivered .preview-tile-value { color: #c084fc; }
+.preview-tile-pending    { border-left-color: #fbbf24; }
+.preview-tile-pending    .preview-tile-value { color: #fcd34d; }
+.preview-tile-total      { border-left-color: #5dd0e6; }
+.preview-tile-total      .preview-tile-value { color: #e2e8f0; font-weight: 700; }
+
+.preview-tile-gross    { border-left-color: #f0abfc; }
+.preview-tile-gross    .preview-tile-value { color: #e2e8f0; }
+.preview-tile-shipping { border-left-color: #5dd0e6; }
+.preview-tile-shipping .preview-tile-value { color: #5dd0e6; }
+.preview-tile-loss     { border-left-color: #fbbf24; }
+.preview-tile-loss     .preview-tile-value { color: #fbbf24; }
+.preview-tile-net      {
+    border-left-color: #5dd0e6;
+    background: linear-gradient(135deg, rgba(8,145,178,0.18), rgba(15,23,42,0.7));
+    box-shadow: 0 0 0 1px rgba(93,208,230,0.25), 0 4px 12px -2px rgba(6,182,212,0.18);
+}
+.preview-tile-net      .preview-tile-value { color: #5dd0e6; font-size: 1.25rem; font-weight: 700; }
+
+.preview-tile-cost   { border-left-color: #fcd34d; }
+.preview-tile-cost   .preview-tile-value { color: #fcd34d; }
+.preview-tile-actual { border-left-color: #fca5a5; }
+.preview-tile-actual .preview-tile-value { color: #fca5a5; }
+.preview-tile-margin { border-left-color: #5dd0e6; }
+.preview-tile-margin .preview-tile-value { color: #5dd0e6; font-weight: 700; }
+.preview-tile-rate   { border-left-color: #c084fc; }
+.preview-tile-rate   .preview-tile-value { color: #c084fc; font-weight: 700; }
+.preview-tile-pp     { border-left-color: #fcd34d; }
+.preview-tile-pp     .preview-tile-value { color: #fcd34d; }
+.preview-tile-ours   {
+    border-left-color: #6ee7b7;
+    background: linear-gradient(135deg, rgba(6,95,70,0.22), rgba(15,23,42,0.7));
+    box-shadow: 0 0 0 1px rgba(110,231,183,0.22), 0 4px 12px -2px rgba(34,197,94,0.15);
+}
+.preview-tile-ours   .preview-tile-value { color: #6ee7b7; font-size: 1.25rem; font-weight: 700; }
+
+/* Active / inactive cost tile (mode-aware) */
+.preview-tile.is-active {
+    box-shadow: 0 0 0 2px rgba(255,255,255,0.18), inset 0 0 0 1px rgba(255,255,255,0.06);
+}
+.preview-tile.is-inactive {
+    opacity: 0.5;
+    filter: saturate(0.7);
+}
+.preview-tile .preview-tile-badge {
+    position: absolute; top: -6px; right: 8px;
+    font-size: 9px; padding: 1px 6px; border-radius: 8px;
+    background: rgba(255,255,255,0.15); color: #e2e8f0;
+    border: 1px solid rgba(255,255,255,0.2);
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    font-weight: 600;
+}
+.preview-tile { position: relative; }
+
+/* Sales-composition flow operators (− − =) */
+.preview-flow-op {
+    display: flex; align-items: center; justify-content: center;
+    color: #475569; font-size: 1.4rem; font-weight: 300;
+    min-width: 18px;
+}
+.preview-flow-op.eq { color: #5dd0e6; font-weight: 500; }
+
+/* ====================================================================
+   Sortable table headers — used in product detail table.
+   3-state click cycle: desc → asc → reset(default).
+   ==================================================================== */
+.pd-sortable {
+    cursor: pointer;
+    user-select: none;
+    position: relative;
+    transition: background 0.12s ease, color 0.12s ease;
+}
+.pd-sortable:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: #e2e8f0;
+}
+.pd-sort-ind {
+    display: inline-block;
+    width: 14px;
+    margin-left: 4px;
+    color: #475569;
+    font-size: 0.7em;
+    opacity: 0.5;
+    transition: all 0.12s ease;
+    vertical-align: middle;
+}
+.pd-sortable:hover .pd-sort-ind {
+    opacity: 0.9;
+    color: #94a3b8;
+}
+.pd-sort-ind.active {
+    color: #5dd0e6;
+    opacity: 1;
+    font-weight: bold;
+}
+.pd-sortable.active-sort {
+    color: #5dd0e6;
+    background: rgba(93, 208, 230, 0.06);
+}
+
+/* ====================================================================
    TERM COLORS — must match the "本月实时预估" card colors so partners can
    visually trace the same value across the formula list and the card.
      总销售额 (gross)        → light/white
-     运费收入 (shipping)     → cyan / text-info
+     运费成本 (shipping)     → cyan / text-info
      运费损失 (loss)         → amber #fbbf24
      净销售额 (net)          → cyan / text-info (bolder)
      约定成本 (cost)         → warning yellow
@@ -444,48 +651,137 @@
                     </div>
                 </div>
                 <div class="card-body">
-                    <!-- Row 1: Order counts breakdown -->
-                    <div class="text-white-50 small mb-2 fw-semibold"><i class="bi bi-bar-chart-steps me-1"></i>订单分布</div>
-                    <div class="row text-center g-2 mb-3">
-                        <div class="col"><div class="text-white-50 small">成功订单</div><div class="h6 text-success mt-1" id="pvSuccessOrders">—</div></div>
-                        <div class="col"><div class="text-white-50 small">失败</div><div class="h6 text-muted mt-1" id="pvFailedOrders">—</div></div>
-                        <div class="col"><div class="text-white-50 small">取消</div><div class="h6 text-muted mt-1" id="pvCancelledOrders">—</div></div>
-                        <div class="col"><div class="text-white-50 small" style="color:rgba(192,132,252,0.85);">未送达</div><div class="h6 mt-1" style="color:#c084fc;" id="pvUndelOrders">—</div></div>
-                        <div class="col"><div class="text-white-50 small">待支付</div><div class="h6 text-muted mt-1" id="pvPendingOrders">—</div></div>
-                        <div class="col"><div class="text-white-50 small">合计入库</div><div class="h6 text-light mt-1" id="pvTotalCount">—</div></div>
+                    <!-- Section 1: 订单分布 -->
+                    <div class="preview-section preview-section-orders">
+                        <div class="preview-section-title">
+                            <span class="pst-icon"><i class="bi bi-bar-chart-steps"></i></span>
+                            订单分布
+                            <span class="pst-hint">本月所有订单的状态分布</span>
+                        </div>
+                        <div class="row g-2">
+                            <div class="col">
+                                <div class="preview-tile preview-tile-success">
+                                    <div class="preview-tile-label"><i class="bi bi-check-circle ptl-icon"></i>成功订单</div>
+                                    <div class="preview-tile-value" id="pvSuccessOrders">—</div>
+                                </div>
+                            </div>
+                            <div class="col">
+                                <div class="preview-tile preview-tile-failed">
+                                    <div class="preview-tile-label"><i class="bi bi-x-circle ptl-icon"></i>失败</div>
+                                    <div class="preview-tile-value" id="pvFailedOrders">—</div>
+                                </div>
+                            </div>
+                            <div class="col">
+                                <div class="preview-tile preview-tile-cancelled">
+                                    <div class="preview-tile-label"><i class="bi bi-slash-circle ptl-icon"></i>取消</div>
+                                    <div class="preview-tile-value" id="pvCancelledOrders">—</div>
+                                </div>
+                            </div>
+                            <div class="col">
+                                <div class="preview-tile preview-tile-undelivered">
+                                    <div class="preview-tile-label"><i class="bi bi-arrow-counterclockwise ptl-icon"></i>未送达</div>
+                                    <div class="preview-tile-value" id="pvUndelOrders">—</div>
+                                </div>
+                            </div>
+                            <div class="col">
+                                <div class="preview-tile preview-tile-pending">
+                                    <div class="preview-tile-label"><i class="bi bi-clock ptl-icon"></i>待支付</div>
+                                    <div class="preview-tile-value" id="pvPendingOrders">—</div>
+                                </div>
+                            </div>
+                            <div class="col">
+                                <div class="preview-tile preview-tile-total">
+                                    <div class="preview-tile-label"><i class="bi bi-inbox ptl-icon"></i>合计入库</div>
+                                    <div class="preview-tile-value" id="pvTotalCount">—</div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
-                    <!-- Row 2: Sales composition -->
-                    <div class="text-white-50 small mb-2 fw-semibold"><i class="bi bi-cash-stack me-1"></i>销售构成</div>
-                    <div class="row text-center g-3 mb-3">
-                        <div class="col-md-3"><div class="text-white-50 small">总销售额</div><div class="h5 text-white mt-1" id="pvGross">—</div></div>
-                        <div class="col-md-3"><div class="text-white-50 small">运费收入</div><div class="h6 text-info mt-1" id="pvShipping">—</div></div>
-                        <div class="col-md-3"><div class="text-white-50 small" style="color:#fbbf24;"><i class="bi bi-arrow-return-left me-1"></i>运费损失</div><div class="h5 mt-1" style="color:#fbbf24;" id="pvShipLoss">—</div></div>
-                        <div class="col-md-3"><div class="text-white-50 small">净销售额</div><div class="h5 text-info mt-1" id="pvNet">—</div></div>
+                    <!-- Section 2: 销售构成 (calculation flow) -->
+                    <div class="preview-section preview-section-sales">
+                        <div class="preview-section-title">
+                            <span class="pst-icon"><i class="bi bi-cash-stack"></i></span>
+                            销售构成
+                            <span class="pst-hint">总销售 − 运费成本 − 运费损失 = 净销售额</span>
+                        </div>
+                        <div class="d-flex align-items-stretch flex-wrap gap-2">
+                            <div class="flex-fill" style="min-width:160px;">
+                                <div class="preview-tile preview-tile-gross">
+                                    <div class="preview-tile-label"><i class="bi bi-cash-coin ptl-icon"></i>总销售额</div>
+                                    <div class="preview-tile-value big" id="pvGross">—</div>
+                                </div>
+                            </div>
+                            <div class="preview-flow-op">−</div>
+                            <div class="flex-fill" style="min-width:140px;">
+                                <div class="preview-tile preview-tile-shipping">
+                                    <div class="preview-tile-label"><i class="bi bi-truck ptl-icon"></i>运费成本</div>
+                                    <div class="preview-tile-value" id="pvShipping">—</div>
+                                </div>
+                            </div>
+                            <div class="preview-flow-op">−</div>
+                            <div class="flex-fill" style="min-width:140px;">
+                                <div class="preview-tile preview-tile-loss">
+                                    <div class="preview-tile-label"><i class="bi bi-arrow-return-left ptl-icon"></i>运费损失</div>
+                                    <div class="preview-tile-value" id="pvShipLoss">—</div>
+                                </div>
+                            </div>
+                            <div class="preview-flow-op eq">=</div>
+                            <div class="flex-fill" style="min-width:170px;">
+                                <div class="preview-tile preview-tile-net">
+                                    <div class="preview-tile-label"><i class="bi bi-cash-stack ptl-icon"></i>净销售额（分账依据）</div>
+                                    <div class="preview-tile-value big" id="pvNet">—</div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
-                    <!-- Row 3: Cost & profit (dual-track: ratio vs actual) -->
-                    <div class="text-white-50 small mb-2 fw-semibold d-flex align-items-center gap-2">
-                        <i class="bi bi-pie-chart me-1"></i>成本与分账
-                        <span class="badge bg-secondary bg-opacity-25 text-secondary small">约定分成 vs 实际产品成本</span>
-                    </div>
-                    <div class="row text-center g-3">
-                        <div class="col-md-3">
-                            <div class="text-white-50 small">约定成本 <span id="pvCostRatioLabel" class="text-muted">(50%)</span></div>
-                            <div class="h5 text-warning mt-1" id="pvCost">—</div>
+                    <!-- Section 3: 成本与分账 (mode-aware) -->
+                    <div class="preview-section preview-section-split">
+                        <div class="preview-section-title">
+                            <span class="pst-icon"><i class="bi bi-pie-chart"></i></span>
+                            成本与分账
+                            <span class="pst-hint">约定分成 vs 实际产品成本（顶部按钮切换）· 未匹配产品的成本不计入，毛利率会偏高 → 提示补录</span>
                         </div>
-                        <div class="col-md-3">
-                            <div class="text-white-50 small">实际产品成本 <span class="text-muted">(按真实进价)</span></div>
-                            <div class="h5 mt-1" style="color:#f87171;" id="pvActualCost">—</div>
-                            <div class="small text-muted" id="pvCostUnmapped"></div>
-                        </div>
-                        <div class="col-md-3">
-                            <div class="text-white-50 small">合伙人利润 <span id="pvPpRatioLabel" class="text-muted">(25%)</span></div>
-                            <div class="h5 text-warning mt-1" id="pvPartnerProfit">—</div>
-                        </div>
-                        <div class="col-md-3">
-                            <div class="text-white-50 small">我方应收 <span id="pvOpRatioLabel" class="text-muted">(25%)</span></div>
-                            <div class="h5 text-success mt-1" id="pvOurRecv">—</div>
+                        <div class="row g-2">
+                            <div class="col-md-4 col-lg-2">
+                                <div class="preview-tile preview-tile-cost" id="pvCostBox">
+                                    <div class="preview-tile-label"><i class="bi bi-percent ptl-icon"></i>约定成本 <span id="pvCostRatioLabel">(50%)</span></div>
+                                    <div class="preview-tile-value" id="pvCost">—</div>
+                                </div>
+                            </div>
+                            <div class="col-md-4 col-lg-2">
+                                <div class="preview-tile preview-tile-actual" id="pvActualBox">
+                                    <div class="preview-tile-label"><i class="bi bi-box-seam ptl-icon"></i>实际产品成本 <span style="color:#94a3b8;">(按真实进价)</span></div>
+                                    <div class="preview-tile-value" id="pvActualCost">—</div>
+                                    <div class="preview-tile-suffix" id="pvCostUnmapped" style="color:#fbbf24;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-4 col-lg-2">
+                                <div class="preview-tile preview-tile-margin" id="pvMarginBox" title="实际毛利 = 净销售额 − 实际产品成本（运费由客户支付不计入成本）。注：未匹配产品的成本未计入，毛利可能偏高">
+                                    <div class="preview-tile-label"><i class="bi bi-graph-up-arrow ptl-icon"></i>实际毛利 <span style="color:#94a3b8;">(净额−成本)</span></div>
+                                    <div class="preview-tile-value" id="pvMargin">—</div>
+                                </div>
+                            </div>
+                            <div class="col-md-4 col-lg-2">
+                                <div class="preview-tile preview-tile-rate" id="pvMarginPctBox" title="实际毛利率 = 实际毛利 ÷ 净销售额 × 100%。未匹配产品的成本未计入 → 此数值会偏高，是给团队补录成本的提示">
+                                    <div class="preview-tile-label"><i class="bi bi-percent ptl-icon"></i>实际毛利率 <span style="color:#94a3b8;">(毛利÷净额)</span></div>
+                                    <div class="preview-tile-value" id="pvMarginPct">—</div>
+                                    <div class="preview-tile-suffix" id="pvMarginPctNote" style="color:#94a3b8;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-4 col-lg-2">
+                                <div class="preview-tile preview-tile-pp">
+                                    <div class="preview-tile-label"><i class="bi bi-piggy-bank ptl-icon"></i>合伙人利润 <span id="pvPpRatioLabel">(25%)</span></div>
+                                    <div class="preview-tile-value" id="pvPartnerProfit">—</div>
+                                </div>
+                            </div>
+                            <div class="col-md-4 col-lg-2">
+                                <div class="preview-tile preview-tile-ours">
+                                    <div class="preview-tile-label"><i class="bi bi-bank ptl-icon"></i>我方应收 <span id="pvOpRatioLabel">(25%)</span></div>
+                                    <div class="preview-tile-value" id="pvOurRecv">—</div>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -493,9 +789,24 @@
 
             <!-- Formula breakdown + money flow -->
             <div class="card data-card mb-4">
-                <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25">
-                    <h5 class="text-white mb-0"><i class="bi bi-calculator me-2"></i>计算公式与本月数据流向</h5>
-                    <div class="text-white-50 small mt-1">每一笔金额是怎么算出来的、流向谁，本节全部公开 — 合伙人可逐项核对</div>
+                <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div>
+                        <h5 class="text-white mb-0"><i class="bi bi-calculator me-2"></i>计算公式与本月数据流向</h5>
+                        <div class="text-white-50 small mt-1">每一笔金额是怎么算出来的、流向谁，本节全部公开 — 合伙人可逐项核对</div>
+                    </div>
+                    <!-- Cost mode toggle: 约定 (合同固定比例) vs 实际 (真实进价 + 剩余利润均分) -->
+                    <div class="btn-group btn-group-sm" role="group" aria-label="cost calculation mode">
+                        <input type="radio" class="btn-check" name="formulaMode" id="formulaModeContract" value="contract" checked>
+                        <label class="btn btn-outline-warning" for="formulaModeContract"
+                               title="按合同约定的固定比例分账（cost_ratio / partner_profit_ratio / our_profit_ratio）">
+                            <i class="bi bi-percent me-1"></i>约定成本（合同比例）
+                        </label>
+                        <input type="radio" class="btn-check" name="formulaMode" id="formulaModeActual" value="actual">
+                        <label class="btn btn-outline-danger" for="formulaModeActual"
+                               title="先报销真实进货成本，剩余利润按 partner:our 比例分配">
+                            <i class="bi bi-box-seam me-1"></i>实际成本（真实进价）
+                        </label>
+                    </div>
                 </div>
                 <div class="card-body">
                     <div id="formulaBoxBody">
@@ -788,51 +1099,83 @@
 
         <!-- ========== PRODUCTS DETAIL TAB ========== -->
         <div class="tab-pane fade" id="tab-products">
-            <!-- Filter bar -->
+            <!-- Filter bar — month + site + manager scope (all AND-applied) -->
             <div class="card data-card mb-3">
                 <div class="card-body py-3 d-flex flex-wrap gap-3 align-items-end">
                     <div>
-                        <label class="form-label text-white-50 small mb-1">月份</label>
+                        <label class="form-label small mb-1" style="color:#cbd5e1;">月份</label>
                         <div class="ym-picker">
                             <select id="pdYear"></select>
                             <select id="pdMonth"></select>
                         </div>
                     </div>
+                    <div style="min-width:200px;">
+                        <label class="form-label small mb-1" style="color:#cbd5e1;">站点</label>
+                        <select id="pdSourceFilter" class="form-select form-select-sm bg-dark text-white border-secondary">
+                            <option value="">全部站点</option>
+                        </select>
+                    </div>
+                    <div style="min-width:130px;">
+                        <label class="form-label small mb-1" style="color:#cbd5e1;">负责人</label>
+                        <select id="pdManagerFilter" class="form-select form-select-sm bg-dark text-white border-secondary">
+                            <option value="">全部负责人</option>
+                        </select>
+                    </div>
                     <button class="btn btn-sm btn-primary" id="btnApplyProductFilter"><i class="bi bi-search me-1"></i>查询</button>
-                    <div class="ms-auto small text-white-50" id="pdSummaryHint"></div>
+                    <button class="btn btn-sm btn-outline-secondary" id="btnResetProductFilter" title="清除站点/负责人筛选"><i class="bi bi-x-circle me-1"></i>清除筛选</button>
+                    <div class="ms-auto small" style="color:#cbd5e1;" id="pdSummaryHint"></div>
                 </div>
             </div>
 
-            <!-- Cards row -->
-            <div class="row g-3 mb-3">
-                <div class="col-md-3"><div class="card data-card border-0" style="background:linear-gradient(135deg,#1e3a8a,#1e40af);"><div class="card-body py-3"><div class="text-white-50 small">产品销售额</div><div class="h4 text-white mt-1" id="pdRevenueValue">—</div></div></div></div>
-                <div class="col-md-3"><div class="card data-card border-0" style="background:linear-gradient(135deg,#7f1d1d,#991b1b);"><div class="card-body py-3"><div class="text-white-50 small">实际产品成本</div><div class="h4 text-white mt-1" id="pdCostValue">—</div></div></div></div>
-                <div class="col-md-3"><div class="card data-card border-0" style="background:linear-gradient(135deg,#065f46,#047857);"><div class="card-body py-3"><div class="text-white-50 small">实际毛利</div><div class="h4 text-white mt-1" id="pdMarginValue">—</div></div></div></div>
-                <div class="col-md-3"><div class="card data-card border-0 h-100" style="background:linear-gradient(135deg,#92400e,#b45309);cursor:pointer;" onclick="showReconUnmappedDetail()" title="点击查看未匹配明细"><div class="card-body py-3"><div class="text-white-50 small">未匹配产品 <i class="bi bi-arrow-right-circle ms-1"></i></div><div class="h4 text-white mt-1" id="pdUnmappedValue">—</div><div class="small text-white-50" id="pdUnmappedDetail"></div></div></div></div>
+            <!-- Cards row — 6 cards: revenue / cost / shipping / margin / margin% / unmapped
+                 Layout: 2 cols on phones, 3 on tablets, 6 on desktops. -->
+            <div class="row g-3 mb-3 row-cols-2 row-cols-md-3 row-cols-xl-6">
+                <div class="col"><div class="card data-card border-0 h-100" style="background:linear-gradient(135deg,#1e3a8a,#1e40af);"><div class="card-body py-3"><div class="text-white-50 small"><i class="bi bi-cash-coin me-1"></i>产品销售额</div><div class="h4 text-white mt-1" id="pdRevenueValue">—</div></div></div></div>
+                <div class="col"><div class="card data-card border-0 h-100" style="background:linear-gradient(135deg,#7f1d1d,#991b1b);"><div class="card-body py-3"><div class="text-white-50 small"><i class="bi bi-box-seam me-1"></i>实际产品成本</div><div class="h4 text-white mt-1" id="pdCostValue">—</div></div></div></div>
+                <div class="col"><div class="card data-card border-0 h-100" style="background:linear-gradient(135deg,#075985,#0284c7);" title="按订单内件数平摊到每个产品的运费 — 客户已付费、合伙人付物流，仅作信息参考，不计入产品成本"><div class="card-body py-3"><div class="text-white-50 small"><i class="bi bi-truck me-1"></i>运费分摊 <span class="ms-1" style="font-size:0.7em;background:rgba(255,255,255,0.15);padding:1px 5px;border-radius:6px;">参考</span></div><div class="h4 text-white mt-1" id="pdShippingValue">—</div><div class="small text-white-50" id="pdShippingDetail"></div></div></div></div>
+                <div class="col"><div class="card data-card border-0 h-100" style="background:linear-gradient(135deg,#065f46,#047857);" title="销售额 − 产品成本（运费由客户支付，与产品利润无关）"><div class="card-body py-3"><div class="text-white-50 small"><i class="bi bi-graph-up-arrow me-1"></i>实际毛利</div><div class="h4 text-white mt-1" id="pdMarginValue">—</div></div></div></div>
+                <div class="col"><div class="card data-card border-0 h-100" style="background:linear-gradient(135deg,#0e7490,#06b6d4);" title="实际毛利 ÷ 销售额"><div class="card-body py-3"><div class="text-white-50 small"><i class="bi bi-percent me-1"></i>实际毛利率</div><div class="h4 text-white mt-1" id="pdMarginPctValue">—</div><div class="small text-white-50" id="pdMarginPctDetail"></div></div></div></div>
+                <div class="col"><div class="card data-card border-0 h-100" style="background:linear-gradient(135deg,#92400e,#b45309);cursor:pointer;" onclick="showReconUnmappedDetail()" title="点击查看未匹配明细 — 这些产品的成本按销售额 50% 估算"><div class="card-body py-3"><div class="text-white-50 small"><i class="bi bi-exclamation-triangle me-1"></i>未匹配产品 <span class="ms-1" style="font-size:0.7em;background:rgba(255,255,255,0.15);padding:1px 5px;border-radius:6px;">按 50% 估算</span> <i class="bi bi-arrow-right-circle ms-1"></i></div><div class="h4 text-white mt-1" id="pdUnmappedValue">—</div><div class="small text-white-50" id="pdUnmappedDetail"></div></div></div></div>
             </div>
 
             <!-- Products table -->
             <div class="card data-card">
-                <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 d-flex justify-content-between align-items-center">
+                <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 d-flex justify-content-between align-items-center flex-wrap gap-2">
                     <h6 class="text-white mb-0"><i class="bi bi-grid me-2"></i>产品销量与成本明细</h6>
-                    <div class="small text-white-50">按销售额降序</div>
+                    <div class="d-flex align-items-center gap-2 flex-wrap">
+                        <span class="small" style="color:#94a3b8;">分组粒度:</span>
+                        <div class="btn-group btn-group-sm" role="group" aria-label="product grouping level">
+                            <input type="radio" class="btn-check" name="pdGroupLevel" id="pdGrpFull" value="full" checked>
+                            <label class="btn btn-outline-info" for="pdGrpFull"
+                                   title="按 品牌 + 口数 + 口味 最细分组（每个 SKU 一行）">品牌+口数+口味</label>
+                            <input type="radio" class="btn-check" name="pdGroupLevel" id="pdGrpBrandPuffs" value="brand_puffs">
+                            <label class="btn btn-outline-info" for="pdGrpBrandPuffs"
+                                   title="按 品牌 + 口数 聚合（同口数的不同口味合并）">品牌+口数</label>
+                            <input type="radio" class="btn-check" name="pdGroupLevel" id="pdGrpBrand" value="brand">
+                            <label class="btn btn-outline-info" for="pdGrpBrand"
+                                   title="仅按品牌聚合（最粗，看品牌总量）">品牌</label>
+                        </div>
+                        <span class="small ms-2" style="color:#cbd5e1;">按销售额降序</span>
+                    </div>
                 </div>
                 <div class="card-body p-0">
                     <div class="table-responsive">
                         <table class="table table-dark table-hover mb-0">
                             <thead>
-                                <tr>
-                                    <th class="ps-3">产品</th>
-                                    <th class="text-end">销量</th>
-                                    <th class="text-end">销售额</th>
-                                    <th class="text-end">单位成本</th>
-                                    <th>生效日期</th>
-                                    <th class="text-end">成本合计</th>
-                                    <th class="text-end">毛利</th>
-                                    <th class="text-end pe-3">毛利率</th>
+                                <tr id="pdProductsHead">
+                                    <th class="ps-3 pd-sortable" data-sort="label" title="点击按产品名排序">产品 <span class="pd-sort-ind">⇅</span></th>
+                                    <th class="text-end pd-sortable" data-sort="line_count" title="点击按 SKU 数排序">SKU 数 <span class="pd-sort-ind">⇅</span></th>
+                                    <th class="text-end pd-sortable" data-sort="qty" title="点击按销量排序">销量 <span class="pd-sort-ind">⇅</span></th>
+                                    <th class="text-end pd-sortable" data-sort="revenue" title="点击按销售额排序">销售额 <span class="pd-sort-ind">⇅</span></th>
+                                    <th class="text-end pd-col-unit pd-sortable" data-sort="cost_unit" title="点击按单位成本排序">单位成本 <span class="pd-sort-ind">⇅</span></th>
+                                    <th class="pd-col-date pd-sortable" data-sort="cost_effective_date" title="点击按生效日期排序">生效日期 <span class="pd-sort-ind">⇅</span></th>
+                                    <th class="text-end pd-sortable" data-sort="cost" title="点击按成本合计排序">成本合计 <span class="pd-sort-ind">⇅</span></th>
+                                    <th class="text-end pd-sortable" data-sort="allocated_shipping" title="按件数从订单运费平摊到每个产品 — 客户已支付，合伙人付物流，相抵 → 仅作信息参考，不计入产品成本。运费/件 高表示该产品常出现在小订单中">运费分摊 <i class="bi bi-info-circle small ms-1" style="color:#94a3b8;"></i><span class="pd-sort-ind">⇅</span></th>
+                                    <th class="text-end pd-sortable" data-sort="margin" title="销售额 − 产品成本">毛利 <span class="pd-sort-ind">⇅</span></th>
+                                    <th class="text-end pe-3 pd-sortable" data-sort="margin_pct" title="毛利率（不扣运费，因运费由客户支付）">毛利率 <span class="pd-sort-ind">⇅</span></th>
                                 </tr>
                             </thead>
-                            <tbody id="pdProductsBody"><tr><td colspan="8" class="text-center text-muted py-4">选择月份后加载...</td></tr></tbody>
+                            <tbody id="pdProductsBody"><tr><td colspan="10" class="text-center text-muted py-4">选择月份后加载...</td></tr></tbody>
                         </table>
                     </div>
                 </div>
@@ -1148,8 +1491,10 @@
 {% endif %}
 
 <script>
-// Template version: v15 (2026-05-07) — clickable unmapped-cost drilldowns (3 entry points)
-console.log('[partner_reconciliation] template loaded v15 — unmapped drilldowns');
+// Template version: v26 (2026-05-08) — REVERT 50% fallback (back to v23 cost=0 behavior)
+//                                       so inflated margin% becomes a forcing function;
+//                                       keep 实际毛利 + 实际毛利率 cards but flag inflated values
+console.log('[partner_reconciliation] template loaded v26 — unmapped cost reverted to 0 (forcing function)');
 const IS_RECON_ADMIN = {{ 'true' if is_recon_admin else 'false' }};
 const IS_SUPER_ADMIN = {{ 'true' if is_super_admin else 'false' }};
 console.log('[partner_reconciliation] IS_RECON_ADMIN=', IS_RECON_ADMIN, 'IS_SUPER_ADMIN=', IS_SUPER_ADMIN);
@@ -1181,6 +1526,8 @@ function saveReconState() {
             odSearch:     document.getElementById('odSearch')?.value || '',
             pdYear:       document.getElementById('pdYear')?.value || '',
             pdMonth:      document.getElementById('pdMonth')?.value || '',
+            pdSource:     document.getElementById('pdSourceFilter')?.value || '',
+            pdManager:    document.getElementById('pdManagerFilter')?.value || '',
             dbYear:       document.getElementById('dbYear')?.value || '',
             dbMonth:      document.getElementById('dbMonth')?.value || '',
             ts: Date.now()
@@ -1235,6 +1582,7 @@ function applyReconStateBase(s) {
     _applyIfValid('odSearch',     s.odSearch);
     _applyIfValid('pdYear',       s.pdYear);
     _applyIfValid('pdMonth',      s.pdMonth);
+    // pdSource / pdManager applied later (after loadPdFilters() populates options)
     _applyIfValid('dbYear',       s.dbYear);
     _applyIfValid('dbMonth',      s.dbMonth);
 }
@@ -1294,6 +1642,10 @@ document.addEventListener('DOMContentLoaded', function() {
         if (savedState && savedState.odSource) {
             _applyIfValid('odSourceFilter', savedState.odSource);
         }
+        // 3b) Pre-load product-detail filters (site / manager) — same idea
+        await loadPdFilters();
+        if (savedState && savedState.pdSource) _applyIfValid('pdSourceFilter', savedState.pdSource);
+        if (savedState && savedState.pdManager) _applyIfValid('pdManagerFilter', savedState.pdManager);
 
         // 4) Restore active tab last — triggers shown.bs.tab event which
         //    lazy-loads order/product detail content as needed.
@@ -1320,11 +1672,14 @@ document.addEventListener('DOMContentLoaded', function() {
         if (activeTab) {
             const target = activeTab.getAttribute('data-bs-target');
             if (target === '#tab-orders') loadOrderDetailTab();
-            if (target === '#tab-products') loadProductDetailTab();
+            if (target === '#tab-products') {
+                loadPdFilters().then(() => loadProductDetailTab());
+            }
             if (target === '#tab-dashboard') loadDashboardTab();
         }
-        // Sync source filter dropdown for current partner
+        // Sync filter dropdowns for current partner
         loadOdSourceFilter();
+        loadPdFilters();
     });
     // ──────────────────────────────────────────────────────────────────
     // CROSS-TAB MONTH SYNC
@@ -1349,13 +1704,62 @@ document.addEventListener('DOMContentLoaded', function() {
     // Product Detail tab wiring
     const btnApplyProductFilter = document.getElementById('btnApplyProductFilter');
     if (btnApplyProductFilter) btnApplyProductFilter.addEventListener('click', loadProductDetailTab);
+    // Site / manager filter changes auto-reload (no need to click 查询)
+    document.getElementById('pdSourceFilter')?.addEventListener('change', () => {
+        if (pdLoaded) loadProductDetailTab();
+    });
+    document.getElementById('pdManagerFilter')?.addEventListener('change', () => {
+        if (pdLoaded) loadProductDetailTab();
+    });
+    // Reset filters button
+    document.getElementById('btnResetProductFilter')?.addEventListener('click', () => {
+        const ss = document.getElementById('pdSourceFilter');
+        const ms = document.getElementById('pdManagerFilter');
+        if (ss) ss.value = '';
+        if (ms) ms.value = '';
+        loadProductDetailTab();
+    });
+
+    // Product grouping level (品牌 / 品牌+口数 / 品牌+口数+口味)
+    // Restore + wire change handlers (re-renders cached data, no API call).
+    try {
+        const savedLvl = localStorage.getItem('pdGroupLevel') || 'full';
+        const lvlRadio = document.getElementById(
+            savedLvl === 'brand' ? 'pdGrpBrand' :
+            savedLvl === 'brand_puffs' ? 'pdGrpBrandPuffs' : 'pdGrpFull'
+        );
+        if (lvlRadio) lvlRadio.checked = true;
+    } catch (e) { /* ignore */ }
+    document.querySelectorAll('input[name="pdGroupLevel"]').forEach(rb => {
+        rb.addEventListener('change', () => {
+            if (!rb.checked) return;
+            try { localStorage.setItem('pdGroupLevel', rb.value); } catch (e) { /* ignore */ }
+            if (_lastProductData) renderPdCardsAndTable(_lastProductData);
+        });
+    });
+
+    // Restore + wire column-sort
+    try {
+        const sf = localStorage.getItem('pdSortField');
+        const sd = localStorage.getItem('pdSortDir');
+        if (sf) pdSortField = sf;
+        if (sd === 'asc' || sd === 'desc') pdSortDir = sd;
+    } catch (e) { /* ignore */ }
+    document.querySelectorAll('#pdProductsHead .pd-sortable').forEach(th => {
+        th.addEventListener('click', () => {
+            const f = th.getAttribute('data-sort');
+            if (f) setPdSort(f);
+        });
+    });
 
     // Lazy-load tab content when first opened
     document.querySelectorAll('#recTabs .nav-link').forEach(btn => {
         btn.addEventListener('shown.bs.tab', e => {
             const target = e.target.getAttribute('data-bs-target');
             if (target === '#tab-orders' && !odLoaded) { loadOdSourceFilter(); loadOrderDetailTab(); }
-            if (target === '#tab-products' && !pdLoaded) loadProductDetailTab();
+            if (target === '#tab-products' && !pdLoaded) {
+                loadPdFilters().then(() => loadProductDetailTab());
+            }
             if (target === '#tab-dashboard' && !dbLoaded) loadDashboardTab();
         });
     });
@@ -1400,6 +1804,23 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('btnSubmitDispute')?.addEventListener('click', submitDispute);
     document.getElementById('btnSubmitResolve')?.addEventListener('click', submitResolve);
     document.getElementById('btnSubmitConfirm')?.addEventListener('click', submitConfirm);
+
+    // Formula mode toggle (约定 / 实际): restore saved choice + wire change handlers.
+    // Re-render uses cached preview data — no extra API call.
+    try {
+        const savedMode = localStorage.getItem('reconFormulaMode') || 'contract';
+        const radio = document.getElementById(savedMode === 'actual' ? 'formulaModeActual' : 'formulaModeContract');
+        if (radio) radio.checked = true;
+    } catch (e) { /* ignore */ }
+    document.querySelectorAll('input[name="formulaMode"]').forEach(rb => {
+        rb.addEventListener('change', () => {
+            if (!rb.checked) return;
+            try { localStorage.setItem('reconFormulaMode', rb.value); } catch (e) { /* ignore */ }
+            // Re-render BOTH the preview cards AND the formula breakdown,
+            // using cached data (no API roundtrip).
+            if (_lastPreviewData) renderPreviewCards(_lastPreviewData);
+        });
+    });
 });
 
 // Cross-tab month synchronization — when month changes in any tab, mirror to
@@ -1471,7 +1892,8 @@ function bindReconStatePersistence() {
     [
         'partnerSelector', 'previewYear', 'previewMonth',
         'odYear', 'odMonth', 'odStatusFilter', 'odSourceFilter',
-        'pdYear', 'pdMonth', 'dbYear', 'dbMonth'
+        'pdYear', 'pdMonth', 'pdSourceFilter', 'pdManagerFilter',
+        'dbYear', 'dbMonth'
     ].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('change', saveReconState);
@@ -1666,6 +2088,11 @@ async function loadOverview() {
     } catch (e) { console.error(e); }
 }
 
+// Cache the latest preview API response so the mode toggle (约定/实际) can
+// re-render both the predictor cards AND the formula breakdown without
+// hitting the backend again.
+let _lastPreviewData = null;
+
 async function refreshPreview() {
     const y = document.getElementById('previewYear').value;
     const m = document.getElementById('previewMonth').value;
@@ -1673,6 +2100,17 @@ async function refreshPreview() {
     if (!y || !m || !partnerId) return;
     try {
         const data = await api(`/api/reconciliation/statements/preview?partner_id=${partnerId}&year=${y}&month=${parseInt(m)}`);
+        _lastPreviewData = data;
+        renderPreviewCards(data);
+    } catch (e) { console.error(e); }
+}
+
+// Render the "本月实时预估" card AND the formula breakdown from data.
+// Extracted from refreshPreview so the mode toggle can call it with cached
+// data (no extra API roundtrip).
+function renderPreviewCards(data) {
+    if (!data) return;
+    try {
         const curr = data.currency || 'PLN';
         const rateBadge = document.getElementById('pvRateBadge');
         if (data.effective_rate_cny) {
@@ -1700,16 +2138,118 @@ async function refreshPreview() {
             : `<span class="text-muted">0</span>`;
         document.getElementById('pvNet').innerHTML = dual(data.total_net_pln, data.total_net_cny, curr);
 
-        // Row 3 — cost & profit (dual track)
-        document.getElementById('pvCostRatioLabel').textContent = `(${(data.cost_ratio * 100).toFixed(0)}%)`;
-        document.getElementById('pvPpRatioLabel').textContent = `(${(data.partner_profit_ratio * 100).toFixed(0)}%)`;
-        document.getElementById('pvOpRatioLabel').textContent = `(${(data.our_profit_ratio * 100).toFixed(0)}%)`;
-        document.getElementById('pvCost').innerHTML = dual(data.cost_amount_pln, data.cost_amount_cny, curr);
+        // Row 3 — cost & profit (dual track, mode-aware)
+        // Compute both contract-based and actual-based values; show pp/our
+        // numbers based on the active mode.
+        const mode = getFormulaMode();
+        const ppr = data.partner_profit_ratio || 0.25;
+        const opr = data.our_profit_ratio || 0.25;
+        const cr  = data.cost_ratio || 0.50;
+        const remTotal = ppr + opr;
+        const ppShare = remTotal > 0 ? (ppr / remTotal) : 0.5;
+        const opShare = remTotal > 0 ? (opr / remTotal) : 0.5;
+        const netPln = data.total_net_pln || 0;
         const actualCostPln = data.actual_cost_pln ?? 0;
         const actualCostCny = data.effective_rate_cny ? actualCostPln * data.effective_rate_cny : null;
+        const remainder = netPln - actualCostPln;
+        const ppActual = remainder * ppShare;
+        const ourActual = remainder * opShare;
+        const rate = data.effective_rate_cny;
+
+        // Card 1 (约定成本): always shows ratio-based number, label changes to indicate active/reference
+        document.getElementById('pvCostRatioLabel').textContent =
+            mode === 'actual' ? `(参考 — ${pct(cr)})` : `(${pct(cr)})`;
+        document.getElementById('pvCost').innerHTML = dual(data.cost_amount_pln, data.cost_amount_cny, curr);
+
+        // Card 2 (实际产品成本): same number, label changes to show "active" in actual mode
         document.getElementById('pvActualCost').innerHTML = actualCostPln > 0
             ? dual(actualCostPln, actualCostCny, curr)
             : `<span class="text-muted">未配置成本</span>`;
+
+        // Card 3 (实际毛利) — net − actual cost. Unmapped lines contribute 0
+        // cost (forcing function), so this margin is INFLATED whenever there
+        // are unmapped products. The card flags this so partners aren't
+        // misled. The "正确" path is to fill in cost data, not to estimate.
+        const marginPln = data.actual_margin_pln ?? (netPln - actualCostPln);
+        const marginCny = data.actual_margin_cny ?? (rate ? marginPln * rate : null);
+        const pvMarginEl = document.getElementById('pvMargin');
+        if (pvMarginEl) {
+            pvMarginEl.innerHTML = dual(marginPln, marginCny, curr);
+        }
+
+        // Card 4 (实际毛利率) — margin / net × 100. When there are unmapped
+        // products this is INFLATED (since their cost is 0). Show an orange
+        // "高估" note pointing to the cost-fill workflow.
+        const marginPctEl = document.getElementById('pvMarginPct');
+        const marginPctNoteEl = document.getElementById('pvMarginPctNote');
+        const marginPctVal = data.actual_margin_pct;
+        const unmappedQ = data.cost_unmapped_qty || 0;
+        if (marginPctEl) {
+            if (marginPctVal == null) {
+                marginPctEl.innerHTML = `<span class="text-muted">—</span>`;
+            } else {
+                // Orange color when inflated, normal purple otherwise
+                const inflated = unmappedQ > 0;
+                const pColor = inflated ? '#fbbf24' : (marginPctVal >= 0 ? '#c084fc' : '#fca5a5');
+                marginPctEl.innerHTML = `<span style="color:${pColor};">${marginPctVal.toFixed(1)}%${inflated ? '*' : ''}</span>`;
+            }
+        }
+        if (marginPctNoteEl) {
+            if (unmappedQ > 0) {
+                const unmappedRevPct = (data.cost_unmapped_revenue_pln && netPln > 0)
+                    ? ((data.cost_unmapped_revenue_pln / netPln) * 100).toFixed(1)
+                    : null;
+                marginPctNoteEl.innerHTML = `<i class="bi bi-exclamation-triangle me-1" style="color:#fbbf24;"></i>* 高估：${unmappedQ} 件未配置成本${unmappedRevPct ? '（占 '+unmappedRevPct+'%）' : ''}`;
+            } else if (actualCostPln > 0) {
+                marginPctNoteEl.innerHTML = `<span style="color:#6ee7b7;"><i class="bi bi-check-circle me-1"></i>全部按真实进价</span>`;
+            } else {
+                marginPctNoteEl.innerHTML = '';
+            }
+        }
+
+        // Card 5 (合伙人利润) — value depends on mode
+        // Card 6 (我方应收) — value depends on mode
+        if (mode === 'actual') {
+            document.getElementById('pvPpRatioLabel').textContent = `(剩余 ${pct1(ppShare)})`;
+            document.getElementById('pvOpRatioLabel').textContent = `(剩余 ${pct1(opShare)})`;
+            document.getElementById('pvPartnerProfit').innerHTML = dual(ppActual, rate ? ppActual * rate : null, curr);
+            document.getElementById('pvOurRecv').innerHTML = dual(ourActual, rate ? ourActual * rate : null, curr);
+        } else {
+            document.getElementById('pvPpRatioLabel').textContent = `(${pct(ppr)})`;
+            document.getElementById('pvOpRatioLabel').textContent = `(${pct(opr)})`;
+            document.getElementById('pvPartnerProfit').innerHTML = dual(data.partner_profit_pln, data.partner_profit_cny, curr);
+            document.getElementById('pvOurRecv').innerHTML = dual(data.our_receivable_pln, data.our_receivable_cny, curr);
+        }
+
+        // Visual highlight: the "active" cost tile pops with a glow + ACTIVE
+        // badge, the other dims via .is-inactive class. Cleaner than direct
+        // opacity manipulation; CSS controls the look.
+        const pvCostTile = document.getElementById('pvCostBox');
+        const pvActualTile = document.getElementById('pvActualBox');
+        if (pvCostTile && pvActualTile) {
+            // Wipe existing badge if any, reset state classes
+            pvCostTile.classList.remove('is-active', 'is-inactive');
+            pvActualTile.classList.remove('is-active', 'is-inactive');
+            const stripBadge = (el) => { const b = el.querySelector('.preview-tile-badge'); if (b) b.remove(); };
+            stripBadge(pvCostTile); stripBadge(pvActualTile);
+            const addBadge = (el, text) => {
+                const b = document.createElement('span');
+                b.className = 'preview-tile-badge';
+                b.textContent = text;
+                el.appendChild(b);
+            };
+            if (mode === 'actual') {
+                pvActualTile.classList.add('is-active');
+                pvCostTile.classList.add('is-inactive');
+                addBadge(pvActualTile, '当前模式');
+            } else {
+                pvCostTile.classList.add('is-active');
+                pvActualTile.classList.add('is-inactive');
+                addBadge(pvCostTile, '当前模式');
+            }
+        }
+
+        // Unmapped warning hint (always show — orthogonal to mode)
         const unmappedRev = data.cost_unmapped_revenue_pln ?? 0;
         const unmappedQty = data.cost_unmapped_qty ?? 0;
         const unmappedHint = document.getElementById('pvCostUnmapped');
@@ -1718,23 +2258,45 @@ async function refreshPreview() {
         } else {
             unmappedHint.innerHTML = '';
         }
-        document.getElementById('pvPartnerProfit').innerHTML = dual(data.partner_profit_pln, data.partner_profit_cny, curr);
-        document.getElementById('pvOurRecv').innerHTML = dual(data.our_receivable_pln, data.our_receivable_cny, curr);
 
         // Render the formula breakdown + money-flow diagram from the same data
         renderFormulaBreakdown(data);
     } catch (e) { console.error(e); }
 }
 
+// pct helpers reused by refreshPreview AND renderFormulaBreakdown.
+// Defined as locals inside renderFormulaBreakdown originally — hoist to module.
+function pct(v) { return `${(+(v || 0) * 100).toFixed(0)}%`; }
+function pct1(v) { return `${(+(v || 0) * 100).toFixed(1)}%`; }
+
 // ============================================================
 // FORMULA BREAKDOWN — write out every formula, plug in current month data,
 // AND show the exchange-rate substitution explicitly. Terms are color-coded
 // to match the "本月实时预估" card so the same value can be visually traced.
+//
+// Two modes (toggled in card header):
+//   contract — 比例分账 (current behavior): cost = net × cost_ratio,
+//              pp = net × pp_ratio, our = net × op_ratio
+//   actual   — 真实进价口径: actual_cost = Σ(qty × price);
+//              remainder = net − actual_cost;
+//              pp = remainder × pp_ratio/(pp+op);
+//              our = remainder × op_ratio/(pp+op)
 // ============================================================
+let _lastFormulaData = null;  // cache so mode toggle re-renders without re-fetch
+
+function getFormulaMode() {
+    const el = document.querySelector('input[name="formulaMode"]:checked');
+    return el ? el.value : 'contract';
+}
+
 function renderFormulaBreakdown(d) {
+    if (!d) return;
+    _lastFormulaData = d;  // cache for mode-toggle re-render
+    const mode = getFormulaMode();
     const curr = d.currency || 'PLN';
     const r = d.effective_rate_cny;
     const pct = (v) => `${(+(v || 0) * 100).toFixed(0)}%`;
+    const pct1 = (v) => `${(+(v || 0) * 100).toFixed(1)}%`;
 
     // Term color spans — colors match the preview card.
     // Each term wraps any text fragment (label or numeric value) so partners can
@@ -1767,6 +2329,16 @@ function renderFormulaBreakdown(d) {
     const ppr = d.partner_profit_ratio || 0.25;
     const opr = d.our_profit_ratio     || 0.25;
 
+    // Actual-mode: split the remainder (net − actual_cost) between partner
+    // and us, proportional to (pp_ratio : op_ratio). When pp = op = 0.25,
+    // the remainder gets a clean 50/50 split.
+    const remainderTotal = ppr + opr;
+    const ppShare = remainderTotal > 0 ? (ppr / remainderTotal) : 0.5;
+    const opShare = remainderTotal > 0 ? (opr / remainderTotal) : 0.5;
+    const remainder = net - actual;
+    const pProfitActual = remainder * ppShare;
+    const ourRecvActual = remainder * opShare;
+
     // Diff between agreed (contract) cost and actual cost
     const costDiff = cost - actual;
     const costDiffSign = costDiff >= 0 ? '+' : '';
@@ -1786,6 +2358,7 @@ function renderFormulaBreakdown(d) {
     // Verification of ratios
     const ratioSum = cr + ppr + opr;
     const ratioOK = Math.abs(ratioSum - 1.0) < 0.001;
+    const shareOK = Math.abs(ppShare + opShare - 1.0) < 0.001;
 
     // Helper that renders the "换算" (CNY conversion) row — explicitly shows
     // value × rate = ¥CNY using the same term color as the source value.
@@ -1818,7 +2391,7 @@ function renderFormulaBreakdown(d) {
                         <span class="formula-tag">公式：</span>
                         <code>${T.gross('总销售额(成功订单)')}</code>
                         <span class="formula-eq">−</span>
-                        <code>${T.ship('运费收入(成功订单)')}</code>
+                        <code>${T.ship('运费成本(成功订单)')}</code>
                         <span class="formula-eq">−</span>
                         <code>${T.loss('运费损失(未送达订单)')}</code>
                         <span class="formula-eq">=</span>
@@ -1839,7 +2412,27 @@ function renderFormulaBreakdown(d) {
                 </div>
             </div>
 
-            <!-- ② Agreed (contract) cost -->
+            <!-- ② Cost — primary in current mode -->
+            ${ mode === 'actual' ? `
+            <div class="formula-item fi-actual">
+                <div class="formula-num">②</div>
+                <div class="formula-body">
+                    <div class="formula-name">${T.actual('<i class="bi bi-box-seam me-1"></i>实际产品成本')}（合伙人留 — 覆盖真实进货）</div>
+                    <div class="formula-row">
+                        <span class="formula-tag">公式：</span>
+                        <code>Σ ( 各产品销量 × 该订单日期下的进价 )</code>
+                        <span class="formula-eq">=</span>
+                        <code>${T.actual('实际产品成本')}</code>
+                    </div>
+                    <div class="formula-row">
+                        <span class="formula-tag">代入：</span>
+                        <code class="formula-result">${T.actual(fmt(actual) + ' ' + curr)}</code>
+                    </div>
+                    ${cnyRow('实际产品成本', actual, T.actual)}
+                    <div class="formula-note">每张订单按下单日期匹配 product_costs 表的真实进价；产品成本表里有版本演变（如 2/28 进价 28，3/15 涨到 30），不同月订单各取所值。</div>
+                    ${unmappedNote}
+                </div>
+            </div>` : `
             <div class="formula-item fi-cost">
                 <div class="formula-num">②</div>
                 <div class="formula-body">
@@ -1863,13 +2456,34 @@ function renderFormulaBreakdown(d) {
                     ${cnyRow('约定成本', cost, T.cost)}
                     <div class="formula-note">按合作约定的固定比例 — 用于覆盖产品进价、损耗、囤货成本</div>
                 </div>
-            </div>
+            </div>` }
 
-            <!-- ③ Actual product cost -->
+            <!-- ③ Reference cost (the "other" mode shown for comparison) -->
+            ${ mode === 'actual' ? `
+            <div class="formula-item fi-cost">
+                <div class="formula-num">③</div>
+                <div class="formula-body">
+                    <div class="formula-name">${T.cost('<i class="bi bi-percent me-1"></i>约定成本')}<span class="ms-2 small" style="color:#94a3b8;">(参考 — 当前未使用)</span></div>
+                    <div class="formula-row">
+                        <span class="formula-tag">公式：</span>
+                        <code>${T.net('净销售额')}</code>
+                        <span class="formula-eq">×</span>
+                        <code>${T.pctTag(pct(cr))}</code>
+                        <span class="formula-eq">=</span>
+                        <code>${T.cost('约定成本')}</code>
+                    </div>
+                    <div class="formula-row">
+                        <span class="formula-tag">代入：</span>
+                        <code class="formula-result">${T.cost(fmt(cost) + ' ' + curr)}</code>
+                        <span class="formula-eq" style="color:${costDiffColor};">(vs ${T.actual('实际')} ${costDiffSign}${fmt(costDiff)} ${curr})</span>
+                    </div>
+                    <div class="formula-note" style="color:${costDiffColor};">${costDiffNote}</div>
+                </div>
+            </div>` : `
             <div class="formula-item fi-actual">
                 <div class="formula-num">③</div>
                 <div class="formula-body">
-                    <div class="formula-name">${T.actual('<i class="bi bi-box-seam me-1"></i>实际产品成本')}（系统按真实进价测算）</div>
+                    <div class="formula-name">${T.actual('<i class="bi bi-box-seam me-1"></i>实际产品成本')}<span class="ms-2 small" style="color:#94a3b8;">(参考 — 当前未使用)</span></div>
                     <div class="formula-row">
                         <span class="formula-tag">公式：</span>
                         <code>Σ ( 各产品销量 × 该订单日期下的进价 )</code>
@@ -1885,9 +2499,34 @@ function renderFormulaBreakdown(d) {
                     <div class="formula-note" style="color:${costDiffColor};">${costDiffNote}</div>
                     ${unmappedNote}
                 </div>
-            </div>
+            </div>` }
 
-            <!-- ④ Partner profit -->
+            <!-- ④ Partner profit — different formula per mode -->
+            ${ mode === 'actual' ? `
+            <div class="formula-item fi-profit">
+                <div class="formula-num">④</div>
+                <div class="formula-body">
+                    <div class="formula-name">${T.pp('<i class="bi bi-piggy-bank me-1"></i>合伙人利润')}（合伙人留 — 实际毛利的 ${pct1(ppShare)}）</div>
+                    <div class="formula-row">
+                        <span class="formula-tag">公式：</span>
+                        <code>(${T.net('净销售额')} <span class="formula-eq">−</span> ${T.actual('实际产品成本')})</code>
+                        <span class="formula-eq">×</span>
+                        <code>${T.pctTag(pct1(ppShare))}</code>
+                        <span class="formula-eq">=</span>
+                        <code>${T.pp('合伙人利润')}</code>
+                    </div>
+                    <div class="formula-row">
+                        <span class="formula-tag">代入：</span>
+                        <code>(${T.net(fmt(net))} <span class="formula-eq">−</span> ${T.actual(fmt(actual))})</code>
+                        <span class="formula-eq">×</span>
+                        <code>${T.pctTag(pct1(ppShare))}</code>
+                        <span class="formula-eq">=</span>
+                        <code class="formula-result">${T.pp(fmt(pProfitActual) + ' ' + curr)}</code>
+                    </div>
+                    ${cnyRow('合伙人利润', pProfitActual, T.pp)}
+                    <div class="formula-note">${pct1(ppShare)} = pp_ratio (${pct(ppr)}) ÷ (pp_ratio + op_ratio) — 实际成本扣完后剩余利润的合伙人份额</div>
+                </div>
+            </div>` : `
             <div class="formula-item fi-profit">
                 <div class="formula-num">④</div>
                 <div class="formula-body">
@@ -1910,9 +2549,34 @@ function renderFormulaBreakdown(d) {
                     </div>
                     ${cnyRow('合伙人利润', pProfit, T.pp)}
                 </div>
-            </div>
+            </div>` }
 
-            <!-- ⑤ Our receivable -->
+            <!-- ⑤ Our receivable — different formula per mode -->
+            ${ mode === 'actual' ? `
+            <div class="formula-item fi-ours">
+                <div class="formula-num">⑤</div>
+                <div class="formula-body">
+                    <div class="formula-name">${T.ours('<i class="bi bi-bank me-1"></i>我方应收')}（实际毛利的 ${pct1(opShare)} — 合伙人需打款给我方）</div>
+                    <div class="formula-row">
+                        <span class="formula-tag">公式：</span>
+                        <code>(${T.net('净销售额')} <span class="formula-eq">−</span> ${T.actual('实际产品成本')})</code>
+                        <span class="formula-eq">×</span>
+                        <code>${T.pctTag(pct1(opShare))}</code>
+                        <span class="formula-eq">=</span>
+                        <code>${T.ours('我方应收')}</code>
+                    </div>
+                    <div class="formula-row">
+                        <span class="formula-tag">代入：</span>
+                        <code>(${T.net(fmt(net))} <span class="formula-eq">−</span> ${T.actual(fmt(actual))})</code>
+                        <span class="formula-eq">×</span>
+                        <code>${T.pctTag(pct1(opShare))}</code>
+                        <span class="formula-eq">=</span>
+                        <code class="formula-result">${T.ours(fmt(ourRecvActual) + ' ' + curr)}</code>
+                    </div>
+                    ${cnyRow('我方应收', ourRecvActual, T.ours)}
+                    <div class="formula-note">${pct1(opShare)} = op_ratio (${pct(opr)}) ÷ (pp_ratio + op_ratio) — 实际成本扣完后剩余利润的我方份额</div>
+                </div>
+            </div>` : `
             <div class="formula-item fi-ours">
                 <div class="formula-num">⑤</div>
                 <div class="formula-body">
@@ -1935,9 +2599,45 @@ function renderFormulaBreakdown(d) {
                     </div>
                     ${cnyRow('我方应收', ourRecv, T.ours)}
                 </div>
-            </div>
+            </div>` }
 
-            <!-- ⑥ Verification + actual margin -->
+            <!-- ⑥ Verification — different in each mode -->
+            ${ mode === 'actual' ? `
+            <div class="formula-item fi-margin">
+                <div class="formula-num">⑥</div>
+                <div class="formula-body">
+                    <div class="formula-name">${T.margin('<i class="bi bi-check2-square me-1"></i>验算 / 实际毛利分配')}</div>
+                    <div class="formula-row">
+                        <span class="formula-tag">实际毛利：</span>
+                        <code>${T.net(fmt(net))}</code>
+                        <span class="formula-eq">−</span>
+                        <code>${T.actual(fmt(actual))}</code>
+                        <span class="formula-eq">=</span>
+                        <code class="formula-result">${T.margin(fmt(margin) + ' ' + curr)}</code>
+                    </div>
+                    <div class="formula-row">
+                        <span class="formula-tag">分配：</span>
+                        <code>${T.pp('合伙人 ' + fmt(pProfitActual))}</code>
+                        <span class="formula-eq">+</span>
+                        <code>${T.ours('我方 ' + fmt(ourRecvActual))}</code>
+                        <span class="formula-eq">=</span>
+                        <code>${fmt(pProfitActual + ourRecvActual) + ' ' + curr}</code>
+                        <span class="formula-eq">${shareOK ? '<span class="text-success">✓ 等于实际毛利</span>' : '<span class="text-danger">✗ 分配不平衡</span>'}</span>
+                    </div>
+                    <div class="formula-row">
+                        <span class="formula-tag">合计：</span>
+                        <code>${T.actual(fmt(actual))}</code>
+                        <span class="formula-eq">+</span>
+                        <code>${T.pp(fmt(pProfitActual))}</code>
+                        <span class="formula-eq">+</span>
+                        <code>${T.ours(fmt(ourRecvActual))}</code>
+                        <span class="formula-eq">=</span>
+                        <code class="formula-result">${T.net(fmt(actual + pProfitActual + ourRecvActual) + ' ' + curr)}</code>
+                        <span class="formula-eq" style="color:#94a3b8;">→ 与净销售额一致</span>
+                    </div>
+                    <div class="formula-note">实际模式：合伙人先收回真实进货成本，剩余利润按 ${pct(ppr)}:${pct(opr)} 比例（即 ${pct1(ppShare)} : ${pct1(opShare)}）分配。注意此模式与合同约定不同 — 合伙人最终拿到 = 实际成本 + 利润分成；我方应收为剩余利润的 ${pct1(opShare)}。</div>
+                </div>
+            </div>` : `
             <div class="formula-item fi-margin">
                 <div class="formula-num">⑥</div>
                 <div class="formula-body">
@@ -1966,7 +2666,7 @@ function renderFormulaBreakdown(d) {
                     ${cnyRow('实际毛利', margin, T.margin)}
                     <div class="formula-note">这是按真实进价算出的"潜在利润"，仅作参考；实际分账仍以约定比例（②④⑤）为准</div>
                 </div>
-            </div>
+            </div>` }
 
         </div>
 
@@ -1988,9 +2688,9 @@ function renderFormulaBreakdown(d) {
             <!-- Layer 2: deductions -->
             <div class="flow-row flow-row-2">
                 <div class="flow-box flow-deduction">
-                    <div class="flow-label">运费收入</div>
+                    <div class="flow-label">运费成本</div>
                     <div class="flow-value">−${fmt(ship)} ${curr}</div>
-                    <div class="flow-note">合伙人收，不进入分账</div>
+                    <div class="flow-note">物流费用，不进入分账</div>
                 </div>
                 <div class="flow-box flow-deduction">
                     <div class="flow-label">运费损失（未送达 ${d.undelivered_orders || 0} 单）</div>
@@ -2010,9 +2710,30 @@ function renderFormulaBreakdown(d) {
                 </div>
             </div>
 
-            <div class="flow-arrow-down"><span>三方分账</span> <span class="arrow">↓</span></div>
+            <div class="flow-arrow-down"><span>${mode === 'actual' ? '按实际成本 + 剩余利润分配' : '三方分账'}</span> <span class="arrow">↓</span></div>
 
-            <!-- Layer 4: 3-way split -->
+            <!-- Layer 4: 3-way split — labels and amounts depend on mode -->
+            ${ mode === 'actual' ? `
+            <div class="flow-row flow-row-3">
+                <div class="flow-box flow-share-cost" style="border-color:rgba(248,113,113,0.5);background:rgba(127,29,29,0.25);">
+                    <div class="flow-label">实际产品成本</div>
+                    <div class="flow-value" style="color:#fca5a5;">${fmt(actual)} ${curr}</div>
+                    ${r ? `<div class="flow-cny">≈ ¥${fmt(actual * r)}</div>` : ''}
+                    <div class="flow-target">→ 合伙人留（覆盖进货）</div>
+                </div>
+                <div class="flow-box flow-share-profit">
+                    <div class="flow-label">合伙人利润 (${pct1(ppShare)} of 剩余)</div>
+                    <div class="flow-value">${fmt(pProfitActual)} ${curr}</div>
+                    ${r ? `<div class="flow-cny">≈ ¥${fmt(pProfitActual * r)}</div>` : ''}
+                    <div class="flow-target">→ 合伙人留</div>
+                </div>
+                <div class="flow-box flow-share-ours">
+                    <div class="flow-label">我方应收 (${pct1(opShare)} of 剩余)</div>
+                    <div class="flow-value">${fmt(ourRecvActual)} ${curr}</div>
+                    ${r ? `<div class="flow-cny">≈ ¥${fmt(ourRecvActual * r)}</div>` : ''}
+                    <div class="flow-target">→ 我方收款</div>
+                </div>
+            </div>` : `
             <div class="flow-row flow-row-3">
                 <div class="flow-box flow-share-cost">
                     <div class="flow-label">约定成本 (${pct(cr)})</div>
@@ -2032,7 +2753,7 @@ function renderFormulaBreakdown(d) {
                     ${r ? `<div class="flow-cny">≈ ¥${fmt(ourRecv * r)}</div>` : ''}
                     <div class="flow-target">→ 我方收款</div>
                 </div>
-            </div>
+            </div>` }
         </div>
     `;
     document.getElementById('formulaBoxBody').innerHTML = html;
@@ -2170,7 +2891,7 @@ function renderOdOrders(data) {
             ? `<span class="badge ms-1" style="background:rgba(168,85,247,0.2);color:#c084fc;border:1px solid rgba(168,85,247,0.4);">含 ${dt.undelivered_count} 单未送达</span>`
             : '';
         const unmappedChip = (dt.unmapped_qty || 0) > 0
-            ? `<a href="javascript:void(0)" onclick="showReconUnmappedDetail()" class="badge ms-1" style="background:rgba(251,191,36,0.18);color:#fbbf24;border:1px solid rgba(251,191,36,0.4);text-decoration:none;cursor:pointer;" title="点击查看未匹配成本的产品明细">⚠ ${dt.unmapped_qty} 件未配置成本</a>`
+            ? `<a href="javascript:void(0)" onclick="showReconUnmappedDetail()" class="badge ms-1" style="background:rgba(251,191,36,0.18);color:#fbbf24;border:1px solid rgba(251,191,36,0.4);text-decoration:none;cursor:pointer;" title="点击查看未匹配成本的产品明细 — 这些行的成本未计入，毛利率被高估，请到产品成本页补录">⚠ ${dt.unmapped_qty} 件未配置成本</a>`
             : '';
         const lossLine = (dt.shipping_loss || 0) > 0
             ? `<div class="small" style="color:#fbbf24;" title="未送达订单的运费损失"><i class="bi bi-arrow-return-left me-1"></i>−${fmt(dt.shipping_loss)} ${curr} 损失</div>`
@@ -2249,7 +2970,9 @@ function renderOdOrders(data) {
             : `<span style="color:#94a3b8;">-</span>`;
 
         // ── COST / MARGIN / MARGIN% columns ──
-        // For revenue orders: show actual cost from product_costs (date-aware)
+        // POLICY: unmapped lines contribute 0 cost (forcing function for cost
+        // data quality). Orders with unmapped products show inflated margin%
+        // and a ⚠ warning so the team knows to fill in real costs.
         // For undelivered/failed/cancelled: show "−" (no inventory consumed)
         let costCol, marginCol, marginPctCol;
         if (!o.cost_eligible) {
@@ -2258,7 +2981,7 @@ function renderOdOrders(data) {
             marginPctCol = '<span style="color:#94a3b8;">−</span>';
         } else {
             const unmapWarn = (o.unmapped_qty || 0) > 0
-                ? ` <i class="bi bi-exclamation-triangle small" style="color:#fbbf24;" title="${o.unmapped_qty} 件未匹配成本"></i>`
+                ? ` <i class="bi bi-exclamation-triangle small" style="color:#fbbf24;" title="${o.unmapped_qty} 件未匹配成本 — 这些行的成本未计入，毛利率被高估，请到产品成本页补录"></i>`
                 : '';
             costCol = `<span style="color:#fca5a5;">${fmt(o.cost || 0)}</span>${unmapWarn}`;
             const mColor = (o.margin || 0) >= 0 ? '#6ee7b7' : '#fca5a5';
@@ -2267,7 +2990,11 @@ function renderOdOrders(data) {
                 marginPctCol = '<span style="color:#94a3b8;">−</span>';
             } else {
                 const pColor = o.margin_pct >= 0 ? '#6ee7b7' : '#fca5a5';
-                marginPctCol = `<span style="color:${pColor};font-weight:600;">${o.margin_pct.toFixed(1)}%</span>`;
+                // Mark as inflated (orange) when this order has unmapped lines
+                const inflated = (o.unmapped_qty || 0) > 0;
+                const pColorFinal = inflated ? '#fbbf24' : pColor;
+                const inflatedHint = inflated ? ' title="毛利率被高估（含未匹配成本的产品）"' : '';
+                marginPctCol = `<span style="color:${pColorFinal};font-weight:600;"${inflatedHint}>${o.margin_pct.toFixed(1)}%${inflated ? '*' : ''}</span>`;
             }
         }
 
@@ -2332,8 +3059,180 @@ function orderStatusBadge(status, paymentMethod, isUndelivered) {
 
 // ============================================================
 // PRODUCT DETAIL TAB
+// ----------------------------------------------------------
+// Cache the raw products array (always at finest granularity:
+//   品牌 + 系列 + 口数 + 口味)
+// so that switching the grouping radio (品牌 / 品牌+口数 / 品牌+口数+口味)
+// re-aggregates the same data on the client without an extra API call.
+// Same cache feeds the column-sort feature — sorting is pure client-side.
 // ============================================================
 let pdLoaded = false;
+let _lastProductData = null;  // cached API response
+
+// Sort state — restored from localStorage on init.
+// Default: revenue desc (most-revenue first). Setting field=null reverts to default.
+let pdSortField = 'revenue';
+let pdSortDir = 'desc';  // 'asc' | 'desc'
+
+function getPdGroupLevel() {
+    const el = document.querySelector('input[name="pdGroupLevel"]:checked');
+    return el ? el.value : 'full';
+}
+
+// Sort the regrouped products array. Nulls always sink to the end so
+// "未匹配" rows don't pollute the top when sorting by margin/cost.
+function sortProducts(arr, field, dir) {
+    if (!field) return arr;
+    const mult = dir === 'asc' ? 1 : -1;
+    return [...arr].sort((a, b) => {
+        const av = a[field];
+        const bv = b[field];
+        const aNull = av == null || av === '';
+        const bNull = bv == null || bv === '';
+        if (aNull && bNull) return 0;
+        if (aNull) return 1;   // nulls always at bottom
+        if (bNull) return -1;
+        if (typeof av === 'string' || typeof bv === 'string') {
+            return mult * String(av).localeCompare(String(bv), 'zh-CN');
+        }
+        return mult * ((av || 0) - (bv || 0));
+    });
+}
+
+// Update the visual indicators on column headers — only the active column
+// shows ↑ / ↓; others show neutral ⇅.
+function updatePdSortIndicators() {
+    document.querySelectorAll('.pd-sortable').forEach(th => {
+        const ind = th.querySelector('.pd-sort-ind');
+        const field = th.getAttribute('data-sort');
+        const isActive = (field === pdSortField);
+        th.classList.toggle('active-sort', isActive);
+        if (!ind) return;
+        ind.classList.toggle('active', isActive);
+        ind.textContent = isActive ? (pdSortDir === 'asc' ? '▲' : '▼') : '⇅';
+    });
+}
+
+// Click-cycle on a header: same field → toggle desc/asc;
+// different field → activate desc; third click on same field → reset default.
+function setPdSort(field) {
+    if (pdSortField === field) {
+        if (pdSortDir === 'desc') {
+            pdSortDir = 'asc';
+        } else {
+            // Third click — back to default
+            pdSortField = 'revenue';
+            pdSortDir = 'desc';
+        }
+    } else {
+        pdSortField = field;
+        pdSortDir = 'desc';
+    }
+    try {
+        localStorage.setItem('pdSortField', pdSortField);
+        localStorage.setItem('pdSortDir', pdSortDir);
+    } catch (e) { /* ignore */ }
+    if (_lastProductData) renderPdCardsAndTable(_lastProductData);
+}
+
+// Re-aggregate the raw `products` array (full granularity) up to the
+// requested level. Sums qty/revenue/cost; per-row cost_unit / 生效日期
+// no longer apply at coarser levels (different SKUs may have different
+// costs), so those cells render as "—".
+function regroupProducts(products, level) {
+    if (level === 'full') return products;
+    const map = new Map();
+    for (const p of products) {
+        let key, label;
+        if (level === 'brand') {
+            key = `b|${p.brand_id || 0}|${p.brand || (p.mapped ? '(未知品牌)' : '(未映射)')}`;
+            label = p.brand || (p.mapped ? '(未知品牌)' : '(未映射)');
+        } else if (level === 'brand_puffs') {
+            key = `bp|${p.brand_id || 0}|${p.puff_count || 0}`;
+            const brandName = p.brand || (p.mapped ? '(未知品牌)' : '(未映射)');
+            label = brandName + (p.puff_count ? ' / ' + p.puff_count.toLocaleString() + '口' : '');
+        } else {
+            return products;
+        }
+        if (!map.has(key)) {
+            map.set(key, {
+                label,
+                brand: p.brand,
+                brand_id: p.brand_id,
+                puff_count: level === 'brand_puffs' ? p.puff_count : null,
+                mapped: !!p.brand_id,
+                qty: 0, revenue: 0, cost: 0,
+                cost_mapped: 0,
+                qty_mapped: 0, qty_estimated: 0,  // qty_estimated counts UNMAPPED qty
+                allocated_shipping: 0,
+                has_cost: false,  // becomes true if any sub-row has real cost
+                cost_unit: null, cost_currency: null, cost_effective_date: null,
+                cost_match_level: null, line_count: 0,
+            });
+        }
+        const e = map.get(key);
+        e.qty += p.qty || 0;
+        e.revenue += p.revenue || 0;
+        e.allocated_shipping += p.allocated_shipping || 0;
+        e.cost += p.cost || 0;
+        e.cost_mapped += p.cost_mapped || 0;
+        e.qty_mapped += p.qty_mapped || 0;
+        e.qty_estimated += p.qty_estimated || 0;
+        if (p.has_cost) e.has_cost = true;
+        e.line_count += p.line_count || 1;
+    }
+    const arr = [...map.values()].sort((a, b) => b.revenue - a.revenue);
+    arr.forEach(e => {
+        // Per-unit shipping (avg across the SKUs aggregated under this row)
+        e.shipping_unit = e.qty > 0 ? (e.allocated_shipping / e.qty) : 0;
+        // Margin uses cost which now EXCLUDES unmapped lines (forcing function).
+        // Rows with unmapped products will show inflated margin% — that's the
+        // intended signal to fill in cost data.
+        e.margin = e.revenue - e.cost;
+        e.margin_pct = e.revenue > 0 ? (e.margin / e.revenue * 100) : null;
+        e.net_profit = e.margin;
+        e.net_margin_pct = e.margin_pct;
+        // Mapping flags (formerly "estimated"; now mean "uncounted")
+        e.is_fully_estimated = (e.qty_mapped === 0 && e.qty_estimated > 0);
+        e.is_partially_estimated = (e.qty_mapped > 0 && e.qty_estimated > 0);
+        e.estimated_ratio_pct = e.qty > 0 ? (e.qty_estimated / e.qty * 100) : 0;
+    });
+    return arr;
+}
+
+// Load partner-bound sites and unique managers into the product-detail
+// filter dropdowns. Called when partner changes (or first time).
+async function loadPdFilters() {
+    const partnerId = getCurrentPartnerId();
+    const sourceSel = document.getElementById('pdSourceFilter');
+    const managerSel = document.getElementById('pdManagerFilter');
+    if (!partnerId || !sourceSel || !managerSel) return;
+    try {
+        const data = await api(`/api/partners/${partnerId}/sites`);
+        // Only sites bound to this partner
+        const bound = (data.all_sites || []).filter(s => data.bound_site_ids.includes(s.id));
+        // Site options: URL → display "domain · 国家"
+        const prevSrc = sourceSel.value;
+        sourceSel.innerHTML = '<option value="">全部站点</option>' + bound.map(s => {
+            const domain = (s.url || '').replace(/^https?:\/\/(www\.)?/, '');
+            const tag = s.country ? ` · ${s.country}` : '';
+            const mgr = s.manager ? ` · ${s.manager}` : '';
+            return `<option value="${s.url}">${domain}${tag}${mgr}</option>`;
+        }).join('');
+        // Restore previous selection if still valid
+        if (prevSrc && Array.from(sourceSel.options).some(o => o.value === prevSrc)) {
+            sourceSel.value = prevSrc;
+        }
+        // Manager options: unique non-empty managers from bound sites
+        const prevMgr = managerSel.value;
+        const managers = [...new Set(bound.map(s => s.manager).filter(Boolean))].sort();
+        managerSel.innerHTML = '<option value="">全部负责人</option>' +
+            managers.map(m => `<option value="${m}">${m}</option>`).join('');
+        if (prevMgr && Array.from(managerSel.options).some(o => o.value === prevMgr)) {
+            managerSel.value = prevMgr;
+        }
+    } catch(e) { console.error('loadPdFilters', e); }
+}
 
 async function loadProductDetailTab() {
     const partnerId = getCurrentPartnerId();
@@ -2341,57 +3240,150 @@ async function loadProductDetailTab() {
     pdLoaded = true;
     const y = document.getElementById('pdYear').value;
     const m = document.getElementById('pdMonth').value;
+    const src = document.getElementById('pdSourceFilter')?.value || '';
+    const mgr = document.getElementById('pdManagerFilter')?.value || '';
+    const params = new URLSearchParams({partner_id: partnerId, year: y, month: parseInt(m)});
+    if (src) params.set('source', src);
+    if (mgr) params.set('manager', mgr);
     try {
-        const data = await api(`/api/reconciliation/products?partner_id=${partnerId}&year=${y}&month=${parseInt(m)}`);
-        const curr = data.currency || 'PLN';
-        const t = data.totals;
-        document.getElementById('pdRevenueValue').innerHTML = `${fmt(t.revenue)} <small style="font-size:0.55em;opacity:0.7;">${curr}</small>`;
-        document.getElementById('pdCostValue').innerHTML = `${fmt(t.actual_cost)} <small style="font-size:0.55em;opacity:0.7;">${curr}</small>`;
-        const margin = (t.revenue || 0) - (t.actual_cost || 0);
-        document.getElementById('pdMarginValue').innerHTML = `${fmt(margin)} <small style="font-size:0.55em;opacity:0.7;">${curr}</small>`;
-        document.getElementById('pdUnmappedValue').innerHTML = `${t.unmapped_qty || 0} <small style="font-size:0.55em;opacity:0.7;">件</small>`;
-        document.getElementById('pdUnmappedDetail').textContent = t.unmapped_qty > 0
-            ? `涉及销售额 ${fmt(t.unmapped_revenue)} ${curr} — 请到产品成本页录入`
-            : '';
-        document.getElementById('pdSummaryHint').textContent = data.products.length > 0
-            ? `共 ${data.products.length} 个产品 · 数据基于真实进货价（按下单日期匹配）`
-            : '';
-
-        const tbody = document.getElementById('pdProductsBody');
-        if (data.products.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-4">本月没有产品销售</td></tr>';
-            return;
-        }
-        tbody.innerHTML = data.products.map(p => {
-            const costCell = p.has_cost
-                ? `${fmt(p.cost_unit)} <span class="small text-muted">${p.cost_currency || curr}</span>${p.cost_match_level && p.cost_match_level.includes('future') ? ' <i class="bi bi-info-circle text-warning" title="使用了订单日期之后的成本（无更早记录）"></i>' : ''}`
-                : `<a href="javascript:void(0)" onclick="showReconUnmappedDetail()" class="small" style="color:#fbbf24;text-decoration:underline dotted;cursor:pointer;" title="点击查看所有未匹配产品并补录成本"><i class="bi bi-exclamation-triangle me-1"></i>未匹配</a>`;
-            const dateCell = p.has_cost ? `<span class="small text-muted">${p.cost_effective_date || '-'}</span>` : '-';
-            const totalCostCell = p.has_cost ? `${fmt(p.cost)} ${curr}` : '<span class="text-muted">-</span>';
-            const marginCell = p.margin != null
-                ? `<span class="${p.margin >= 0 ? 'text-success' : 'text-danger'}">${fmt(p.margin)}</span>`
-                : '<span class="text-muted">-</span>';
-            const marginPctCell = p.margin_pct != null
-                ? `<span class="${p.margin_pct >= 0 ? 'text-success' : 'text-danger'}">${p.margin_pct.toFixed(1)}%</span>`
-                : '-';
-            const productLabel = p.mapped
-                ? `<strong class="text-info">${p.label}</strong>`
-                : `<span class="text-warning">${p.label}</span> <i class="bi bi-exclamation-triangle text-warning small" title="未在系统中映射，请到产品管理页定义"></i>`;
-            return `<tr>
-                <td class="ps-3">${productLabel}</td>
-                <td class="text-end">${(p.qty || 0).toLocaleString()}</td>
-                <td class="text-end">${fmt(p.revenue)} ${curr}</td>
-                <td class="text-end">${costCell}</td>
-                <td>${dateCell}</td>
-                <td class="text-end">${totalCostCell}</td>
-                <td class="text-end">${marginCell}</td>
-                <td class="text-end pe-3">${marginPctCell}</td>
-            </tr>`;
-        }).join('');
+        const data = await api(`/api/reconciliation/products?${params}`);
+        _lastProductData = data;
+        // Pass the active filter for display in summary hint
+        data._activeFilter = { source: src, manager: mgr };
+        renderPdCardsAndTable(data);
     } catch(e) {
         console.error('loadProductDetailTab', e);
-        document.getElementById('pdProductsBody').innerHTML = `<tr><td colspan="8" class="text-center text-danger py-4">${e.message}</td></tr>`;
+        document.getElementById('pdProductsBody').innerHTML = `<tr><td colspan="10" class="text-center text-danger py-4">${e.message}</td></tr>`;
     }
+}
+
+// Pure render — used by both initial load and grouping-level toggle.
+function renderPdCardsAndTable(data) {
+    if (!data) return;
+    const curr = data.currency || 'PLN';
+    const t = data.totals || {};
+    const level = getPdGroupLevel();
+
+    // Top cards: revenue / cost / shipping(info) / margin / margin% / unmapped
+    // 毛利 = 销售额 − 产品成本（运费由客户支付，与产品利润无关）
+    // 运费分摊为信息参考列，不参与利润计算
+    const revenue = t.revenue || 0;
+    const actualCost = t.actual_cost || 0;
+    const allocShip = t.allocated_shipping || 0;
+    const margin = revenue - actualCost;
+    const marginPct = revenue > 0 ? (margin / revenue * 100) : null;
+    const small = (s) => `<small style="font-size:0.55em;opacity:0.7;">${s}</small>`;
+    document.getElementById('pdRevenueValue').innerHTML = `${fmt(revenue)} ${small(curr)}`;
+    document.getElementById('pdCostValue').innerHTML = `${fmt(actualCost)} ${small(curr)}`;
+    document.getElementById('pdShippingValue').innerHTML = `${fmt(allocShip)} ${small(curr)}`;
+    // Average shipping per unit + ratio of revenue (info)
+    const totalQty = (data.products || []).reduce((s, p) => s + (p.qty || 0), 0);
+    const shipRatio = revenue > 0 ? (allocShip / revenue * 100) : 0;
+    document.getElementById('pdShippingDetail').innerHTML = totalQty > 0
+        ? `平均 ${(allocShip / totalQty).toFixed(2)} ${curr}/件 · 占销售 ${shipRatio.toFixed(1)}%`
+        : '按订单内件数平摊';
+    document.getElementById('pdMarginValue').innerHTML = `${fmt(margin)} ${small(curr)}`;
+    const pctEl = document.getElementById('pdMarginPctValue');
+    pctEl.innerHTML = marginPct == null ? '—' : `${marginPct.toFixed(1)} ${small('%')}`;
+    document.getElementById('pdMarginPctDetail').textContent = marginPct == null
+        ? ''
+        : `毛利 ${fmt(margin)} ÷ 销售 ${fmt(revenue)}`;
+    document.getElementById('pdUnmappedValue').innerHTML = `${t.unmapped_qty || 0} ${small('件')}`;
+    document.getElementById('pdUnmappedDetail').textContent = t.unmapped_qty > 0
+        ? `销售 ${fmt(t.unmapped_revenue)} ${curr} 未计入成本 → 毛利率会偏高，请到产品成本页补录`
+        : '';
+
+    // Re-aggregate products to the chosen level, then apply column sort.
+    let groups = regroupProducts(data.products || [], level);
+    groups = sortProducts(groups, pdSortField, pdSortDir);
+    updatePdSortIndicators();
+
+    const sortFieldLabel = {
+        label: '产品名', line_count: 'SKU 数', qty: '销量', revenue: '销售额',
+        cost_unit: '单位成本', cost_effective_date: '生效日期', cost: '成本合计',
+        allocated_shipping: '运费分摊', margin: '毛利', margin_pct: '毛利率',
+        // Old names kept as aliases for backward compat with saved sort state
+        net_profit: '毛利', net_margin_pct: '毛利率',
+    }[pdSortField] || pdSortField;
+    const sortBadge = pdSortField
+        ? ` · 按 <span style="color:#5dd0e6;">${sortFieldLabel} ${pdSortDir === 'asc' ? '升序' : '降序'}</span>`
+        : '';
+    // Echo active site / manager filters in the hint
+    const f = data._activeFilter || {};
+    const filterChips = [];
+    if (f.source) filterChips.push(`<span class="badge ms-1" style="background:rgba(93,208,230,0.18);color:#5dd0e6;">站点: ${f.source.replace(/^https?:\/\/(www\.)?/, '')}</span>`);
+    if (f.manager) filterChips.push(`<span class="badge ms-1" style="background:rgba(93,208,230,0.18);color:#5dd0e6;">负责人: ${f.manager}</span>`);
+    const filterStr = filterChips.length ? ' · 筛选: ' + filterChips.join('') : '';
+    document.getElementById('pdSummaryHint').innerHTML = groups.length > 0
+        ? `共 ${groups.length} 组 (粒度: ${level === 'full' ? '品牌+口数+口味' : level === 'brand_puffs' ? '品牌+口数' : '品牌'})${sortBadge}${filterStr}`
+        : (filterChips.length ? `当前筛选无数据${filterStr}` : '');
+
+    // Show / hide 单位成本 + 生效日期 columns at coarser levels
+    // (those cells don't make sense after aggregation across SKUs).
+    const showSkuCols = level === 'full';
+    document.querySelectorAll('.pd-col-unit, .pd-col-date').forEach(el => {
+        el.style.display = showSkuCols ? '' : 'none';
+    });
+
+    const tbody = document.getElementById('pdProductsBody');
+    if (groups.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-4">本月没有产品销售</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = groups.map(p => {
+        // Per-row cost cells — only meaningful at finest granularity.
+        // Unmapped rows have cost = 0 by design (forcing function); show
+        // a warning badge so the team knows which rows to fill in.
+        const isFullyUnmapped = (!p.has_cost) || (p.qty_mapped === 0 && p.qty_estimated > 0);
+        const isPartialUnmapped = p.has_cost && p.qty_mapped > 0 && p.qty_estimated > 0;
+        const warnBadge = isFullyUnmapped
+            ? '<a href="javascript:void(0)" onclick="showReconUnmappedDetail()" class="badge ms-1" style="background:rgba(251,191,36,0.18);color:#fbbf24;text-decoration:none;cursor:pointer;font-size:0.7em;" title="该产品未在 product_costs 表配置成本 — 成本未计入，毛利率被高估，请补录">⚠ 未配置成本</a>'
+            : isPartialUnmapped
+                ? `<a href="javascript:void(0)" onclick="showReconUnmappedDetail()" class="badge ms-1" style="background:rgba(251,191,36,0.18);color:#fbbf24;text-decoration:none;cursor:pointer;font-size:0.7em;" title="部分订单未配置成本（${p.qty_estimated} / ${p.qty} 件，约 ${p.estimated_ratio_pct}%）— 请补录">⚠ 部分未配置</a>`
+                : '';
+        const costCell = !showSkuCols
+            ? '<span class="small" style="color:#94a3b8;">(多)</span>'
+            : (isFullyUnmapped
+                ? `<span style="color:#94a3b8;">—</span>`
+                : `${fmt(p.cost_unit)} <span class="small text-muted">${p.cost_currency || curr}</span>${p.cost_match_level && p.cost_match_level.includes('future') ? ' <i class="bi bi-info-circle text-warning" title="使用了订单日期之后的成本（无更早记录）"></i>' : ''}`);
+        const dateCell = !showSkuCols
+            ? '<span style="color:#94a3b8;">—</span>'
+            : (isFullyUnmapped
+                ? '<span class="small" style="color:#94a3b8;">—</span>'
+                : `<span class="small text-muted">${p.cost_effective_date || '-'}</span>`);
+        const totalCostCell = `${fmt(p.cost)} ${curr}${warnBadge}`;
+        // 运费分摊：仅作信息展示 — 客户已付费，与利润计算无关
+        const shipUnit = p.shipping_unit || (p.qty > 0 ? (p.allocated_shipping / p.qty) : 0);
+        const shipRatioPct = p.revenue > 0 ? (p.allocated_shipping / p.revenue * 100) : 0;
+        const shippingCell = (p.allocated_shipping || 0) > 0
+            ? `<div style="color:#5dd0e6;">${fmt(p.allocated_shipping)} <span class="small text-muted">${curr}</span></div>` +
+              `<div class="small" style="color:#94a3b8;">${shipUnit.toFixed(2)}/件 · 占销售 ${shipRatioPct.toFixed(1)}%</div>`
+            : '<span class="text-muted">-</span>';
+        // 毛利 = 销售 − 成本（运费不扣）
+        const marginCell = p.margin != null
+            ? `<span class="${p.margin >= 0 ? 'text-success' : 'text-danger'}">${fmt(p.margin)}</span>`
+            : '<span class="text-muted">-</span>';
+        const marginPctCell = p.margin_pct != null
+            ? `<span class="${p.margin_pct >= 0 ? 'text-success' : 'text-danger'} fw-semibold">${p.margin_pct.toFixed(1)}%</span>`
+            : '-';
+        const productLabel = p.mapped
+            ? `<strong class="text-info">${p.label}</strong>`
+            : `<span class="text-warning">${p.label}</span> <i class="bi bi-exclamation-triangle text-warning small" title="未在系统中映射，请到产品管理页定义"></i>`;
+        const skuCount = p.line_count || 1;
+        return `<tr>
+            <td class="ps-3">${productLabel}</td>
+            <td class="text-end"><span class="badge" style="background:rgba(99,102,241,0.18);color:#a5b4fc;">${skuCount}</span></td>
+            <td class="text-end">${(p.qty || 0).toLocaleString()}</td>
+            <td class="text-end">${fmt(p.revenue)} ${curr}</td>
+            <td class="text-end pd-col-unit"${showSkuCols ? '' : ' style="display:none;"'}>${costCell}</td>
+            <td class="pd-col-date"${showSkuCols ? '' : ' style="display:none;"'}>${dateCell}</td>
+            <td class="text-end">${totalCostCell}</td>
+            <td class="text-end">${shippingCell}</td>
+            <td class="text-end">${marginCell}</td>
+            <td class="text-end pe-3">${marginPctCell}</td>
+        </tr>`;
+    }).join('');
 }
 
 // ============================================================
@@ -2965,7 +3957,7 @@ async function openStatementDetail(id) {
                     <table class="table table-dark table-sm mb-0" style="--bs-table-bg:transparent;">
                         <tbody>
                             <tr><td class="ps-3"><i class="bi bi-check-circle text-success me-2"></i>成功订单</td><td class="text-end">${ld.success_orders} 单</td><td class="text-end text-success">+ ${fmt(s.total_gross_pln)} ${curr}</td><td class="text-muted small">总销售额</td></tr>
-                            <tr><td class="ps-3"><i class="bi bi-truck me-2 text-info"></i>运费收入</td><td></td><td class="text-end text-warning">− ${fmt(ld.by_status?.success?.shipping || 0)} ${curr}</td><td class="text-muted small">运费不计入合伙人净额</td></tr>
+                            <tr><td class="ps-3"><i class="bi bi-truck me-2 text-info"></i>运费成本</td><td></td><td class="text-end text-warning">− ${fmt(ld.by_status?.success?.shipping || 0)} ${curr}</td><td class="text-muted small">物流费用，不计入合伙人净额</td></tr>
                             <tr style="color:#c084fc;"><td class="ps-3"><i class="bi bi-arrow-return-left me-2"></i>未送达订单运费损失</td><td class="text-end">${ld.undelivered_orders} 单</td><td class="text-end" style="color:#fbbf24;">− ${fmt(ld.shipping_loss)} ${curr}</td><td class="text-muted small">未送达即运费由我方承担</td></tr>
                             <tr style="background:rgba(99,102,241,0.1);font-weight:600;border-top:2px solid rgba(255,255,255,0.1);"><td class="ps-3 text-info">= 净销售额</td><td></td><td class="text-end text-info">${fmt(s.total_net_pln)} ${curr}</td><td class="text-muted small">用于分账</td></tr>
                             <tr class="text-muted small"><td class="ps-3 text-muted">未计入对账的：失败 ${ld.failed_orders} / 取消 ${ld.cancelled_orders} / 待支付 ${ld.pending_orders}</td><td colspan="3" class="text-muted small">这些订单状态视为未产生收入</td></tr>
