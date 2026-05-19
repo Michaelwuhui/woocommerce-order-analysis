@@ -96,6 +96,7 @@
                             <th colspan="4" class="text-center border-start">成功订单</th>
                             <th colspan="2" class="text-center border-start">失败/取消</th>
                             <th colspan="2" class="text-center border-start" style="color:#c084fc;">未送达</th>
+                            <th colspan="2" class="text-center border-start" style="color:#f87171;">问题退货</th>
                             <th rowspan="2" class="align-middle text-center">汇率</th>
                             <th rowspan="2" class="align-middle text-end text-warning">¥净金额</th>
                         </tr>
@@ -110,7 +111,9 @@
                             <th class="text-end border-start">失败</th>
                             <th class="text-end">取消</th>
                             <th class="text-end border-start" style="color:#c084fc;">单数</th>
-                            <th class="text-end" style="color:#c084fc;">运费损失</th>
+                            <th class="text-end" style="color:#fbbf24;">运费损失</th>
+                            <th class="text-end border-start" style="color:#f87171;">单数</th>
+                            <th class="text-end" style="color:#fbbf24;">货值损失</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -159,6 +162,15 @@
                                     {% endif %}
                                 {% endfor %}
                             </td>
+                            <td class="text-end fw-bold align-middle border-start" style="color:#f87171;">{{
+                                "{:,}".format(monthly_aggregates[row.month].problem_return_orders or 0) }}</td>
+                            <td class="text-end fw-bold align-middle" style="color:#fbbf24;">
+                                {% for cur, amt in monthly_aggregates[row.month].currency_amounts.items() %}
+                                    {% if amt.product_loss and amt.product_loss > 0 %}
+                                    <div>{{ "{:,.2f}".format(amt.product_loss) }} <span class="badge bg-secondary" style="font-size:0.7em;">{{ cur }}</span></div>
+                                    {% endif %}
+                                {% endfor %}
+                            </td>
                             <td colspan="1"></td>
                             <td class="text-end text-warning fw-bold align-middle fs-6">¥{{
                                 "{:,.2f}".format(monthly_aggregates[row.month].success_net_amount_cny) }}</td>
@@ -186,6 +198,8 @@
                             <td class="text-end text-danger">{{ row.cancelled_orders }}</td>
                             <td class="text-end border-start" style="color:#c084fc;">{{ row.undelivered_orders or 0 }}</td>
                             <td class="text-end" style="color:{{ '#fbbf24' if row.shipping_loss and row.shipping_loss > 0 else '#6b7280' }};">{{ "{:,.2f}".format(row.shipping_loss or 0) }} {{ row.currency or '' }}</td>
+                            <td class="text-end border-start" style="color:{{ '#f87171' if (row.problem_return_orders or 0) > 0 else '#6b7280' }};">{{ row.problem_return_orders or 0 }}</td>
+                            <td class="text-end" style="color:{{ '#fbbf24' if row.product_loss and row.product_loss > 0 else '#6b7280' }};">{{ "{:,.2f}".format(row.product_loss or 0) }} {{ row.currency or '' }}</td>
                             <td class="text-center"><span class="badge bg-info bg-opacity-25 text-info">{{
                                     "%.4f"|format(row.rate_to_cny) if row.rate_to_cny else '-' }}</span></td>
                             <td class="text-end text-warning">{% if row.success_net_amount_cny %}¥{{
@@ -193,7 +207,7 @@
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="14" class="text-center py-5">
+                            <td colspan="16" class="text-center py-5">
                                 <i class="bi bi-inbox display-4 text-muted"></i>
                                 <p class="text-muted mt-3">暂无统计数据</p>
                             </td>

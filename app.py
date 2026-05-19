@@ -993,14 +993,24 @@ def dashboard():
     # Cancelled/failed orders count
     stats['cancelled_orders'] = conn.execute(f"SELECT COUNT(*) FROM orders {date_condition} AND status IN ('cancelled', 'failed')", params).fetchone()[0]
 
-    # Undelivered (refused/returned) orders count + shipping loss aggregated by currency
+    # Undelivered (refused/returned) orders count + shipping loss aggregated by currency.
+    # shipping_loss covers BOTH undelivered AND 问题退货 orders (shared column).
     stats['undelivered_orders'] = conn.execute(f"SELECT COUNT(*) FROM orders {date_condition} AND is_undelivered = 1", params).fetchone()[0]
     shipping_loss_raw = conn.execute(f'''
         SELECT currency, SUM(COALESCE(shipping_loss_amount, 0)) as loss
-        FROM orders {date_condition} AND is_undelivered = 1
+        FROM orders {date_condition} AND (is_undelivered = 1 OR is_problem_return = 1)
         GROUP BY currency
     ''', params).fetchall()
     stats['shipping_loss_by_currency'] = {row['currency'] or 'N/A': float(row['loss'] or 0) for row in shipping_loss_raw}
+
+    # 问题退货 orders count + product (货值) loss aggregated by currency
+    stats['problem_return_orders'] = conn.execute(f"SELECT COUNT(*) FROM orders {date_condition} AND is_problem_return = 1", params).fetchone()[0]
+    product_loss_raw = conn.execute(f'''
+        SELECT currency, SUM(COALESCE(product_loss_amount, 0)) as loss
+        FROM orders {date_condition} AND is_problem_return = 1
+        GROUP BY currency
+    ''', params).fetchall()
+    stats['product_loss_by_currency'] = {row['currency'] or 'N/A': float(row['loss'] or 0) for row in product_loss_raw}
     
     # Total revenue by currency - add status filter
     revenue_conditions = conditions.copy()
@@ -1011,10 +1021,10 @@ def dashboard():
     # Valid orders count (for AOV calculation)
     stats['valid_orders'] = conn.execute(f'SELECT COUNT(*) FROM orders {revenue_where}', params).fetchone()[0]
     
-    # Get revenue grouped by currency (total and net = total - shipping − shipping_loss)
-    # The revenue_where filter already excludes undelivered orders (so their
-    # totals don't get counted as revenue); shipping_loss for those orders
-    # is a real cost we ate, subtracted here so the net matches /monthly.
+    # Get revenue grouped by currency (total and net = total - shipping − shipping_loss − product_loss)
+    # The revenue_where filter already excludes undelivered + problem-return orders
+    # (so their totals don't get counted as revenue); their shipping_loss and
+    # product_loss are real costs we ate, subtracted here so net matches /monthly.
     revenue_by_currency_raw = conn.execute(f'''
         SELECT currency, SUM(total) as revenue, SUM(shipping_total) as shipping
         FROM orders {revenue_where}
@@ -1024,6 +1034,7 @@ def dashboard():
     stats['net_revenue_by_currency'] = {
         row['currency']: (row['revenue'] or 0) - (row['shipping'] or 0)
                        - stats['shipping_loss_by_currency'].get(row['currency'] or 'N/A', 0)
+                       - stats['product_loss_by_currency'].get(row['currency'] or 'N/A', 0)
         for row in revenue_by_currency_raw
     }
 
@@ -1071,14 +1082,22 @@ def dashboard():
         GROUP BY source, currency
     ''', params).fetchall()
 
-    # Per-source/per-currency shipping loss from undelivered orders. Same
+    # Per-source/per-currency shipping loss from undelivered + 问题退货 orders. Same
     # date filter as the revenue query so the deduction lines up.
     source_loss_raw = conn.execute(f'''
         SELECT source, currency, SUM(COALESCE(shipping_loss_amount, 0)) as loss
-        FROM orders {date_condition} AND is_undelivered = 1
+        FROM orders {date_condition} AND (is_undelivered = 1 OR is_problem_return = 1)
         GROUP BY source, currency
     ''', params).fetchall()
     source_loss_lookup = {(r['source'], r['currency']): float(r['loss'] or 0) for r in source_loss_raw}
+
+    # Per-source/per-currency 货值损失 from 问题退货 orders.
+    source_product_loss_raw = conn.execute(f'''
+        SELECT source, currency, SUM(COALESCE(product_loss_amount, 0)) as loss
+        FROM orders {date_condition} AND is_problem_return = 1
+        GROUP BY source, currency
+    ''', params).fetchall()
+    source_product_loss_lookup = {(r['source'], r['currency']): float(r['loss'] or 0) for r in source_product_loss_raw}
 
     # Build success data lookup
     success_lookup = {}
@@ -1100,10 +1119,12 @@ def dashboard():
         source_dict[source]['revenue'] += row['revenue'] or 0
 
         # Net revenue = success revenue − success shipping − this source's
-        # shipping_loss from undelivered orders. Mirrors the /monthly view.
+        # shipping_loss (未送达 + 问题退货) − product_loss (问题退货).
+        # Mirrors the /monthly view.
         success_data = success_lookup.get((source, currency), {'success_revenue': 0, 'success_shipping': 0})
         loss = source_loss_lookup.get((source, currency), 0)
-        source_dict[source]['net_revenue'] += success_data['success_revenue'] - success_data['success_shipping'] - loss
+        p_loss = source_product_loss_lookup.get((source, currency), 0)
+        source_dict[source]['net_revenue'] += success_data['success_revenue'] - success_data['success_shipping'] - loss - p_loss
     
     source_data = list(source_dict.values())
     
@@ -1497,7 +1518,9 @@ def orders():
 
     where_clause = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
     
-    # Summary statistics by source (with currency)
+    # Summary statistics by source (with currency).
+    # shipping_loss covers both undelivered and problem-return orders because
+    # both flows write to the same shipping_loss_amount column.
     stats_query = f'''
         SELECT source, currency,
             COUNT(*) as total_orders,
@@ -1509,7 +1532,10 @@ def orders():
             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_orders,
             SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled_orders,
             SUM(CASE WHEN is_undelivered = 1 THEN 1 ELSE 0 END) as undelivered_orders,
-            SUM(CASE WHEN is_undelivered = 1 THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END) as shipping_loss
+            SUM(CASE WHEN COALESCE(is_undelivered,0) = 1 OR COALESCE(is_problem_return,0) = 1
+                     THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END) as shipping_loss,
+            SUM(CASE WHEN is_problem_return = 1 THEN 1 ELSE 0 END) as problem_return_orders,
+            SUM(CASE WHEN is_problem_return = 1 THEN COALESCE(product_loss_amount, 0) ELSE 0 END) as product_loss
         FROM orders {where_clause} GROUP BY source, currency
     '''
     summary_raw = conn.execute(stats_query, params).fetchall()
@@ -1542,10 +1568,11 @@ def orders():
         stat['failed_products'] = prods.get('failed', 0)
         stat['cancelled_products'] = prods.get('cancelled', 0)
         # Net = product revenue minus collected shipping fees minus
-        # shipping losses from undelivered orders. Mirrors the /monthly
-        # view's formula so the two summaries cross-validate.
+        # shipping/product losses from undelivered + problem-return orders.
+        # Mirrors the /monthly view's formula so the two summaries cross-validate.
         stat['shipping_loss'] = float(stat.get('shipping_loss') or 0)
-        stat['success_net_amount'] = (stat['success_amount'] or 0) - (stat['success_shipping'] or 0) - stat['shipping_loss']
+        stat['product_loss'] = float(stat.get('product_loss') or 0)
+        stat['success_net_amount'] = (stat['success_amount'] or 0) - (stat['success_shipping'] or 0) - stat['shipping_loss'] - stat['product_loss']
 
     totals = {
         'total_orders': sum(s['total_orders'] or 0 for s in summary_stats),
@@ -1559,6 +1586,8 @@ def orders():
         'cancelled_orders': sum(s['cancelled_orders'] or 0 for s in summary_stats),
         'undelivered_orders': sum(s.get('undelivered_orders') or 0 for s in summary_stats),
         'shipping_loss': sum(s.get('shipping_loss') or 0 for s in summary_stats),
+        'problem_return_orders': sum(s.get('problem_return_orders') or 0 for s in summary_stats),
+        'product_loss': sum(s.get('product_loss') or 0 for s in summary_stats),
     }
     
     # Get all available months for pagination
@@ -1732,11 +1761,13 @@ def orders():
     displayed_totals = {
         'order_count': len(processed_orders),
         'undelivered_count': 0,
+        'problem_return_count': 0,
         'product_count': 0,
         'by_currency': {},
         'net_cny': 0.0,
         'shipping_loss_cny': 0.0,
-        'final_net_cny': 0.0,  # net minus shipping_loss — matches monthly view
+        'product_loss_cny': 0.0,
+        'final_net_cny': 0.0,  # net minus shipping_loss/product_loss — matches monthly view
     }
     # Mirrors _revenue_status_cond() in SQL — same exclusion list so the
     # order-list totals row matches the filter-summary "净金额" column.
@@ -1751,19 +1782,24 @@ def orders():
             return False
         if o.get('is_undelivered'):
             return False
+        if o.get('is_problem_return'):
+            return False
         return True
 
     for o in processed_orders:
         cur = o.get('currency') or 'N/A'
         bucket = displayed_totals['by_currency'].setdefault(cur, {
             'amount': 0.0, 'shipping': 0.0, 'net': 0.0,
-            'shipping_loss': 0.0, 'undelivered_count': 0,
+            'shipping_loss': 0.0, 'product_loss': 0.0,
+            'undelivered_count': 0, 'problem_return_count': 0,
             'order_count': 0,
         })
         bucket['order_count'] += 1
         bucket['amount']   += float(o.get('total') or 0)
         bucket['shipping'] += float(o.get('shipping_total') or 0)
         displayed_totals['product_count'] += int(o.get('product_count') or 0)
+
+        rate = float(o.get('rate_to_cny') or 0)
 
         if o.get('is_undelivered'):
             # Undelivered: package came back, goods resellable, but carrier
@@ -1774,8 +1810,29 @@ def orders():
             bucket['undelivered_count'] += 1
             loss = float(o.get('shipping_loss_amount') or 0)
             bucket['shipping_loss'] += loss
-            if o.get('rate_to_cny'):
-                displayed_totals['shipping_loss_cny'] += loss * float(o['rate_to_cny'])
+            if rate:
+                displayed_totals['shipping_loss_cny'] += loss * rate
+            # If the same order also has a problem-return marker, surface
+            # its product_loss too (shipping_loss already attributed above).
+            if o.get('is_problem_return'):
+                displayed_totals['problem_return_count'] += 1
+                bucket['problem_return_count'] += 1
+                p_loss = float(o.get('product_loss_amount') or 0)
+                bucket['product_loss'] += p_loss
+                if rate:
+                    displayed_totals['product_loss_cny'] += p_loss * rate
+        elif o.get('is_problem_return'):
+            # Problem return: package came back but contents were wrong/
+            # missing/damaged. Both shipping AND product value are lost.
+            displayed_totals['problem_return_count'] += 1
+            bucket['problem_return_count'] += 1
+            s_loss = float(o.get('shipping_loss_amount') or 0)
+            p_loss = float(o.get('product_loss_amount') or 0)
+            bucket['shipping_loss'] += s_loss
+            bucket['product_loss'] += p_loss
+            if rate:
+                displayed_totals['shipping_loss_cny'] += s_loss * rate
+                displayed_totals['product_loss_cny'] += p_loss * rate
         elif _is_revenue_order(o):
             # Successful (or pending delivery from a paid order) — its
             # product revenue counts.
@@ -1787,7 +1844,11 @@ def orders():
         # the would-be number but it's not summed here.
     displayed_totals['net_cny'] = round(displayed_totals['net_cny'], 2)
     displayed_totals['shipping_loss_cny'] = round(displayed_totals['shipping_loss_cny'], 2)
-    displayed_totals['final_net_cny'] = round(displayed_totals['net_cny'] - displayed_totals['shipping_loss_cny'], 2)
+    displayed_totals['product_loss_cny'] = round(displayed_totals['product_loss_cny'], 2)
+    displayed_totals['final_net_cny'] = round(
+        displayed_totals['net_cny']
+        - displayed_totals['shipping_loss_cny']
+        - displayed_totals['product_loss_cny'], 2)
 
     # Get customer attributes for the displayed orders
     customer_emails = list(set(o['customer_email'] for o in processed_orders if o.get('customer_email')))
@@ -2038,7 +2099,8 @@ def monthly():
 
     query = f'''
         SELECT id, status, date_created, total, shipping_total, source, currency, payment_method, line_items,
-               is_undelivered, shipping_loss_amount
+               is_undelivered, shipping_loss_amount,
+               is_problem_return, product_loss_amount
         FROM orders
         {where_clause}
         ORDER BY date_created DESC
@@ -2071,7 +2133,7 @@ def monthly():
         total_products = gdf['product_qty'].sum()
         total_amount = gdf['total'].sum()
 
-        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat']) & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod')) & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs')) & (gdf['is_undelivered'].fillna(0) == 0)
+        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat']) & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod')) & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs')) & (gdf['is_undelivered'].fillna(0) == 0) & (gdf['is_problem_return'].fillna(0) == 0)
         success_orders = int(success_mask.sum())
         success_amount = gdf.loc[success_mask, 'total'].sum()
         success_products = gdf.loc[success_mask, 'product_qty'].sum()
@@ -2085,12 +2147,20 @@ def monthly():
 
         undelivered_mask = gdf['is_undelivered'].fillna(0) == 1
         undelivered_orders = int(undelivered_mask.sum())
-        shipping_loss = float(gdf.loc[undelivered_mask, 'shipping_loss_amount'].fillna(0).sum())
+
+        problem_return_mask = gdf['is_problem_return'].fillna(0) == 1
+        problem_return_orders = int(problem_return_mask.sum())
+
+        # shipping_loss covers both undelivered AND problem-return orders
+        # (same column on either flag); product_loss is problem-return only.
+        loss_mask = undelivered_mask | problem_return_mask
+        shipping_loss = float(gdf.loc[loss_mask, 'shipping_loss_amount'].fillna(0).sum())
+        product_loss = float(gdf.loc[problem_return_mask, 'product_loss_amount'].fillna(0).sum())
 
         # Net = product revenue (after deducting collected shipping fees)
-        # MINUS shipping losses from undelivered orders. Without this last
-        # term, returned-package losses were silently absorbed.
-        success_net_amount = success_amount - success_shipping - shipping_loss
+        # MINUS shipping AND product losses. Without these terms, returned-
+        # package and brick-swap losses were silently absorbed.
+        success_net_amount = success_amount - success_shipping - shipping_loss - product_loss
 
         rows.append({
             'month': str(month),
@@ -2106,7 +2176,9 @@ def monthly():
             'failed_orders': failed_orders,
             'cancelled_orders': cancelled_orders,
             'undelivered_orders': undelivered_orders,
-            'shipping_loss': shipping_loss
+            'shipping_loss': shipping_loss,
+            'problem_return_orders': problem_return_orders,
+            'product_loss': product_loss
         })
     
     # Get sort parameter
@@ -2137,23 +2209,25 @@ def monthly():
     for row in rows:
         m = row['month']
         if m not in monthly_aggregates:
-            monthly_aggregates[m] = {'success_net_amount_cny': 0, 'success_orders': 0, 'success_products': 0, 'failed_orders': 0, 'cancelled_orders': 0, 'undelivered_orders': 0, 'total_orders': 0, 'total_products': 0, 'currency_amounts': {}}
+            monthly_aggregates[m] = {'success_net_amount_cny': 0, 'success_orders': 0, 'success_products': 0, 'failed_orders': 0, 'cancelled_orders': 0, 'undelivered_orders': 0, 'problem_return_orders': 0, 'total_orders': 0, 'total_products': 0, 'currency_amounts': {}}
         monthly_aggregates[m]['success_net_amount_cny'] += (row.get('success_net_amount_cny') or 0)
         monthly_aggregates[m]['success_orders'] += row['success_orders']
         monthly_aggregates[m]['success_products'] += row['success_products']
         monthly_aggregates[m]['failed_orders'] += row['failed_orders']
         monthly_aggregates[m]['cancelled_orders'] += row['cancelled_orders']
         monthly_aggregates[m]['undelivered_orders'] += row.get('undelivered_orders', 0)
+        monthly_aggregates[m]['problem_return_orders'] += row.get('problem_return_orders', 0)
         monthly_aggregates[m]['total_orders'] += row['total_orders']
         monthly_aggregates[m]['total_products'] += row['total_products']
-        # Aggregate amounts by currency (shipping_loss tracked here too — same currency as orders)
+        # Aggregate amounts by currency (shipping_loss/product_loss tracked here too — same currency as orders)
         currency = row.get('currency', 'PLN')
         if currency not in monthly_aggregates[m]['currency_amounts']:
-            monthly_aggregates[m]['currency_amounts'][currency] = {'total_amount': 0, 'success_amount': 0, 'success_net_amount': 0, 'shipping_loss': 0}
+            monthly_aggregates[m]['currency_amounts'][currency] = {'total_amount': 0, 'success_amount': 0, 'success_net_amount': 0, 'shipping_loss': 0, 'product_loss': 0}
         monthly_aggregates[m]['currency_amounts'][currency]['total_amount'] += row.get('total_amount', 0)
         monthly_aggregates[m]['currency_amounts'][currency]['success_amount'] += row.get('success_amount', 0)
         monthly_aggregates[m]['currency_amounts'][currency]['success_net_amount'] += row.get('success_net_amount', 0)
         monthly_aggregates[m]['currency_amounts'][currency]['shipping_loss'] += row.get('shipping_loss', 0)
+        monthly_aggregates[m]['currency_amounts'][currency]['product_loss'] += row.get('product_loss', 0)
         
     return render_template('monthly.html', monthly_stats=rows, monthly_aggregates=monthly_aggregates, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, country_filter=country_filter, all_managers=all_managers, all_countries=all_countries, sort_by=sort_by, site_managers=site_managers, start_month=start_month, end_month=end_month)
 
@@ -2236,7 +2310,8 @@ def monthly_export():
 
     query = f'''
         SELECT id, status, date_created, total, shipping_total, source, currency, payment_method, line_items,
-               is_undelivered, shipping_loss_amount
+               is_undelivered, shipping_loss_amount,
+               is_problem_return, product_loss_amount
         FROM orders
         {where_clause}
         ORDER BY date_created DESC
@@ -2248,7 +2323,7 @@ def monthly_export():
     sites = conn.execute('SELECT url, manager FROM sites').fetchall()
     site_managers = {s['url']: s['manager'] or '' for s in sites}
     conn.close()
-    
+
     if len(df) == 0:
         return jsonify({'error': '没有数据可导出'}), 400
     
@@ -2272,7 +2347,7 @@ def monthly_export():
         total_products = gdf['product_qty'].sum()
         total_amount = gdf['total'].sum()
         
-        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat']) & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod')) & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs')) & (gdf['is_undelivered'].fillna(0) == 0)
+        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat']) & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod')) & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs')) & (gdf['is_undelivered'].fillna(0) == 0) & (gdf['is_problem_return'].fillna(0) == 0)
         success_orders = int(success_mask.sum())
         success_amount = gdf.loc[success_mask, 'total'].sum()
         success_products = gdf.loc[success_mask, 'product_qty'].sum()
@@ -2283,17 +2358,23 @@ def monthly_export():
 
         undelivered_mask = gdf['is_undelivered'].fillna(0) == 1
         undelivered_orders = int(undelivered_mask.sum())
-        shipping_loss = float(gdf.loc[undelivered_mask, 'shipping_loss_amount'].fillna(0).sum())
+
+        problem_return_mask = gdf['is_problem_return'].fillna(0) == 1
+        problem_return_orders = int(problem_return_mask.sum())
+
+        loss_mask = undelivered_mask | problem_return_mask
+        shipping_loss = float(gdf.loc[loss_mask, 'shipping_loss_amount'].fillna(0).sum())
+        product_loss = float(gdf.loc[problem_return_mask, 'product_loss_amount'].fillna(0).sum())
 
         # Net = product revenue minus collected shipping fees minus
-        # shipping losses from undelivered orders (kept consistent with the
-        # /monthly view).
-        success_net_amount = success_amount - success_shipping - shipping_loss
+        # shipping AND product losses (kept consistent with the /monthly view).
+        success_net_amount = success_amount - success_shipping - shipping_loss - product_loss
 
         # Get CNY rate
         rate, _ = get_cny_rate(currency, str(month))
         success_net_amount_cny = round(success_net_amount * rate, 2) if rate else 0
         shipping_loss_cny = round(shipping_loss * rate, 2) if rate else 0
+        product_loss_cny = round(product_loss * rate, 2) if rate else 0
 
         rows.append({
             '月份': str(month),
@@ -2312,6 +2393,9 @@ def monthly_export():
             '未送达订单': undelivered_orders,
             '运费损失': round(shipping_loss, 2),
             '运费损失(CNY)': shipping_loss_cny,
+            '问题退货订单': problem_return_orders,
+            '货值损失': round(product_loss, 2),
+            '货值损失(CNY)': product_loss_cny,
             '汇率': round(rate, 4) if rate else 0,
             '净金额(CNY)': round(success_net_amount_cny, 2),
             '_total_amount': float(total_amount),
@@ -2319,7 +2403,9 @@ def monthly_export():
             '_success_net_amount': float(success_net_amount),
             '_net_amount_cny': success_net_amount_cny,
             '_shipping_loss': shipping_loss,
-            '_shipping_loss_cny': shipping_loss_cny
+            '_shipping_loss_cny': shipping_loss_cny,
+            '_product_loss': product_loss,
+            '_product_loss_cny': product_loss_cny
         })
     
     # Sort by month descending
@@ -2344,6 +2430,9 @@ def monthly_export():
                 'undelivered_orders': 0,
                 'shipping_loss': 0,
                 'shipping_loss_cny': 0,
+                'problem_return_orders': 0,
+                'product_loss': 0,
+                'product_loss_cny': 0,
                 'net_amount_cny': 0
             }
         monthly_totals[m]['site_count'] += 1
@@ -2359,6 +2448,9 @@ def monthly_export():
         monthly_totals[m]['undelivered_orders'] += row.get('未送达订单', 0)
         monthly_totals[m]['shipping_loss'] += row.get('_shipping_loss', 0)
         monthly_totals[m]['shipping_loss_cny'] += row.get('_shipping_loss_cny', 0)
+        monthly_totals[m]['problem_return_orders'] += row.get('问题退货订单', 0)
+        monthly_totals[m]['product_loss'] += row.get('_product_loss', 0)
+        monthly_totals[m]['product_loss_cny'] += row.get('_product_loss_cny', 0)
         monthly_totals[m]['net_amount_cny'] += row['_net_amount_cny']
     
     # Create Excel workbook
@@ -2476,10 +2568,34 @@ def monthly_export():
         cell = ws.cell(row=row_num, column=13, value=totals['cancelled_orders'])
         cell.font = summary_font
         cell.alignment = center_align
-        # Column N: 汇率 - 留空
-        ws.cell(row=row_num, column=14, value='').alignment = center_align
-        # Column O: 净金额(CNY)
-        cell = ws.cell(row=row_num, column=15, value=f'¥{round(totals["net_amount_cny"], 2)}')
+        # Column N: 未送达订单
+        cell = ws.cell(row=row_num, column=14, value=totals['undelivered_orders'])
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column O: 运费损失
+        cell = ws.cell(row=row_num, column=15, value=round(totals['shipping_loss'], 2))
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column P: 运费损失(CNY)
+        cell = ws.cell(row=row_num, column=16, value=round(totals['shipping_loss_cny'], 2))
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column Q: 问题退货订单
+        cell = ws.cell(row=row_num, column=17, value=totals['problem_return_orders'])
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column R: 货值损失
+        cell = ws.cell(row=row_num, column=18, value=round(totals['product_loss'], 2))
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column S: 货值损失(CNY)
+        cell = ws.cell(row=row_num, column=19, value=round(totals['product_loss_cny'], 2))
+        cell.font = summary_font
+        cell.alignment = center_align
+        # Column T: 汇率 - 留空
+        ws.cell(row=row_num, column=20, value='').alignment = center_align
+        # Column U: 净金额(CNY)
+        cell = ws.cell(row=row_num, column=21, value=f'¥{round(totals["net_amount_cny"], 2)}')
         cell.font = summary_font
         cell.alignment = center_align
     
@@ -2698,8 +2814,8 @@ def cancelled_analysis():
     source_query += ' ORDER BY source'
     all_sources = conn.execute(source_query, source_params).fetchall()
     
-    # Build query conditions for problem orders: cancelled / failed / undelivered
-    conditions = ["(status IN ('cancelled', 'failed') OR is_undelivered = 1)"]
+    # Build query conditions for problem orders: cancelled / failed / undelivered / 问题退货
+    conditions = ["(status IN ('cancelled', 'failed') OR is_undelivered = 1 OR is_problem_return = 1)"]
     params = []
     
     if allowed_sources is not None:
@@ -2746,10 +2862,12 @@ def cancelled_analysis():
     
     where_clause = 'WHERE ' + ' AND '.join(conditions)
     
-    # Query problem orders (cancelled / failed / undelivered) with date information
+    # Query problem orders (cancelled / failed / undelivered / 问题退货) with date information
     query = f'''
         SELECT id, number, status, total, shipping_total, currency, date_created, date_modified, source,
-               line_items, billing, payment_method, is_undelivered, shipping_loss_amount
+               line_items, billing, payment_method,
+               is_undelivered, shipping_loss_amount,
+               is_problem_return, problem_return_type, product_loss_amount
         FROM orders
         {where_clause}
         ORDER BY date_created DESC
@@ -2757,11 +2875,11 @@ def cancelled_analysis():
 
     orders_data = conn.execute(query, params).fetchall()
 
-    # Get available months (also covers undelivered)
+    # Get available months (also covers undelivered / 问题退货)
     months_query = '''
         SELECT DISTINCT strftime('%Y-%m', date_created) as month
         FROM orders
-        WHERE status IN ('cancelled', 'failed') OR is_undelivered = 1
+        WHERE status IN ('cancelled', 'failed') OR is_undelivered = 1 OR is_problem_return = 1
         ORDER BY month DESC
     '''
     available_months = conn.execute(months_query).fetchall()
@@ -2782,7 +2900,8 @@ def cancelled_analysis():
     status_stats = {
         'cancelled': {'count': 0, 'amount': 0},
         'failed': {'count': 0, 'amount': 0},
-        'undelivered': {'count': 0, 'amount': 0, 'shipping_loss': 0}
+        'undelivered': {'count': 0, 'amount': 0, 'shipping_loss': 0},
+        'problem_return': {'count': 0, 'amount': 0, 'shipping_loss': 0, 'product_loss': 0}
     }
 
     source_stats = {}
@@ -2853,14 +2972,24 @@ def cancelled_analysis():
             timing_stats['over_7_days']['amount'] += total
             od['timing_category'] = '7天+'
         
-        # Status stats — undelivered (delivery refused/returned) is its own bucket,
-        # even if the underlying status is e.g. 'completed' before the order came back
+        # Status stats — undelivered (delivery refused/returned) and 问题退货
+        # (swap/short/damaged contents) are their own buckets, even if the
+        # underlying status is e.g. 'completed' before the order came back.
         is_undelivered = bool(order['is_undelivered']) if 'is_undelivered' in order.keys() else False
+        is_problem_return = bool(order['is_problem_return']) if 'is_problem_return' in order.keys() else False
         loss_amount = float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in order.keys() else 0.0
+        product_loss = float(order['product_loss_amount'] or 0) if 'product_loss_amount' in order.keys() else 0.0
         od['is_undelivered'] = is_undelivered
+        od['is_problem_return'] = is_problem_return
         od['shipping_loss_amount'] = loss_amount
+        od['product_loss_amount'] = product_loss
 
-        if is_undelivered:
+        if is_problem_return:
+            status_stats['problem_return']['count'] += 1
+            status_stats['problem_return']['amount'] += total
+            status_stats['problem_return']['shipping_loss'] += loss_amount
+            status_stats['problem_return']['product_loss'] += product_loss
+        elif is_undelivered:
             status_stats['undelivered']['count'] += 1
             status_stats['undelivered']['amount'] += total
             status_stats['undelivered']['shipping_loss'] += loss_amount
@@ -2870,10 +2999,16 @@ def cancelled_analysis():
 
         # Source stats
         if source not in source_stats:
-            source_stats[source] = {'count': 0, 'amount': 0, 'cancelled': 0, 'failed': 0, 'undelivered': 0, 'shipping_loss': 0}
+            source_stats[source] = {'count': 0, 'amount': 0, 'cancelled': 0, 'failed': 0,
+                                    'undelivered': 0, 'shipping_loss': 0,
+                                    'problem_return': 0, 'product_loss': 0}
         source_stats[source]['count'] += 1
         source_stats[source]['amount'] += total
-        if is_undelivered:
+        if is_problem_return:
+            source_stats[source]['problem_return'] += 1
+            source_stats[source]['shipping_loss'] += loss_amount
+            source_stats[source]['product_loss'] += product_loss
+        elif is_undelivered:
             source_stats[source]['undelivered'] += 1
             source_stats[source]['shipping_loss'] += loss_amount
         elif status == 'cancelled':
@@ -3116,8 +3251,8 @@ def cancelled_analysis():
     source_query += ' ORDER BY source'
     all_sources = conn.execute(source_query, source_params).fetchall()
     
-    # Build query conditions for problem orders: cancelled / failed / undelivered
-    conditions = ["(status IN ('cancelled', 'failed') OR is_undelivered = 1)"]
+    # Build query conditions for problem orders: cancelled / failed / undelivered / 问题退货
+    conditions = ["(status IN ('cancelled', 'failed') OR is_undelivered = 1 OR is_problem_return = 1)"]
     params = []
     
     if allowed_sources is not None:
@@ -3273,14 +3408,24 @@ def cancelled_analysis():
             timing_stats['over_7_days']['amount'] += total
             od['timing_category'] = '7天+'
         
-        # Status stats — undelivered (delivery refused/returned) is its own bucket,
-        # even if the underlying status is e.g. 'completed' before the order came back
+        # Status stats — undelivered (delivery refused/returned) and 问题退货
+        # (swap/short/damaged contents) are their own buckets, even if the
+        # underlying status is e.g. 'completed' before the order came back.
         is_undelivered = bool(order['is_undelivered']) if 'is_undelivered' in order.keys() else False
+        is_problem_return = bool(order['is_problem_return']) if 'is_problem_return' in order.keys() else False
         loss_amount = float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in order.keys() else 0.0
+        product_loss = float(order['product_loss_amount'] or 0) if 'product_loss_amount' in order.keys() else 0.0
         od['is_undelivered'] = is_undelivered
+        od['is_problem_return'] = is_problem_return
         od['shipping_loss_amount'] = loss_amount
+        od['product_loss_amount'] = product_loss
 
-        if is_undelivered:
+        if is_problem_return:
+            status_stats['problem_return']['count'] += 1
+            status_stats['problem_return']['amount'] += total
+            status_stats['problem_return']['shipping_loss'] += loss_amount
+            status_stats['problem_return']['product_loss'] += product_loss
+        elif is_undelivered:
             status_stats['undelivered']['count'] += 1
             status_stats['undelivered']['amount'] += total
             status_stats['undelivered']['shipping_loss'] += loss_amount
@@ -3290,10 +3435,16 @@ def cancelled_analysis():
 
         # Source stats
         if source not in source_stats:
-            source_stats[source] = {'count': 0, 'amount': 0, 'cancelled': 0, 'failed': 0, 'undelivered': 0, 'shipping_loss': 0}
+            source_stats[source] = {'count': 0, 'amount': 0, 'cancelled': 0, 'failed': 0,
+                                    'undelivered': 0, 'shipping_loss': 0,
+                                    'problem_return': 0, 'product_loss': 0}
         source_stats[source]['count'] += 1
         source_stats[source]['amount'] += total
-        if is_undelivered:
+        if is_problem_return:
+            source_stats[source]['problem_return'] += 1
+            source_stats[source]['shipping_loss'] += loss_amount
+            source_stats[source]['product_loss'] += product_loss
+        elif is_undelivered:
             source_stats[source]['undelivered'] += 1
             source_stats[source]['shipping_loss'] += loss_amount
         elif status == 'cancelled':
@@ -3543,7 +3694,10 @@ def customers():
             SUM({_success_status_case()}) as successful_orders,
             {_success_amount_case('total')} as total_spent,
             SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 1 ELSE 0 END) as undelivered_orders,
-            SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END) as shipping_loss_total,
+            SUM(CASE WHEN COALESCE(is_undelivered,0) = 1 OR COALESCE(is_problem_return,0) = 1
+                     THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END) as shipping_loss_total,
+            SUM(CASE WHEN COALESCE(is_problem_return, 0) = 1 THEN 1 ELSE 0 END) as problem_return_orders,
+            SUM(CASE WHEN COALESCE(is_problem_return, 0) = 1 THEN COALESCE(product_loss_amount, 0) ELSE 0 END) as product_loss_total,
             MAX(date_created) as last_order_date,
             MIN(date_created) as first_order_date,
             GROUP_CONCAT(DISTINCT source) as sources
@@ -3577,6 +3731,8 @@ def customers():
         c['total_spent'] = float(c['total_spent'] or 0)
         c['undelivered_orders'] = int(c.get('undelivered_orders') or 0)
         c['shipping_loss_total'] = float(c.get('shipping_loss_total') or 0)
+        c['problem_return_orders'] = int(c.get('problem_return_orders') or 0)
+        c['product_loss_total'] = float(c.get('product_loss_total') or 0)
         c['refusal_rate'] = round(c['undelivered_orders'] / c['total_orders'] * 100, 1) if c['total_orders'] else 0
         total_revenue += c['total_spent']
 
@@ -3799,6 +3955,11 @@ def get_order_details(order_id):
     if order_dict.get('is_undelivered') and order_dict.get('undelivered_by'):
         marker = conn.execute('SELECT name FROM users WHERE id = ?', (order_dict['undelivered_by'],)).fetchone()
         order_dict['undelivered_by_name'] = marker['name'] if marker else None
+
+    # Resolve who marked the order as a problem return (for audit display)
+    if order_dict.get('is_problem_return') and order_dict.get('problem_return_by'):
+        pr_marker = conn.execute('SELECT name FROM users WHERE id = ?', (order_dict['problem_return_by'],)).fetchone()
+        order_dict['problem_return_by_name'] = pr_marker['name'] if pr_marker else None
 
     if order_dict.get('warehouse_id'):
         wh = conn.execute('SELECT name FROM warehouses WHERE id=?', (order_dict['warehouse_id'],)).fetchone()
@@ -4129,12 +4290,14 @@ def _success_status_case(prefix='', as_name='is_success'):
       COD:   on-hold(shipped) + shipped/delivered/partial-shipped + completed
       bacs:  on-hold is NOT success (awaiting bank transfer) — only after processing
       Online(Stripe): processing(paid) + shipped/delivered/partial-shipped + completed
-    Undelivered (refused/returned) is never a success regardless of payment mode."""
+    Undelivered (refused/returned) and 问题退货 (swap/short/damaged) are never
+    a success regardless of payment mode."""
     p = f'{prefix}.' if prefix else ''
     return f"""(CASE WHEN ({p}status IN ('completed','shipped','delivered','partial-shipped')
                     OR ({p}status = 'on-hold' AND COALESCE({p}payment_method,'cod') != 'bacs')
                     OR ({p}status = 'processing' AND COALESCE({p}payment_method,'cod') != 'cod'))
                     AND COALESCE({p}is_undelivered, 0) = 0
+                    AND COALESCE({p}is_problem_return, 0) = 0
                THEN 1 ELSE 0 END)"""
 
 
@@ -4145,18 +4308,21 @@ def _success_status_cond(prefix=''):
     return f"""(({p}status IN ('completed','shipped','delivered','partial-shipped')
         OR ({p}status = 'on-hold' AND COALESCE({p}payment_method,'cod') != 'bacs')
         OR ({p}status = 'processing' AND COALESCE({p}payment_method,'cod') != 'cod'))
-        AND COALESCE({p}is_undelivered, 0) = 0)"""
+        AND COALESCE({p}is_undelivered, 0) = 0
+        AND COALESCE({p}is_problem_return, 0) = 0)"""
 
 
 def _revenue_status_cond(prefix=''):
     """SQL boolean condition: true if order should count toward revenue.
     Excludes: failed/cancelled/draft/trash/cheat, online-pending, bacs-on-hold,
-    and undelivered (package returned, no money collected)."""
+    undelivered (package returned, no money collected), and 问题退货 (contents
+    were wrong/missing/damaged, customer never paid or money was refunded)."""
     p = f'{prefix}.' if prefix else ''
     return f"""({p}status NOT IN ('failed','cancelled','checkout-draft','trash','cheat')
         AND NOT ({p}status = 'pending' AND COALESCE({p}payment_method,'cod') != 'cod')
         AND NOT ({p}status = 'on-hold' AND {p}payment_method = 'bacs')
-        AND COALESCE({p}is_undelivered, 0) = 0)"""
+        AND COALESCE({p}is_undelivered, 0) = 0
+        AND COALESCE({p}is_problem_return, 0) = 0)"""
 
 
 def _active_status_cond(prefix=''):
@@ -4169,7 +4335,8 @@ def _active_status_cond(prefix=''):
     return f"""({p}status NOT IN ('failed','cancelled')
         AND NOT ({p}status = 'pending' AND COALESCE({p}payment_method,'cod') != 'cod')
         AND NOT ({p}status = 'on-hold' AND {p}payment_method = 'bacs')
-        AND COALESCE({p}is_undelivered, 0) = 0)"""
+        AND COALESCE({p}is_undelivered, 0) = 0
+        AND COALESCE({p}is_problem_return, 0) = 0)"""
 
 
 def _success_amount_case(col, prefix=''):
@@ -4457,8 +4624,10 @@ def init_users_table():
 
 def init_undelivered_columns():
     """Add columns to orders table for tracking undelivered (refused/returned) orders.
-    Kept on a separate flag column instead of overloading status, because sync_utils
-    uses INSERT OR REPLACE which would otherwise overwrite a local 'undelivered' status."""
+    Kept on a separate flag column instead of overloading status so the WC-sourced
+    status field can keep flowing through sync untouched. The WC sync paths
+    (sync_utils.save_orders_to_db and 1.wooorders_sqlite.py) use UPSERT that only
+    updates WC-managed columns, so these local flags survive every refresh."""
     conn = get_db_connection()
     for ddl in (
         'ALTER TABLE orders ADD COLUMN is_undelivered INTEGER DEFAULT 0',
@@ -4473,6 +4642,33 @@ def init_undelivered_columns():
             pass  # Column already exists
     try:
         conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_is_undelivered ON orders(is_undelivered)')
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+    conn.close()
+
+
+def init_problem_return_columns():
+    """Add columns to orders for tracking problem returns — packages that came
+    back with wrong/missing/damaged contents (e.g. the brick-swap scam).
+    Distinct from is_undelivered: there the package never reached the customer
+    and only the shipping fee is lost; here the goods themselves are lost."""
+    conn = get_db_connection()
+    for ddl in (
+        'ALTER TABLE orders ADD COLUMN is_problem_return INTEGER DEFAULT 0',
+        'ALTER TABLE orders ADD COLUMN problem_return_type TEXT',
+        'ALTER TABLE orders ADD COLUMN product_loss_amount REAL DEFAULT 0',
+        'ALTER TABLE orders ADD COLUMN problem_return_at TEXT',
+        'ALTER TABLE orders ADD COLUMN problem_return_by INTEGER',
+        'ALTER TABLE orders ADD COLUMN problem_return_note TEXT',
+        'ALTER TABLE orders ADD COLUMN problem_return_evidence TEXT',
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+    try:
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_is_problem_return ON orders(is_problem_return)')
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -4527,7 +4723,16 @@ def init_shipping_tables():
         ]
         conn.executemany('INSERT INTO shipping_carriers (slug, name, tracking_url) VALUES (?, ?, ?)', default_carriers)
         conn.commit()
-    
+
+    # Backfill carriers for orders shipped from China to overseas markets.
+    # Idempotent: INSERT OR IGNORE only adds the row when slug is new, so
+    # repeat boots don't reset URLs that an admin may have edited later.
+    conn.execute('''
+        INSERT OR IGNORE INTO shipping_carriers (slug, name, tracking_url)
+        VALUES ('ems', 'EMS', 'https://t.17track.net/en#nums={tracking}')
+    ''')
+    conn.commit()
+
     conn.close()
 
 
@@ -5262,6 +5467,7 @@ with app.app_context():
     init_users_table()
     init_shipping_tables()
     init_undelivered_columns()
+    init_problem_return_columns()
     init_product_tables()
     init_user_preferences_table()
     init_sales_board_tables()
@@ -12749,6 +12955,9 @@ def settings_api():
                     # These remain global settings (admin only)
                     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
                     need_update_cron = True
+                elif key in ['big_order_qty_threshold', 'big_order_amount_threshold']:
+                    # Big-order alert thresholds (global)
+                    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
             conn.commit()
             
             # 如果自动同步设置发生变更，同步更新 Crontab 定时任务
@@ -12901,13 +13110,51 @@ def extract_custom_billing_fields(meta_data):
     return custom_fields
 
 
+def get_big_order_thresholds(conn):
+    """Read big-order alert thresholds from settings (with defaults).
+
+    Returns (qty_threshold, amount_threshold) as floats. A threshold of 0
+    disables that dimension. Defaults: qty>=10 units, amount>=1500.
+    """
+    rows = conn.execute(
+        "SELECT key, value FROM settings "
+        "WHERE key IN ('big_order_qty_threshold', 'big_order_amount_threshold')"
+    ).fetchall()
+    vals = {r['key']: r['value'] for r in rows}
+    try:
+        qty = float(vals.get('big_order_qty_threshold') or 10)
+    except (TypeError, ValueError):
+        qty = 10
+    try:
+        amount = float(vals.get('big_order_amount_threshold') or 1500)
+    except (TypeError, ValueError):
+        amount = 1500
+    return qty, amount
+
+
+def evaluate_big_order(product_count, total, qty_threshold, amount_threshold):
+    """Return (is_big, reasons[]) for an order given the thresholds.
+
+    Amount is compared against the order total in its own currency — a rough
+    trigger for a shipping-floor prompt, not an accounting figure.
+    """
+    reasons = []
+    if qty_threshold and product_count >= qty_threshold:
+        reasons.append(f"数量 {product_count} ≥ {int(qty_threshold)}")
+    if amount_threshold and total >= amount_threshold:
+        t = int(total) if float(total).is_integer() else round(total, 2)
+        reasons.append(f"金额 {t} ≥ {int(amount_threshold)}")
+    return (len(reasons) > 0, reasons)
+
+
 @app.route('/api/shipping/pending')
 @login_required
 @shipper_required
 def get_pending_orders():
     """Get orders pending shipment (status=processing)"""
     conn = get_db_connection()
-    
+    qty_threshold, amount_threshold = get_big_order_thresholds(conn)
+
     # Get filter parameters
     source_filter = request.args.get('source', '')
     manager_filter = request.args.get('manager', '')
@@ -12916,11 +13163,13 @@ def get_pending_orders():
     query = '''
         SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created,
                o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_total, o.shipping_lines,
-               o.customer_note,
+               o.customer_note, o.warehouse_id,
                s.manager,
+               w.name as warehouse_name,
                n.note as latest_note, n.date_created as latest_note_date, n.author as latest_note_author
         FROM orders o
         LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN warehouses w ON o.warehouse_id = w.id
         LEFT JOIN (
             SELECT order_id, note, date_created, author
             FROM order_notes
@@ -13009,10 +13258,15 @@ def get_pending_orders():
             ]
             customer_address = ', '.join(filter(None, dpd_parts))
 
+        product_count = sum(item.get('quantity', 1) for item in (line_items or []))
+        order_total = float(order['total'] or 0)
+        is_big_order, big_order_reasons = evaluate_big_order(
+            product_count, order_total, qty_threshold, amount_threshold)
+
         result.append({
             'id': order['id'],
             'number': order['number'],
-            'total': float(order['total'] or 0),
+            'total': order_total,
             'currency': order['currency'],
             'date_created': order['date_created'],
             'source': order['source'].replace('https://www.', '').replace('https://', ''),
@@ -13026,13 +13280,17 @@ def get_pending_orders():
             'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (line_items or [])],
             'shipping_total': float(order['shipping_total'] or 0),
             'shipping_method': shipping_method,
-            'product_count': sum(item.get('quantity', 1) for item in (line_items or [])),
+            'product_count': product_count,
+            'is_big_order': is_big_order,
+            'big_order_reasons': big_order_reasons,
             'customer_note': order['customer_note'] or '',
+            'warehouse_id': order['warehouse_id'],
+            'warehouse_name': order['warehouse_name'] or '',
             'latest_note': order['latest_note'] or '',
             'latest_note_date': order['latest_note_date'] or '',
             'latest_note_author': order['latest_note_author'] or ''
         })
-    
+
     return jsonify(result)
 
 
@@ -13050,14 +13308,17 @@ def get_shipped_orders():
     query = '''
         SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, o.date_modified,
                o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_lines, o.shipping_total,
-               o.customer_note,
+               o.customer_note, o.warehouse_id,
                o.is_undelivered, o.shipping_loss_amount, o.undelivered_at, o.undelivered_note,
+               o.is_problem_return,
                s.manager,
+               w.name AS warehouse_name,
                sl.tracking_number, sl.carrier_slug, sl.shipped_at,
                u.name AS undelivered_by_name,
                n.note as latest_note, n.date_created as latest_note_date, n.author as latest_note_author
         FROM orders o
         LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN warehouses w ON o.warehouse_id = w.id
         LEFT JOIN shipping_logs sl ON o.id = sl.order_id
         LEFT JOIN users u ON o.undelivered_by = u.id
         LEFT JOIN (
@@ -13171,6 +13432,7 @@ def find_orders_by_tracking():
                o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_lines, o.shipping_total,
                o.customer_note,
                o.is_undelivered, o.shipping_loss_amount, o.undelivered_at, o.undelivered_note,
+               o.is_problem_return,
                s.manager,
                sl.tracking_number, sl.carrier_slug, sl.shipped_at,
                u.name AS undelivered_by_name,
@@ -13855,6 +14117,12 @@ def detect_carriers_for_site(conn, site_url, lookback_orders=80):
         'inpost': 'inpost', 'inpost paczkomaty': 'inpost', 'paczkomaty': 'inpost',
         'dpd': 'dpd', 'dpd polska': 'dpd', 'dpd poland': 'dpd', 'dpd-pl': 'dpd',
         'australia post': 'australia-post', 'auspost': 'australia-post', 'australia-post': 'australia-post',
+        # EMS shipments out of China to overseas (mostly used on AU sites for
+        # the 国内发 warehouse fulfillment). Cover common ways WC plugins or
+        # shippers label these so detection picks them up regardless of region.
+        'ems': 'ems', 'ems china': 'ems', 'china ems': 'ems', 'china post ems': 'ems',
+        'china post': 'ems', 'ems express': 'ems', 'epacket': 'ems',
+        '中国邮政': 'ems', '中国邮政ems': 'ems', '邮政ems': 'ems',
     }
     # Slug aliases — collapse AST's regional variants down to our shipping_carriers
     # canonical slug so the URL lookup works in ship_order.
@@ -13864,6 +14132,11 @@ def detect_carriers_for_site(conn, site_url, lookback_orders=80):
         'dpd-pl': 'dpd',
         'dpd-polska': 'dpd',
         'auspost': 'australia-post',
+        'china-ems': 'ems',
+        'china-post': 'ems',
+        'china-post-ems': 'ems',
+        'ems-china': 'ems',
+        'epacket': 'ems',
     }
 
     def _record_slug(slug, fallback_name):
@@ -13950,7 +14223,12 @@ def detect_carriers_for_site(conn, site_url, lookback_orders=80):
 def get_carriers_for_site():
     """Return the carriers actually in use on a given site (auto-detected
     from recent shipped orders). Used by the ship modal so each site only
-    shows its own relevant carriers."""
+    shows its own relevant carriers.
+
+    For AU sites we always make sure both Australia Post and EMS are present
+    even when one of them has zero history — orders fulfilled from the China
+    warehouse use EMS and must be selectable from the very first shipment.
+    """
     source = request.args.get('source', '').strip()
     if not source:
         return jsonify({'error': 'missing source'}), 400
@@ -13963,6 +14241,32 @@ def get_carriers_for_site():
 
     conn = get_db_connection()
     carriers = detect_carriers_for_site(conn, source)
+
+    # Augment with country-specific must-have carriers. Detected carriers keep
+    # their usage_count and original order; required ones are appended at the
+    # end (usage_count = 0) so the dropdown still highlights what the site
+    # actually uses most.
+    site = conn.execute('SELECT country FROM sites WHERE url = ?', (source,)).fetchone()
+    required_slugs_by_country = {
+        'AU': ('australia-post', 'ems'),
+    }
+    if site and site['country'] in required_slugs_by_country:
+        present = {c['slug'] for c in carriers}
+        for slug in required_slugs_by_country[site['country']]:
+            if slug in present:
+                continue
+            row = conn.execute(
+                'SELECT slug, name, tracking_url FROM shipping_carriers WHERE slug = ? AND is_active = 1',
+                (slug,)
+            ).fetchone()
+            if row:
+                carriers.append({
+                    'slug': row['slug'],
+                    'name': row['name'],
+                    'tracking_url': row['tracking_url'] or '',
+                    'usage_count': 0,
+                })
+
     conn.close()
     return jsonify(carriers)
 
@@ -14541,6 +14845,174 @@ def unmark_order_undelivered(order_id):
     return jsonify({'success': True, 'message': '已撤销未送达标记'})
 
 
+PROBLEM_RETURN_TYPES = {
+    'swap': '调包 / 假货',
+    'short': '少件 / 空盒',
+    'damaged': '实物损坏',
+    'other': '其他',
+}
+
+
+@app.route('/api/order/<int:order_id>/mark-problem-return', methods=['POST'])
+@login_required
+@shipper_required
+def mark_order_problem_return(order_id):
+    """Mark an order as a problem return — the package came back but the
+    contents were wrong / missing / damaged (e.g. the brick-swap scam).
+    Records the lost product value and an audit trail. Distinct from
+    mark-undelivered, which only covers a lost shipping fee."""
+    import requests as req
+
+    data = request.get_json(silent=True) or {}
+    return_type = (data.get('type') or '').strip()
+    raw_amount = data.get('product_loss_amount', 0)
+    raw_shipping_loss = data.get('shipping_loss_amount', 0)
+    note_text = (data.get('note') or '').strip()
+    evidence_text = (data.get('evidence') or '').strip()
+
+    if return_type not in PROBLEM_RETURN_TYPES:
+        return jsonify({'success': False, 'error': '问题类型不正确'}), 400
+    try:
+        loss_amount = float(raw_amount or 0)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': '货值损失金额格式不正确'}), 400
+    if loss_amount < 0:
+        return jsonify({'success': False, 'error': '货值损失金额不能为负数'}), 400
+    try:
+        shipping_loss = float(raw_shipping_loss or 0)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': '运费损失金额格式不正确'}), 400
+    if shipping_loss < 0:
+        return jsonify({'success': False, 'error': '运费损失金额不能为负数'}), 400
+
+    conn = get_db_connection()
+    order = conn.execute(
+        'SELECT id, number, source, is_problem_return FROM orders WHERE id = ?',
+        (order_id,)
+    ).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    if order['is_problem_return']:
+        conn.close()
+        return jsonify({'success': False, 'error': '该订单已被标记为问题退货'}), 409
+
+    type_label = PROBLEM_RETURN_TYPES[return_type]
+    try:
+        conn.execute('''
+            UPDATE orders
+               SET is_problem_return = 1,
+                   problem_return_type = ?,
+                   product_loss_amount = ?,
+                   shipping_loss_amount = ?,
+                   problem_return_at = datetime('now'),
+                   problem_return_by = ?,
+                   problem_return_note = ?,
+                   problem_return_evidence = ?
+             WHERE id = ?
+        ''', (return_type, loss_amount, shipping_loss, int(current_user.id),
+              note_text or None, evidence_text or None, order_id))
+
+        log_line = (f"订单被 {current_user.name} 标记为「问题退货 · {type_label}」，"
+                    f"货值损失 {loss_amount:.2f}，运费损失 {shipping_loss:.2f}")
+        if evidence_text:
+            log_line += f"。证据：{evidence_text}"
+        if note_text:
+            log_line += f"。说明：{note_text}"
+        conn.execute('''
+            INSERT INTO order_notes (order_id, note, date_created, customer_note, author, added_by_user)
+            VALUES (?, ?, datetime('now'), 0, ?, 1)
+        ''', (order_id, log_line, current_user.name))
+
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return jsonify({'success': False, 'error': f'本地写入失败: {e}'}), 500
+
+    # Best-effort remote note — failure is non-fatal
+    site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    conn.close()
+    if site and site['consumer_key'] and site['consumer_secret']:
+        try:
+            req.post(
+                f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes",
+                json={'note': log_line, 'customer_note': False},
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=10,
+                headers={
+                    'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+                    'Content-Type': 'application/json',
+                },
+            )
+        except Exception as remote_err:
+            app.logger.warning(f'Remote note for problem-return order {order_id} failed: {remote_err}')
+
+    return jsonify({
+        'success': True,
+        'message': f'已标记为问题退货（{type_label}），货值损失 {loss_amount:.2f}，运费损失 {shipping_loss:.2f}',
+        'product_loss_amount': loss_amount,
+        'shipping_loss_amount': shipping_loss,
+    })
+
+
+@app.route('/api/order/<int:order_id>/unmark-problem-return', methods=['POST'])
+@login_required
+@shipper_required
+def unmark_order_problem_return(order_id):
+    """Reverse a previous mark-problem-return (e.g., marked by mistake)."""
+    conn = get_db_connection()
+    order = conn.execute(
+        'SELECT id, is_problem_return, is_undelivered FROM orders WHERE id = ?',
+        (order_id,)
+    ).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    if not order['is_problem_return']:
+        conn.close()
+        return jsonify({'success': False, 'error': '该订单未被标记为问题退货'}), 409
+
+    # Only clear shipping_loss_amount when no other marker still owns it
+    # (the same column is shared with mark-undelivered).
+    also_undelivered = bool(order['is_undelivered'])
+    try:
+        if also_undelivered:
+            conn.execute('''
+                UPDATE orders
+                   SET is_problem_return = 0,
+                       problem_return_type = NULL,
+                       product_loss_amount = 0,
+                       problem_return_at = NULL,
+                       problem_return_by = NULL,
+                       problem_return_note = NULL,
+                       problem_return_evidence = NULL
+                 WHERE id = ?
+            ''', (order_id,))
+        else:
+            conn.execute('''
+                UPDATE orders
+                   SET is_problem_return = 0,
+                       problem_return_type = NULL,
+                       product_loss_amount = 0,
+                       shipping_loss_amount = 0,
+                       problem_return_at = NULL,
+                       problem_return_by = NULL,
+                       problem_return_note = NULL,
+                       problem_return_evidence = NULL
+                 WHERE id = ?
+            ''', (order_id,))
+        conn.execute('''
+            INSERT INTO order_notes (order_id, note, date_created, customer_note, author, added_by_user)
+            VALUES (?, ?, datetime('now'), 0, ?, 1)
+        ''', (order_id, f"{current_user.name} 撤销了「问题退货」标记", current_user.name))
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return jsonify({'success': False, 'error': f'撤销失败: {e}'}), 500
+    conn.close()
+    return jsonify({'success': True, 'message': '已撤销问题退货标记'})
+
+
 @app.route('/api/shipping/print/label/<int:order_id>')
 @login_required
 @shipper_required
@@ -15021,6 +15493,8 @@ def process_shipped_order(order, conn, carriers, ast_provider_mapping):
         'currency': order['currency'],
         'source': order['source'].replace('https://www.', '').replace('https://', ''),
         'manager': order['manager'] or '',
+        'warehouse_id': order['warehouse_id'] if 'warehouse_id' in keys else None,
+        'warehouse_name': (order['warehouse_name'] if 'warehouse_name' in keys else '') or '',
         'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
         'customer_email': billing.get('email', ''),
         'customer_phone': addr.get('phone') or billing.get('phone', ''),
@@ -15041,6 +15515,7 @@ def process_shipped_order(order, conn, carriers, ast_provider_mapping):
         'undelivered_at': order['undelivered_at'] if 'undelivered_at' in keys else None,
         'undelivered_note': order['undelivered_note'] if 'undelivered_note' in keys else None,
         'undelivered_by_name': order['undelivered_by_name'] if 'undelivered_by_name' in keys else None,
+        'is_problem_return': bool(order['is_problem_return']) if 'is_problem_return' in keys else False,
         'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (parse_json_field(order['line_items']) or [])],
         'shipping_total': float(order['shipping_total'] or 0),
         'product_count': sum(item.get('quantity', 1) for item in (parse_json_field(order['line_items']) or [])),
@@ -15839,24 +16314,28 @@ def _compute_sales_board_data(selected_month):
             AND {_revenue_status_cond()}
         ''', site_urls + [week_start.isoformat(), week_end.isoformat()]).fetchall()
 
-        # Undelivered orders for this manager (for shipping-loss visibility — separate from revenue)
+        # Undelivered + 问题退货 orders for this manager (shipping/product loss
+        # visibility — separate from revenue). Both flows live on shared
+        # shipping_loss_amount column; product_loss_amount is problem-return only.
         undelivered_rows = conn.execute(f'''
-            SELECT shipping_loss_amount, currency, source
+            SELECT shipping_loss_amount, product_loss_amount, currency, source,
+                   is_undelivered, is_problem_return
             FROM orders
             WHERE source IN ({placeholders})
             AND strftime('%Y-%m', date_created) = ?
-            AND is_undelivered = 1
+            AND (is_undelivered = 1 OR is_problem_return = 1)
         ''', site_urls + [selected_month]).fetchall()
 
-        # Previous-month shipping_loss — needed so the 上月销售 card on the
-        # board uses the same net definition as the current month (and as
+        # Previous-month shipping + product loss — needed so the 上月销售 card on
+        # the board uses the same net definition as the current month (and as
         # /monthly / dashboard).
         prev_undelivered_rows = conn.execute(f'''
-            SELECT shipping_loss_amount, currency
+            SELECT shipping_loss_amount, product_loss_amount, currency,
+                   is_undelivered, is_problem_return
             FROM orders
             WHERE source IN ({placeholders})
             AND strftime('%Y-%m', date_created) = ?
-            AND is_undelivered = 1
+            AND (is_undelivered = 1 OR is_problem_return = 1)
         ''', site_urls + [prev_month]).fetchall()
 
         # Calculate month amounts by currency and total products
@@ -15990,13 +16469,15 @@ def _compute_sales_board_data(selected_month):
             rate = _prev_rate(currency)
             if rate:
                 prev_net_cny += net * rate
-        # Subtract prev-month shipping_loss so 上月销售 card matches /monthly.
+        # Subtract prev-month shipping_loss AND product_loss so 上月销售 card
+        # matches /monthly.
         for u in prev_undelivered_rows:
             cur = u['currency'] or 'PLN'
             amt = float(u['shipping_loss_amount'] or 0)
+            p_amt = float(u['product_loss_amount'] or 0) if bool(u['is_problem_return']) else 0.0
             r = _prev_rate(cur)
             if r:
-                prev_net_cny -= amt * r
+                prev_net_cny -= (amt + p_amt) * r
 
         # Current week amounts by currency
         week_currency_amounts = defaultdict(lambda: {'net_amount': 0})
@@ -16015,31 +16496,47 @@ def _compute_sales_board_data(selected_month):
             if rate:
                 week_net_cny += net * rate
 
-        # Aggregate undelivered shipping loss (count + by-currency + CNY-equivalent)
-        undelivered_count = len(undelivered_rows)
+        # Aggregate undelivered + 问题退货 losses (count + by-currency + CNY-equivalent).
+        # shipping_loss_amount is populated by either flow; product_loss_amount
+        # only by 问题退货.
+        undelivered_count = sum(1 for u in undelivered_rows if bool(u['is_undelivered']))
+        problem_return_count = sum(1 for u in undelivered_rows if bool(u['is_problem_return']))
         shipping_loss_by_currency = defaultdict(float)
+        product_loss_by_currency = defaultdict(float)
         shipping_loss_cny = 0
+        product_loss_cny = 0
         for u in undelivered_rows:
             cur = u['currency'] or 'PLN'
             amt = float(u['shipping_loss_amount'] or 0)
+            p_amt = float(u['product_loss_amount'] or 0) if bool(u['is_problem_return']) else 0.0
             shipping_loss_by_currency[cur] += amt
+            product_loss_by_currency[cur] += p_amt
             r = _rate_for(cur)
             if r:
                 shipping_loss_cny += amt * r
+                product_loss_cny += p_amt * r
                 u_country = site_country_map.get(u['source'], 'PL')
                 country_profit[u_country]['shipping_loss_cny'] += amt * r
-                country_profit[u_country]['undelivered_count'] += 1
+                if bool(u['is_undelivered']):
+                    country_profit[u_country]['undelivered_count'] += 1
+                if bool(u['is_problem_return']):
+                    country_profit[u_country].setdefault('product_loss_cny', 0)
+                    country_profit[u_country].setdefault('problem_return_count', 0)
+                    country_profit[u_country]['product_loss_cny'] += p_amt * r
+                    country_profit[u_country]['problem_return_count'] += 1
 
-        # Subtract shipping_loss from net so 完成率 / 利润 / per-country net
-        # match the rest of the system. Per-currency totals get the loss
+        # Subtract shipping + product loss from net so 完成率 / 利润 / per-country
+        # net match the rest of the system. Per-currency totals get the losses
         # baked in too — same pattern as /monthly.
-        month_net_cny = month_net_cny - shipping_loss_cny
+        month_net_cny = month_net_cny - shipping_loss_cny - product_loss_cny
         for cur, loss_amt in shipping_loss_by_currency.items():
+            month_currency_amounts[cur]['net_amount'] -= loss_amt
+        for cur, loss_amt in product_loss_by_currency.items():
             month_currency_amounts[cur]['net_amount'] -= loss_amt
         # Per-country net was incremented above (line ~13757) without the
         # loss; now subtract each country's loss to get the true net.
         for c, v in country_profit.items():
-            v['net_cny'] = v['net_cny'] - v['shipping_loss_cny']
+            v['net_cny'] = v['net_cny'] - v['shipping_loss_cny'] - v.get('product_loss_cny', 0)
 
         # Get target info
         target = targets.get(manager, {})
@@ -16112,6 +16609,9 @@ def _compute_sales_board_data(selected_month):
             'undelivered_count': undelivered_count,
             'shipping_loss_by_currency': {c: round(v, 2) for c, v in shipping_loss_by_currency.items()},
             'shipping_loss_cny': round(shipping_loss_cny, 2),
+            'problem_return_count': problem_return_count,
+            'product_loss_by_currency': {c: round(v, 2) for c, v in product_loss_by_currency.items()},
+            'product_loss_cny': round(product_loss_cny, 2),
             'excluded_brand_breakdown': {
                 brand: {
                     'qty': v['qty'],
@@ -16134,6 +16634,8 @@ def _compute_sales_board_data(selected_month):
                 'unmapped_count': v['unmapped_count'],
                 'shipping_loss_cny': round(v['shipping_loss_cny'], 2),
                 'undelivered_count': v['undelivered_count'],
+                'product_loss_cny': round(v.get('product_loss_cny', 0), 2),
+                'problem_return_count': v.get('problem_return_count', 0),
             } for c, v in country_profit.items()},
         })
 
@@ -16198,6 +16700,8 @@ def _compute_sales_board_data(selected_month):
         'total_income': round(sum(d['total_income'] for d in board_data) + total_leader_bonuses, 2),
         'undelivered_count': sum(d.get('undelivered_count', 0) for d in board_data),
         'shipping_loss_cny': round(sum(d.get('shipping_loss_cny', 0) for d in board_data), 2),
+        'problem_return_count': sum(d.get('problem_return_count', 0) for d in board_data),
+        'product_loss_cny': round(sum(d.get('product_loss_cny', 0) for d in board_data), 2),
     }
     # Compute masked values for "hide leader commission" display mode.
     # Leaders' base salary is shown as the default (7000) so they look like regular members.
@@ -16244,7 +16748,7 @@ def _compute_sales_board_data(selected_month):
     team_totals['month_profit_pct_cny'] = round(sum(d.get('month_profit_pct_cny', 0) for d in board_data), 2)
 
     # Per-country profit totals
-    country_profit_totals = defaultdict(lambda: {'net_cny': 0, 'cost_cny': 0, 'unmapped_revenue_cny': 0, 'unmapped_count': 0, 'shipping_loss_cny': 0, 'undelivered_count': 0})
+    country_profit_totals = defaultdict(lambda: {'net_cny': 0, 'cost_cny': 0, 'unmapped_revenue_cny': 0, 'unmapped_count': 0, 'shipping_loss_cny': 0, 'undelivered_count': 0, 'product_loss_cny': 0, 'problem_return_count': 0})
     for d in board_data:
         for c, v in d.get('country_profit', {}).items():
             for k in country_profit_totals[c]:
@@ -16259,6 +16763,8 @@ def _compute_sales_board_data(selected_month):
             'unmapped_count': v['unmapped_count'],
             'shipping_loss_cny': round(v['shipping_loss_cny'], 2),
             'undelivered_count': v['undelivered_count'],
+            'product_loss_cny': round(v.get('product_loss_cny', 0), 2),
+            'problem_return_count': v.get('problem_return_count', 0),
             'profit_pct': cpct,
             'profit_actual_cny': round(v['net_cny'] - v['cost_cny'] - v['unmapped_revenue_cny'] * (1 - cpct / 100), 2),
             'profit_pct_cny': round(v['net_cny'] * cpct / 100, 2),

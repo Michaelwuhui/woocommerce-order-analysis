@@ -1,0 +1,392 @@
+/* ============================================================================
+   全局响应式适配 — 笔记本 (1280-1920px) + 手机 (<768px)
+   PC (≥1920px) 保持现状。所有规则只在小屏触发，不影响大屏。
+   ============================================================================ */
+
+/* ---------- 笔记本：让顶部 11+ 菜单项能挤进单行 ---------- */
+@media (max-width: 1599.98px) {
+    .navbar-nav .nav-link {
+        padding: 0.5rem 0.65rem !important;
+        font-size: 0.875rem;
+    }
+    .navbar-brand {
+        font-size: 1.1rem;
+    }
+    .navbar {
+        padding: 0.5rem 1rem;
+    }
+}
+
+@media (max-width: 1399.98px) {
+    .navbar-nav .nav-link {
+        padding: 0.45rem 0.5rem !important;
+        font-size: 0.825rem;
+    }
+    .navbar-nav .nav-link i {
+        margin-right: 0.2rem !important;
+    }
+    .navbar-brand {
+        font-size: 1rem;
+    }
+}
+
+/* 1280-1366 这档极窄笔记本：图标-only 菜单（保留品牌+图标，hover 显示文字 tooltip） */
+@media (max-width: 1279.98px) and (min-width: 992px) {
+    .navbar-nav .nav-link {
+        padding: 0.45rem 0.4rem !important;
+        font-size: 0.78rem;
+    }
+}
+
+/* ---------- 平板/笔记本：超宽数据表横向滚动而非挤压 ---------- */
+@media (max-width: 1399.98px) {
+    .card-body > .table-responsive,
+    .card > .table-responsive {
+        max-width: 100%;
+    }
+    .summary-table th,
+    .summary-table td {
+        padding: 8px 10px;
+        font-size: 0.78rem;
+    }
+}
+
+/* ---------- < 992px：navbar 折叠为汉堡时的菜单展开样式 ---------- */
+@media (max-width: 991.98px) {
+    .navbar-collapse {
+        max-height: calc(100vh - 76px);
+        overflow-y: auto;
+    }
+    .navbar-nav .nav-link {
+        padding: 0.65rem 1rem !important;
+        font-size: 0.95rem;
+        border-radius: 8px;
+    }
+    .navbar-nav .nav-link i {
+        margin-right: 0.5rem !important;
+        width: 20px;
+        text-align: center;
+    }
+    /* 用户/仅负责人那组按钮在汉堡里独立成块 */
+    .navbar-nav + .navbar-nav {
+        padding-top: 0.5rem;
+        margin-top: 0.5rem;
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
+    }
+}
+
+/* ============================================================================
+   手机端 (<768px) — 完整重排
+   ============================================================================ */
+@media (max-width: 767.98px) {
+    /* 容器内边距收紧 */
+    .container,
+    .container-fluid {
+        padding-left: 12px !important;
+        padding-right: 12px !important;
+    }
+
+    /* navbar 折叠后不再需要 76px 顶部间距 */
+    .main-content {
+        padding-top: 64px;
+    }
+
+    /* ----- 数据表 ----- */
+    /* 已被 .table-responsive 包装（含 JS 自动包装）的会横向滚 */
+    .table-responsive {
+        -webkit-overflow-scrolling: touch;
+        overflow-x: auto;
+        overflow-y: hidden;
+        margin-bottom: 1rem;
+    }
+    /* 表内文字防自动换行（强制走横向滚） */
+    .table th,
+    .table td {
+        white-space: nowrap;
+        padding: 8px 10px !important;
+        font-size: 0.8rem !important;
+    }
+    /* 但产品名/备注这种长文本允许换行 */
+    .table td.allow-wrap,
+    .table td.text-wrap,
+    .order-modal .product-table td {
+        white-space: normal;
+    }
+
+    /* ----- 弹窗：手机上自动全屏 ----- */
+    .modal-dialog:not(.modal-fullscreen) {
+        margin: 0 !important;
+        max-width: 100% !important;
+        width: 100% !important;
+        height: 100vh !important;
+        min-height: 100vh;
+    }
+    .modal-content {
+        height: 100vh !important;
+        border-radius: 0 !important;
+    }
+    .modal-body {
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+    }
+
+    /* ----- 卡片 / 统计区 ----- */
+    .stat-card {
+        padding: 14px;
+    }
+    .stat-icon {
+        width: 42px;
+        height: 42px;
+        font-size: 18px;
+    }
+    .stat-content h3 {
+        font-size: 1.1rem;
+    }
+    .data-card,
+    .card {
+        margin-bottom: 12px;
+    }
+    .card-body {
+        padding: 12px;
+    }
+    .card-header {
+        padding: 10px 12px;
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    /* ----- 按钮触摸区 (≥38px) ----- */
+    .btn {
+        min-height: 38px;
+    }
+    .btn-sm {
+        min-height: 32px;
+        padding: 4px 10px;
+    }
+    .btn-group .btn {
+        flex: 1;
+    }
+
+    /* ----- 表单 ----- */
+    .form-control,
+    .form-select {
+        font-size: 16px;  /* 防止 iOS Safari 自动 zoom */
+        min-height: 38px;
+    }
+    .form-control-sm,
+    .form-select-sm {
+        font-size: 14px;
+        min-height: 32px;
+    }
+    .input-group {
+        flex-wrap: wrap;
+    }
+
+    /* ----- flex 容器自动换行 ----- */
+    .d-flex.justify-content-between,
+    .d-flex.align-items-center {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    /* ----- 标题字号收紧 ----- */
+    h1 { font-size: 1.5rem; }
+    h2 { font-size: 1.3rem; }
+    h3 { font-size: 1.15rem; }
+    h4 { font-size: 1.05rem; }
+    h5, h6 { font-size: 0.95rem; }
+
+    /* ----- 图表高度限制 ----- */
+    canvas {
+        max-height: 280px !important;
+    }
+
+    /* ----- Flatpickr 日历适配 ----- */
+    .flatpickr-calendar {
+        max-width: calc(100vw - 24px);
+    }
+
+    /* ----- 工具条按钮组在小屏分组换行 ----- */
+    .btn-toolbar > .btn-group,
+    .toolbar > * {
+        margin-bottom: 6px;
+    }
+
+    /* ----- 隐藏笔记本/PC 才意义的辅助列（按需加 .hide-on-mobile 类即可触发） ----- */
+    .hide-on-mobile {
+        display: none !important;
+    }
+}
+
+/* ============================================================================
+   P1 重点页面深度适配
+   ============================================================================ */
+
+/* ----- 通用：页面顶部工具栏在窄笔记本/手机自动换行 ----- */
+@media (max-width: 1399.98px) {
+    /* 各页面顶部的标题+按钮组容器，常见模式: container-fluid 直接子 d-flex */
+    .container-fluid > .d-flex.justify-content-between,
+    .container > .d-flex.justify-content-between {
+        flex-wrap: wrap;
+        gap: 12px;
+        row-gap: 10px;
+    }
+    /* 顶部工具栏内部的二级 flex（多组筛选器）也允许换行 */
+    .container-fluid > .d-flex.justify-content-between > .d-flex,
+    .container > .d-flex.justify-content-between > .d-flex {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+}
+
+/* ----- 订单详情 / 客户详情 Modal ----- */
+/* 笔记本 1280-1399px：modal-xl 按视口收缩 */
+@media (max-width: 1399.98px) and (min-width: 768px) {
+    .modal-xl {
+        max-width: calc(100vw - 80px);
+    }
+    .modal-lg {
+        max-width: calc(100vw - 100px);
+    }
+}
+
+/* 小屏：订单详情内部信息卡片紧凑化 */
+@media (max-width: 991.98px) {
+    .order-modal .modal-body {
+        padding: 12px;
+    }
+    .order-modal .info-card {
+        margin-bottom: 12px;
+    }
+    .order-modal .info-card .card-header {
+        padding: 10px 12px;
+    }
+    .order-modal .info-card .card-body {
+        padding: 12px;
+    }
+    .order-modal .info-card .card-body p {
+        font-size: 13px;
+        margin-bottom: 6px;
+    }
+    .order-modal .product-table {
+        font-size: 0.8rem;
+    }
+    .order-modal .product-table thead th,
+    .order-modal .product-table tbody td {
+        padding: 8px 6px !important;
+    }
+    .order-modal .total-amount {
+        font-size: 16px;
+    }
+}
+
+/* 手机：订单详情内的产品明细表强制横向滚动（绕过 JS 排除） */
+@media (max-width: 767.98px) {
+    .order-modal .info-card .card-body.p-0 {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+    .order-modal .product-table {
+        min-width: 480px;
+    }
+    /* 订单内 col-md-4 / col-md-6 列在弹窗里也要堆叠 */
+    .order-modal .row > [class*="col-"] {
+        margin-bottom: 8px;
+    }
+}
+
+/* ----- 月度统计 ----- */
+/* 14列宽表在小笔记本上字号小一档 */
+@media (max-width: 1599.98px) {
+    .monthly-table th,
+    .monthly-table td {
+        padding: 8px 10px;
+        font-size: 0.78rem;
+    }
+}
+@media (max-width: 1279.98px) {
+    .monthly-table th,
+    .monthly-table td {
+        padding: 6px 8px;
+        font-size: 0.74rem;
+    }
+}
+@media (max-width: 767.98px) {
+    /* 手机端：让表头的两行布局更紧凑 */
+    .monthly-table th {
+        font-size: 0.7rem !important;
+        padding: 6px 4px !important;
+    }
+    .monthly-table td {
+        font-size: 0.72rem !important;
+        padding: 6px 4px !important;
+    }
+    /* 月度页 flatpickr 月份选择器在小屏上不要并排，让它们换行 */
+    .container-fluid .flatpickr-month {
+        width: 100% !important;
+        min-width: 90px;
+    }
+}
+
+/* ----- 综合报表 ----- */
+/* 报表的日期区+快速选择按钮组在窄屏堆叠 */
+@media (max-width: 1199.98px) {
+    /* col-md-2 的查询按钮在 lg 以下需要重新对齐 */
+    #reportTable th,
+    #reportTable td,
+    #trendSummaryTable th,
+    #trendSummaryTable td {
+        font-size: 0.78rem;
+        padding: 6px 8px;
+    }
+}
+@media (max-width: 767.98px) {
+    /* 报表顶部的多个 dropdown 按钮换行 */
+    #countryFilterBtn,
+    .btn-toolbar .btn,
+    .container-fluid > .d-flex .btn {
+        font-size: 0.8rem;
+        padding: 6px 10px;
+    }
+    /* 快速日期按钮组在小屏垂直堆叠 */
+    .btn-group.w-100 {
+        flex-wrap: wrap;
+    }
+    .btn-group.w-100 .btn {
+        flex: 1 1 50%;
+        font-size: 0.78rem;
+    }
+    /* 时间粒度按钮换行 */
+    #granularityBtnGroup {
+        flex-wrap: wrap;
+    }
+    /* 表格 sticky 表头在弹窗外也表现良好 */
+    #reportTable {
+        min-width: 640px;
+    }
+}
+
+/* ============================================================================
+   工具类 — 给开发者按需用
+   ============================================================================ */
+.show-on-mobile {
+    display: none !important;
+}
+@media (max-width: 767.98px) {
+    .show-on-mobile {
+        display: block !important;
+    }
+    .show-on-mobile-inline {
+        display: inline !important;
+    }
+}
+
+/* 大屏才显示 */
+.hide-below-lg {
+    display: none !important;
+}
+@media (min-width: 992px) {
+    .hide-below-lg {
+        display: block !important;
+    }
+}

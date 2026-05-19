@@ -10,6 +10,7 @@
     <link href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/dark.css" rel="stylesheet">
     <link href="{{ url_for('static', filename='css/style.css') }}" rel="stylesheet">
+    <link href="{{ url_for('static', filename='css/responsive.css') }}?v=2" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
     <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/zh.js"></script>
@@ -312,6 +313,67 @@
         </div>
     </div>
 
+    <!-- Problem Return Modal (shared) — record a return whose contents were
+         wrong / missing / damaged (e.g. the brick-swap scam) -->
+    <div class="modal fade" id="problemReturnModal" tabindex="-1" style="z-index: 1070;">
+        <div class="modal-dialog">
+            <div class="modal-content bg-dark border border-secondary border-opacity-25">
+                <div class="modal-header border-bottom border-secondary border-opacity-25">
+                    <h5 class="modal-title text-white"><i class="bi bi-box-seam me-2"></i>标记问题退货</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="problemReturnOrderId">
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">订单号</label>
+                        <div class="text-white" id="problemReturnOrderInfo"></div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">问题类型 *</label>
+                        <select class="form-select bg-dark text-white border-secondary" id="problemReturnType">
+                            <option value="swap">调包 / 假货（箱内是砖头、废纸等）</option>
+                            <option value="short">少件 / 空盒</option>
+                            <option value="damaged">实物损坏</option>
+                            <option value="other">其他</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">货值损失金额 <span id="problemReturnCurrencyLabel" class="text-muted"></span></label>
+                        <input type="number" step="0.01" min="0" class="form-control bg-dark text-white border-secondary"
+                            id="problemReturnLossAmount" placeholder="退回货物的实际损失货值（无则填 0）">
+                        <small class="text-muted">退回包裹里缺失 / 被调包货物的成本或售价，将计入退货损失统计</small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">运费损失金额 <span id="problemReturnShippingCurrencyLabel" class="text-muted"></span></label>
+                        <input type="number" step="0.01" min="0" class="form-control bg-dark text-white border-secondary"
+                            id="problemReturnShippingLoss" placeholder="往返运费等运输环节的损失（无则填 0）">
+                        <small class="text-muted">问题退货同样产生的运费损失（与未送达运费损失统一汇总）</small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">证据编号 / 位置</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary"
+                            id="problemReturnEvidence" placeholder="例如：开箱录像编号、称重记录、照片存放位置...">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-white-50">说明 / 备注</label>
+                        <textarea class="form-control bg-dark text-white border-secondary" id="problemReturnNote" rows="3"
+                            placeholder="例如：客户退回包裹内为砖头，重量与发货不符..."></textarea>
+                    </div>
+                    <div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25 mb-0">
+                        <i class="bi bi-exclamation-triangle me-1"></i>
+                        标记后将记入该客户的问题退货历史，作为后续风险识别的依据。
+                    </div>
+                </div>
+                <div class="modal-footer border-top border-secondary border-opacity-25">
+                    <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-danger" id="confirmProblemReturnBtn">
+                        <i class="bi bi-box-seam me-1"></i> 确认标记
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Email Detail Modal — shows the full body / headers of one log entry -->
     <div class="modal fade" id="emailDetailModal" tabindex="-1" style="z-index: 1070;">
         <div class="modal-dialog modal-xl modal-dialog-scrollable">
@@ -511,7 +573,7 @@
                 .then(function (response) { return response.json(); })
                 .then(function (order) {
                     if (order.error) {
-                        document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger">订单未找到</div>';
+                        document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25">订单未找到</div>';
                         return;
                     }
 
@@ -617,6 +679,47 @@
                         html += '<div class="info-card" style="border-color: rgba(168,85,247,0.25);"><div class="card-body d-flex align-items-center justify-content-between flex-wrap gap-2">';
                         html += '<div><i class="bi bi-arrow-return-left me-2" style="color:#c084fc;"></i><span style="color:#e2e8f0;">如客户拒收 / 包裹被退回，可记录运费损失</span></div>';
                         html += '<button class="btn btn-sm" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);" onclick="openMarkUndeliveredDialog(' + order.id + ', \'' + (order.currency || '') + '\')"><i class="bi bi-flag me-1"></i>标记为未送达</button>';
+                        html += '</div></div></div>';
+                    }
+
+                    // Problem return (wrong / missing / damaged contents) panel
+                    if (order.is_problem_return) {
+                        var prTypeLabels = { swap: '调包 / 假货', short: '少件 / 空盒', damaged: '实物损坏', other: '其他' };
+                        var prType = prTypeLabels[order.problem_return_type] || (order.problem_return_type || '问题退货');
+                        var prLoss = parseFloat(order.product_loss_amount || 0).toFixed(2);
+                        // shipping_loss_amount is shared with mark-undelivered;
+                        // only display it as the problem-return's own loss when
+                        // the order isn't also flagged as undelivered (otherwise
+                        // it belongs to the 未送达记录 card above).
+                        var prShipRaw = order.is_undelivered ? 0 : parseFloat(order.shipping_loss_amount || 0);
+                        var prShip = prShipRaw.toFixed(2);
+                        var prAt = (order.problem_return_at || '').replace('T', ' ').substring(0, 16);
+                        var prBy = order.problem_return_by_name || ('用户#' + (order.problem_return_by || '?'));
+                        html += '<div class="col-12">';
+                        html += '<div class="info-card" style="border-color: rgba(220,53,69,0.45);">';
+                        html += '<div class="card-header" style="background: linear-gradient(90deg, rgba(220,53,69,0.18) 0%, transparent 100%);"><h6 style="color:#f87171;"><i class="bi bi-box-seam me-2"></i>问题退货记录</h6></div>';
+                        html += '<div class="card-body">';
+                        html += '<div class="row g-2">';
+                        html += '<div class="col-md-3"><strong>问题类型:</strong> <span style="color:#f87171; font-weight:600;">' + prType + '</span></div>';
+                        html += '<div class="col-md-2"><strong>货值损失:</strong> <span style="color:#fbbf24; font-weight:600;">' + prLoss + ' ' + (order.currency || '') + '</span></div>';
+                        html += '<div class="col-md-2"><strong>运费损失:</strong> <span style="color:' + (prShipRaw > 0 ? '#fbbf24' : '#6b7280') + '; font-weight:600;">' + prShip + ' ' + (order.currency || '') + '</span></div>';
+                        html += '<div class="col-md-2"><strong>标记人:</strong> ' + prBy + '</div>';
+                        html += '<div class="col-md-3"><strong>标记时间:</strong> ' + (prAt || '-') + '</div>';
+                        if (order.problem_return_evidence) {
+                            html += '<div class="col-12 mt-1"><strong>证据:</strong> <span style="color:#e2e8f0;">' + order.problem_return_evidence + '</span></div>';
+                        }
+                        if (order.problem_return_note) {
+                            html += '<div class="col-12 mt-1"><strong>说明:</strong> <span style="color:#e2e8f0;">' + order.problem_return_note + '</span></div>';
+                        }
+                        if (canShip) {
+                            html += '<div class="col-12 mt-2"><button class="btn btn-sm btn-outline-light" onclick="unmarkProblemReturn(' + order.id + ')"><i class="bi bi-arrow-counterclockwise me-1"></i>撤销标记</button></div>';
+                        }
+                        html += '</div></div></div></div>';
+                    } else if (canShip) {
+                        html += '<div class="col-12">';
+                        html += '<div class="info-card" style="border-color: rgba(220,53,69,0.25);"><div class="card-body d-flex align-items-center justify-content-between flex-wrap gap-2">';
+                        html += '<div><i class="bi bi-box-seam me-2" style="color:#f87171;"></i><span style="color:#e2e8f0;">退回包裹内货物被调包 / 缺失 / 损坏，可在此记录</span></div>';
+                        html += '<button class="btn btn-sm" style="background:rgba(220,53,69,0.2); color:#f87171; border:1px solid rgba(220,53,69,0.4);" onclick="openProblemReturnModal(' + order.id + ', \'' + order.number + '\', \'' + (order.currency || '') + '\')"><i class="bi bi-flag me-1"></i>标记问题退货</button>';
                         html += '</div></div></div>';
                     }
 
@@ -959,7 +1062,7 @@
                 })
                 .catch(function (err) {
                     console.error(err);
-                    document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger">加载失败: ' + err.message + '</div>';
+                    document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25">加载失败: ' + err.message + '</div>';
                 });
         }
 
@@ -987,7 +1090,7 @@
                         }
                     }
                     if (!data.success) {
-                        bodyEl.innerHTML = '<div class="alert alert-warning small mb-0"><i class="bi bi-exclamation-triangle me-1"></i>' + (data.error || '无法读取邮件日志') + '</div>';
+                        bodyEl.innerHTML = '<div class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25 small mb-0"><i class="bi bi-exclamation-triangle me-1"></i>' + (data.error || '无法读取邮件日志') + '</div>';
                         return;
                     }
                     if (!data.logs || data.logs.length === 0) {
@@ -1021,7 +1124,7 @@
                 })
                 .catch(function (err) {
                     if (btn) btn.disabled = false;
-                    bodyEl.innerHTML = '<div class="alert alert-danger small mb-0">请求失败: ' + err.message + '</div>';
+                    bodyEl.innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25 small mb-0">请求失败: ' + err.message + '</div>';
                 });
         }
 
@@ -1041,7 +1144,7 @@
                 .then(function (data) {
                     if (btn) btn.disabled = false;
                     if (!data.success) {
-                        bodyEl.innerHTML = '<div class="alert alert-warning small mb-0">' + (data.error || '加载失败') + '</div>';
+                        bodyEl.innerHTML = '<div class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25 small mb-0">' + (data.error || '加载失败') + '</div>';
                         return;
                     }
                     if (summaryEl) {
@@ -1091,7 +1194,7 @@
                 })
                 .catch(function (err) {
                     if (btn) btn.disabled = false;
-                    bodyEl.innerHTML = '<div class="alert alert-danger small mb-0">请求失败: ' + err.message + '</div>';
+                    bodyEl.innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25 small mb-0">请求失败: ' + err.message + '</div>';
                 });
         }
 
@@ -1192,6 +1295,11 @@
                 btn.dataset.bound = '1';
                 btn.addEventListener('click', addNote);
             }
+            var prBtn = document.getElementById('confirmProblemReturnBtn');
+            if (prBtn && !prBtn.dataset.bound) {
+                prBtn.dataset.bound = '1';
+                prBtn.addEventListener('click', confirmProblemReturn);
+            }
         });
 
         // Open the per-email detail modal. Loads body lazily.
@@ -1222,7 +1330,7 @@
                 .then(function (r) { return r.json(); })
                 .then(function (e) {
                     if (!e || e.success === false) {
-                        bodyEl.innerHTML = '<div class="alert alert-danger">' + ((e && e.error) || '加载失败') + '</div>';
+                        bodyEl.innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25">' + ((e && e.error) || '加载失败') + '</div>';
                         return;
                     }
                     var statusBadge = (e.status === 'sent')
@@ -1246,7 +1354,7 @@
                     html += '</div>';
 
                     if (e.response) {
-                        html += '<div class="alert alert-warning small" style="word-break:break-word;"><strong>响应/错误:</strong> ' + e.response + '</div>';
+                        html += '<div class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25 small" style="word-break:break-word;"><strong>响应/错误:</strong> ' + e.response + '</div>';
                     }
 
                     // Body — sandboxed iframe so any HTML/CSS in the email
@@ -1275,7 +1383,7 @@
                     bodyEl.innerHTML = html;
                 })
                 .catch(function (err) {
-                    bodyEl.innerHTML = '<div class="alert alert-danger">请求失败: ' + err.message + '</div>';
+                    bodyEl.innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25">请求失败: ' + err.message + '</div>';
                 });
         }
 
@@ -1381,12 +1489,107 @@
                 .catch(function (err) { alert('请求失败: ' + err.message); });
         }
 
+        function openProblemReturnModal(orderId, orderNumber, currency) {
+            document.getElementById('problemReturnOrderId').value = orderId;
+            document.getElementById('problemReturnOrderInfo').innerHTML = '<strong>#' + orderNumber + '</strong>';
+            var curLabel = currency ? '(' + currency + ')' : '';
+            document.getElementById('problemReturnCurrencyLabel').textContent = curLabel;
+            document.getElementById('problemReturnShippingCurrencyLabel').textContent = curLabel;
+            document.getElementById('problemReturnType').value = 'swap';
+            document.getElementById('problemReturnLossAmount').value = '';
+            document.getElementById('problemReturnShippingLoss').value = '';
+            document.getElementById('problemReturnEvidence').value = '';
+            document.getElementById('problemReturnNote').value = '';
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('problemReturnModal')).show();
+        }
+
+        function confirmProblemReturn() {
+            var orderId = document.getElementById('problemReturnOrderId').value;
+            var type = document.getElementById('problemReturnType').value;
+            var lossRaw = document.getElementById('problemReturnLossAmount').value.trim();
+            var shipLossRaw = document.getElementById('problemReturnShippingLoss').value.trim();
+            var evidence = document.getElementById('problemReturnEvidence').value.trim();
+            var note = document.getElementById('problemReturnNote').value.trim();
+            var lossAmount = parseFloat(lossRaw || '0');
+            var shippingLoss = parseFloat(shipLossRaw || '0');
+
+            if (isNaN(lossAmount) || lossAmount < 0) {
+                alert('请输入合法的货值损失金额（≥ 0）');
+                return;
+            }
+            if (isNaN(shippingLoss) || shippingLoss < 0) {
+                alert('请输入合法的运费损失金额（≥ 0）');
+                return;
+            }
+            if (lossAmount === 0 && shippingLoss === 0) {
+                if (!confirm('货值损失和运费损失都为 0，仍要继续标记吗？')) return;
+            }
+
+            var btn = document.getElementById('confirmProblemReturnBtn');
+            var original = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>处理中...';
+
+            fetch('/api/order/' + orderId + '/mark-problem-return', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type: type, product_loss_amount: lossAmount, shipping_loss_amount: shippingLoss, evidence: evidence, note: note })
+            })
+                .then(function (res) { return res.json(); })
+                .then(function (data) {
+                    btn.disabled = false;
+                    btn.innerHTML = original;
+                    if (data.success) {
+                        var m = bootstrap.Modal.getInstance(document.getElementById('problemReturnModal'));
+                        if (m) m.hide();
+                        alert(data.message || '已标记为问题退货');
+                        showOrderDetail(orderId);
+                        if (typeof refreshActiveViews === 'function') {
+                            refreshActiveViews();
+                        } else if (typeof refreshOrderList === 'function') {
+                            refreshOrderList();
+                        }
+                    } else {
+                        alert('标记失败: ' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(function (err) {
+                    btn.disabled = false;
+                    btn.innerHTML = original;
+                    alert('请求失败: ' + err.message);
+                });
+        }
+
+        function unmarkProblemReturn(orderId) {
+            if (!confirm('确认撤销「问题退货」标记？\n撤销后，该订单的问题退货记录会被清除。')) return;
+
+            fetch('/api/order/' + orderId + '/unmark-problem-return', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            })
+                .then(function (res) { return res.json(); })
+                .then(function (data) {
+                    if (data.success) {
+                        alert(data.message || '已撤销');
+                        showOrderDetail(orderId);
+                        if (typeof refreshActiveViews === 'function') {
+                            refreshActiveViews();
+                        } else if (typeof refreshOrderList === 'function') {
+                            refreshOrderList();
+                        }
+                    } else {
+                        alert('撤销失败: ' + (data.error || ''));
+                    }
+                })
+                .catch(function (err) { alert('请求失败: ' + err.message); });
+        }
+
         function showCustomerDetail(email) {
             // Check if email is valid
             if (!email || email.trim() === '') {
                 var modal = new bootstrap.Modal(document.getElementById('customerDetailModal'));
                 document.getElementById('modalCustomerName').textContent = '';
-                document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-warning"><i class="bi bi-exclamation-triangle me-2"></i>该订单没有客户邮箱信息</div>';
+                document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25"><i class="bi bi-exclamation-triangle me-2"></i>该订单没有客户邮箱信息</div>';
                 modal.show();
                 return;
             }
@@ -1407,7 +1610,7 @@
                 .then(function (response) { return response.json(); })
                 .then(function (customer) {
                     if (customer.error) {
-                        document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-danger">客户未找到</div>';
+                        document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25">客户未找到</div>';
                         return;
                     }
 
@@ -1550,7 +1753,7 @@
                     if (customer.email) loadCustomerEmails(customer.email, false);
                 })
                 .catch(function (err) {
-                    document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-danger">加载失败: ' + err.message + '</div>';
+                    document.getElementById('customerDetailContent').innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25">加载失败: ' + err.message + '</div>';
                 });
         }
 
@@ -1688,6 +1891,41 @@
         });
     </script>
     {% block scripts %}{% endblock %}
+
+    <script>
+    /* 响应式辅助：未被 .table-responsive 包装的 .table 自动包一层，
+       使其在窄屏（笔记本/手机）下能横向滚动而非压扁 */
+    (function () {
+        function wrapTables(root) {
+            (root || document).querySelectorAll('table.table').forEach(function (t) {
+                var p = t.parentElement;
+                if (!p) return;
+                if (p.classList.contains('table-responsive')) return;
+                /* 弹窗内已自定义样式的产品明细表跳过 */
+                if (t.classList.contains('product-table')) return;
+                var w = document.createElement('div');
+                w.className = 'table-responsive';
+                p.insertBefore(w, t);
+                w.appendChild(t);
+            });
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', function () { wrapTables(); });
+        } else {
+            wrapTables();
+        }
+        /* 监听后续动态插入（如 AJAX 渲染的表格） */
+        if (window.MutationObserver) {
+            new MutationObserver(function (muts) {
+                muts.forEach(function (m) {
+                    m.addedNodes.forEach(function (n) {
+                        if (n.nodeType === 1) wrapTables(n);
+                    });
+                });
+            }).observe(document.body, { childList: true, subtree: true });
+        }
+    })();
+    </script>
 </body>
 
 </html>

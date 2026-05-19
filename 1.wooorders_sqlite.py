@@ -363,41 +363,39 @@ def save_orders_to_db(orders_data):
     
     try:
         cursor = connection.cursor()
-        
-        # 准备插入语句
-        insert_query = """
-        INSERT OR REPLACE INTO orders (
-            id, parent_id, number, order_key, created_via, version, status, currency,
-            date_created, date_created_gmt, date_modified, date_modified_gmt,
-            discount_total, discount_tax, shipping_total, shipping_tax, cart_tax,
-            total, total_tax, prices_include_tax, customer_id, customer_ip_address,
-            customer_user_agent, customer_note, billing, shipping, payment_method,
-            payment_method_title, transaction_id, date_paid, date_paid_gmt,
-            date_completed, date_completed_gmt, cart_hash, meta_data, line_items,
-            tax_lines, shipping_lines, fee_lines, coupon_lines, refunds, set_paid, source,
-            updated_at
-        ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
+
+        # WC-managed columns. Local-only columns (is_undelivered, is_problem_return
+        # and friends) are deliberately NOT listed — they're set by the web UI
+        # and must survive every deep sync. INSERT OR REPLACE wipes ALL columns
+        # not in the list because it DELETEs the row first; UPSERT only touches
+        # the columns we name.
+        wc_fields = [
+            'id', 'parent_id', 'number', 'order_key', 'created_via', 'version', 'status', 'currency',
+            'date_created', 'date_created_gmt', 'date_modified', 'date_modified_gmt',
+            'discount_total', 'discount_tax', 'shipping_total', 'shipping_tax', 'cart_tax',
+            'total', 'total_tax', 'prices_include_tax', 'customer_id', 'customer_ip_address',
+            'customer_user_agent', 'customer_note', 'billing', 'shipping', 'payment_method',
+            'payment_method_title', 'transaction_id', 'date_paid', 'date_paid_gmt',
+            'date_completed', 'date_completed_gmt', 'cart_hash', 'meta_data', 'line_items',
+            'tax_lines', 'shipping_lines', 'fee_lines', 'coupon_lines', 'refunds', 'set_paid', 'source'
+        ]
+        all_columns = wc_fields + ['updated_at']
+        placeholders = ', '.join(['?'] * len(all_columns))
+        update_set = ', '.join(f'{c} = excluded.{c}' for c in all_columns if c != 'id')
+        insert_query = f"""
+        INSERT INTO orders ({', '.join(all_columns)})
+        VALUES ({placeholders})
+        ON CONFLICT(id) DO UPDATE SET {update_set}
         """
-        
+
         # 处理订单数据
         processed_orders = []
         for order in orders_data:
             processed_order = []
-            
+
             # 按照字段顺序处理数据
-            fields = [
-                'id', 'parent_id', 'number', 'order_key', 'created_via', 'version', 'status', 'currency',
-                'date_created', 'date_created_gmt', 'date_modified', 'date_modified_gmt',
-                'discount_total', 'discount_tax', 'shipping_total', 'shipping_tax', 'cart_tax',
-                'total', 'total_tax', 'prices_include_tax', 'customer_id', 'customer_ip_address',
-                'customer_user_agent', 'customer_note', 'billing', 'shipping', 'payment_method',
-                'payment_method_title', 'transaction_id', 'date_paid', 'date_paid_gmt',
-                'date_completed', 'date_completed_gmt', 'cart_hash', 'meta_data', 'line_items',
-                'tax_lines', 'shipping_lines', 'fee_lines', 'coupon_lines', 'refunds', 'set_paid', 'source'
-            ]
-            
+            fields = wc_fields
+
             for field in fields:
                 value = order.get(field)
                 

@@ -88,3 +88,5 @@ secrets.json
 *.bak
 *.bak_*
 *.backup
+# 带时间戳的备份文件（如 app.py.bak.20260506_094532）
+*.bak.*

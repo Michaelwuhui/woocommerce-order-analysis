@@ -106,44 +106,44 @@ def save_orders_to_db(orders_data, connection=None):
     
     try:
         cursor = connection.cursor()
-        
-        insert_query = """
-        INSERT OR REPLACE INTO orders (
-            id, parent_id, number, order_key, created_via, version, status, currency,
-            date_created, date_created_gmt, date_modified, date_modified_gmt,
-            discount_total, discount_tax, shipping_total, shipping_tax, cart_tax,
-            total, total_tax, prices_include_tax, customer_id, customer_ip_address,
-            customer_user_agent, customer_note, billing, shipping, payment_method,
-            payment_method_title, transaction_id, date_paid, date_paid_gmt,
-            date_completed, date_completed_gmt, cart_hash, meta_data, line_items,
-            tax_lines, shipping_lines, fee_lines, coupon_lines, refunds, set_paid, source,
-            updated_at
-        ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
+
+        # WC-managed columns. Local-only columns (is_undelivered,
+        # shipping_loss_amount, undelivered_*, is_problem_return,
+        # problem_return_*, product_loss_amount) are deliberately NOT listed —
+        # they're set by /api/order/<id>/mark-* and must survive every sync.
+        # Previously we used INSERT OR REPLACE which DELETEs the row first,
+        # wiping those flags on every refresh; UPSERT only touches the columns
+        # we name, so the local markings stay intact.
+        wc_fields = [
+            'id', 'parent_id', 'number', 'order_key', 'created_via', 'version', 'status', 'currency',
+            'date_created', 'date_created_gmt', 'date_modified', 'date_modified_gmt',
+            'discount_total', 'discount_tax', 'shipping_total', 'shipping_tax', 'cart_tax',
+            'total', 'total_tax', 'prices_include_tax', 'customer_id', 'customer_ip_address',
+            'customer_user_agent', 'customer_note', 'billing', 'shipping', 'payment_method',
+            'payment_method_title', 'transaction_id', 'date_paid', 'date_paid_gmt',
+            'date_completed', 'date_completed_gmt', 'cart_hash', 'meta_data', 'line_items',
+            'tax_lines', 'shipping_lines', 'fee_lines', 'coupon_lines', 'refunds', 'set_paid', 'source'
+        ]
+        all_columns = wc_fields + ['updated_at']
+        placeholders = ', '.join(['?'] * len(all_columns))
+        # On UPDATE, set every column EXCEPT id (the conflict key).
+        update_set = ', '.join(f'{c} = excluded.{c}' for c in all_columns if c != 'id')
+        insert_query = f"""
+        INSERT INTO orders ({', '.join(all_columns)})
+        VALUES ({placeholders})
+        ON CONFLICT(id) DO UPDATE SET {update_set}
         """
-        
+
         # Filter out checkout-draft orders - they should not be synced
         orders_data = [o for o in orders_data if o.get('status') != 'checkout-draft']
-        
+
         if not orders_data:
             return
-        
+
         processed_orders = []
         for order in orders_data:
             processed_order = []
-            fields = [
-                'id', 'parent_id', 'number', 'order_key', 'created_via', 'version', 'status', 'currency',
-                'date_created', 'date_created_gmt', 'date_modified', 'date_modified_gmt',
-                'discount_total', 'discount_tax', 'shipping_total', 'shipping_tax', 'cart_tax',
-                'total', 'total_tax', 'prices_include_tax', 'customer_id', 'customer_ip_address',
-                'customer_user_agent', 'customer_note', 'billing', 'shipping', 'payment_method',
-                'payment_method_title', 'transaction_id', 'date_paid', 'date_paid_gmt',
-                'date_completed', 'date_completed_gmt', 'cart_hash', 'meta_data', 'line_items',
-                'tax_lines', 'shipping_lines', 'fee_lines', 'coupon_lines', 'refunds', 'set_paid', 'source'
-            ]
-            
-            for field in fields:
+            for field in wc_fields:
                 value = order.get(field)
                 if field == 'set_paid':
                     if isinstance(value, dict) or value is None:
@@ -156,10 +156,10 @@ def save_orders_to_db(orders_data, connection=None):
                     processed_order.append(json.dumps(value, ensure_ascii=False))
                 else:
                     processed_order.append(value)
-            
+
             processed_order.append(datetime.now().isoformat())
             processed_orders.append(tuple(processed_order))
-        
+
         cursor.executemany(insert_query, processed_orders)
         connection.commit()
         

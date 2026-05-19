@@ -156,6 +156,26 @@
                 </div>
             </a>
         </div>
+        <div class="col-xl col-md-6">
+            <a href="{{ url_for('cancelled_analysis') }}" class="text-decoration-none">
+                <div class="stat-card h-100" style="border-color: rgba(220,53,69,0.4);">
+                    <div class="stat-icon" style="color:#f87171;">
+                        <i class="bi bi-box-seam"></i>
+                    </div>
+                    <div class="stat-content">
+                        <h3 style="color:#f87171;">{{ stats.problem_return_orders or 0 }}</h3>
+                        {% if stats.product_loss_by_currency %}
+                            {% for cur, loss in stats.product_loss_by_currency.items() %}
+                                {% if loss > 0 %}
+                                <div class="small text-warning">货值损失 {{ "%.2f"|format(loss) }} {{ cur }}</div>
+                                {% endif %}
+                            {% endfor %}
+                        {% endif %}
+                        <p>问题退货 (调包/假货) <i class="bi bi-arrow-right-short"></i></p>
+                    </div>
+                </div>
+            </a>
+        </div>
     </div>
 
     <div class="row g-4 mb-4">
@@ -178,7 +198,7 @@
                         </label>
                         <input type="radio" class="btn-check" name="trendMetric" id="trendMetricNet" value="net">
                         <label class="btn btn-outline-success" for="trendMetricNet"
-                               title="净额 = 成功订单金额 − 运费 − 未送达订单运费损失">
+                               title="净额 = 成功订单金额 − 运费 − 未送达/问题退货运费损失 − 问题退货货值损失">
                             <i class="bi bi-check-circle me-1"></i>净额 (实际成功)
                         </label>
                     </div>
@@ -356,7 +376,7 @@
     // Check if Chart is loaded
     if (typeof Chart === 'undefined') {
         console.error('Chart.js not loaded');
-        document.getElementById('trendChart').parentNode.innerHTML = '<div class="alert alert-danger">图表组件加载失败，请检查网络连接</div>';
+        document.getElementById('trendChart').parentNode.innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25">图表组件加载失败，请检查网络连接</div>';
         return;
     }
 

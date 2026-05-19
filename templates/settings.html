@@ -270,6 +270,36 @@
     </div>
 </div>
 
+<!-- Big Order Alert Thresholds -->
+<div class="card data-card mb-4">
+    <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
+        <h5 class="card-title text-white mb-0">
+            <i class="bi bi-exclamation-triangle me-2" style="color:#ef4444;"></i>大单提示阈值
+        </h5>
+    </div>
+    <div class="card-body">
+        <div class="alert alert-info bg-info bg-opacity-10 border-0 small mb-3 px-3 py-2">
+            <i class="bi bi-info-circle me-1"></i>
+            达到任一阈值的待发货订单，会在发货页标记「大单」，并在发货时弹出操作清单（序列号 / 录像 / 称重 / 签收物流），需勾选确认后才能发货。任一项设为 0 即关闭该项判定。
+        </div>
+        <div class="row g-3">
+            <div class="col-md-4">
+                <label class="form-label text-white-50">数量阈值（产品总支数 ≥）</label>
+                <input type="number" min="0" step="1"
+                    class="form-control bg-dark text-white border-secondary" id="bigOrderQtyThreshold"
+                    placeholder="10">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label text-white-50">金额阈值（订单金额 ≥，按订单货币原值）</label>
+                <input type="number" min="0" step="0.01"
+                    class="form-control bg-dark text-white border-secondary" id="bigOrderAmountThreshold"
+                    placeholder="1500">
+            </div>
+        </div>
+        <small class="d-block mt-2"><span id="bigOrderSaveHint"></span></small>
+    </div>
+</div>
+
 <!-- Product Masters Management Card -->
 <div class="card data-card mb-4">
     <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
@@ -1559,6 +1589,49 @@
                     .catch(err => {
                         alert('设置错误');
                     });
+            });
+        }
+
+        // 大单提示阈值
+        const bigOrderQty = document.getElementById('bigOrderQtyThreshold');
+        const bigOrderAmount = document.getElementById('bigOrderAmountThreshold');
+        if (bigOrderQty && bigOrderAmount) {
+            fetch('/api/settings')
+                .then(res => res.json())
+                .then(data => {
+                    if (data.big_order_qty_threshold !== undefined) bigOrderQty.value = data.big_order_qty_threshold;
+                    if (data.big_order_amount_threshold !== undefined) bigOrderAmount.value = data.big_order_amount_threshold;
+                });
+
+            const saveBigOrderThreshold = function (key, value) {
+                const hint = document.getElementById('bigOrderSaveHint');
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ [key]: value })
+                })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            hint.textContent = '✓ 已保存';
+                            hint.className = 'text-success';
+                            setTimeout(() => { hint.textContent = ''; }, 2000);
+                        } else {
+                            hint.textContent = '保存失败';
+                            hint.className = 'text-danger';
+                        }
+                    })
+                    .catch(() => {
+                        hint.textContent = '保存错误';
+                        hint.className = 'text-danger';
+                    });
+            };
+
+            bigOrderQty.addEventListener('change', function () {
+                saveBigOrderThreshold('big_order_qty_threshold', Math.max(0, parseFloat(this.value) || 0));
+            });
+            bigOrderAmount.addEventListener('change', function () {
+                saveBigOrderThreshold('big_order_amount_threshold', Math.max(0, parseFloat(this.value) || 0));
             });
         }
 

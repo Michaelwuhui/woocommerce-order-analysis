@@ -203,15 +203,25 @@
                             <td class="text-center">{{ c.successful_orders }}</td>
                             <td class="text-end fw-bold text-success">{{ c.total_spent|round(2) }}</td>
                             <td class="text-center">
+                                {% if (c.undelivered_orders and c.undelivered_orders > 0) or (c.problem_return_orders and c.problem_return_orders > 0) %}
                                 {% if c.undelivered_orders and c.undelivered_orders > 0 %}
                                 <span class="badge" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);" title="拒收 {{ c.undelivered_orders }} 单 / 共 {{ c.total_orders }} 单 = {{ c.refusal_rate }}%">
-                                    {{ c.undelivered_orders }}
+                                    未送达 {{ c.undelivered_orders }}
                                     {% if c.refusal_rate >= 30 %}
                                     <i class="bi bi-exclamation-triangle-fill ms-1" style="color:#fbbf24;" title="高拒收率"></i>
                                     {% endif %}
                                 </span>
+                                {% endif %}
+                                {% if c.problem_return_orders and c.problem_return_orders > 0 %}
+                                <span class="badge ms-1" style="background:rgba(220,53,69,0.2); color:#f87171; border:1px solid rgba(220,53,69,0.4);" title="问题退货（调包/少件/损坏）{{ c.problem_return_orders }} 单">
+                                    问题退货 {{ c.problem_return_orders }}
+                                </span>
+                                {% endif %}
                                 {% if c.shipping_loss_total > 0 %}
-                                <div><small class="text-warning">损失 {{ "%.2f"|format(c.shipping_loss_total) }}</small></div>
+                                <div><small class="text-warning">运费损失 {{ "%.2f"|format(c.shipping_loss_total) }}</small></div>
+                                {% endif %}
+                                {% if c.product_loss_total and c.product_loss_total > 0 %}
+                                <div><small class="text-warning">货值损失 {{ "%.2f"|format(c.product_loss_total) }}</small></div>
                                 {% endif %}
                                 {% else %}
                                 <span class="text-secondary">—</span>

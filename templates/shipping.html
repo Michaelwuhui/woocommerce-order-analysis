@@ -213,6 +213,25 @@
             </div>
             <div class="modal-body">
                 <input type="hidden" id="shipOrderId">
+                <div id="bigOrderAlert" class="d-none mb-3">
+                    <div class="alert alert-danger bg-danger bg-opacity-10 border-danger border-opacity-25 mb-0">
+                        <div class="fw-bold text-danger mb-2">
+                            <i class="bi bi-exclamation-triangle-fill me-1"></i>大单订单
+                            <span id="bigOrderReasons" class="text-white-50 fw-normal small ms-1"></span>
+                        </div>
+                        <div class="small text-white-50 mb-2">发货前请完成以下操作，防止退货被调包：</div>
+                        <ul class="small text-white-50 mb-2 ps-3">
+                            <li>逐支记录产品序列号</li>
+                            <li>开箱发货过程录像存档</li>
+                            <li>包裹称重并记录重量</li>
+                            <li>选择带签收确认的物流方式</li>
+                        </ul>
+                        <div class="form-check mb-0">
+                            <input class="form-check-input" type="checkbox" id="bigOrderAck">
+                            <label class="form-check-label text-warning fw-bold" for="bigOrderAck">我已按大单流程处理</label>
+                        </div>
+                    </div>
+                </div>
                 <div class="mb-3">
                     <label class="form-label text-white-50">订单号</label>
                     <input type="text" class="form-control bg-dark text-white border-secondary" id="shipOrderNumber"
@@ -417,6 +436,9 @@
             // Confirm ship button
             document.getElementById('confirmShipBtn').addEventListener('click', shipOrder);
 
+            // Big-order acknowledgment gates the confirm-ship button
+            document.getElementById('bigOrderAck').addEventListener('change', updateShipBtnState);
+
             // confirmNoteBtn is wired by base.html (the noteModal is shared)
 
             // Confirm mark-undelivered button
@@ -469,9 +491,9 @@
                         return;
                     }
                     tbody.innerHTML = orders.map(o => `
-                <tr>
+                <tr${o.is_big_order ? ' style="background-color: rgba(220,53,69,0.1);"' : ''}>
                     <td class="ps-3">
-                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a></div>
+                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a>${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}</div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
                     </td>
 
@@ -554,7 +576,7 @@
                         <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="printLabel(${o.id})" title="打印">
                             <i class="bi bi-printer"></i>
                         </a>
-                        <button class="btn btn-sm btn-primary px-3" onclick="openShipModal(${o.id}, '${o.number}', '${o.customer_name}', '${o.customer_address.replace(/'/g, "\\'")}', '${(o.source || '').replace(/'/g, "\\'")}')">
+                        <button class="btn btn-sm btn-primary px-3" onclick="openShipModal(${o.id}, '${o.number}', '${o.customer_name}', '${o.customer_address.replace(/'/g, "\\'")}', '${(o.source || '').replace(/'/g, "\\'")}', ${o.is_big_order ? 'true' : 'false'}, '${(o.big_order_reasons || []).join(' · ').replace(/'/g, "\\'")}', '${(o.warehouse_name || '').replace(/'/g, "\\'")}')">
                             <i class="bi bi-truck me-1"></i>发货
                         </button>
                     </td>
@@ -637,6 +659,15 @@
                         <a href="javascript:void(0)" class="text-secondary me-3 text-decoration-none" onclick="openNoteModal(${o.id}, '${o.number}')" title="备注">
                             <i class="bi bi-chat-left-text"></i>
                         </a>
+                        ${o.is_problem_return ? `
+                            <a href="javascript:void(0)" class="text-warning me-3 text-decoration-none" onclick="unmarkProblemReturn(${o.id})" title="撤销问题退货标记">
+                                <i class="bi bi-arrow-counterclockwise"></i>
+                            </a>
+                        ` : `
+                            <a href="javascript:void(0)" class="text-danger me-3 text-decoration-none" onclick="openProblemReturnModal(${o.id}, '${o.number}', '${(o.currency || '').replace(/'/g, "\\'")}')" title="标记问题退货（调包/少件/损坏）">
+                                <i class="bi bi-box-seam"></i>
+                            </a>
+                        `}
                         ${o.is_undelivered ? `
                             <a href="javascript:void(0)" class="text-warning text-decoration-none" onclick="unmarkUndelivered(${o.id}, '${o.number}')" title="撤销退回标记">
                                 <i class="bi bi-arrow-counterclockwise"></i>
@@ -652,23 +683,54 @@
                 });
         }
 
-        function openShipModal(orderId, orderNumber, customerName, customerAddress, source) {
+        function openShipModal(orderId, orderNumber, customerName, customerAddress, source, isBigOrder, bigOrderReasons, warehouseName) {
             document.getElementById('shipOrderId').value = orderId;
             document.getElementById('shipOrderNumber').value = '#' + orderNumber;
+            // Surface the warehouse in the modal so the shipper sees where the
+            // goods are fulfilled from (drives the default carrier choice).
+            const whHint = warehouseName ? `<small class="text-info d-block">出库: ${warehouseName}</small>` : '';
             document.getElementById('shipCustomerInfo').innerHTML = `
         <div class="fw-bold">${customerName}</div>
         <small class="text-muted">${customerAddress}</small>
+        ${whHint}
     `;
             document.getElementById('shipTrackingNumber').value = '';
             document.getElementById('shipSendEmail').checked = true;
-            loadCarriersForSite(source);
+            applyBigOrderGate(isBigOrder, bigOrderReasons);
+            loadCarriersForSite(source, warehouseName || '');
             bootstrap.Modal.getOrCreateInstance(document.getElementById('shipModal')).show();
+        }
+
+        // Show/hide the big-order checklist and gate the confirm button on the
+        // acknowledgment checkbox. For non-big orders the gate stays off.
+        function applyBigOrderGate(isBigOrder, bigOrderReasons) {
+            const alertBox = document.getElementById('bigOrderAlert');
+            const ack = document.getElementById('bigOrderAck');
+            if (isBigOrder) {
+                document.getElementById('bigOrderReasons').textContent = bigOrderReasons ? `（${bigOrderReasons}）` : '';
+                alertBox.classList.remove('d-none');
+                ack.checked = false;
+            } else {
+                alertBox.classList.add('d-none');
+                ack.checked = true;
+            }
+            updateShipBtnState();
+        }
+
+        function updateShipBtnState() {
+            const btn = document.getElementById('confirmShipBtn');
+            const ack = document.getElementById('bigOrderAck');
+            if (btn) btn.disabled = !ack.checked;
         }
 
         // Populate the carrier dropdown with the carriers actually used on
         // this order's site (so AU sites only show Australia Post, PL sites
         // only show InPost / DPD, etc).
-        function loadCarriersForSite(source) {
+        //
+        // warehouseName: if given, we pick the default selection based on it
+        // ("国内发*" → EMS, "澳洲仓*" → Australia Post, etc). The full list of
+        // carriers is still shown so the shipper can manually override.
+        function loadCarriersForSite(source, warehouseName) {
             const sel = document.getElementById('shipCarrier');
             sel.innerHTML = '<option value="">加载中...</option>';
             sel.disabled = true;
@@ -684,10 +746,10 @@
                     if (!Array.isArray(carriers) || carriers.length === 0) {
                         // Site has no shipping history yet — fall back to global list
                         return fetch('/api/shipping/carriers').then(r => r.json()).then(globalList => {
-                            renderCarrierOptions(sel, globalList, true);
+                            renderCarrierOptions(sel, globalList, true, warehouseName);
                         });
                     }
-                    renderCarrierOptions(sel, carriers, false);
+                    renderCarrierOptions(sel, carriers, false, warehouseName);
                 })
                 .catch(() => {
                     sel.disabled = false;
@@ -695,18 +757,42 @@
                 });
         }
 
-        function renderCarrierOptions(sel, carriers, isFallback) {
+        // Pick the slug that should be pre-selected based on warehouse name.
+        // Conservative: only matches well-known prefixes; if nothing fits we
+        // return '' and the shipper has to choose manually.
+        function defaultCarrierForWarehouse(warehouseName, availableSlugs) {
+            const wh = (warehouseName || '').toLowerCase();
+            if (!wh) return '';
+            // 国内发* → EMS (goods shipped from China overseas)
+            if (wh.indexOf('国内发') >= 0 && availableSlugs.indexOf('ems') >= 0) return 'ems';
+            // 澳洲仓* → Australia Post
+            if (wh.indexOf('澳洲仓') >= 0 && availableSlugs.indexOf('australia-post') >= 0) return 'australia-post';
+            // 波兰仓* → leave to single-option / usage-frequency logic; PL has
+            // both InPost and DPD and the per-customer address dictates which.
+            return '';
+        }
+
+        function renderCarrierOptions(sel, carriers, isFallback, warehouseName) {
             const opts = ['<option value="">选择物流商</option>'];
             carriers.forEach(c => {
-                const hint = c.usage_count ? ` · 该站已用 ${c.usage_count} 次` : '';
+                const hint = c.usage_count
+                    ? ` · 该站已用 ${c.usage_count} 次`
+                    : (c.usage_count === 0 ? ' · 该站尚未使用' : '');
                 opts.push(`<option value="${c.slug}">${c.name}${hint}</option>`);
             });
             if (isFallback) {
                 opts.push('<option disabled>— 该站点暂无发货历史，显示全部 —</option>');
             }
             sel.innerHTML = opts.join('');
-            // Auto-select if there's only one option
-            if (carriers.length === 1) sel.value = carriers[0].slug;
+
+            // Prefer warehouse-based default. Fall back to single-option auto-select.
+            const slugs = carriers.map(c => c.slug);
+            const defaultSlug = defaultCarrierForWarehouse(warehouseName, slugs);
+            if (defaultSlug) {
+                sel.value = defaultSlug;
+            } else if (carriers.length === 1) {
+                sel.value = carriers[0].slug;
+            }
         }
 
         // For orders already in on-hold status but without tracking
@@ -720,6 +806,7 @@
             document.getElementById('shipCarrier').value = '';
             document.getElementById('shipTrackingNumber').value = '';
             document.getElementById('shipSendEmail').checked = false; // 不默认发邮件，因为可能已经通知过
+            applyBigOrderGate(false, '');
             bootstrap.Modal.getOrCreateInstance(document.getElementById('shipModal')).show();
         }
 
