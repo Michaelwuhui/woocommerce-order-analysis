@@ -510,6 +510,38 @@
                                             // Update Status
                                             statusText.textContent = status.message;
 
+                                            // Server has no memory of this sync (worker was recycled,
+                                            // e.g. a deploy HUP killed the background thread). Treat
+                                            // it as terminated so the modal isn't stuck forever.
+                                            if (status.status === 'unknown') {
+                                                clearInterval(syncPollInterval);
+                                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                                progressBar.classList.add('bg-danger');
+                                                progressBar.style.width = '100%';
+                                                statusText.textContent = '同步状态已丢失（服务可能已重启）。请关闭并查看最新数据。';
+                                                statusText.classList.add('text-danger');
+                                                closeBtn.disabled = false;
+                                                closeBtn.textContent = '关闭并刷新';
+                                                closeBtn.onclick = () => location.reload();
+                                                return;
+                                            }
+
+                                            // Backend heartbeat went silent for >90s while it claims
+                                            // to still be running — almost certainly a zombie. Same
+                                            // remedy: stop polling, prompt the user.
+                                            if (status.status === 'running' && status.stale_seconds != null && status.stale_seconds > 90) {
+                                                clearInterval(syncPollInterval);
+                                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                                progressBar.classList.add('bg-warning');
+                                                progressBar.style.width = '100%';
+                                                statusText.textContent = `服务端 ${Math.round(status.stale_seconds)} 秒无响应，同步可能已中断。请关闭并查看最新数据。`;
+                                                statusText.classList.add('text-warning');
+                                                closeBtn.disabled = false;
+                                                closeBtn.textContent = '关闭并刷新';
+                                                closeBtn.onclick = () => location.reload();
+                                                return;
+                                            }
+
                                             if (status.status === 'running') {
                                                 if (progressBar.style.width === '0%') progressBar.style.width = '100%';
                                             } else if (status.status === 'success') {

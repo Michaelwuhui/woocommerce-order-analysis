@@ -236,6 +236,204 @@ def parse_json_field(value):
         return {}
 
 
+# ─────────────────────────── Customer risk ─────────────────────────────
+# Match repeat freeloaders across email / phone / address. The matching
+# keys are deliberately fuzzy-but-conservative: we want to catch a
+# customer who tweaks their email but reuses the same phone, but NOT
+# false-positive different households sharing one apartment block. See
+# _build_risk_index / _assess_customer_risk below.
+
+def _normalize_email(e):
+    s = (e or '').strip().lower()
+    return s or None
+
+
+def _normalize_phone(p):
+    """Keep digits only; collapse to the last 9 digits to fold away the
+    PL +48 / AU +61 / AE +971 country codes that customers add inconsistently.
+    Returns None if there's no plausible phone number left."""
+    digits = ''.join(c for c in (p or '') if c.isdigit())
+    if len(digits) < 7:  # too short to be a real number
+        return None
+    return digits[-9:] if len(digits) >= 9 else digits
+
+
+def _normalize_address(addr_dict):
+    """Build a tight match key from address_1 + postcode + city. All
+    lowercase, whitespace collapsed. Returns None when too sparse to be
+    a useful match (a country code alone isn't a customer)."""
+    if not isinstance(addr_dict, dict):
+        return None
+    import re as _re
+    a1 = _re.sub(r'\s+', ' ', (addr_dict.get('address_1') or '').strip().lower())
+    pc = (addr_dict.get('postcode') or '').strip().replace(' ', '').lower()
+    city = _re.sub(r'\s+', ' ', (addr_dict.get('city') or '').strip().lower())
+    parts = [p for p in (a1, pc, city) if p]
+    if len(parts) < 2 or not a1:
+        return None
+    return ' | '.join(parts)
+
+
+def _addr_for_order(billing, shipping):
+    """Pick the more complete of (shipping, billing) for matching."""
+    if isinstance(shipping, dict) and shipping.get('address_1'):
+        return shipping
+    return billing if isinstance(billing, dict) else {}
+
+
+def _build_risk_index(conn):
+    """Scan every order that's been flagged as a problem-return or undelivered
+    and group them by normalized email / phone / address. Each bucket lists
+    the matching orders so the consumer can dedupe and aggregate.
+
+    Returned shape:
+        {
+          'problem': {'email': {key: [rec, ...]}, 'phone': {...}, 'addr': {...}},
+          'undeliv': {'email': {...}, 'phone': {...}, 'addr': {...}},
+        }
+    rec = {order_id, number, source, at, loss, type}
+    """
+    out = {
+        'problem': {'email': {}, 'phone': {}, 'addr': {}},
+        'undeliv': {'email': {}, 'phone': {}, 'addr': {}},
+    }
+    try:
+        rows = conn.execute("""
+            SELECT id, number, billing, shipping, source,
+                   is_problem_return, problem_return_type, product_loss_amount, problem_return_at,
+                   is_undelivered, shipping_loss_amount, undelivered_at
+            FROM orders
+            WHERE COALESCE(is_problem_return,0) = 1 OR COALESCE(is_undelivered,0) = 1
+        """).fetchall()
+    except Exception:
+        return out
+
+    for r in rows:
+        billing = parse_json_field(r['billing']) or {}
+        shipping = parse_json_field(r['shipping']) or {}
+        addr_d = _addr_for_order(billing, shipping)
+        email = _normalize_email(billing.get('email') or shipping.get('email'))
+        phone = _normalize_phone(addr_d.get('phone') or billing.get('phone'))
+        addr_key = _normalize_address(addr_d)
+
+        if r['is_problem_return']:
+            rec = {
+                'order_id': r['id'],
+                'number': r['number'],
+                'source': r['source'],
+                'at': r['problem_return_at'],
+                'loss': float(r['product_loss_amount'] or 0),
+                'type': r['problem_return_type'] or '',
+            }
+            if email: out['problem']['email'].setdefault(email, []).append(rec)
+            if phone: out['problem']['phone'].setdefault(phone, []).append(rec)
+            if addr_key: out['problem']['addr'].setdefault(addr_key, []).append(rec)
+        if r['is_undelivered']:
+            rec = {
+                'order_id': r['id'],
+                'number': r['number'],
+                'source': r['source'],
+                'at': r['undelivered_at'],
+                'loss': float(r['shipping_loss_amount'] or 0),
+                'type': '',
+            }
+            if email: out['undeliv']['email'].setdefault(email, []).append(rec)
+            if phone: out['undeliv']['phone'].setdefault(phone, []).append(rec)
+            if addr_key: out['undeliv']['addr'].setdefault(addr_key, []).append(rec)
+
+    return out
+
+
+# Threshold for the medium ("repeat refuser") warning. Tunable later.
+_RISK_UNDELIVERED_THRESHOLD = 2
+
+
+def _assess_customer_risk(billing, shipping, idx, current_order_id=None):
+    """Look up this customer in the risk index across email/phone/addr and
+    return a risk dict, or None if no prior risky history is found.
+
+    The current order itself is excluded by id so a freshly-marked order
+    doesn't flag its own self.
+
+    Returns:
+        {
+          'level': 'high' | 'medium',
+          'problem_count': int,            # distinct prior 问题退货 orders
+          'problem_loss': float,           # sum of product_loss_amount
+          'undeliv_count': int,            # distinct prior 未送达 orders
+          'undeliv_loss': float,           # sum of shipping_loss_amount
+          'matched_by': ['email', 'phone', 'address'],
+          'last_at': '2026-05-18 08:03',   # most recent of either
+          'last_number': '7914',
+          'types': ['swap', 'short', ...]  # problem-return types seen
+        }
+    """
+    if not idx:
+        return None
+
+    billing = billing or {}
+    shipping = shipping or {}
+    addr_d = _addr_for_order(billing, shipping)
+    email = _normalize_email(billing.get('email') or shipping.get('email'))
+    phone = _normalize_phone(addr_d.get('phone') or billing.get('phone'))
+    addr_key = _normalize_address(addr_d)
+
+    keys = [('email', email), ('phone', phone), ('address', addr_key)]
+
+    p_matched, p_via = _collect_in_indices(idx['problem'], keys, current_order_id)
+    u_matched, u_via = _collect_in_indices(idx['undeliv'], keys, current_order_id)
+
+    problem_count = len(p_matched)
+    problem_loss = sum(r['loss'] for r in p_matched.values())
+    undeliv_count = len(u_matched)
+    undeliv_loss = sum(r['loss'] for r in u_matched.values())
+
+    # Severity gating: problem-return at all → high; otherwise medium needs
+    # the count threshold so a customer with 1 unlucky no-receipt doesn't
+    # trip a yellow flag on every future order.
+    level = None
+    if problem_count >= 1:
+        level = 'high'
+    elif undeliv_count >= _RISK_UNDELIVERED_THRESHOLD:
+        level = 'medium'
+
+    if not level:
+        return None
+
+    # Latest event for display
+    all_recs = list(p_matched.values()) + list(u_matched.values())
+    latest = max(all_recs, key=lambda r: (r['at'] or ''))
+    types = sorted({r['type'] for r in p_matched.values() if r.get('type')})
+
+    return {
+        'level': level,
+        'problem_count': problem_count,
+        'problem_loss': round(problem_loss, 2),
+        'undeliv_count': undeliv_count,
+        'undeliv_loss': round(undeliv_loss, 2),
+        'matched_by': sorted(p_via | u_via),
+        'last_at': latest['at'],
+        'last_number': latest['number'],
+        'types': types,
+    }
+
+
+def _collect_in_indices(category_idx, keys, current_order_id):
+    """Helper: walk email/phone/addr sub-indices in `category_idx`, dedupe by
+    order_id, track which marker matched."""
+    matched = {}
+    via = set()
+    for marker, k in keys:
+        if not k:
+            continue
+        for rec in category_idx.get(marker, {}).get(k, []):
+            if current_order_id is not None and rec['order_id'] == current_order_id:
+                continue
+            matched[rec['order_id']] = rec
+            via.add(marker)
+    return matched, via
+
+
 def extract_flavor_from_meta(item):
     """
     Extract flavor/variation attribute from WooCommerce line_item meta_data.
@@ -1589,6 +1787,12 @@ def orders():
         'problem_return_orders': sum(s.get('problem_return_orders') or 0 for s in summary_stats),
         'product_loss': sum(s.get('product_loss') or 0 for s in summary_stats),
     }
+    # If every row in the summary shares one currency (typically because the
+    # user's permission scope is a single country, e.g. 澳洲发货员 only sees AUD
+    # sites), the 合计 row can show real currency amounts instead of "(混合货币)".
+    # Empty filter result → no currency to pick → fall back to the placeholder.
+    currencies_in_view = {s.get('currency') for s in summary_stats if s.get('currency')}
+    totals['uniform_currency'] = next(iter(currencies_in_view)) if len(currencies_in_view) == 1 else None
     
     # Get all available months for pagination
     months_query = f'''
@@ -1624,6 +1828,10 @@ def orders():
     count_query = f'SELECT COUNT(*) FROM orders {where_clause}'
     total = conn.execute(count_query, params).fetchone()[0]
     
+    # Pre-build risk index so every order in this listing gets cheap
+    # repeat-freeloader lookups (problem-return + undelivered).
+    risk_idx = _build_risk_index(conn)
+
     processed_orders = []
     # 嘻嘻嘻嘻嘻
     for order in orders_data:
@@ -1640,13 +1848,14 @@ def orders():
             od['product_count'] = 0
             od['products'] = []
         billing = parse_json_field(order['billing'])
+        shipping = parse_json_field(order['shipping']) if 'shipping' in od else {}
         od['customer_name'] = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip()
         od['customer_email'] = billing.get('email', '')
-        
+
         # Extract DPD address for list display
         meta_data = parse_json_field(order['meta_data'])
         custom_fields = extract_custom_billing_fields(meta_data)
-        
+
         dpd_address = ''
         if custom_fields.get('dpd_street') or custom_fields.get('dpd_city'):
              parts = [
@@ -1656,6 +1865,10 @@ def orders():
              ]
              dpd_address = ', '.join(filter(None, parts))
         od['dpd_address'] = dpd_address
+
+        # Surface prior-freeloader risk for this order's customer.
+        od['customer_risk'] = _assess_customer_risk(billing, shipping, risk_idx, current_order_id=order['id'])
+
         processed_orders.append(od)
     
     # Get available sources (filtered by permissions and manager)
@@ -1771,6 +1984,15 @@ def orders():
     }
     # Mirrors _revenue_status_cond() in SQL — same exclusion list so the
     # order-list totals row matches the filter-summary "净金额" column.
+    # Pre-load each site's cod_on_hold_is_shipped flag so we can replicate the
+    # SQL's EXISTS check in-memory without hitting the DB per order. The set
+    # contains the source URLs where on-hold IS treated as shipped (PL by
+    # default; admins can override per site in /settings).
+    on_hold_shipped_sources = {
+        r['url'] for r in conn.execute(
+            "SELECT url FROM sites WHERE cod_on_hold_is_shipped = 1"
+        ).fetchall()
+    }
     def _is_revenue_order(o):
         st = o.get('status') or ''
         pm = (o.get('payment_method') or 'cod')
@@ -1779,6 +2001,9 @@ def orders():
         if st == 'pending' and pm != 'cod':
             return False
         if st == 'on-hold' and pm == 'bacs':
+            return False
+        if st == 'on-hold' and o.get('source') not in on_hold_shipped_sources:
+            # AU/AE etc — on-hold here means "received, waiting", not shipped.
             return False
         if o.get('is_undelivered'):
             return False
@@ -2107,6 +2332,14 @@ def monthly():
     '''
 
     df = pd.read_sql_query(query, conn, params=params if params else None)
+    # Pre-load on-hold-is-shipped sites so the pandas mask can exclude on-hold
+    # orders from AU/AE (and any new countries where on-hold means "received,
+    # waiting" rather than "shipped via COD").
+    on_hold_shipped_sources = {
+        r['url'] for r in conn.execute(
+            "SELECT url FROM sites WHERE cod_on_hold_is_shipped = 1"
+        ).fetchall()
+    }
     conn.close()
 
     if len(df) == 0:
@@ -2133,7 +2366,14 @@ def monthly():
         total_products = gdf['product_qty'].sum()
         total_amount = gdf['total'].sum()
 
-        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat']) & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod')) & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs')) & (gdf['is_undelivered'].fillna(0) == 0) & (gdf['is_problem_return'].fillna(0) == 0)
+        success_mask = (
+            ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat'])
+            & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod'))
+            & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs'))
+            & ~((gdf['status'] == 'on-hold') & ~gdf['source'].isin(on_hold_shipped_sources))
+            & (gdf['is_undelivered'].fillna(0) == 0)
+            & (gdf['is_problem_return'].fillna(0) == 0)
+        )
         success_orders = int(success_mask.sum())
         success_amount = gdf.loc[success_mask, 'total'].sum()
         success_products = gdf.loc[success_mask, 'product_qty'].sum()
@@ -2319,14 +2559,15 @@ def monthly_export():
 
     df = pd.read_sql_query(query, conn, params=params if params else None)
 
-    # Get site managers
-    sites = conn.execute('SELECT url, manager FROM sites').fetchall()
+    # Get site managers + on-hold-is-shipped lookup in the same pass
+    sites = conn.execute('SELECT url, manager, cod_on_hold_is_shipped FROM sites').fetchall()
     site_managers = {s['url']: s['manager'] or '' for s in sites}
+    on_hold_shipped_sources = {s['url'] for s in sites if s['cod_on_hold_is_shipped'] == 1}
     conn.close()
 
     if len(df) == 0:
         return jsonify({'error': '没有数据可导出'}), 400
-    
+
     # Calculate product quantities
     def get_product_qty(line_items):
         try:
@@ -2334,20 +2575,27 @@ def monthly_export():
             return sum(item.get('quantity', 0) for item in items)
         except:
             return 0
-    
+
     df['product_qty'] = df['line_items'].apply(get_product_qty)
     df['month'] = pd.to_datetime(df['date_created']).dt.to_period('M')
-    
+
     # Group by month, source
     rows = []
     for (month, source), gdf in df.groupby(['month', 'source']):
         currency = gdf['currency'].iloc[0] if len(gdf) > 0 else 'N/A'
-        
+
         total_orders = len(gdf)
         total_products = gdf['product_qty'].sum()
         total_amount = gdf['total'].sum()
-        
-        success_mask = ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat']) & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod')) & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs')) & (gdf['is_undelivered'].fillna(0) == 0) & (gdf['is_problem_return'].fillna(0) == 0)
+
+        success_mask = (
+            ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat'])
+            & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod'))
+            & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs'))
+            & ~((gdf['status'] == 'on-hold') & ~gdf['source'].isin(on_hold_shipped_sources))
+            & (gdf['is_undelivered'].fillna(0) == 0)
+            & (gdf['is_problem_return'].fillna(0) == 0)
+        )
         success_orders = int(success_mask.sum())
         success_amount = gdf.loc[success_mask, 'total'].sum()
         success_products = gdf.loc[success_mask, 'product_qty'].sum()
@@ -3978,7 +4226,7 @@ def get_customer_details(email):
     email = unquote(email)
     
     conn = get_db_connection()
-    
+
     # Get all orders from this customer
     orders = conn.execute('''
         SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing,
@@ -3987,6 +4235,13 @@ def get_customer_details(email):
         WHERE json_extract(billing, '$.email') = ? AND status NOT IN ('checkout-draft', 'trash')
         ORDER BY date_created DESC
     ''', (email,)).fetchall()
+
+    # On-hold is "shipped" only for sites flagged so (PL by default).
+    on_hold_shipped_sources = {
+        r['url'] for r in conn.execute(
+            "SELECT url FROM sites WHERE cod_on_hold_is_shipped = 1"
+        ).fetchall()
+    }
 
     conn.close()
 
@@ -4056,11 +4311,15 @@ def get_customer_details(email):
         status = order['status']
         currency = order['currency'] or 'N/A'
         payment_method = order['payment_method'] or ''
+        order_source = order['source'] or ''
         is_undelivered = bool(order['is_undelivered']) if 'is_undelivered' in order.keys() else False
+        on_hold_is_success = (status == 'on-hold'
+                              and payment_method != 'bacs'
+                              and order_source in on_hold_shipped_sources)
         if is_undelivered:
             undelivered_orders += 1
             shipping_loss_total += float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in order.keys() else 0
-        elif status in ['completed', 'shipped', 'delivered', 'partial-shipped'] or (status == 'on-hold' and payment_method != 'bacs') or (status == 'processing' and payment_method and payment_method != 'cod'):
+        elif status in ['completed', 'shipped', 'delivered', 'partial-shipped'] or on_hold_is_success or (status == 'processing' and payment_method and payment_method != 'cod'):
             successful_orders += 1
             order_total = float(order['total'] or 0)
             total_spending += order_total
@@ -4284,17 +4543,32 @@ def is_cod(payment_method):
 # Online success: processing + on-hold + completed (processing = already paid)
 # Never success:  pending (online), failed, cancelled, checkout-draft, trash, cheat
 
+def _on_hold_is_shipped_clause(prefix=''):
+    """SQL fragment used by the status helpers below.
+    True when the order's site has cod_on_hold_is_shipped=1 — i.e. on-hold
+    is the local convention for "shipped" (PL COD workflow). Without this
+    gate, on-hold orders from AU/AE would wrongly count as success."""
+    p = f'{prefix}.' if prefix else ''
+    return (f"EXISTS (SELECT 1 FROM sites _s WHERE _s.url = {p}source "
+            f"AND _s.cod_on_hold_is_shipped = 1)")
+
+
 def _success_status_case(prefix='', as_name='is_success'):
     """SQL CASE expression: 1 if order is 'successful', 0 otherwise.
     Three payment modes:
       COD:   on-hold(shipped) + shipped/delivered/partial-shipped + completed
       bacs:  on-hold is NOT success (awaiting bank transfer) — only after processing
       Online(Stripe): processing(paid) + shipped/delivered/partial-shipped + completed
+    The on-hold→success rule additionally requires that the order's site has
+    cod_on_hold_is_shipped=1 (set per-country in /settings). PL sites have it
+    on by default; AU/AE have it off, so on-hold there is never a success.
     Undelivered (refused/returned) and 问题退货 (swap/short/damaged) are never
     a success regardless of payment mode."""
     p = f'{prefix}.' if prefix else ''
+    on_hold_clause = _on_hold_is_shipped_clause(prefix)
     return f"""(CASE WHEN ({p}status IN ('completed','shipped','delivered','partial-shipped')
-                    OR ({p}status = 'on-hold' AND COALESCE({p}payment_method,'cod') != 'bacs')
+                    OR ({p}status = 'on-hold' AND COALESCE({p}payment_method,'cod') != 'bacs'
+                        AND {on_hold_clause})
                     OR ({p}status = 'processing' AND COALESCE({p}payment_method,'cod') != 'cod'))
                     AND COALESCE({p}is_undelivered, 0) = 0
                     AND COALESCE({p}is_problem_return, 0) = 0
@@ -4305,8 +4579,10 @@ def _success_status_cond(prefix=''):
     """SQL boolean condition: true if order is 'successful'.
     Same logic as _success_status_case but for WHERE clauses."""
     p = f'{prefix}.' if prefix else ''
+    on_hold_clause = _on_hold_is_shipped_clause(prefix)
     return f"""(({p}status IN ('completed','shipped','delivered','partial-shipped')
-        OR ({p}status = 'on-hold' AND COALESCE({p}payment_method,'cod') != 'bacs')
+        OR ({p}status = 'on-hold' AND COALESCE({p}payment_method,'cod') != 'bacs'
+            AND {on_hold_clause})
         OR ({p}status = 'processing' AND COALESCE({p}payment_method,'cod') != 'cod'))
         AND COALESCE({p}is_undelivered, 0) = 0
         AND COALESCE({p}is_problem_return, 0) = 0)"""
@@ -4315,12 +4591,15 @@ def _success_status_cond(prefix=''):
 def _revenue_status_cond(prefix=''):
     """SQL boolean condition: true if order should count toward revenue.
     Excludes: failed/cancelled/draft/trash/cheat, online-pending, bacs-on-hold,
+    on-hold orders from sites that don't treat on-hold as shipped (AU/AE),
     undelivered (package returned, no money collected), and 问题退货 (contents
     were wrong/missing/damaged, customer never paid or money was refunded)."""
     p = f'{prefix}.' if prefix else ''
+    on_hold_clause = _on_hold_is_shipped_clause(prefix)
     return f"""({p}status NOT IN ('failed','cancelled','checkout-draft','trash','cheat')
         AND NOT ({p}status = 'pending' AND COALESCE({p}payment_method,'cod') != 'cod')
         AND NOT ({p}status = 'on-hold' AND {p}payment_method = 'bacs')
+        AND NOT ({p}status = 'on-hold' AND NOT {on_hold_clause})
         AND COALESCE({p}is_undelivered, 0) = 0
         AND COALESCE({p}is_problem_return, 0) = 0)"""
 
@@ -4332,9 +4611,11 @@ def _active_status_cond(prefix=''):
     matches the previous inline strings exactly — do NOT consolidate without checking
     each callsite's data semantics."""
     p = f'{prefix}.' if prefix else ''
+    on_hold_clause = _on_hold_is_shipped_clause(prefix)
     return f"""({p}status NOT IN ('failed','cancelled')
         AND NOT ({p}status = 'pending' AND COALESCE({p}payment_method,'cod') != 'cod')
         AND NOT ({p}status = 'on-hold' AND {p}payment_method = 'bacs')
+        AND NOT ({p}status = 'on-hold' AND NOT {on_hold_clause})
         AND COALESCE({p}is_undelivered, 0) = 0
         AND COALESCE({p}is_problem_return, 0) = 0)"""
 
@@ -4468,6 +4749,28 @@ def init_sites_table():
         conn.execute('ALTER TABLE sites ADD COLUMN product_master_id INTEGER')
     except:
         pass  # Column already exists
+    # Whether `status=on-hold` counts as "shipped/success" for this site.
+    # In Poland the COD workflow puts shipped COD orders into on-hold until the
+    # carrier collects payment, so on-hold is real revenue. In AU/AE there is no
+    # COD; on-hold there means "received, waiting for something" — never shipped.
+    # Initial value is set per-country below (PL→1, others→0); admins can
+    # toggle individual sites on the settings page afterward.
+    try:
+        conn.execute('ALTER TABLE sites ADD COLUMN cod_on_hold_is_shipped INTEGER')
+    except:
+        pass  # Column already exists
+    # Backfill ONLY rows that still have NULL (i.e. never touched by an admin).
+    # Once an admin toggles a row to 0 or 1, this WHERE clause skips it on the
+    # next boot. New sites added later also get classified here on first boot
+    # after their country is set.
+    conn.execute("""
+        UPDATE sites SET cod_on_hold_is_shipped = 1
+        WHERE cod_on_hold_is_shipped IS NULL AND country = 'PL'
+    """)
+    conn.execute("""
+        UPDATE sites SET cod_on_hold_is_shipped = 0
+        WHERE cod_on_hold_is_shipped IS NULL AND country IS NOT NULL AND country != 'PL'
+    """)
     conn.commit()
     conn.close()
 
@@ -6825,6 +7128,10 @@ def update_site(site_id):
     # product_master_id: optional. Empty string / None / 0 / "" → NULL (un-link / standalone)
     raw_pm = data.get('product_master_id')
     product_master_id = int(raw_pm) if raw_pm not in (None, '', 0, '0') else None
+    # Whether on-hold means "shipped" for this site (PL COD convention).
+    # Defaults to current DB value when the client doesn't send the flag, so
+    # legacy callers (e.g. the import-from-script path) keep their setting.
+    cod_on_hold_raw = data.get('cod_on_hold_is_shipped', None)
 
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -6835,11 +7142,21 @@ def update_site(site_id):
 
     conn = get_db_connection()
     try:
-        conn.execute('''UPDATE sites
-            SET url = ?, consumer_key = ?, consumer_secret = ?,
-                manager = ?, mask_id = ?, country = ?, product_master_id = ?
-            WHERE id = ?''',
-                     (url, ck, cs, manager, mask_id, country, product_master_id, site_id))
+        if cod_on_hold_raw is None:
+            conn.execute('''UPDATE sites
+                SET url = ?, consumer_key = ?, consumer_secret = ?,
+                    manager = ?, mask_id = ?, country = ?, product_master_id = ?
+                WHERE id = ?''',
+                         (url, ck, cs, manager, mask_id, country, product_master_id, site_id))
+        else:
+            cod_on_hold_val = 1 if cod_on_hold_raw in (1, '1', True, 'true', 'on') else 0
+            conn.execute('''UPDATE sites
+                SET url = ?, consumer_key = ?, consumer_secret = ?,
+                    manager = ?, mask_id = ?, country = ?, product_master_id = ?,
+                    cod_on_hold_is_shipped = ?
+                WHERE id = ?''',
+                         (url, ck, cs, manager, mask_id, country, product_master_id,
+                          cod_on_hold_val, site_id))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
@@ -6871,9 +7188,34 @@ SYNC_STATUS = {}
 @app.route('/api/sync/status/<int:site_id>')
 @login_required
 def get_sync_status(site_id):
-    """Get synchronization status for a site"""
-    status = SYNC_STATUS.get(site_id, {'status': 'idle', 'message': '', 'logs': []})
-    return jsonify(status)
+    """Get synchronization status for a site.
+
+    Returns the in-memory SYNC_STATUS entry plus a derived `stale_seconds`
+    (seconds since last heartbeat) so the frontend can tell a healthy
+    long-running sync apart from a zombie one whose worker is gone.
+    Workers don't share memory, so a poll hitting a different worker than
+    the one running the sync will see no entry at all — also surfaced as
+    a fresh 'unknown' status to the client.
+    """
+    import time as _time
+    entry = SYNC_STATUS.get(site_id)
+    if entry is None:
+        # This worker has no record. Either the sync never ran here, or it
+        # ran in another worker that's since been recycled (HUP / OOM).
+        return jsonify({
+            'status': 'unknown',
+            'message': '',
+            'logs': [],
+            'stale_seconds': None,
+        })
+
+    out = dict(entry)
+    updated_at = out.get('updated_at')
+    if updated_at:
+        out['stale_seconds'] = round(_time.time() - updated_at, 1)
+    else:
+        out['stale_seconds'] = None
+    return jsonify(out)
 
 @app.route('/api/sync', methods=['POST'])
 @login_required
@@ -7694,41 +8036,54 @@ def sync_all_data():
     """Trigger data synchronization for ALL sites"""
     import sync_utils
     import threading
-    
+    import time as _time
+
     # Use a special ID for "all sites" sync status
     ALL_SITES_ID = 999999
-    
-    # Initialize status
+
+    # `updated_at` is a wall-clock heartbeat the frontend uses to detect a
+    # zombie sync — if the gunicorn worker hosting this thread is killed
+    # (e.g. by a deploy HUP) the dict goes with it, and a fresh worker has
+    # no record of this sync_id at all. The frontend polling would then sit
+    # forever on the last cached logs. Bumping this on every progress tick
+    # lets the UI flag "stale" when updated_at falls too far behind now.
     SYNC_STATUS[ALL_SITES_ID] = {
         'status': 'running',
         'message': 'Starting global synchronization...',
-        'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Global sync job started"]
+        'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Global sync job started"],
+        'updated_at': _time.time(),
     }
-    
+
+    def _touch():
+        SYNC_STATUS[ALL_SITES_ID]['updated_at'] = _time.time()
+
     def run_sync_all(app_context):
         with app_context:
             try:
                 conn = get_db_connection()
                 sites = conn.execute('SELECT * FROM sites').fetchall()
                 conn.close()
-                
+
                 if not sites:
                     SYNC_STATUS[ALL_SITES_ID]['status'] = 'error'
                     SYNC_STATUS[ALL_SITES_ID]['message'] = 'No sites found to sync'
+                    _touch()
                     return
 
                 total_sites = len(sites)
                 SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Found {total_sites} sites to sync")
+                _touch()
 
                 for index, site in enumerate(sites):
                     site_id = site['id']
                     site_url = site['url']
                     current_step = index + 1
-                    
+
                     msg = f"Syncing site {current_step}/{total_sites}: {site_url}"
                     SYNC_STATUS[ALL_SITES_ID]['message'] = msg
                     SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] --- Starting {site_url} ---")
-                    
+                    _touch()
+
                     def progress_callback(msg):
                         timestamp = datetime.now().strftime('%H:%M:%S')
                         # Prefix log with site info
@@ -7737,33 +8092,37 @@ def sync_all_data():
                         # Only update main message if it's significant, otherwise keep "Syncing site X/Y"
                         # Actually, let's update the message to show detail
                         SYNC_STATUS[ALL_SITES_ID]['message'] = f"[{current_step}/{total_sites}] {site_url}: {msg}"
+                        _touch()
 
                     result = sync_utils.sync_site(
-                        site['url'], 
-                        site['consumer_key'], 
+                        site['url'],
+                        site['consumer_key'],
                         site['consumer_secret'],
                         progress_callback
                     )
-                    
+
                     if result['status'] == 'success':
                         # Update last sync time
                         conn = get_db_connection()
-                        conn.execute('UPDATE sites SET last_sync = ? WHERE id = ?', 
+                        conn.execute('UPDATE sites SET last_sync = ? WHERE id = ?',
                                      (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), site_id))
                         conn.commit()
                         conn.close()
                         SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] {site_url} Completed")
                     else:
                         SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] {site_url} Failed: {result.get('message')}")
-                
+                    _touch()
+
                 SYNC_STATUS[ALL_SITES_ID]['status'] = 'success'
                 SYNC_STATUS[ALL_SITES_ID]['message'] = 'All sites synchronized successfully'
                 SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Global sync finished")
-                    
+                _touch()
+
             except Exception as e:
                 SYNC_STATUS[ALL_SITES_ID]['status'] = 'error'
                 SYNC_STATUS[ALL_SITES_ID]['message'] = str(e)
                 SYNC_STATUS[ALL_SITES_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+                _touch()
 
     # Run sync in background thread
     thread = threading.Thread(target=run_sync_all, args=(app.app_context(),))
@@ -9021,6 +9380,14 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
         placeholders = ','.join(['?'] * len(site_urls))
         month_str = f'{year:04d}-{month:02d}'
 
+        # Which of these partner sites treat on-hold as "shipped" (PL by default).
+        on_hold_shipped_sources = {
+            r['url'] for r in conn.execute(
+                f"SELECT url FROM sites WHERE cod_on_hold_is_shipped = 1 AND url IN ({placeholders})",
+                site_urls,
+            ).fetchall()
+        }
+
         # Pull every order in scope (partner sites + currency + month). We keep
         # ALL statuses so we can break them out (success / failed / cancelled /
         # undelivered / pending). Loaders downstream filter for revenue.
@@ -9110,10 +9477,13 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
         # Classification
         is_failed = status == 'failed'
         is_cancelled = status == 'cancelled'
-        # 'success' uses the same condition the SQL helper does — see _revenue_status_cond
+        # 'success' uses the same condition the SQL helper does — see _revenue_status_cond.
+        # on-hold without the site's "treated as shipped" flag (AU/AE etc) is
+        # also bucketed into pending here so it doesn't inflate net sales.
         is_pending_unsuccessful = (
             (status == 'pending' and (pm_method or 'cod') != 'cod')
             or (status == 'on-hold' and pm_method == 'bacs')
+            or (status == 'on-hold' and (o['source'] or '') not in on_hold_shipped_sources)
         )
         is_success = (
             status not in ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat')
@@ -9936,6 +10306,11 @@ def api_recon_orders():
 
         site_managers = {s['url']: s['manager'] for s in conn.execute('SELECT url, manager FROM sites').fetchall()}
         site_country_map = {s['url']: s['country'] for s in conn.execute('SELECT url, country FROM sites').fetchall()}
+        on_hold_shipped_sources = {
+            r['url'] for r in conn.execute(
+                "SELECT url FROM sites WHERE cod_on_hold_is_shipped = 1"
+            ).fetchall()
+        }
 
         # Lookup CNY rate for the period (used per-order net_cny conversion).
         # Fall back to month-of-order if no period rate, so multi-month dumps
@@ -9992,12 +10367,15 @@ def api_recon_orders():
             'margin_cny': 0.0,
         }
 
-        def _is_revenue(status, pm, is_undel):
+        def _is_revenue(status, pm, is_undel, src=None):
             if status in ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat'):
                 return False
             if status == 'pending' and (pm or 'cod') != 'cod':
                 return False
             if status == 'on-hold' and pm == 'bacs':
+                return False
+            if status == 'on-hold' and src not in on_hold_shipped_sources:
+                # AU/AE etc — on-hold is "received, waiting", never shipped.
                 return False
             if is_undel:
                 return False
@@ -10065,7 +10443,7 @@ def api_recon_orders():
             # 50% of revenue. Same logic as _calc_partner_recon_detail so the
             # 订单明细 tab and 产品明细 tab agree on totals.
             UNMAPPED_FALLBACK_RATIO = 0.5
-            order_is_revenue = _is_revenue(r['status'] or '', r['payment_method'], is_undel)
+            order_is_revenue = _is_revenue(r['status'] or '', r['payment_method'], is_undel, r['source'])
             order_cost = 0.0
             order_unmapped_qty = 0
             cost_eligible = order_is_revenue and not is_undel  # only revenue orders consume inventory
@@ -13224,8 +13602,11 @@ def get_pending_orders():
     query += ' ORDER BY o.date_created DESC'
     
     orders = conn.execute(query, params).fetchall()
+    # Build the risk index once (small scan over flagged orders only) and
+    # reuse it for every row in this listing. Closing conn AFTER the build.
+    risk_idx = _build_risk_index(conn)
     conn.close()
-    
+
     result = []
     for order in orders:
         billing = parse_json_field(order['billing'])
@@ -13233,12 +13614,12 @@ def get_pending_orders():
         line_items = parse_json_field(order['line_items'])
         shipping_lines = parse_json_field(order['shipping_lines'])
         shipping_method = shipping_lines[0].get('method_title', 'Unknown') if shipping_lines and len(shipping_lines) > 0 else ''
-        
+
         # Get shipping address (prefer shipping, fallback to billing)
         addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
         meta_data = parse_json_field(order['meta_data'])
         custom_fields = extract_custom_billing_fields(meta_data)
-        
+
         # Calculate customer address (Standard)
         std_parts = [
             addr.get('address_1', ''),
@@ -13248,7 +13629,7 @@ def get_pending_orders():
             addr.get('country', '')
         ]
         customer_address = ', '.join(filter(None, std_parts))
-        
+
         # DPD Fallback: If standard address is empty but DPD fields exist
         if not addr.get('address_1') and (custom_fields.get('dpd_street') or custom_fields.get('dpd_city')):
             dpd_parts = [
@@ -13262,6 +13643,7 @@ def get_pending_orders():
         order_total = float(order['total'] or 0)
         is_big_order, big_order_reasons = evaluate_big_order(
             product_count, order_total, qty_threshold, amount_threshold)
+        customer_risk = _assess_customer_risk(billing, shipping_info, risk_idx, current_order_id=order['id'])
 
         result.append({
             'id': order['id'],
@@ -13286,6 +13668,7 @@ def get_pending_orders():
             'customer_note': order['customer_note'] or '',
             'warehouse_id': order['warehouse_id'],
             'warehouse_name': order['warehouse_name'] or '',
+            'customer_risk': customer_risk,
             'latest_note': order['latest_note'] or '',
             'latest_note_date': order['latest_note_date'] or '',
             'latest_note_author': order['latest_note_author'] or ''
@@ -13395,10 +13778,23 @@ def get_shipped_orders():
         'dpd-pl': ('dpd', 'DPD'),
     }
     
+    # Build risk index once and pass into each row (cheaper than rebuilding
+    # per-order; same orders' billing/shipping JSON is parsed once inside
+    # process_shipped_order, so we can't easily share that — but the index
+    # itself is the expensive part).
+    risk_idx = _build_risk_index(conn)
+
     result = []
     for order in orders:
         try:
-            result.append(process_shipped_order(order, conn, carriers, ast_provider_mapping))
+            payload = process_shipped_order(order, conn, carriers, ast_provider_mapping)
+            payload['customer_risk'] = _assess_customer_risk(
+                parse_json_field(order['billing']),
+                parse_json_field(order['shipping']),
+                risk_idx,
+                current_order_id=order['id'],
+            )
+            result.append(payload)
         except Exception as e:
             print(f"Error processing shipped order {order['number']}: {e}")
             continue

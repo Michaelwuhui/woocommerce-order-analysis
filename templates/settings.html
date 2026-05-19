@@ -250,6 +250,7 @@
                                     data-key="{{ site.consumer_key }}" data-secret="{{ site.consumer_secret }}"
                                     data-manager="{{ site.manager or '' }}" data-mask-id="{{ site.mask_id or '' }}"
                                     data-country="{{ site.country or '' }}"
+                                    data-cod-on-hold-is-shipped="{{ site.cod_on_hold_is_shipped or 0 }}"
                                     data-product-master-id="{{ site.product_master_id or '' }}"><i class="bi bi-pencil"></i></button>
                                 <button class="btn btn-sm btn-outline-danger delete-btn" data-site-id="{{ site.id }}"><i
                                         class="bi bi-trash"></i></button>
@@ -1315,6 +1316,20 @@
                             <option value="CN">中国 (China)</option>
                             <option value="OTHER">其他</option>
                         </select>
+                    </div>
+                    <div class="mb-3 p-3 rounded" style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08);">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="editSiteCodOnHoldIsShipped">
+                            <label class="form-check-label text-white-50" for="editSiteCodOnHoldIsShipped">
+                                <strong>on-hold 视为「已发货」</strong>
+                            </label>
+                        </div>
+                        <div class="text-muted small mt-2" style="line-height:1.5;">
+                            波兰 COD 习惯：发货后单子置 on-hold，等司机收钱才完结。
+                            勾选 → on-hold 计入<strong>成功销售/收入</strong>。<br>
+                            澳大利亚/阿联酋等没有 COD 的站请<strong>不要勾选</strong>，否则未付款的 on-hold 单会被算进收入。<br>
+                            <span class="text-info">默认：PL=勾选，其它国家=不勾选。</span>
+                        </div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">站点 URL</label>
@@ -2409,6 +2424,10 @@
                 const data = Object.fromEntries(formData.entries());
                 const siteId = data.site_id;
 
+                // on-hold-is-shipped (the checkbox isn't part of the form, read directly)
+                data.cod_on_hold_is_shipped =
+                    document.getElementById('editSiteCodOnHoldIsShipped').checked ? 1 : 0;
+
                 // If multistore toggle is off, force product_master_id to empty
                 // (the field would carry whatever was selected before unchecking)
                 if (!document.getElementById('editSiteMultistoreToggle').checked) {
@@ -2457,6 +2476,10 @@
                 document.getElementById('editSiteManager').value = manager;
                 document.getElementById('editSiteMaskId').value = maskId;
                 document.getElementById('editSiteCountry').value = country;
+
+                // on-hold-is-shipped toggle
+                document.getElementById('editSiteCodOnHoldIsShipped').checked =
+                    String(editBtn.dataset.codOnHoldIsShipped || '') === '1';
 
                 // Populate multistore section
                 const productMasterId = editBtn.dataset.productMasterId || '';

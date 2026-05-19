@@ -463,6 +463,56 @@
             });
         });
 
+        // Render a "repeat-freeloader" warning for a single order. Returns
+        // a string of HTML (possibly empty). `compact=true` for inline use
+        // next to the customer name, full for a banner in the ship modal.
+        // Severity colors:
+        //   high   → red  (该客户曾被标记问题退货 — 调包/假货/少件/损坏)
+        //   medium → amber (该客户多次被记录未送达/拒收)
+        function renderRiskBadge(risk, opts) {
+            if (!risk) return '';
+            opts = opts || {};
+            const isCompact = !!opts.compact;
+            const high = risk.level === 'high';
+            const bg = high ? 'rgba(220,53,69,0.18)' : 'rgba(245,158,11,0.18)';
+            const fg = high ? '#f87171' : '#fbbf24';
+            const border = high ? 'rgba(220,53,69,0.55)' : 'rgba(245,158,11,0.55)';
+            const icon = high ? 'bi-exclamation-octagon-fill' : 'bi-exclamation-triangle-fill';
+            const headline = high ? '⚠ 高风险客户' : '可疑客户';
+
+            const lines = [];
+            if (risk.problem_count > 0) {
+                lines.push(`历史问题退货 ${risk.problem_count} 单${risk.problem_loss ? ` · 货值损失 ${risk.problem_loss.toFixed(2)}` : ''}`);
+                if (risk.types && risk.types.length) {
+                    const typeMap = { swap: '调包/假货', short: '少件/空盒', damaged: '损坏', other: '其它' };
+                    const labels = risk.types.map(t => typeMap[t] || t).join(' · ');
+                    lines.push(`类型: ${labels}`);
+                }
+            }
+            if (risk.undeliv_count > 0) {
+                lines.push(`历史未送达 ${risk.undeliv_count} 单${risk.undeliv_loss ? ` · 运费损失 ${risk.undeliv_loss.toFixed(2)}` : ''}`);
+            }
+            if (risk.matched_by && risk.matched_by.length) {
+                const m = risk.matched_by.map(x => ({ email: '邮箱', phone: '手机', address: '地址' }[x] || x)).join('/');
+                lines.push(`命中: ${m}${risk.last_number ? ` · 最近 #${risk.last_number}` : ''}`);
+            }
+            const tip = lines.join('\n').replace(/"/g, '&quot;');
+
+            if (isCompact) {
+                const summary = risk.problem_count > 0
+                    ? `${risk.problem_count} 问题退货`
+                    : `${risk.undeliv_count} 拒收`;
+                return `<span class="badge me-1" style="background:${bg};color:${fg};border:1px solid ${border};cursor:help;" title="${tip}">
+                            <i class="bi ${icon} me-1"></i>${headline} · ${summary}
+                        </span>`;
+            }
+            // Full banner mode (for modals)
+            return `<div class="alert mb-2 py-2 px-3" style="background:${bg};color:${fg};border:1px solid ${border};">
+                        <div class="fw-bold"><i class="bi ${icon} me-2"></i>${headline}</div>
+                        <div class="small mt-1" style="white-space:pre-line;">${lines.join('\n')}</div>
+                    </div>`;
+        }
+
         function loadOrders() {
             const source = document.getElementById('siteFilter').value;
             const country = document.getElementById('countryFilter').value;
@@ -490,8 +540,18 @@
                         tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">暂无待发货订单</td></tr>';
                         return;
                     }
-                    tbody.innerHTML = orders.map(o => `
-                <tr${o.is_big_order ? ' style="background-color: rgba(220,53,69,0.1);"' : ''}>
+                    tbody.innerHTML = orders.map(o => {
+                    // High-risk rows: stronger tint to grab attention even when
+                    // it's not also a "big order". Falls back to the big-order
+                    // tint, then no tint.
+                    const rowStyle = (o.customer_risk && o.customer_risk.level === 'high')
+                        ? ' style="background-color: rgba(220,53,69,0.18);"'
+                        : (o.customer_risk && o.customer_risk.level === 'medium')
+                            ? ' style="background-color: rgba(245,158,11,0.12);"'
+                            : (o.is_big_order ? ' style="background-color: rgba(220,53,69,0.1);"' : '');
+                    const riskBadge = renderRiskBadge(o.customer_risk, { compact: true });
+                    return `
+                <tr${rowStyle}>
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a>${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}</div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
@@ -499,7 +559,8 @@
 
                     <td>
                         <div class="fw-bold mb-1"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name}</a></div>
-                        
+                        ${riskBadge ? `<div class="mb-2">${riskBadge}</div>` : ''}
+
                         <!-- Contact Info -->
                         <div class="mb-2">
                             ${o.customer_phone ? `<div class="d-flex align-items-center mb-1"><i class="bi bi-telephone text-secondary me-2"></i><span class="text-light small">${o.customer_phone}</span></div>` : ''}
@@ -576,12 +637,13 @@
                         <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="printLabel(${o.id})" title="打印">
                             <i class="bi bi-printer"></i>
                         </a>
-                        <button class="btn btn-sm btn-primary px-3" onclick="openShipModal(${o.id}, '${o.number}', '${o.customer_name}', '${o.customer_address.replace(/'/g, "\\'")}', '${(o.source || '').replace(/'/g, "\\'")}', ${o.is_big_order ? 'true' : 'false'}, '${(o.big_order_reasons || []).join(' · ').replace(/'/g, "\\'")}', '${(o.warehouse_name || '').replace(/'/g, "\\'")}')">
+                        <button class="btn btn-sm btn-primary px-3" onclick='openShipModal(${o.id}, ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)})'>
                             <i class="bi bi-truck me-1"></i>发货
                         </button>
                     </td>
                 </tr>
-            `).join('');
+            `;
+                    }).join('');
                 });
 
             // Load shipped orders
@@ -594,14 +656,17 @@
                         tbody.innerHTML = '<tr><td colspan="10" class="text-center py-4 text-muted">暂无已发货订单</td></tr>';
                         return;
                     }
-                    tbody.innerHTML = orders.map(o => `
-                <tr>
+                    tbody.innerHTML = orders.map(o => {
+                    const shippedRiskBadge = renderRiskBadge(o.customer_risk, { compact: true });
+                    return `
+                <tr${o.customer_risk && o.customer_risk.level === 'high' ? ' style="background-color: rgba(220,53,69,0.10);"' : ''}>
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a></div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
                     </td>
                     <td>
                         <div class="text-white"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name}</a></div>
+                        ${shippedRiskBadge ? `<div class="mt-1">${shippedRiskBadge}</div>` : ''}
                         <small class="text-muted d-block" title="${o.customer_address || ''}">${o.customer_address || ''}</small>
                     </td>
                     <td>
@@ -679,17 +744,23 @@
                         `}
                     </td>
                 </tr>
-            `).join('');
+            `;
+                    }).join('');
                 });
         }
 
-        function openShipModal(orderId, orderNumber, customerName, customerAddress, source, isBigOrder, bigOrderReasons, warehouseName) {
+        function openShipModal(orderId, orderNumber, customerName, customerAddress, source, isBigOrder, bigOrderReasons, warehouseName, customerRisk) {
             document.getElementById('shipOrderId').value = orderId;
             document.getElementById('shipOrderNumber').value = '#' + orderNumber;
             // Surface the warehouse in the modal so the shipper sees where the
             // goods are fulfilled from (drives the default carrier choice).
             const whHint = warehouseName ? `<small class="text-info d-block">出库: ${warehouseName}</small>` : '';
+            // Surface the prior-freeloader risk as a prominent banner BEFORE
+            // the shipper can pick a carrier — they should pause and verify
+            // the order before sending a known scammer more goods.
+            const riskBanner = renderRiskBadge(customerRisk, { compact: false });
             document.getElementById('shipCustomerInfo').innerHTML = `
+        ${riskBanner}
         <div class="fw-bold">${customerName}</div>
         <small class="text-muted">${customerAddress}</small>
         ${whHint}

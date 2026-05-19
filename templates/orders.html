@@ -180,26 +180,39 @@
                         </tr>
                         {% endfor %}
                         <!-- Totals Row -->
+                        {# When every site in view shares one currency the合计 row
+                           can show real summed amounts (e.g. AU-only user); otherwise
+                           it still falls back to the "(混合货币)" / "-" placeholders. #}
+                        {% set ucur = totals.uniform_currency %}
                         <tr class="totals-row">
                             <td><strong>合计</strong></td>
-                            <td class="text-center">-</td>
+                            <td class="text-center">{% if ucur %}<span class="badge bg-secondary">{{ ucur }}</span>{% else %}-{% endif %}</td>
                             <td class="text-end border-start"><strong>{{ "{:,}".format(totals.total_orders) }}</strong>
                             </td>
                             <td class="text-end"><strong>{{ "{:,}".format(totals.total_products) }}</strong></td>
-                            <td class="text-end"><strong>(混合货币)</strong></td>
+                            <td class="text-end">
+                                {% if ucur %}<strong>{{ "{:,.2f}".format(totals.total_amount or 0) }} {{ ucur }}</strong>
+                                {% else %}<strong>(混合货币)</strong>{% endif %}
+                            </td>
                             <td class="text-end border-start text-success"><strong>{{
                                     "{:,}".format(totals.success_orders) }}</strong></td>
                             <td class="text-end text-success"><strong>{{ "{:,}".format(totals.success_products)
                                     }}</strong></td>
-                            <td class="text-end text-success"><strong>-</strong></td>
-                            <td class="text-end text-success"><strong>-</strong></td>
+                            <td class="text-end text-success">
+                                {% if ucur %}<strong>{{ "{:,.2f}".format(totals.success_amount or 0) }} {{ ucur }}</strong>
+                                {% else %}<strong>-</strong>{% endif %}
+                            </td>
+                            <td class="text-end text-success">
+                                {% if ucur %}<strong>{{ "{:,.2f}".format(totals.success_net_amount or 0) }} {{ ucur }}</strong>
+                                {% else %}<strong>-</strong>{% endif %}
+                            </td>
                             <td class="text-end border-start text-danger"><strong>{{ totals.failed_orders }}</strong>
                             </td>
                             <td class="text-end text-danger"><strong>{{ totals.cancelled_orders }}</strong></td>
                             <td class="text-end border-start" style="color:#c084fc;"><strong>{{ totals.undelivered_orders or 0 }}</strong></td>
-                            <td class="text-end" style="color:{{ '#fbbf24' if (totals.shipping_loss or 0) > 0 else '#6b7280' }};"><strong>{{ "{:,.2f}".format(totals.shipping_loss or 0) }}</strong></td>
+                            <td class="text-end" style="color:{{ '#fbbf24' if (totals.shipping_loss or 0) > 0 else '#6b7280' }};"><strong>{{ "{:,.2f}".format(totals.shipping_loss or 0) }}{% if ucur and (totals.shipping_loss or 0) > 0 %} {{ ucur }}{% endif %}</strong></td>
                             <td class="text-end border-start" style="color:#f87171;"><strong>{{ totals.problem_return_orders or 0 }}</strong></td>
-                            <td class="text-end" style="color:{{ '#fbbf24' if (totals.product_loss or 0) > 0 else '#6b7280' }};"><strong>{{ "{:,.2f}".format(totals.product_loss or 0) }}</strong></td>
+                            <td class="text-end" style="color:{{ '#fbbf24' if (totals.product_loss or 0) > 0 else '#6b7280' }};"><strong>{{ "{:,.2f}".format(totals.product_loss or 0) }}{% if ucur and (totals.product_loss or 0) > 0 %} {{ ucur }}{% endif %}</strong></td>
                             <td class="text-center">-</td>
                             <td class="text-end text-warning"><strong>¥{{ "{:,.2f}".format(totals.success_net_amount_cny
                                     or 0) }}</strong></td>
@@ -354,6 +367,19 @@
                                         class="text-light text-decoration-none">{{ order.customer_name or '-' }}</a>
                                 </div>
                                 <div class="customer-email text-muted">{{ order.customer_email }}</div>
+                                {% if order.customer_risk %}
+                                {% set risk = order.customer_risk %}
+                                {% set is_high = risk.level == 'high' %}
+                                {% set type_map = {'swap':'调包/假货','short':'少件/空盒','damaged':'损坏','other':'其它'} %}
+                                {% set matched_map = {'email':'邮箱','phone':'手机','address':'地址'} %}
+                                <div class="mt-1">
+                                    <span class="badge" style="background:{{ 'rgba(220,53,69,0.18)' if is_high else 'rgba(245,158,11,0.18)' }};color:{{ '#f87171' if is_high else '#fbbf24' }};border:1px solid {{ 'rgba(220,53,69,0.55)' if is_high else 'rgba(245,158,11,0.55)' }};cursor:help;"
+                                        title="{% if risk.problem_count > 0 %}历史问题退货 {{ risk.problem_count }} 单 · 货值损失 {{ '%.2f'|format(risk.problem_loss) }}&#10;{% if risk.types %}类型: {% for t in risk.types %}{{ type_map.get(t, t) }}{% if not loop.last %} · {% endif %}{% endfor %}&#10;{% endif %}{% endif %}{% if risk.undeliv_count > 0 %}历史未送达 {{ risk.undeliv_count }} 单 · 运费损失 {{ '%.2f'|format(risk.undeliv_loss) }}&#10;{% endif %}{% if risk.matched_by %}命中: {% for m in risk.matched_by %}{{ matched_map.get(m, m) }}{% if not loop.last %}/{% endif %}{% endfor %}{% if risk.last_number %} · 最近 #{{ risk.last_number }}{% endif %}{% endif %}">
+                                        <i class="bi {{ 'bi-exclamation-octagon-fill' if is_high else 'bi-exclamation-triangle-fill' }} me-1"></i>{{ '⚠ 高风险' if is_high else '可疑' }}
+                                        · {% if risk.problem_count > 0 %}{{ risk.problem_count }} 问题退货{% else %}{{ risk.undeliv_count }} 拒收{% endif %}
+                                    </span>
+                                </div>
+                                {% endif %}
                                 {% if order.dpd_address %}
                                 <div class="small text-info mt-1 text-truncate" style="max-width: 180px;"
                                     title="{{ order.dpd_address }}">
