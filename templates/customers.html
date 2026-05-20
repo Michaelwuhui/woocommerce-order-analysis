@@ -132,14 +132,25 @@
             </div>
         </div>
         <div class="col-xl-3 col-md-6">
-            <div class="stat-card h-100 stat-card-info">
+            <div class="stat-card h-100 stat-card-info"
+                 data-rate-headcount="{{ stats.repeat_rate|round(1) }}"
+                 data-rate-orders="{{ stats.repeat_rate_orders|round(1) }}"
+                 data-rate-revenue="{{ stats.repeat_rate_revenue|round(1) }}"
+                 data-sub-headcount="购买超过 1 次的客户占比（{{ stats.repeat_customers }}/{{ stats.total_customers }} 人）"
+                 data-sub-orders="复购客户贡献的订单占比（{{ stats.repeat_success_orders }}/{{ stats.total_success_orders }} 单）"
+                 data-sub-revenue="复购客户贡献的销售额占比">
                 <div class="stat-icon">
                     <i class="bi bi-arrow-repeat"></i>
                 </div>
                 <div class="stat-content">
-                    <h3>{{ stats.repeat_rate|round(1) }}%</h3>
+                    <h3 id="repeatRateValue">{{ stats.repeat_rate|round(1) }}%</h3>
                     <p class="mb-1">复购率</p>
-                    <small class="text-secondary">购买超过 1 次的客户占比</small>
+                    <div class="btn-group btn-group-sm mb-1" role="group" id="repeatRateToggle">
+                        <button type="button" class="btn btn-outline-info active" data-mode="headcount">人头</button>
+                        <button type="button" class="btn btn-outline-info" data-mode="orders">按订单</button>
+                        <button type="button" class="btn btn-outline-info" data-mode="revenue">按金额</button>
+                    </div>
+                    <small class="text-secondary d-block" id="repeatRateSub">购买超过 1 次的客户占比（{{ stats.repeat_customers }}/{{ stats.total_customers }} 人）</small>
                 </div>
             </div>
         </div>
@@ -446,6 +457,32 @@
             flatpickr('#dateFrom', dateConfig);
             flatpickr('#dateTo', dateConfig);
         }
+
+        // 复购率口径切换：人头 / 按订单 / 按金额。记住上次选择。
+        (function () {
+            var card = document.querySelector('.stat-card[data-rate-headcount]');
+            var toggle = document.getElementById('repeatRateToggle');
+            if (!card || !toggle) return;
+            var valEl = document.getElementById('repeatRateValue');
+            var subEl = document.getElementById('repeatRateSub');
+            function apply(mode) {
+                var v = card.getAttribute('data-rate-' + mode);
+                var s = card.getAttribute('data-sub-' + mode);
+                if (v === null) return;
+                valEl.textContent = parseFloat(v).toFixed(1) + '%';
+                subEl.textContent = s || '';
+                toggle.querySelectorAll('button').forEach(function (b) {
+                    b.classList.toggle('active', b.getAttribute('data-mode') === mode);
+                });
+                try { localStorage.setItem('repeatRateMode', mode); } catch (e) {}
+            }
+            toggle.querySelectorAll('button').forEach(function (b) {
+                b.addEventListener('click', function () { apply(b.getAttribute('data-mode')); });
+            });
+            var saved = 'headcount';
+            try { saved = localStorage.getItem('repeatRateMode') || 'headcount'; } catch (e) {}
+            apply(saved);
+        })();
     });
 
     $(document).ready(function () {

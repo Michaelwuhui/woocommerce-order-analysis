@@ -4154,6 +4154,13 @@ def customers():
     repeat_customers = 0
     new_customers_month = 0
     new_customers_last_month = 0
+    # Repeat-rate numerators/denominators for the three switchable口径:
+    #   headcount = repeat_customers / total_customers
+    #   by_orders = repeat_success_orders / total_success_orders
+    #   by_revenue = repeat_spending / total_revenue
+    total_success_orders = 0
+    repeat_success_orders = 0
+    repeat_spending = 0.0
 
     import datetime
     now = datetime.datetime.now()
@@ -4281,8 +4288,11 @@ def customers():
             bucket['shipping'] += c['shipping_loss_total']
             bucket['product'] += c['product_loss_total']
 
+        total_success_orders += c['successful_orders']
         if c['successful_orders'] > 1:
             repeat_customers += 1
+            repeat_success_orders += c['successful_orders']
+            repeat_spending += c['total_spent']
         if c['first_order_date'] and c['first_order_date'] >= thirty_days_ago:
             new_customers_month += 1
         elif c['first_order_date'] and c['first_order_date'] >= sixty_days_ago:
@@ -4369,6 +4379,13 @@ def customers():
         'total_customers': total_customers,
         'avg_ltv': total_revenue / total_customers if total_customers > 0 else 0,
         'repeat_rate': (repeat_customers / total_customers * 100) if total_customers > 0 else 0,
+        # Weighted repeat-rate variants (switchable on the KPI card).
+        'repeat_rate_orders': (repeat_success_orders / total_success_orders * 100) if total_success_orders > 0 else 0,
+        'repeat_rate_revenue': (repeat_spending / total_revenue * 100) if total_revenue > 0 else 0,
+        'repeat_customers': repeat_customers,
+        'repeat_success_orders': repeat_success_orders,
+        'total_success_orders': total_success_orders,
+        'repeat_spending': round(repeat_spending, 2),
         'new_customer_rate': (new_customers_month / total_customers * 100) if total_customers > 0 else 0,
         'new_customers_month': new_customers_month,
         'new_customers_last_month': new_customers_last_month,
