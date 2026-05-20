@@ -246,9 +246,16 @@
 
     <!-- Customers Table -->
     <div class="card data-card">
-        <div class="card-header d-flex justify-content-between align-items-center">
-            <h5><i class="bi bi-list-ul me-2"></i>客户列表</h5>
-            <div class="d-flex gap-2">
+        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <h5 class="mb-0"><i class="bi bi-list-ul me-2"></i>客户列表</h5>
+            <div class="d-flex gap-2 align-items-center flex-wrap">
+                <div class="position-relative">
+                    <i class="bi bi-search position-absolute text-secondary" style="left:10px; top:50%; transform:translateY(-50%); pointer-events:none;"></i>
+                    <input type="text" id="customerSearchBox"
+                        class="form-control form-control-sm bg-dark text-white border-secondary"
+                        style="width: 260px; padding-left: 30px;"
+                        placeholder="搜索 姓名 / 邮箱 / 电话...">
+                </div>
                 <button class="btn btn-sm btn-outline-purple" id="toggleMergedBtn"
                     style="color:#a78bfa;border-color:rgba(167,139,250,0.6);">
                     <i class="bi bi-people-fill me-1"></i>只看聚合客户
@@ -278,8 +285,10 @@
                     </thead>
                     <tbody>
                         {% for c in customers %}
+                        {% set _ident_emails = (c.identity_emails or [c.email])|join(' ') %}
                         <tr>
-                            <td data-identity-count="{{ c.identity_email_count or 1 }}">
+                            <td data-identity-count="{{ c.identity_email_count or 1 }}"
+                                data-search="{{ ((c.name or '') ~ ' ' ~ _ident_emails ~ ' ' ~ (c.phone or ''))|lower }}">
                                 <div class="d-flex align-items-center">
                                     <div
                                         class="avatar-circle me-2 bg-gradient-{{ 'warning' if c.tier == 'VIP' else ('success' if c.tier == '优质' else ('primary' if c.tier == '普通' else 'secondary')) }}">
@@ -495,6 +504,10 @@
         var lossOnly = false;
         var multiSiteOnly = false;
         var mergedOnly = false;
+        // Name/email/phone search. Matches against the 姓名 cell's data-search
+        // attribute, which includes the customer name + ALL merged-identity
+        // emails + phone — so searching a secondary (merged-in) email still hits.
+        var customerQuery = '';
         $.fn.dataTable.ext.search.push(function (settings, data, dataIndex) {
             if (settings.nTable.id !== 'customersTable') return true;
             var cells = settings.aoData[dataIndex].anCells;
@@ -509,6 +522,10 @@
             if (mergedOnly) {
                 var ic = parseInt(cells[0].getAttribute('data-identity-count') || '1', 10);
                 if (!(ic >= 2)) return false;
+            }
+            if (customerQuery) {
+                var hay = (cells[0].getAttribute('data-search') || '');
+                if (hay.indexOf(customerQuery) === -1) return false;
             }
             return true;
         });
@@ -543,8 +560,20 @@
                 { orderable: false, targets: [3, 9, 10] }, // Disable sort for Contact, Smart Actions, Actions
                 { type: 'num', targets: [2, 7] }           // 多站(2) + 损失(7) sort numerically via data-order
             ],
+            // Hide the built-in search box ('f') — we provide our own labelled
+            // 姓名/邮箱/电话 box in the card header that also matches merged emails.
+            dom: 'lrtip',
             pageLength: 25
         });
+
+        // Wire the custom 姓名/邮箱/电话 search box → custom ext.search filter.
+        var searchBox = document.getElementById('customerSearchBox');
+        if (searchBox) {
+            searchBox.addEventListener('input', function () {
+                customerQuery = this.value.trim().toLowerCase();
+                dt.draw();
+            });
+        }
 
         // Wire the "只看有损失" toggle button (only present when losses exist).
         var lossBtn = document.getElementById('toggleLossOnlyBtn');
