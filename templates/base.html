@@ -9,7 +9,7 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/dark.css" rel="stylesheet">
-    <link href="{{ url_for('static', filename='css/style.css') }}" rel="stylesheet">
+    <link href="{{ url_for('static', filename='css/style.css') }}?v=20260519" rel="stylesheet">
     <link href="{{ url_for('static', filename='css/responsive.css') }}?v=2" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
@@ -1713,6 +1713,25 @@
                     html += '<div class="info-card h-100"><div class="card-header"><h6><i class="bi bi-person me-2"></i>基本信息</h6></div>';
                     html += '<div class="card-body">';
                     html += '<p><strong>邮箱:</strong> <a href="mailto:' + customer.email + '" class="text-info">' + customer.email + '</a></p>';
+                    // Identity: when several emails were merged, list the others
+                    // so the operator can see the full picture of this person.
+                    if (customer.identity_email_count && customer.identity_email_count > 1) {
+                        var matchedMap = { phone: '同手机', address: '同地址' };
+                        var reasons = (customer.identity_matched_by || []).map(function (m) { return matchedMap[m] || m; }).join('+');
+                        var otherEmails = (customer.identity_emails || []).filter(function (e) {
+                            return e.toLowerCase() !== (customer.email || '').toLowerCase();
+                        });
+                        html += '<div class="mb-2 p-2 rounded" style="background:rgba(167,139,250,0.12);border:1px solid rgba(167,139,250,0.4);">';
+                        html += '<div class="small" style="color:#a78bfa;"><i class="bi bi-people-fill me-1"></i><strong>合并身份</strong> · 共 ' + customer.identity_email_count + ' 个邮箱' + (reasons ? '（依据：' + reasons + '）' : '') + '</div>';
+                        if (otherEmails.length) {
+                            html += '<div class="small text-white-50 mt-1">其它邮箱：</div>';
+                            otherEmails.forEach(function (e) {
+                                html += '<div class="small"><a href="mailto:' + e + '" class="text-white-50">' + e + '</a></div>';
+                            });
+                        }
+                        html += '<div class="text-muted mt-1" style="font-size:0.75em;">下方所有统计与购买记录已合并这些邮箱的订单。</div>';
+                        html += '</div>';
+                    }
                     html += '<p><strong>电话:</strong> ' + (customer.phone || '-') + '</p>';
                     html += '<p><strong>首次购买:</strong> ' + (customer.first_order_date || '-') + '</p>';
                     html += '<p><strong>最近购买:</strong> ' + (customer.last_order_date || '-') + '</p>';
@@ -1740,10 +1759,13 @@
                     html += '</tbody></table></div></div></div>';
 
                     // Recent Orders
+                    // When the identity merges several emails, add an 邮箱 column
+                    // so the operator can see which address placed each order.
+                    var showEmailCol = (customer.identity_email_count && customer.identity_email_count > 1);
                     html += '<div class="col-12">';
                     html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-clock-history me-2"></i>购买记录</h6></div>';
                     html += '<div class="card-body p-0"><div class="table-responsive"><table class="table product-table mb-0">';
-                    html += '<thead><tr><th>订单号</th><th>日期</th><th>网站</th><th>状态</th><th>商品数</th><th class="text-end">金额</th><th>操作</th></tr></thead><tbody>';
+                    html += '<thead><tr><th>订单号</th><th>日期</th><th>网站</th>' + (showEmailCol ? '<th>邮箱</th>' : '') + '<th>状态</th><th>商品数</th><th class="text-end">金额</th><th>操作</th></tr></thead><tbody>';
 
                     var statusColors = {
                         'pending': '#f59e0b', 'processing': '#3b82f6', 'on-hold': '#6b7280',
@@ -1759,6 +1781,11 @@
                         html += '<td><a href="#" onclick="showOrderDetail(\'' + order.id + '\'); return false;">#' + order.number + '</a></td>';
                         html += '<td>' + order.date_created.replace('T', ' ').substring(0, 16) + '</td>';
                         html += '<td>' + order.source + '</td>';
+                        if (showEmailCol) {
+                            var oe = order.email || '';
+                            var isPrimary = oe.toLowerCase() === (customer.email || '').toLowerCase();
+                            html += '<td><span class="small ' + (isPrimary ? 'text-white-50' : '') + '" style="' + (isPrimary ? '' : 'color:#a78bfa;') + '" title="' + oe + '">' + oe + '</span></td>';
+                        }
                         html += '<td><span style="color:' + (statusColors[order.status] || '#ccc') + '">' + (statusLabels[order.status] || order.status) + '</span></td>';
                         html += '<td>' + order.product_count + '</td>';
                         html += '<td class="text-end">' + order.total.toFixed(2) + ' ' + (order.currency || '') + '</td>';

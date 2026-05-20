@@ -248,14 +248,33 @@ def _normalize_email(e):
     return s or None
 
 
+def _is_placeholder_phone(digits):
+    """True for obviously-fake numbers people type to bypass a required field:
+    all-same-digit (000000000), or a straight ascending/descending run
+    (123456789 / 987654321). These must never link unrelated customers."""
+    if not digits:
+        return True
+    if len(set(digits)) <= 1:
+        return True
+    if len(digits) >= 6:
+        diffs = {int(digits[i + 1]) - int(digits[i]) for i in range(len(digits) - 1)}
+        if diffs == {1} or diffs == {-1}:
+            return True
+    return False
+
+
 def _normalize_phone(p):
     """Keep digits only; collapse to the last 9 digits to fold away the
     PL +48 / AU +61 / AE +971 country codes that customers add inconsistently.
-    Returns None if there's no plausible phone number left."""
+    Returns None if there's no plausible phone number left, or if it's an
+    obvious placeholder (so it can't merge / flag unrelated people)."""
     digits = ''.join(c for c in (p or '') if c.isdigit())
     if len(digits) < 7:  # too short to be a real number
         return None
-    return digits[-9:] if len(digits) >= 9 else digits
+    canonical = digits[-9:] if len(digits) >= 9 else digits
+    if _is_placeholder_phone(canonical) or _is_placeholder_phone(digits):
+        return None
+    return canonical
 
 
 def _normalize_address(addr_dict):
@@ -432,6 +451,106 @@ def _collect_in_indices(category_idx, keys, current_order_id):
             matched[rec['order_id']] = rec
             via.add(marker)
     return matched, via
+
+
+# A phone / address shared by MORE distinct emails than this is treated as
+# non-identifying (placeholder number like 123456789, a shared web form, an
+# apartment block) and will NOT merge identities. Email is always trusted.
+_IDENTITY_SHARED_KEY_LIMIT = 4
+
+
+def _resolve_identity_clusters(conn, where_clause, params):
+    """Entity resolution over the customer base: union emails that belong to
+    the same person, linked by a shared phone number or delivery address.
+
+    Returns a tuple (email_to_cluster, cluster_meta):
+      email_to_cluster: {normalized_email: cluster_key}
+      cluster_meta:     {cluster_key: {'emails': set, 'phones': set, 'addrs': set,
+                                       'matched_by': set(['phone','address'])}}
+    The cluster_key is the lexicographically-smallest email in the cluster
+    (stable across requests). Emails that share nothing form singleton clusters.
+
+    Over-merge guard: phone/address keys linked to more than
+    _IDENTITY_SHARED_KEY_LIMIT distinct emails are dropped before unioning.
+    """
+    rows = conn.execute(
+        f"SELECT billing, shipping FROM orders {where_clause}", params
+    ).fetchall()
+
+    email_keys = {}     # email -> {'phones': set, 'addrs': set}
+    phone_emails = {}   # phone -> set(emails)
+    addr_emails = {}    # addr  -> set(emails)
+    for r in rows:
+        b = parse_json_field(r['billing']) or {}
+        s = parse_json_field(r['shipping']) or {}
+        ad = _addr_for_order(b, s)
+        e = _normalize_email(b.get('email') or s.get('email'))
+        if not e:
+            continue
+        p = _normalize_phone(ad.get('phone') or b.get('phone'))
+        ak = _normalize_address(ad)
+        ek = email_keys.setdefault(e, {'phones': set(), 'addrs': set()})
+        if p:
+            ek['phones'].add(p)
+            phone_emails.setdefault(p, set()).add(e)
+        if ak:
+            ek['addrs'].add(ak)
+            addr_emails.setdefault(ak, set()).add(e)
+
+    good_phone = {p for p, es in phone_emails.items() if len(es) <= _IDENTITY_SHARED_KEY_LIMIT}
+    good_addr = {a for a, es in addr_emails.items() if len(es) <= _IDENTITY_SHARED_KEY_LIMIT}
+
+    # Union-Find over emails.
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:  # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rb < ra:
+            ra, rb = rb, ra
+        parent[rb] = ra
+
+    for e in email_keys:
+        find(e)
+
+    matched_via = {}  # email -> set of reasons it got merged ('phone'/'address')
+    for p, es in phone_emails.items():
+        if p not in good_phone or len(es) < 2:
+            continue
+        es = list(es)
+        for other in es[1:]:
+            union(es[0], other)
+        for e in es:
+            matched_via.setdefault(e, set()).add('phone')
+    for a, es in addr_emails.items():
+        if a not in good_addr or len(es) < 2:
+            continue
+        es = list(es)
+        for other in es[1:]:
+            union(es[0], other)
+        for e in es:
+            matched_via.setdefault(e, set()).add('address')
+
+    email_to_cluster = {e: find(e) for e in email_keys}
+    cluster_meta = {}
+    for e, ck in email_to_cluster.items():
+        m = cluster_meta.setdefault(ck, {'emails': set(), 'phones': set(),
+                                         'addrs': set(), 'matched_by': set()})
+        m['emails'].add(e)
+        m['phones'] |= email_keys[e]['phones']
+        m['addrs'] |= email_keys[e]['addrs']
+        m['matched_by'] |= matched_via.get(e, set())
+    return email_to_cluster, cluster_meta
 
 
 def extract_flavor_from_meta(item):
@@ -3851,15 +3970,61 @@ def cancelled_analysis():
 @app.route('/customers')
 @login_required
 def customers():
+    from datetime import date, timedelta
     conn = get_db_connection()
-    
+
     # Get user's allowed sources for permission filtering
     allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
-    
+
     # Get source filter
     source_filter = request.args.get('source', '')
     manager_filter = request.args.get('manager', '')
-    
+    country_filter = request.args.get('country', '')
+
+    # Period filter (period口径: every number reflects only orders in range).
+    # Default is 'all' so the page keeps showing the lifetime customer base
+    # until the user explicitly scopes to a month.
+    quick_date = request.args.get('quick_date', 'all')
+    date_from = request.args.get('date_from', '')
+    date_to = request.args.get('date_to', '')
+    # Explicit dates win; otherwise derive the range from the quick preset.
+    if not date_from and not date_to:
+        today = date.today()
+        if quick_date == 'this_month':
+            date_from = today.replace(day=1).isoformat()
+            date_to = today.isoformat()
+        elif quick_date == 'last_month':
+            first_of_this = today.replace(day=1)
+            last_month_end = first_of_this - timedelta(days=1)
+            date_from = last_month_end.replace(day=1).isoformat()
+            date_to = last_month_end.isoformat()
+        elif quick_date == 'last_quarter':
+            date_from = (today - timedelta(days=90)).isoformat()
+            date_to = today.isoformat()
+        elif quick_date == 'half_year':
+            date_from = (today - timedelta(days=180)).isoformat()
+            date_to = today.isoformat()
+        elif quick_date == 'one_year':
+            date_from = (today - timedelta(days=365)).isoformat()
+            date_to = today.isoformat()
+        # 'all' (or anything else) → no date bounds
+
+    # Build the shared date-range SQL fragment (applied to BOTH the customer
+    # aggregation query and the identity-resolution scan so they stay in sync).
+    date_conditions = []
+    date_params = []
+    if date_from:
+        date_conditions.append('date_created >= ?')
+        date_params.append(date_from)
+    if date_to:
+        date_conditions.append('date_created <= ?')
+        date_params.append(date_to + 'T23:59:59')
+
+    # All countries for the filter dropdown
+    all_countries = [c['country'] for c in conn.execute(
+        "SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != '' ORDER BY country"
+    ).fetchall()]
+
     # Get all managers
     all_managers = get_all_managers()
     
@@ -3927,12 +4092,27 @@ def customers():
         else:
             conditions.append('1=0')
     
+    # Add country filter (resolve to that country's site URLs)
+    if country_filter:
+        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country_filter,)).fetchall()
+        country_urls = [s['url'] for s in country_sites]
+        if country_urls:
+            placeholders = ', '.join(['?' for _ in country_urls])
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(country_urls)
+        else:
+            conditions.append('1=0')
+
     if source_filter:
         conditions.append('source = ?')
         params.append(source_filter)
-    
+
+    # Period口径: scope every aggregate to the selected date range.
+    conditions.extend(date_conditions)
+    params.extend(date_params)
+
     where_clause = 'WHERE ' + ' AND '.join(conditions)
-    
+
     query = f'''
         SELECT
             json_extract(billing, '$.email') as email,
@@ -3948,7 +4128,8 @@ def customers():
             SUM(CASE WHEN COALESCE(is_problem_return, 0) = 1 THEN COALESCE(product_loss_amount, 0) ELSE 0 END) as product_loss_total,
             MAX(date_created) as last_order_date,
             MIN(date_created) as first_order_date,
-            GROUP_CONCAT(DISTINCT source) as sources
+            GROUP_CONCAT(DISTINCT source) as sources,
+            GROUP_CONCAT(DISTINCT currency) as currencies
         FROM orders
         {where_clause}
         GROUP BY email
@@ -3956,89 +4137,233 @@ def customers():
     '''
     
     customers_data = conn.execute(query, params).fetchall()
-    
+
+    # Site→manager map used to label each customer's sites in the 多站下单 column.
+    site_managers_global = {s['url']: (s['manager'] or '')
+                            for s in conn.execute('SELECT url, manager FROM sites').fetchall()}
+
+    # Identity resolution: union emails that share a phone/address into one
+    # person so someone spreading orders across multiple emails collapses into a
+    # single row. Uses the SAME filter as the customer query above so the scope
+    # matches (permissions / manager / source filters).
+    email_to_cluster, cluster_meta = _resolve_identity_clusters(conn, where_clause, params)
+
     conn.close()
-    
-    customers_list = []
-    total_customers = len(customers_data)
+
     total_revenue = 0
     repeat_customers = 0
     new_customers_month = 0
     new_customers_last_month = 0
-    
+
     import datetime
     now = datetime.datetime.now()
     thirty_days_ago = (now - datetime.timedelta(days=30)).strftime('%Y-%m-%d')
     sixty_days_ago = (now - datetime.timedelta(days=60)).strftime('%Y-%m-%d')
     ninety_days_ago = (now - datetime.timedelta(days=90)).strftime('%Y-%m-%d')
-    
+
     tier_counts = {'VIP': 0, '优质': 0, '普通': 0, '新客': 0}
-    
+
+    # Aggregate loss bookkeeping so the page can headline "who's costing us money".
+    loss_stats = {
+        'customers_with_loss': 0,        # distinct identities with any shipping/product loss
+        'undelivered_customers': 0,      # identities with ≥1 undelivered order
+        'problem_return_customers': 0,   # identities with ≥1 problem-return order
+        'shipping_loss_total': 0.0,      # summed across identities (native currency, see note)
+        'product_loss_total': 0.0,
+        # Per-currency breakdown so the overview strip can label amounts with
+        # their real currency instead of an ambiguous bare number. Single-country
+        # users get one bucket; admins viewing all countries get several.
+        'by_currency': {},               # {currency: {'shipping': x, 'product': y}}
+    }
+
+    # ── Phase A: fold the per-email SQL rows into identity clusters ──
+    # Each SQL row is one raw email (GROUP BY email). We sum its numbers into the
+    # cluster that _resolve_identity_clusters assigned its normalized email to.
+    # Guest orders with no email never merge — each gets a unique singleton key.
+    identities = {}
+    _singleton_seq = 0
     for row in customers_data:
         c = dict(row)
-        c['total_spent'] = float(c['total_spent'] or 0)
-        c['undelivered_orders'] = int(c.get('undelivered_orders') or 0)
-        c['shipping_loss_total'] = float(c.get('shipping_loss_total') or 0)
-        c['problem_return_orders'] = int(c.get('problem_return_orders') or 0)
-        c['product_loss_total'] = float(c.get('product_loss_total') or 0)
+        raw_email = c.get('email')
+        norm = _normalize_email(raw_email)
+        ck = email_to_cluster.get(norm) if norm else None
+        if not ck:
+            _singleton_seq += 1
+            ck = f"__noemail_{_singleton_seq}"
+
+        idn = identities.get(ck)
+        if idn is None:
+            idn = identities[ck] = {
+                'cluster_key': ck,
+                'emails_by_spend': [], 'names_by_spend': [], 'phones': set(),
+                'total_orders': 0, 'successful_orders': 0, 'total_spent': 0.0,
+                'undelivered_orders': 0, 'shipping_loss_total': 0.0,
+                'problem_return_orders': 0, 'product_loss_total': 0.0,
+                'sources': set(), 'currencies': set(),
+                'first_order_date': None, 'last_order_date': None,
+            }
+        spend = float(c.get('total_spent') or 0)
+        if raw_email:
+            idn['emails_by_spend'].append((spend, raw_email))
+        nm = (c.get('name') or '').strip()
+        if nm:
+            idn['names_by_spend'].append((spend, nm))
+        if c.get('phone'):
+            idn['phones'].add(str(c['phone']).strip())
+        idn['total_orders'] += int(c.get('total_orders') or 0)
+        idn['successful_orders'] += int(c.get('successful_orders') or 0)
+        idn['total_spent'] += spend
+        idn['undelivered_orders'] += int(c.get('undelivered_orders') or 0)
+        idn['shipping_loss_total'] += float(c.get('shipping_loss_total') or 0)
+        idn['problem_return_orders'] += int(c.get('problem_return_orders') or 0)
+        idn['product_loss_total'] += float(c.get('product_loss_total') or 0)
+        for s in (c.get('sources') or '').split(','):
+            s = s.strip()
+            if s:
+                idn['sources'].add(s)
+        for cur in (c.get('currencies') or '').split(','):
+            cur = cur.strip()
+            if cur:
+                idn['currencies'].add(cur)
+        fod, lod = c.get('first_order_date'), c.get('last_order_date')
+        if fod:
+            idn['first_order_date'] = fod if idn['first_order_date'] is None else min(idn['first_order_date'], fod)
+        if lod:
+            idn['last_order_date'] = lod if idn['last_order_date'] is None else max(idn['last_order_date'], lod)
+
+    # ── Phase C: derive per-identity display fields + accumulate page stats ──
+    customers_list = []
+    for ck, idn in identities.items():
+        c = {}
+        idn['emails_by_spend'].sort(reverse=True)
+        idn['names_by_spend'].sort(reverse=True)
+        # Representative name + primary email = the highest-spending within the
+        # merged identity (so the "main" account leads the display).
+        primary_email = idn['emails_by_spend'][0][1] if idn['emails_by_spend'] else ''
+        c['email'] = primary_email
+        c['name'] = idn['names_by_spend'][0][1] if idn['names_by_spend'] else (primary_email or 'Unknown')
+        c['phone'] = next(iter(idn['phones'])) if idn['phones'] else ''
+
+        # Merged-identity surfacing: how many distinct emails/phones rolled up.
+        distinct_emails = sorted({e for _, e in idn['emails_by_spend']}, key=str.lower)
+        c['identity_emails'] = distinct_emails
+        c['identity_email_count'] = len(distinct_emails)
+        c['identity_phone_count'] = len(idn['phones'])
+        c['identity_matched_by'] = sorted(cluster_meta.get(ck, {}).get('matched_by', set()))
+
+        c['total_orders'] = idn['total_orders']
+        c['successful_orders'] = idn['successful_orders']
+        c['total_spent'] = round(idn['total_spent'], 2)
+        c['undelivered_orders'] = idn['undelivered_orders']
+        c['shipping_loss_total'] = round(idn['shipping_loss_total'], 2)
+        c['problem_return_orders'] = idn['problem_return_orders']
+        c['product_loss_total'] = round(idn['product_loss_total'], 2)
+        c['total_loss'] = round(c['shipping_loss_total'] + c['product_loss_total'], 2)
         c['refusal_rate'] = round(c['undelivered_orders'] / c['total_orders'] * 100, 1) if c['total_orders'] else 0
+        c['first_order_date'] = idn['first_order_date']
+        c['last_order_date'] = idn['last_order_date']
+        cur_str = sorted(idn['currencies'])[0] if idn['currencies'] else 'N/A'
+        c['currency'] = cur_str
+        c['currencies'] = ','.join(sorted(idn['currencies']))
+
         total_revenue += c['total_spent']
+
+        if c['total_loss'] > 0:
+            loss_stats['customers_with_loss'] += 1
+        if c['undelivered_orders'] > 0:
+            loss_stats['undelivered_customers'] += 1
+        if c['problem_return_orders'] > 0:
+            loss_stats['problem_return_customers'] += 1
+        loss_stats['shipping_loss_total'] += c['shipping_loss_total']
+        loss_stats['product_loss_total'] += c['product_loss_total']
+        if c['shipping_loss_total'] or c['product_loss_total']:
+            bucket = loss_stats['by_currency'].setdefault(cur_str, {'shipping': 0.0, 'product': 0.0})
+            bucket['shipping'] += c['shipping_loss_total']
+            bucket['product'] += c['product_loss_total']
 
         if c['successful_orders'] > 1:
             repeat_customers += 1
-            
-        if c['first_order_date'] >= thirty_days_ago:
+        if c['first_order_date'] and c['first_order_date'] >= thirty_days_ago:
             new_customers_month += 1
-        elif c['first_order_date'] >= sixty_days_ago:
+        elif c['first_order_date'] and c['first_order_date'] >= sixty_days_ago:
             new_customers_last_month += 1
-            
-        # Calculate Tier (same logic as API)
+
+        # Calculate Tier (same logic as API), now over the merged identity.
         avg_days = 0
-        if c['successful_orders'] > 1:
+        if c['successful_orders'] > 1 and c['first_order_date'] and c['last_order_date']:
             first = datetime.datetime.fromisoformat(c['first_order_date'])
             last = datetime.datetime.fromisoformat(c['last_order_date'])
             days = (last - first).days or 1
             avg_days = days / c['successful_orders']
-            
+
         score = min(c['successful_orders'] * 10, 30) + min(c['total_spent'] / 100, 40)
         score += 30 if avg_days > 0 and avg_days < 60 else (15 if avg_days < 120 else 0)
         score = min(score, 100)
-        
+
         if score >= 80: tier = 'VIP'
         elif score >= 60: tier = '优质'
         elif score >= 40: tier = '普通'
         else: tier = '新客'
-        
+
         c['tier'] = tier
         tier_counts[tier] += 1
-        
+
         # Smart Actions
         actions = []
         if tier == 'VIP':
             actions.append({'type': 'success', 'icon': 'gift', 'text': '专属礼遇'})
             actions.append({'type': 'primary', 'icon': 'people', 'text': '邀请入群'})
-        elif c['last_order_date'] < ninety_days_ago:
+        elif c['last_order_date'] and c['last_order_date'] < ninety_days_ago:
             actions.append({'type': 'warning', 'icon': 'ticket-perforated', 'text': '召回优惠券'})
-        elif c['successful_orders'] == 1 and c['first_order_date'] >= thirty_days_ago:
+        elif c['successful_orders'] == 1 and c['first_order_date'] and c['first_order_date'] >= thirty_days_ago:
             actions.append({'type': 'info', 'icon': 'book', 'text': '欢迎指南'})
             actions.append({'type': 'info', 'icon': 'bag-plus', 'text': '关联推荐'})
         elif c['successful_orders'] > 3:
-             actions.append({'type': 'primary', 'icon': 'arrow-repeat', 'text': '订阅服务'})
-        
-        # Process sources
-        source_str = c.get('sources', '') or ''
-        sources = list(set([s.strip() for s in source_str.split(',') if s.strip()]))
+            actions.append({'type': 'primary', 'icon': 'arrow-repeat', 'text': '订阅服务'})
+        c['actions'] = actions
+
+        # Sources across the WHOLE identity (drives the 多站下单 column).
+        sources = sorted(idn['sources'])
         c['source'] = sources[0] if sources else 'Unknown'
         c['all_sources'] = sources
+        c['site_count'] = len(sources)
+        c['site_list'] = [{
+            'url': s,
+            'short': s.replace('https://www.', '').replace('https://', ''),
+            'manager': site_managers_global.get(s, ''),
+        } for s in sources]
 
-        c['actions'] = actions
         customers_list.append(c)
-        
+
+    # Identity count drives all the per-customer rate stats below.
+    total_customers = len(customers_list)
+    # Initial server-side order: highest spenders first (DataTables re-sorts client-side).
+    customers_list.sort(key=lambda x: x['total_spent'], reverse=True)
+
     # Calculate growth rate
     if new_customers_last_month > 0:
         growth_rate = ((new_customers_month - new_customers_last_month) / new_customers_last_month) * 100
     else:
         growth_rate = 100 if new_customers_month > 0 else 0
+
+    loss_stats['shipping_loss_total'] = round(loss_stats['shipping_loss_total'], 2)
+    loss_stats['product_loss_total'] = round(loss_stats['product_loss_total'], 2)
+    loss_stats['combined_loss_total'] = round(
+        loss_stats['shipping_loss_total'] + loss_stats['product_loss_total'], 2)
+    # Round per-currency buckets and expose a sorted list for the template,
+    # plus a single uniform_currency when there's exactly one in view.
+    for cur, b in loss_stats['by_currency'].items():
+        b['shipping'] = round(b['shipping'], 2)
+        b['product'] = round(b['product'], 2)
+    loss_stats['currency_rows'] = [
+        {'currency': cur, 'shipping': b['shipping'], 'product': b['product']}
+        for cur, b in sorted(loss_stats['by_currency'].items(),
+                             key=lambda kv: -(kv[1]['shipping'] + kv[1]['product']))
+    ]
+    loss_stats['uniform_currency'] = (
+        loss_stats['currency_rows'][0]['currency']
+        if len(loss_stats['currency_rows']) == 1 else None
+    )
 
     stats = {
         'total_customers': total_customers,
@@ -4048,7 +4373,8 @@ def customers():
         'new_customers_month': new_customers_month,
         'new_customers_last_month': new_customers_last_month,
         'growth_rate': growth_rate,
-        'tier_counts': tier_counts
+        'tier_counts': tier_counts,
+        'loss': loss_stats,
     }
     
     # Get site managers mapping
@@ -4057,7 +4383,19 @@ def customers():
     site_managers = {s['url']: s['manager'] or '' for s in sites}
     conn2.close()
     
-    return render_template('customers.html', customers=customers_list, stats=stats, sources=all_sources, source_filter=source_filter, manager_filter=manager_filter, all_managers=all_managers, site_managers=site_managers)
+    current_filters = {
+        'source': source_filter,
+        'manager': manager_filter,
+        'country': country_filter,
+        'quick_date': quick_date,
+        'date_from': date_from,
+        'date_to': date_to,
+    }
+    period_active = bool(date_from or date_to)
+    return render_template('customers.html', customers=customers_list, stats=stats, sources=all_sources,
+                           source_filter=source_filter, manager_filter=manager_filter, all_managers=all_managers,
+                           site_managers=site_managers, all_countries=all_countries,
+                           current_filters=current_filters, period_active=period_active)
 
 
 @app.route('/api/chart-data')
@@ -4227,14 +4565,52 @@ def get_customer_details(email):
     
     conn = get_db_connection()
 
-    # Get all orders from this customer
-    orders = conn.execute('''
-        SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing,
-               payment_method, is_undelivered, shipping_loss_amount
-        FROM orders
-        WHERE json_extract(billing, '$.email') = ? AND status NOT IN ('checkout-draft', 'trash')
-        ORDER BY date_created DESC
-    ''', (email,)).fetchall()
+    # Resolve this customer's full IDENTITY (emails linked by a shared phone /
+    # address), scoped to the sites this user may see, so the detail view
+    # aggregates the same merged identity the customer list shows. Callers pass
+    # just one email; we expand it to every email in the identity here.
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    scope_conditions = ["status NOT IN ('checkout-draft', 'trash')"]
+    scope_params = []
+    if allowed_sources is not None:
+        if allowed_sources:
+            ph = ','.join(['?'] * len(allowed_sources))
+            scope_conditions.append(f'source IN ({ph})')
+            scope_params.extend(allowed_sources)
+        else:
+            scope_conditions.append('1=0')
+    scope_where = 'WHERE ' + ' AND '.join(scope_conditions)
+
+    norm_email = _normalize_email(email)
+    email_to_cluster, cluster_meta = _resolve_identity_clusters(conn, scope_where, scope_params)
+    cluster_key = email_to_cluster.get(norm_email) if norm_email else None
+    if cluster_key and cluster_key in cluster_meta:
+        identity_emails = sorted(cluster_meta[cluster_key]['emails'])
+        identity_matched_by = sorted(cluster_meta[cluster_key]['matched_by'])
+    else:
+        identity_emails = [norm_email] if norm_email else []
+        identity_matched_by = []
+
+    # Get all orders across EVERY email in the identity (case-insensitive).
+    if identity_emails:
+        ident_ph = ','.join(['?'] * len(identity_emails))
+        order_sql = f'''
+            SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing,
+                   payment_method, is_undelivered, shipping_loss_amount
+            FROM orders
+            WHERE lower(trim(json_extract(billing, '$.email'))) IN ({ident_ph})
+              AND {' AND '.join(scope_conditions)}
+            ORDER BY date_created DESC
+        '''
+        orders = conn.execute(order_sql, identity_emails + scope_params).fetchall()
+    else:
+        orders = conn.execute('''
+            SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing,
+                   payment_method, is_undelivered, shipping_loss_amount
+            FROM orders
+            WHERE json_extract(billing, '$.email') = ? AND status NOT IN ('checkout-draft', 'trash')
+            ORDER BY date_created DESC
+        ''', (email,)).fetchall()
 
     # On-hold is "shipped" only for sites flagged so (PL by default).
     on_hold_shipped_sources = {
@@ -4345,7 +4721,8 @@ def get_customer_details(email):
             'date_created': order['date_created'],
             'source': source.replace('https://www.', ''),
             'product_count': order_qty,
-            'products': order_products
+            'products': order_products,
+            'email': (billing.get('email') or '').strip(),
         })
     
     # Calculate frequency
@@ -4369,9 +4746,17 @@ def get_customer_details(email):
     quality_score += 30 if avg_days_between > 0 and avg_days_between < 60 else (15 if avg_days_between < 120 else 0)  # Frequency bonus
     quality_score = min(quality_score, 100)
     
-    # Check for manual override
+    # Check for manual override — honor a tier set on ANY email in the identity.
     conn = get_db_connection()
-    manual_setting = conn.execute('SELECT quality_tier FROM customer_settings WHERE email = ?', (email,)).fetchone()
+    if identity_emails:
+        ms_ph = ','.join(['?'] * len(identity_emails))
+        manual_setting = conn.execute(
+            f"SELECT quality_tier FROM customer_settings "
+            f"WHERE lower(trim(email)) IN ({ms_ph}) AND COALESCE(quality_tier,'auto') != 'auto' LIMIT 1",
+            identity_emails
+        ).fetchone()
+    else:
+        manual_setting = conn.execute('SELECT quality_tier FROM customer_settings WHERE email = ?', (email,)).fetchone()
     conn.close()
     manual_tier = manual_setting['quality_tier'] if manual_setting else 'auto'
     
@@ -4417,6 +4802,10 @@ def get_customer_details(email):
         'email': email,
         'name': customer_name,
         'phone': customer_phone,
+        # Identity surfacing: which emails were merged + why.
+        'identity_emails': identity_emails,
+        'identity_email_count': len(identity_emails),
+        'identity_matched_by': identity_matched_by,
         'total_orders': len(order_list),
         'successful_orders': successful_orders,
         'failed_orders': failed_orders,

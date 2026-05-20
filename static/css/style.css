@@ -566,3 +566,10 @@ input.flatpickr-input+input,
 .table-dark small.text-muted {
     color: #b0c4de !important;
 }
+
+/* Same fix inside the customer / order detail modals — Bootstrap's default
+   .text-muted (#6c757d) is unreadable on these dark modal backgrounds, e.g.
+   the merged-identity note, the email-log empty state and site-check hints. */
+.order-modal .text-muted {
+    color: #9fafc4 !important;
+}

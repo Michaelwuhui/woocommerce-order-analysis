@@ -8,38 +8,85 @@
     <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3">
         <div>
             <h1 class="h2 text-white">客户分析</h1>
-            <p class="text-white-50">深入了解您的客户群体，发现高价值客户并采取行动。</p>
+            <p class="text-white-50 mb-0">深入了解您的客户群体，发现高价值客户并采取行动。
+                {% if period_active %}
+                <span class="badge ms-2" style="background:rgba(96,165,250,0.18);color:#60a5fa;border:1px solid rgba(96,165,250,0.5);">
+                    <i class="bi bi-calendar-range me-1"></i>当前为「期间口径」：所有数字仅统计 {{ current_filters.date_from or '起始' }} ~ {{ current_filters.date_to or '至今' }} 的订单
+                </span>
+                {% endif %}
+            </p>
         </div>
-        <div class="btn-toolbar mb-2 mb-md-0 gap-3">
-            <div class="d-flex align-items-center gap-2">
-                <span class="text-secondary"><i class="bi bi-person-badge me-1"></i>负责人：</span>
-                <select id="managerFilter" class="form-select form-select-sm bg-dark text-white border-secondary"
-                    style="width: auto; min-width: 120px;"
-                    onchange="window.location.href='{{ url_for('customers') }}?manager=' + this.value">
-                    <option value="">全部负责人</option>
-                    {% for manager in all_managers %}
-                    <option value="{{ manager }}" {% if manager_filter==manager %}selected{% endif %}>
-                        {{ manager }}
-                    </option>
-                    {% endfor %}
-                </select>
-            </div>
-            <div class="d-flex align-items-center gap-2">
-                <span class="text-secondary"><i class="bi bi-globe me-1"></i>网站：</span>
-                <select id="sourceFilter" class="form-select form-select-sm bg-dark text-white border-secondary"
-                    style="width: auto; min-width: 180px;"
-                    onchange="window.location.href='{{ url_for('customers') }}?source=' + this.value">
-                    <option value="">全部网站</option>
-                    {% for source in sources %}
-                    <option value="{{ source.source }}" {% if source_filter==source.source %}selected{% endif %}>
-                        {{ source.source.replace('https://www.', '').replace('https://', '') }}
-                    </option>
-                    {% endfor %}
-                </select>
-            </div>
-            <div class="btn-group me-2">
-                <button type="button" class="btn btn-sm btn-outline-secondary">导出 Excel</button>
-            </div>
+        <div class="btn-group">
+            <button type="button" class="btn btn-sm btn-outline-secondary">导出 Excel</button>
+        </div>
+    </div>
+
+    <!-- Quick Date Filters -->
+    <div class="quick-filters mb-3">
+        <div class="d-flex flex-wrap gap-2 align-items-center">
+            <span class="text-secondary me-2"><i class="bi bi-calendar-range me-1"></i>快速筛选：</span>
+            {% set qd = current_filters.quick_date %}
+            <a href="{{ url_for('customers', source=current_filters.source, manager=current_filters.manager, country=current_filters.country, quick_date='this_month') }}"
+                class="btn btn-quick {% if qd == 'this_month' %}active{% endif %}"><i class="bi bi-calendar-check me-1"></i>本月至今</a>
+            <a href="{{ url_for('customers', source=current_filters.source, manager=current_filters.manager, country=current_filters.country, quick_date='last_month') }}"
+                class="btn btn-quick {% if qd == 'last_month' %}active{% endif %}"><i class="bi bi-calendar-minus me-1"></i>上个月</a>
+            <a href="{{ url_for('customers', source=current_filters.source, manager=current_filters.manager, country=current_filters.country, quick_date='last_quarter') }}"
+                class="btn btn-quick {% if qd == 'last_quarter' %}active{% endif %}"><i class="bi bi-calendar3 me-1"></i>近三个月</a>
+            <a href="{{ url_for('customers', source=current_filters.source, manager=current_filters.manager, country=current_filters.country, quick_date='half_year') }}"
+                class="btn btn-quick {% if qd == 'half_year' %}active{% endif %}"><i class="bi bi-calendar2 me-1"></i>近半年</a>
+            <a href="{{ url_for('customers', source=current_filters.source, manager=current_filters.manager, country=current_filters.country, quick_date='one_year') }}"
+                class="btn btn-quick {% if qd == 'one_year' %}active{% endif %}"><i class="bi bi-calendar-event me-1"></i>近一年</a>
+            <a href="{{ url_for('customers', source=current_filters.source, manager=current_filters.manager, country=current_filters.country, quick_date='all') }}"
+                class="btn btn-quick {% if qd == 'all' %}active{% endif %} ms-2"><i class="bi bi-arrow-counterclockwise me-1"></i>全部</a>
+        </div>
+    </div>
+
+    <!-- Filter Section -->
+    <div class="card filter-card mb-4">
+        <div class="card-body">
+            <form method="GET" action="{{ url_for('customers') }}" class="row g-3 align-items-end">
+                <input type="hidden" name="quick_date" value="{{ current_filters.quick_date }}">
+                <div class="col-md-2">
+                    <label class="form-label">国家</label>
+                    <select name="country" class="form-select" onchange="this.form.submit()">
+                        <option value="">全部国家</option>
+                        {% for country in all_countries %}
+                        <option value="{{ country }}" {% if current_filters.country==country %}selected{% endif %}>{{ country }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">负责人</label>
+                    <select name="manager" class="form-select" onchange="this.form.submit()">
+                        <option value="">全部负责人</option>
+                        {% for manager in all_managers %}
+                        <option value="{{ manager }}" {% if current_filters.manager==manager %}selected{% endif %}>{{ manager }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">网站来源</label>
+                    <select name="source" class="form-select">
+                        <option value="">全部网站</option>
+                        {% for source in sources %}
+                        <option value="{{ source.source }}" {% if current_filters.source==source.source %}selected{% endif %}>
+                            {{ source.source.replace('https://www.', '').replace('https://', '') }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">开始日期</label>
+                    <input type="text" name="date_from" id="dateFrom" class="form-control datepicker" placeholder="选择日期" value="{{ current_filters.date_from }}">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">结束日期</label>
+                    <input type="text" name="date_to" id="dateTo" class="form-control datepicker" placeholder="选择日期" value="{{ current_filters.date_to }}">
+                </div>
+                <div class="col-md-1">
+                    <button type="submit" class="btn btn-primary w-100"><i class="bi bi-search"></i></button>
+                </div>
+            </form>
         </div>
     </div>
 
@@ -135,11 +182,70 @@
         </div>
     </div>
 
+    <!-- Loss overview strip — surfaces who's costing money at a glance -->
+    {% if stats.loss and (stats.loss.customers_with_loss or 0) > 0 %}
+    <div class="card data-card mb-3" style="border-color: rgba(220,53,69,0.35);">
+        <div class="card-body py-3">
+            <div class="d-flex flex-wrap align-items-center gap-4">
+                <div>
+                    <div class="text-white-50 small"><i class="bi bi-exclamation-triangle-fill me-1" style="color:#f87171;"></i>造成损失的客户</div>
+                    <div class="fw-bold fs-5" style="color:#f87171;">{{ stats.loss.customers_with_loss }} 位</div>
+                </div>
+                <div>
+                    <div class="text-white-50 small">未送达客户</div>
+                    <div class="fw-bold" style="color:#c084fc;">{{ stats.loss.undelivered_customers }} 位</div>
+                </div>
+                <div>
+                    <div class="text-white-50 small">问题退货客户</div>
+                    <div class="fw-bold" style="color:#f87171;">{{ stats.loss.problem_return_customers }} 位</div>
+                </div>
+                <div>
+                    <div class="text-white-50 small">累计运费损失</div>
+                    {% if stats.loss.uniform_currency %}
+                    <div class="fw-bold" style="color:#fbbf24;">{{ "{:,.2f}".format(stats.loss.shipping_loss_total) }} {{ stats.loss.uniform_currency }}</div>
+                    {% else %}
+                    {% for r in stats.loss.currency_rows %}{% if r.shipping > 0 %}
+                    <div class="fw-bold" style="color:#fbbf24;">{{ "{:,.2f}".format(r.shipping) }} <span class="text-white-50 small">{{ r.currency }}</span></div>
+                    {% endif %}{% endfor %}
+                    {% endif %}
+                </div>
+                <div>
+                    <div class="text-white-50 small">累计货值损失</div>
+                    {% if stats.loss.uniform_currency %}
+                    <div class="fw-bold" style="color:#fbbf24;">{{ "{:,.2f}".format(stats.loss.product_loss_total) }} {{ stats.loss.uniform_currency }}</div>
+                    {% else %}
+                    {% for r in stats.loss.currency_rows %}{% if r.product > 0 %}
+                    <div class="fw-bold" style="color:#fbbf24;">{{ "{:,.2f}".format(r.product) }} <span class="text-white-50 small">{{ r.currency }}</span></div>
+                    {% endif %}{% endfor %}
+                    {% if stats.loss.product_loss_total == 0 %}<div class="fw-bold text-white-50">0.00</div>{% endif %}
+                    {% endif %}
+                </div>
+                <div class="ms-auto">
+                    <button class="btn btn-sm btn-outline-danger" id="toggleLossOnlyBtn">
+                        <i class="bi bi-funnel me-1"></i>只看有损失的客户
+                    </button>
+                </div>
+            </div>
+            <div class="text-muted small mt-2">
+                金额为订单原币种合计（同一客户通常单一币种）；点表头「未送达/货值损失」列可按损失金额排序。
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
     <!-- Customers Table -->
     <div class="card data-card">
         <div class="card-header d-flex justify-content-between align-items-center">
             <h5><i class="bi bi-list-ul me-2"></i>客户列表</h5>
-            <!-- Search input removed as DataTables handles it -->
+            <div class="d-flex gap-2">
+                <button class="btn btn-sm btn-outline-purple" id="toggleMergedBtn"
+                    style="color:#a78bfa;border-color:rgba(167,139,250,0.6);">
+                    <i class="bi bi-people-fill me-1"></i>只看聚合客户
+                </button>
+                <button class="btn btn-sm btn-outline-info" id="toggleMultiSiteBtn">
+                    <i class="bi bi-diagram-3 me-1"></i>只看多站客户
+                </button>
+            </div>
         </div>
         <div class="card-body p-0">
             <div class="table-responsive p-3">
@@ -148,11 +254,12 @@
                         <tr>
                             <th>客户姓名</th>
                             <th>来源</th>
+                            <th class="text-center" style="color:#5dd0e6;" title="该客户（按邮箱）在我们几个站点下过单">多站下单</th>
                             <th>触达通道</th>
                             <th>等级</th>
                             <th class="text-center">订单数</th>
                             <th class="text-end">总消费 (PLN)</th>
-                            <th class="text-center" style="color:#c084fc;">未送达</th>
+                            <th class="text-center" style="color:#fbbf24;" title="按损失金额排序">未送达 / 货值损失</th>
                             <th>最近购买</th>
                             <th>建议行动 (Smart Actions)</th>
                             <th>操作</th>
@@ -161,7 +268,7 @@
                     <tbody>
                         {% for c in customers %}
                         <tr>
-                            <td>
+                            <td data-identity-count="{{ c.identity_email_count or 1 }}">
                                 <div class="d-flex align-items-center">
                                     <div
                                         class="avatar-circle me-2 bg-gradient-{{ 'warning' if c.tier == 'VIP' else ('success' if c.tier == '优质' else ('primary' if c.tier == '普通' else 'secondary')) }}">
@@ -170,6 +277,15 @@
                                     <div>
                                         <div class="fw-bold text-white">{{ c.name or 'Unknown' }}</div>
                                         <small class="text-white-50">{{ c.email }}</small>
+                                        {% if (c.identity_email_count or 1) > 1 %}
+                                        {% set matched_map = {'phone':'同手机','address':'同地址'} %}
+                                        <div class="mt-1">
+                                            <span class="badge" style="background:rgba(167,139,250,0.18);color:#a78bfa;border:1px solid rgba(167,139,250,0.5);cursor:help;"
+                                                title="同一身份合并了 {{ c.identity_email_count }} 个邮箱（依据：{% for m in c.identity_matched_by %}{{ matched_map.get(m, m) }}{% if not loop.last %}+{% endif %}{% endfor %}）：&#10;{% for e in c.identity_emails %}· {{ e }}&#10;{% endfor %}">
+                                                <i class="bi bi-people-fill me-1"></i>合并 {{ c.identity_email_count }} 邮箱
+                                            </span>
+                                        </div>
+                                        {% endif %}
                                     </div>
                                 </div>
                             </td>
@@ -178,6 +294,16 @@
                                 %}{% if source_display_mode != 'manager_only' %}<span
                                     class="badge bg-dark border border-secondary">{{
                                     c.source.replace('https://www.', '').replace('https://', '') }}</span>{% endif %}
+                            </td>
+                            <td class="text-center" data-order="{{ c.site_count or 1 }}">
+                                {% if (c.site_count or 1) >= 2 %}
+                                <span class="badge" style="background:rgba(93,208,230,0.18);color:#5dd0e6;border:1px solid rgba(93,208,230,0.5);cursor:help;"
+                                    title="该客户在 {{ c.site_count }} 个站点下过单：&#10;{% for s in c.site_list %}· {{ s.short }}{% if s.manager %} ({{ s.manager }}){% endif %}&#10;{% endfor %}">
+                                    <i class="bi bi-diagram-3 me-1"></i>{{ c.site_count }} 站
+                                </span>
+                                {% else %}
+                                <span class="text-secondary">—</span>
+                                {% endif %}
                             </td>
                             <td>
                                 <div class="btn-group">
@@ -202,7 +328,7 @@
                             </td>
                             <td class="text-center">{{ c.successful_orders }}</td>
                             <td class="text-end fw-bold text-success">{{ c.total_spent|round(2) }}</td>
-                            <td class="text-center">
+                            <td class="text-center" data-order="{{ c.total_loss or 0 }}" data-loss="{{ c.total_loss or 0 }}">
                                 {% if (c.undelivered_orders and c.undelivered_orders > 0) or (c.problem_return_orders and c.problem_return_orders > 0) %}
                                 {% if c.undelivered_orders and c.undelivered_orders > 0 %}
                                 <span class="badge" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);" title="拒收 {{ c.undelivered_orders }} 单 / 共 {{ c.total_orders }} 单 = {{ c.refusal_rate }}%">
@@ -218,10 +344,10 @@
                                 </span>
                                 {% endif %}
                                 {% if c.shipping_loss_total > 0 %}
-                                <div><small class="text-warning">运费损失 {{ "%.2f"|format(c.shipping_loss_total) }}</small></div>
+                                <div><small class="text-warning">运费损失 {{ "%.2f"|format(c.shipping_loss_total) }} {{ c.currency }}</small></div>
                                 {% endif %}
                                 {% if c.product_loss_total and c.product_loss_total > 0 %}
-                                <div><small class="text-warning">货值损失 {{ "%.2f"|format(c.product_loss_total) }}</small></div>
+                                <div><small class="text-warning">货值损失 {{ "%.2f"|format(c.product_loss_total) }} {{ c.currency }}</small></div>
                                 {% endif %}
                                 {% else %}
                                 <span class="text-secondary">—</span>
@@ -313,8 +439,44 @@
 </style>
 
 <script>
+    // Date range pickers for the filter bar (flatpickr is loaded globally in base.html).
+    document.addEventListener('DOMContentLoaded', function () {
+        if (window.flatpickr) {
+            var dateConfig = { locale: 'zh', dateFormat: 'Y-m-d', altInput: true, altFormat: 'Y年m月d日', allowInput: true, disableMobile: true };
+            flatpickr('#dateFrom', dateConfig);
+            flatpickr('#dateTo', dateConfig);
+        }
+    });
+
     $(document).ready(function () {
-        $('#customersTable').DataTable({
+        // Column layout (after inserting 多站下单 at index 2):
+        // 0姓名 1来源 2多站 3触达 4等级 5订单数 6总消费 7损失 8最近购买 9行动 10操作
+        // "只看有损失" filter: keep only rows whose loss cell (index 7) has data-loss > 0.
+        // "只看多站客户" filter: keep only rows whose 多站 cell (index 2) data-order >= 2.
+        // "只看聚合客户" filter: keep only rows whose 姓名 cell (index 0)
+        //                       data-identity-count >= 2 (merged from ≥2 emails).
+        var lossOnly = false;
+        var multiSiteOnly = false;
+        var mergedOnly = false;
+        $.fn.dataTable.ext.search.push(function (settings, data, dataIndex) {
+            if (settings.nTable.id !== 'customersTable') return true;
+            var cells = settings.aoData[dataIndex].anCells;
+            if (lossOnly) {
+                var loss = parseFloat(cells[7].getAttribute('data-loss') || '0');
+                if (!(loss > 0)) return false;
+            }
+            if (multiSiteOnly) {
+                var sc = parseInt(cells[2].getAttribute('data-order') || '1', 10);
+                if (!(sc >= 2)) return false;
+            }
+            if (mergedOnly) {
+                var ic = parseInt(cells[0].getAttribute('data-identity-count') || '1', 10);
+                if (!(ic >= 2)) return false;
+            }
+            return true;
+        });
+
+        var dt = $('#customersTable').DataTable({
             language: {
                 "sProcessing": "处理中...",
                 "sLengthMenu": "显示 _MENU_ 项结果",
@@ -339,12 +501,73 @@
                     "sSortDescending": ": 以降序排列此列"
                 }
             },
-            order: [[5, 'desc']], // Default sort by Total Spent (index 5)
+            order: [[6, 'desc']], // Default sort by Total Spent (now index 6)
             columnDefs: [
-                { orderable: false, targets: [2, 7, 8] } // Disable sort for Contact, Smart Actions, Actions
+                { orderable: false, targets: [3, 9, 10] }, // Disable sort for Contact, Smart Actions, Actions
+                { type: 'num', targets: [2, 7] }           // 多站(2) + 损失(7) sort numerically via data-order
             ],
             pageLength: 25
         });
+
+        // Wire the "只看有损失" toggle button (only present when losses exist).
+        var lossBtn = document.getElementById('toggleLossOnlyBtn');
+        if (lossBtn) {
+            lossBtn.addEventListener('click', function () {
+                lossOnly = !lossOnly;
+                if (lossOnly) {
+                    lossBtn.classList.add('active', 'btn-danger');
+                    lossBtn.classList.remove('btn-outline-danger');
+                    lossBtn.innerHTML = '<i class="bi bi-funnel-fill me-1"></i>显示全部客户';
+                    dt.order([7, 'desc']);   // sort by loss desc so worst offenders top the list
+                } else {
+                    lossBtn.classList.remove('active', 'btn-danger');
+                    lossBtn.classList.add('btn-outline-danger');
+                    lossBtn.innerHTML = '<i class="bi bi-funnel me-1"></i>只看有损失的客户';
+                    dt.order([6, 'desc']);   // restore default sort by total spent
+                }
+                dt.draw();
+            });
+        }
+
+        // Wire the "只看多站客户" toggle button.
+        var multiBtn = document.getElementById('toggleMultiSiteBtn');
+        if (multiBtn) {
+            multiBtn.addEventListener('click', function () {
+                multiSiteOnly = !multiSiteOnly;
+                if (multiSiteOnly) {
+                    multiBtn.classList.add('active', 'btn-info');
+                    multiBtn.classList.remove('btn-outline-info');
+                    multiBtn.innerHTML = '<i class="bi bi-funnel-fill me-1"></i>显示全部客户';
+                    dt.order([2, 'desc']);   // most-spread customers first
+                } else {
+                    multiBtn.classList.remove('active', 'btn-info');
+                    multiBtn.classList.add('btn-outline-info');
+                    multiBtn.innerHTML = '<i class="bi bi-diagram-3 me-1"></i>只看多站客户';
+                    dt.order([6, 'desc']);
+                }
+                dt.draw();
+            });
+        }
+
+        // Wire the "只看聚合客户" toggle button (identity merged ≥2 emails).
+        var mergedBtn = document.getElementById('toggleMergedBtn');
+        if (mergedBtn) {
+            mergedBtn.addEventListener('click', function () {
+                mergedOnly = !mergedOnly;
+                if (mergedOnly) {
+                    mergedBtn.classList.add('active');
+                    mergedBtn.style.background = '#a78bfa';
+                    mergedBtn.style.color = '#fff';
+                    mergedBtn.innerHTML = '<i class="bi bi-funnel-fill me-1"></i>显示全部客户';
+                } else {
+                    mergedBtn.classList.remove('active');
+                    mergedBtn.style.background = '';
+                    mergedBtn.style.color = '#a78bfa';
+                    mergedBtn.innerHTML = '<i class="bi bi-people-fill me-1"></i>只看聚合客户';
+                }
+                dt.draw();
+            });
+        }
     });
 
     // Tier Chart
