@@ -14083,6 +14083,147 @@ def get_pending_orders():
     return jsonify(result)
 
 
+@app.route('/api/shipping/pending-outcome')
+@login_required
+@shipper_required
+def get_pending_outcome_orders():
+    """「待确认结局」queue: COD orders that were shipped (on-hold/shipped) some
+    days ago but whose fate was never recorded — neither 已签收 nor 拒收 nor
+    问题退货. These are the orders starving the repeat-freeloader risk index:
+    every refusal hiding here is a risk signal that never got fed back.
+
+    Oldest first, so the shipper works the backlog down. The risk badge is
+    attached so a refusal from a known bad customer is obvious at a glance."""
+    from datetime import timedelta
+    conn = get_db_connection()
+
+    try:
+        days = int(request.args.get('days', 14))
+    except (TypeError, ValueError):
+        days = 14
+    days = max(0, min(days, 3650))
+    # date_created is stored ISO 'T'-separated (e.g. 2025-06-17T19:39:35); match
+    # that format so the string comparison below is apples-to-apples.
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
+
+    source_filter = request.args.get('source', '')
+    country_filter = request.args.get('country', '')
+
+    query = '''
+        SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created,
+               o.source, o.billing, o.shipping, o.line_items, o.meta_data,
+               o.shipping_total, o.customer_note, o.warehouse_id,
+               o.carrier_status, o.carrier_status_at,
+               s.manager,
+               w.name AS warehouse_name,
+               sl.tracking_number, sl.carrier_slug, sl.shipped_at,
+               n.note AS latest_note, n.date_created AS latest_note_date, n.author AS latest_note_author
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN warehouses w ON o.warehouse_id = w.id
+        LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        LEFT JOIN (
+            SELECT order_id, note, date_created, author
+            FROM order_notes
+            WHERE customer_note = 0
+            GROUP BY order_id
+            HAVING date_created = MAX(date_created)
+        ) n ON o.id = n.order_id
+        WHERE o.status IN ('on-hold', 'shipped', 'partial-shipped')
+          AND o.payment_method = 'cod'
+          AND COALESCE(o.is_undelivered, 0) = 0
+          AND COALESCE(o.is_problem_return, 0) = 0
+          AND COALESCE(o.delivery_confirmed, 0) = 0
+          AND o.date_created <= ?
+    '''
+    params = [cutoff]
+
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    if allowed_sources is not None:
+        if not allowed_sources:
+            query += ' AND 1=0'
+        else:
+            placeholders = ','.join(['?' for _ in allowed_sources])
+            query += f' AND o.source IN ({placeholders})'
+            params.extend(allowed_sources)
+
+    if source_filter:
+        query += ' AND o.source = ?'
+        params.append(source_filter)
+    if country_filter:
+        query += ' AND s.country = ?'
+        params.append(country_filter)
+
+    # Surface the most actionable rows first: detected returns (need a 拒收
+    # decision), then attention, then carrier-confirmed deliveries (ready to
+    # batch-approve), then everything still in transit / unchecked — each group
+    # oldest-first so the backlog drains.
+    query += """ ORDER BY CASE COALESCE(o.carrier_status,'')
+                            WHEN 'returned' THEN 0
+                            WHEN 'attention' THEN 1
+                            WHEN 'delivered' THEN 2
+                            WHEN 'in_transit' THEN 3
+                            ELSE 4 END, o.date_created ASC"""
+
+    orders = conn.execute(query, params).fetchall()
+    risk_idx = _build_risk_index(conn)
+    conn.close()
+
+    now = datetime.now()
+    result = []
+    for order in orders:
+        billing = parse_json_field(order['billing']) or {}
+        shipping_info = parse_json_field(order['shipping']) or {}
+        line_items = parse_json_field(order['line_items'])
+        addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
+        meta_data = parse_json_field(order['meta_data'])
+        custom_fields = extract_custom_billing_fields(meta_data)
+
+        std_parts = [addr.get('address_1', ''), addr.get('address_2', ''),
+                     addr.get('postcode', ''), addr.get('city', ''), addr.get('country', '')]
+        customer_address = ', '.join(filter(None, std_parts))
+        if not addr.get('address_1') and (custom_fields.get('dpd_street') or custom_fields.get('dpd_city')):
+            dpd_parts = [f"{custom_fields.get('dpd_street', '')} {custom_fields.get('dpd_house', '')}".strip(),
+                         custom_fields.get('dpd_zip', ''), custom_fields.get('dpd_city', '')]
+            customer_address = ', '.join(filter(None, dpd_parts))
+
+        days_pending = None
+        try:
+            d = datetime.fromisoformat((order['date_created'] or '')[:19])
+            days_pending = (now - d).days
+        except (ValueError, TypeError):
+            pass
+
+        result.append({
+            'id': order['id'],
+            'number': order['number'],
+            'status': order['status'],
+            'total': float(order['total'] or 0),
+            'currency': order['currency'],
+            'date_created': order['date_created'],
+            'days_pending': days_pending,
+            'carrier_status': order['carrier_status'] or '',
+            'carrier_status_at': order['carrier_status_at'] or '',
+            'source': order['source'].replace('https://www.', '').replace('https://', ''),
+            'manager': order['manager'] or '',
+            'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
+            'customer_email': billing.get('email', ''),
+            'customer_phone': addr.get('phone') or billing.get('phone', ''),
+            'customer_address': customer_address,
+            'shipping_total': float(order['shipping_total'] or 0),
+            'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1)} for item in (line_items or [])],
+            'tracking_number': order['tracking_number'] or '',
+            'carrier_slug': order['carrier_slug'] or '',
+            'warehouse_name': order['warehouse_name'] or '',
+            'customer_risk': _assess_customer_risk(billing, shipping_info, risk_idx, current_order_id=order['id']),
+            'latest_note': order['latest_note'] or '',
+            'latest_note_date': order['latest_note_date'] or '',
+            'latest_note_author': order['latest_note_author'] or '',
+        })
+
+    return jsonify(result)
+
+
 @app.route('/api/shipping/shipped')
 @login_required
 @shipper_required
@@ -15606,6 +15747,163 @@ def mark_order_undelivered(order_id):
         'message': f'已标记为未送达，运费损失 {loss_amount:.2f}',
         'shipping_loss_amount': loss_amount,
     })
+
+
+@app.route('/api/order/<int:order_id>/confirm-delivery', methods=['POST'])
+@login_required
+@shipper_required
+def confirm_order_delivery(order_id):
+    """Approve a shipped order as delivered & accepted (COD collected).
+
+    This is the human approval step in the 待确认结局 workflow. It:
+      1. sets the local delivery_confirmed flag (clears it from the queue;
+         a local-only column, so it survives every sync), then
+      2. pushes the WooCommerce status to 'completed' so the store reflects
+         reality. That fires WooCommerce's 'completed' customer email — the
+         operator accepted this trade-off. WC sync is best-effort: if it fails
+         the local confirm still stands and the order still leaves the queue."""
+    import requests as req
+    conn = get_db_connection()
+    order = conn.execute(
+        'SELECT id, number, source, status, is_undelivered, is_problem_return, delivery_confirmed FROM orders WHERE id = ?',
+        (order_id,)
+    ).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+
+    if order['is_undelivered'] or order['is_problem_return']:
+        conn.close()
+        return jsonify({'success': False, 'error': '该订单已标记为未送达/问题退货，不能再标记签收'}), 409
+
+    # 1. Local confirm — source of truth for the queue; always first.
+    if not order['delivery_confirmed']:
+        try:
+            conn.execute('''UPDATE orders SET delivery_confirmed = 1,
+                            delivery_confirmed_at = datetime('now'), delivery_confirmed_by = ?
+                            WHERE id = ?''', (int(current_user.id), order_id))
+            conn.execute('''INSERT INTO order_notes (order_id, note, date_created, customer_note, author, added_by_user)
+                            VALUES (?, ?, datetime('now'), 0, ?, 1)''',
+                         (order_id, f"订单被 {current_user.name} 确认「已签收」", current_user.name))
+            conn.commit()
+        except Exception as e:
+            conn.close()
+            return jsonify({'success': False, 'error': f'本地写入失败: {e}'}), 500
+
+    # 2. Sync WooCommerce -> completed (best-effort; fires WC completed email).
+    site = conn.execute('SELECT url, consumer_key, consumer_secret, api_write_status FROM sites WHERE url = ?',
+                        (order['source'],)).fetchone()
+    sync_msg = ''
+    if order['status'] == 'completed':
+        sync_msg = '；站点已是已完成'
+    elif site and site['consumer_key'] and site['consumer_secret'] and (
+            'api_write_status' not in site.keys() or site['api_write_status'] != 'error'):
+        try:
+            r = req.put(f"{site['url']}/wp-json/wc/v3/orders/{order['id']}",
+                        json={'status': 'completed'},
+                        auth=(site['consumer_key'], site['consumer_secret']), timeout=60,
+                        headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0', 'Content-Type': 'application/json'})
+            if r.status_code in (200, 201):
+                conn.execute("UPDATE orders SET status='completed' WHERE id=?", (order_id,))
+                conn.commit()
+                sync_msg = '；已同步站点为「已完成」'
+            else:
+                sync_msg = f'；站点同步失败({r.status_code})，本地已标记签收'
+                app.logger.warning(f"confirm-delivery WC sync {order_id} -> {r.status_code}: {(r.text or '')[:200]}")
+        except Exception as e:
+            sync_msg = '；站点同步异常，本地已标记签收'
+            app.logger.warning(f"confirm-delivery WC sync {order_id} error: {e}")
+    else:
+        sync_msg = '；该站点无写权限，仅本地标记签收'
+
+    conn.close()
+    return jsonify({'success': True, 'message': '已确认签收' + sync_msg})
+
+
+@app.route('/api/order/<int:order_id>/carrier-status')
+@login_required
+@shipper_required
+def order_carrier_status(order_id):
+    """On-demand 查物流: live carrier lookup for ONE order (read-only).
+    InPost = synchronous public API (full timeline). DPD = via 17track."""
+    import requests as req
+    import carrier_tracking as ct
+    conn = get_db_connection()
+    order = conn.execute('SELECT id, number, meta_data, line_items, shipping_lines FROM orders WHERE id=?',
+                         (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+    krow = conn.execute("SELECT value FROM settings WHERE key='track718_api_key'").fetchone()
+    key718 = krow['value'] if krow else None
+    conn.close()
+
+    # Extract tracking number + provider (AST -> VillaTheme -> _tracking_number)
+    number, provider = '', ''
+    md = parse_json_field(order['meta_data']) or []
+    li = parse_json_field(order['line_items']) or []
+    for m in md:
+        if isinstance(m, dict) and m.get('key') == '_wc_shipment_tracking_items':
+            v = m.get('value') or []
+            if v and isinstance(v[0], dict) and v[0].get('tracking_number'):
+                number = str(v[0]['tracking_number']).strip()
+                provider = str(v[0].get('tracking_provider', ''))
+                break
+    if not number:
+        for it in li:
+            for m in (it.get('meta_data', []) if isinstance(it, dict) else []):
+                if isinstance(m, dict) and m.get('key') == '_vi_wot_order_item_tracking_data':
+                    try:
+                        td = m.get('value')
+                        td = json.loads(td) if isinstance(td, str) else td
+                        if td and td[0].get('tracking_number'):
+                            number = str(td[0]['tracking_number']).strip()
+                            provider = str(td[0].get('carrier_slug') or td[0].get('carrier_name') or '')
+                    except Exception:
+                        pass
+                if number:
+                    break
+            if number:
+                break
+    if not number:
+        for m in md:
+            if isinstance(m, dict) and m.get('key') == '_tracking_provider':
+                provider = provider or str(m.get('value', ''))
+            if isinstance(m, dict) and m.get('key') == '_tracking_number' and str(m.get('value', '')).strip():
+                number = str(m['value']).strip()
+    if not number:
+        return jsonify({'success': False, 'error': '该订单没有运单号'}), 404
+
+    carrier = ct.classify_carrier(provider, number)
+    if carrier == 'inpost':
+        try:
+            r = req.get(f"https://api-shipx-pl.easypack24.net/v1/tracking/{number}",
+                        headers={'User-Agent': 'woo-analysis-tracker/1.0'}, timeout=12)
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'InPost 查询失败: {e}'}), 502
+        if r.status_code == 404:
+            return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
+                            'outcome': 'unknown', 'events': [], 'note': 'InPost 查无此单（可能太老已清除）'})
+        if r.status_code != 200:
+            return jsonify({'success': False, 'error': f'InPost API {r.status_code}'}), 502
+        d = r.json()
+        raw = d.get('status', '')
+        events = sorted([{'time': ev.get('datetime', ''), 'status': ev.get('status', '')}
+                         for ev in (d.get('tracking_details') or [])],
+                        key=lambda e: e['time'], reverse=True)
+        return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
+                        'raw': raw, 'outcome': ct.INPOST_STATUS_MAP.get(raw, 'in_transit'), 'events': events})
+    if carrier == 'dpd':
+        if not key718:
+            return jsonify({'success': False, 'error': '未配置 Track718 key'}), 400
+        res = ct.track718_detail(number, key718)
+        if res.get('events'):
+            return jsonify({'success': True, 'carrier': 'DPD', 'tracking_number': number,
+                            'outcome': res.get('outcome', 'unknown'), 'events': res['events']})
+        return jsonify({'success': True, 'carrier': 'DPD', 'tracking_number': number,
+                        'outcome': res.get('outcome', 'unknown'), 'events': [],
+                        'note': 'Track718 正在抓取轨迹，请稍后再查（DPD 单需登记后等几分钟）'})
+    return jsonify({'success': False, 'error': f'未识别物流商（provider={provider}）'}), 400
 
 
 @app.route('/api/order/<int:order_id>/unmark-undelivered', methods=['POST'])

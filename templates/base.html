@@ -595,6 +595,102 @@
             }).catch(e => alert('请求失败: ' + e.message));
         }
 
+        // ─── 查物流 (live carrier tracking) — global so it works from the
+        //     order list, order-detail modal, shipped tab, 待确认结局, etc.
+        const INPOST_EVENT_LABELS = {
+            created: '已创建', confirmed: '已确认', offers_prepared: '已下单',
+            dispatched_by_sender: '寄件人已发出', collected_from_sender: '已揽收',
+            taken_by_courier: '快递员已取件', adopted_at_source_branch: '到达始发分拣',
+            sent_from_source_branch: '从始发分拣发出', adopted_at_sorting_center: '到达分拣中心',
+            out_for_delivery: '派送中', ready_to_pickup: '到达待取(柜机)', delivered: '已签收',
+            avizo: '投递通知/待取', returned_to_sender: '退回寄件人', canceled: '已取消',
+            stack_in_box_machine: '已投柜', stack_parcel_pickup_time_expired: '取件超时',
+        };
+        const DPD_PL_PHRASES = [
+            ['Zarejestrowano dane', '已登记包裹数据（尚未交寄）'],
+            ['jeszcze nienadana', '尚未交寄'],
+            ['Nadanie przesyłki w punkcie Pickup', '在 Pickup 点交寄'],
+            ['Nadanie przesyłki', '已交寄'],
+            ['Przekazanie przesyłki kurierowi', '移交给快递员'],
+            ['odebrana przez Kuriera', '快递员已揽收'],
+            ['Przyjęcie przesyłki w oddziale', '到达 DPD 分拣点'],
+            ['Wydanie przesyłki do doręczenia', '出库派送'],
+            ['Przekazanie przesyłki do doręczenia', '移交派送'],
+            ['Przesyłka doręczona', '✅ 已签收/送达'],
+            ['W doręczeniu', '派送中'],
+            ['Powiadomienie mail', '邮件通知'],
+            ['Powiadomienie SMS', '短信通知'],
+            ['Awizo', '投递通知（待取）'],
+            ['Przesyłka zwrócona', '↩ 已退回'],
+            ['Zwrot', '↩ 退回'],
+            ['Niedoręczona', '投递失败'],
+            ['Magazyn', '仓库'],
+            ['doręczona', '已送达'],
+        ];
+        function carrierEventLabel(s) {
+            const stripped = (s || '').replace(/^WA\d+(\/PL\d+)?,\s*/i, '').trim();
+            if (INPOST_EVENT_LABELS[stripped]) return INPOST_EVENT_LABELS[stripped];
+            for (const [pl, zh] of DPD_PL_PHRASES) {
+                if (stripped.indexOf(pl) !== -1) return zh;
+            }
+            return stripped || (s || '');
+        }
+        function queryCarrier(orderId, orderNumber) {
+            if (typeof showToast === 'function') showToast('正在查询物流…', 'info');
+            fetch(`/api/order/${orderId}/carrier-status`)
+                .then(res => res.json())
+                .then(data => {
+                    if (!data.success) { alert('查询失败: ' + (data.error || '未知错误')); return; }
+                    const outMap = { delivered: '🟢 已签收', returned: '🔴 退回', attention: '🟡 异常', in_transit: '🔵 在途', unknown: '⚪ 未知' };
+                    let html = `<div class="mb-2 pb-2 border-bottom border-secondary border-opacity-25">
+                        <strong>#${orderNumber}</strong> · ${data.carrier} · <span class="text-info">${data.tracking_number || ''}</span>
+                        <span class="ms-2 small text-muted">${outMap[data.outcome] || data.outcome || ''}</span></div>`;
+                    if (data.events && data.events.length) {
+                        const th = 'text-align:left;padding:6px 10px;color:#9ca3af;font-weight:normal;border-bottom:1px solid rgba(255,255,255,0.18);white-space:nowrap;';
+                        html += '<div style="max-height:460px;overflow:auto;">' +
+                            '<table style="width:100%;border-collapse:collapse;background:transparent;font-size:0.92rem;">' +
+                            `<thead><tr><th style="${th}">时间</th><th style="${th}">状态</th><th style="${th}">物流商原文</th></tr></thead><tbody>`;
+                        data.events.forEach((e, i) => {
+                            const t = (e.time || '').replace('T', ' ').substring(0, 16);
+                            const zh = carrierEventLabel(e.status);
+                            const fw = i === 0 ? '600' : '400';
+                            const bd = 'border-bottom:1px solid rgba(255,255,255,0.06);padding:6px 10px;';
+                            html += `<tr style="background:transparent;">
+                                <td style="${bd}white-space:nowrap;color:#cbd5e1;font-weight:${fw};">${t}</td>
+                                <td style="${bd}color:${i === 0 ? '#ffffff' : '#e5e7eb'};font-weight:${fw};">${zh}</td>
+                                <td style="${bd}color:#94a3b8;font-size:0.85em;">${(e.status || '')}</td></tr>`;
+                        });
+                        html += '</tbody></table></div>';
+                    } else {
+                        html += `<div class="text-warning small">${data.note || '暂无轨迹明细'}</div>`;
+                    }
+                    showCarrierModal(html);
+                })
+                .catch(err => alert('请求失败: ' + err));
+        }
+        function showCarrierModal(html) {
+            let el = document.getElementById('carrierModal');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'carrierModal'; el.className = 'modal fade'; el.tabIndex = -1;
+                el.innerHTML = `<div class="modal-dialog modal-lg modal-dialog-scrollable"><div class="modal-content bg-dark border border-secondary border-opacity-25 text-light">
+                    <div class="modal-header border-secondary border-opacity-25"><h6 class="modal-title"><i class="bi bi-truck me-1"></i>物流轨迹</h6>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+                    <div class="modal-body" id="carrierModalBody"></div></div></div>`;
+                document.body.appendChild(el);
+            }
+            document.getElementById('carrierModalBody').innerHTML = html;
+            // Stack ABOVE any modal already open (e.g. the 订单详情 modal) so the
+            // timeline isn't hidden behind it. Default modal z-index is ~1055.
+            el.style.zIndex = '20000';
+            el.addEventListener('shown.bs.modal', function onShown() {
+                el.removeEventListener('shown.bs.modal', onShown);
+                const bds = document.querySelectorAll('.modal-backdrop');
+                if (bds.length) bds[bds.length - 1].style.zIndex = '19990';
+            });
+            bootstrap.Modal.getOrCreateInstance(el).show();
+        }
+
         function showOrderDetail(orderId) {
             var modal = new bootstrap.Modal(document.getElementById('orderDetailModal'));
             document.getElementById('modalOrderNumber').textContent = orderId;
@@ -1068,6 +1164,7 @@
                         html += '<div class="col-12">';
                         html += '<div class="info-card" style="border-color: rgba(16, 185, 129, 0.3);"><div class="card-header" style="background: linear-gradient(90deg, rgba(16, 185, 129, 0.15) 0%, transparent 100%);"><h6 style="color: #34d399;"><i class="bi bi-geo-alt-fill me-2"></i>运单追踪</h6></div>';
                         html += '<div class="card-body">';
+                        html += '<button class="btn btn-sm btn-success mb-2" onclick="queryCarrier(' + order.id + ', \'' + (order.number || '') + '\')"><i class="bi bi-truck me-1"></i>查物流（实时中文轨迹）</button>';
                         allTracking.forEach(function (t) {
                             html += '<div class="mb-2 p-2 rounded" style="background: rgba(16, 185, 129, 0.1);">';
                             html += '<div><strong>运单号:</strong> <span class="text-info">' + t.tracking_number + '</span></div>';
