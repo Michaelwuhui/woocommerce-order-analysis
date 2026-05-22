@@ -10108,9 +10108,11 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
             v['shipping_loss'] = round(v['shipping_loss'], 2)
 
     total_net = total_gross - total_shipping - total_shipping_loss
-    cost_ratio = float(partner['cost_ratio'] or 0.5)
-    pp_ratio = float(partner['partner_profit_ratio'] or 0.25)
-    op_ratio = float(partner['our_profit_ratio'] or 0.25)
+    # NULL means "unset" → use contract default; an explicit 0 is a real ratio
+    # and must be honored (0 is falsy, so `or DEFAULT` would wrongly override it).
+    cost_ratio = float(partner['cost_ratio']) if partner['cost_ratio'] is not None else 0.5
+    pp_ratio = float(partner['partner_profit_ratio']) if partner['partner_profit_ratio'] is not None else 0.25
+    op_ratio = float(partner['our_profit_ratio']) if partner['our_profit_ratio'] is not None else 0.25
 
     # Actual margin = net − actual cost (50%-fallback already inside total_actual_cost)
     actual_margin = total_net - total_actual_cost
@@ -10196,9 +10198,9 @@ def _empty_recon_detail(partner, currency, year, month):
         'actual_margin_pct': None,
         'partner_profit_pln': 0,
         'our_receivable_pln': 0,
-        'cost_ratio': float(partner['cost_ratio'] or 0.5),
-        'partner_profit_ratio': float(partner['partner_profit_ratio'] or 0.25),
-        'our_profit_ratio': float(partner['our_profit_ratio'] or 0.25),
+        'cost_ratio': float(partner['cost_ratio']) if partner['cost_ratio'] is not None else 0.5,
+        'partner_profit_ratio': float(partner['partner_profit_ratio']) if partner['partner_profit_ratio'] is not None else 0.25,
+        'our_profit_ratio': float(partner['our_profit_ratio']) if partner['our_profit_ratio'] is not None else 0.25,
         'by_status': {},
         'by_site': [],
         'by_product': [],
@@ -11404,8 +11406,8 @@ def api_recon_dashboard_monthly_trend():
         ''', (partner_id, ym_min, ym_max)).fetchall()
         rcpt_map = {r['ym']: float(r['received'] or 0) for r in rcpt_rows}
 
-        cr  = float(partner['cost_ratio'] or 0.5)
-        opr = float(partner['our_profit_ratio'] or 0.25)
+        cr  = float(partner['cost_ratio']) if partner['cost_ratio'] is not None else 0.5
+        opr = float(partner['our_profit_ratio']) if partner['our_profit_ratio'] is not None else 0.25
 
         # Build full series — fill 0s for empty months. Actual cost computation
         # is expensive (per-line product lookup) so we only call the detail

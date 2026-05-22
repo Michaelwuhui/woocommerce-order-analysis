@@ -2142,9 +2142,9 @@ function renderPreviewCards(data) {
         // Compute both contract-based and actual-based values; show pp/our
         // numbers based on the active mode.
         const mode = getFormulaMode();
-        const ppr = data.partner_profit_ratio || 0.25;
-        const opr = data.our_profit_ratio || 0.25;
-        const cr  = data.cost_ratio || 0.50;
+        const ppr = data.partner_profit_ratio ?? 0.25;
+        const opr = data.our_profit_ratio ?? 0.25;
+        const cr  = data.cost_ratio ?? 0.50;
         const remTotal = ppr + opr;
         const ppShare = remTotal > 0 ? (ppr / remTotal) : 0.5;
         const opShare = remTotal > 0 ? (opr / remTotal) : 0.5;
@@ -2325,9 +2325,9 @@ function renderFormulaBreakdown(d) {
     const ourRecv = d.our_receivable_pln || 0;
     const margin  = net - actual;
 
-    const cr  = d.cost_ratio           || 0.50;
-    const ppr = d.partner_profit_ratio || 0.25;
-    const opr = d.our_profit_ratio     || 0.25;
+    const cr  = d.cost_ratio           ?? 0.50;
+    const ppr = d.partner_profit_ratio ?? 0.25;
+    const opr = d.our_profit_ratio     ?? 0.25;
 
     // Actual-mode: split the remainder (net − actual_cost) between partner
     // and us, proportional to (pp_ratio : op_ratio). When pp = op = 0.25,
