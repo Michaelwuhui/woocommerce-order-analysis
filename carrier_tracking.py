@@ -11,6 +11,8 @@ returns 'dpd' so the resolver can skip those rows until a DPD path is chosen.
 This module does pure lookups: no DB access, no writes. The resolver
 (resolve_outcomes.py) owns all DB side effects and policy.
 """
+import time
+
 import requests
 
 INPOST_TRACKING_URL = "https://api-shipx-pl.easypack24.net/v1/tracking/{number}"
@@ -48,10 +50,16 @@ def classify_carrier(provider, tracking_number=None):
         return 'inpost'
     if 'dpd' in p:
         return 'dpd'
-    tn = ''.join(ch for ch in (tracking_number or '') if ch.isdigit())
-    if len(tn) >= 20:
-        return 'inpost'
-    if 11 <= len(tn) <= 16:
+    # Provider names some OTHER real carrier (australia-post, ems, gls, …):
+    # do NOT guess from the number shape — hand it to Track718 to auto-detect.
+    if p and not p.startswith('custom') and p not in ('', 'unknown', 'auto', 'other'):
+        return 'unknown'
+    # No useful provider → guess by number FORMAT.
+    raw = (tracking_number or '').strip()
+    digits = ''.join(ch for ch in raw if ch.isdigit())
+    if raw.isdigit() and len(raw) >= 20:   # InPost = a PURE 24-digit number
+        return 'inpost'                    # (AusPost 'R…' / others have letters → not InPost)
+    if 11 <= len(digits) <= 16:            # DPD-PL = ~13 digits (often + trailing letter)
         return 'dpd'
     return 'unknown'
 
@@ -187,36 +195,61 @@ def track718_query(numbers, key, code=TRACK718_DPD_PL, timeout=25, session=None)
     return out
 
 
-def track718_detail(number, key, code=TRACK718_DPD_PL, timeout=25, session=None):
+def track718_detail(number, key, code=None, timeout=25, session=None, poll=3, poll_wait=2.0):
     """On-demand single-number lookup returning the FULL event timeline
-    (for the 查物流 button). Adds first (so Track718 crawls) then queries and
-    flattens fromDetail+toDetail into time-sorted events."""
+    (for the 查物流 button). `code` forces a carrier (e.g. 'dpd-pl'); when None,
+    Track718 AUTO-DETECTS the carrier — covering EMS/中国邮政, Australia Post,
+    GLS, etc. Track718 is async (add → crawl → query), so we poll the query a
+    few times over a few seconds to catch numbers that crawl quickly. Returns
+    detected `carrier` + time-sorted events flattened from fromDetail+toDetail."""
     getter = session or requests
-    track718_add([{'trackNum': number, 'code': code}], key, session=getter)
+    item = {'trackNum': number}
+    if code:
+        item['code'] = code
+    # Register; if Track718 can't auto-detect the carrier (errorCode 40013) it
+    # returns candidate codes in `otherCodes` — retry the add with the first
+    # one (e.g. 'australia-post') so the number actually gets registered/crawled.
     try:
-        r = getter.post(TRACK718_QUERY_URL, json=[{'trackNum': number, 'code': code}],
-                        headers=_t718_headers(key), timeout=timeout)
-        rows = ((r.json().get('data') or {}).get('list')) or []
+        ar = getter.post(TRACK718_ADD_URL, json=[item], headers=_t718_headers(key), timeout=timeout).json()
+        errs = ((ar.get('data') or {}).get('errors')) or []
+        if errs and not item.get('code'):
+            oc = errs[0].get('otherCodes') or []
+            if oc:
+                item['code'] = oc[0]
+                getter.post(TRACK718_ADD_URL, json=[item], headers=_t718_headers(key), timeout=timeout)
     except (requests.exceptions.RequestException, ValueError):
-        return {'ok': False, 'error': 'conn', 'events': []}
-    if not rows:
-        return {'ok': False, 'error': 'no_info', 'events': []}
-    row = rows[0]
-    result = row.get('result', 0)
-    outcome = TRACK718_RESULT_MAP.get(result)
-    events = []
-    for seg in ('toDetail', 'fromDetail'):
-        for e in (row.get(seg) or []):
-            t = e.get('date', '')          # Track718 event fields: date + status
-            if not t:
-                continue
-            ai = e.get('addressInfo') or {}
-            loc = e.get('address') or ' '.join(p for p in (ai.get('city', ''), ai.get('country', '')) if p) or ''
-            events.append({'time': t, 'status': ((loc + ' · ') if loc else '') + (e.get('status', '') or '')})
-    events.sort(key=lambda x: x['time'], reverse=True)
-    return {'ok': bool(events or outcome), 'result': result,
-            'outcome': outcome or 'unknown', 'events': events,
-            'error': None if (events or outcome) else 'no_info'}
+        pass
+    last = {'ok': False, 'error': 'no_info', 'events': []}
+    for attempt in range(max(1, poll)):
+        if attempt:
+            time.sleep(poll_wait)
+        try:
+            r = getter.post(TRACK718_QUERY_URL, json=[item], headers=_t718_headers(key), timeout=timeout)
+            rows = ((r.json().get('data') or {}).get('list')) or []
+        except (requests.exceptions.RequestException, ValueError):
+            last = {'ok': False, 'error': 'conn', 'events': []}
+            continue
+        if not rows:
+            continue
+        row = rows[0]
+        result = row.get('result', 0)
+        outcome = TRACK718_RESULT_MAP.get(result)
+        events = []
+        for seg in ('toDetail', 'fromDetail'):
+            for e in (row.get(seg) or []):
+                t = e.get('date', '')          # Track718 event fields: date + status
+                if not t:
+                    continue
+                ai = e.get('addressInfo') or {}
+                loc = e.get('address') or ' '.join(p for p in (ai.get('city', ''), ai.get('country', '')) if p) or ''
+                events.append({'time': t, 'status': ((loc + ' · ') if loc else '') + (e.get('status', '') or '')})
+        events.sort(key=lambda x: x['time'], reverse=True)
+        last = {'ok': bool(events or outcome), 'result': result, 'outcome': outcome or 'unknown',
+                'carrier': row.get('code') or code or '', 'events': events,
+                'error': None if (events or outcome) else 'no_info'}
+        if events:           # got the timeline → stop polling
+            break
+    return last
 
 
 def lookup(carrier, tracking_number, key=None, **kw):

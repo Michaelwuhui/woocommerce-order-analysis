@@ -635,6 +635,16 @@
             }
             return stripped || (s || '');
         }
+        // Official carrier tracking page — fallback when the in-app timeline is
+        // empty (e.g. Track718 can't crawl Australia Post for some numbers).
+        function carrierWebUrl(carrier, num) {
+            const c = (carrier || '').toLowerCase();
+            num = encodeURIComponent(num || '');
+            if (c.indexOf('inpost') !== -1) return 'https://inpost.pl/sledzenie-przesylek?number=' + num;
+            if (c.indexOf('dpd') !== -1) return 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + num;
+            if (c.indexOf('australia') !== -1 || c.indexOf('auspost') !== -1) return 'https://auspost.com.au/mypost/track/details/' + num;
+            return 'https://www.17track.net/zh-CN/track#nums=' + num;
+        }
         function queryCarrier(orderId, orderNumber) {
             if (typeof showToast === 'function') showToast('正在查询物流…', 'info');
             fetch(`/api/order/${orderId}/carrier-status`)
@@ -642,9 +652,11 @@
                 .then(data => {
                     if (!data.success) { alert('查询失败: ' + (data.error || '未知错误')); return; }
                     const outMap = { delivered: '🟢 已签收', returned: '🔴 退回', attention: '🟡 异常', in_transit: '🔵 在途', unknown: '⚪ 未知' };
+                    const webUrl = carrierWebUrl(data.carrier, data.tracking_number);
                     let html = `<div class="mb-2 pb-2 border-bottom border-secondary border-opacity-25">
                         <strong>#${orderNumber}</strong> · ${data.carrier} · <span class="text-info">${data.tracking_number || ''}</span>
-                        <span class="ms-2 small text-muted">${outMap[data.outcome] || data.outcome || ''}</span></div>`;
+                        <span class="ms-2 small text-muted">${outMap[data.outcome] || data.outcome || ''}</span>
+                        <a href="${webUrl}" target="_blank" class="ms-2 small text-decoration-none">官网查询↗</a></div>`;
                     if (data.events && data.events.length) {
                         const th = 'text-align:left;padding:6px 10px;color:#9ca3af;font-weight:normal;border-bottom:1px solid rgba(255,255,255,0.18);white-space:nowrap;';
                         html += '<div style="max-height:460px;overflow:auto;">' +
@@ -662,7 +674,9 @@
                         });
                         html += '</tbody></table></div>';
                     } else {
-                        html += `<div class="text-warning small">${data.note || '暂无轨迹明细'}</div>`;
+                        html += `<div class="text-warning small mb-2">${data.note || '暂无轨迹明细'}</div>`;
+                        html += `<div class="small text-muted mb-2">该物流商在聚合平台暂无可用轨迹（如 Australia Post 等)，可点下方按钮到物流商官网查询：</div>`;
+                        html += `<a href="${webUrl}" target="_blank" class="btn btn-sm btn-outline-info"><i class="bi bi-box-arrow-up-right me-1"></i>去物流商官网查询</a>`;
                     }
                     showCarrierModal(html);
                 })

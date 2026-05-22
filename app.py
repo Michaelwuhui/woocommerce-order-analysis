@@ -11818,6 +11818,270 @@ def api_get_statement(stmt_id):
     return jsonify(result)
 
 
+@app.route('/api/reconciliation/statements/<int:stmt_id>/export', methods=['GET'])
+@login_required
+@reconciliation_api_required
+def api_export_statement(stmt_id):
+    """Export one reconciliation statement as a styled multi-sheet .xlsx.
+
+    Sheets: 对账单汇总 / 按站点 / 按产品 / 收款记录. Read-only — access mirrors
+    the detail view (via _check_partner_access), so a partner can export their
+    own statement. Top-line amounts come from the saved snapshot; the
+    by-site / by-product drill-down is recomputed live, exactly like the
+    detail modal. Manual statements have no live drill-down → only the
+    summary (+ receipts) sheet is produced.
+    """
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    conn = get_db_connection()
+    stmt = conn.execute('''
+        SELECT s.*, p.name AS partner_name, p.currency
+        FROM reconciliation_statements s
+        JOIN partners p ON s.partner_id = p.id
+        WHERE s.id = ?
+    ''', (stmt_id,)).fetchone()
+    if not stmt:
+        conn.close()
+        return jsonify({'error': '对账单不存在'}), 404
+    if not _check_partner_access(stmt['partner_id']):
+        conn.close()
+        return jsonify({'error': '无权查看'}), 403
+    receipts = conn.execute(
+        'SELECT * FROM partner_receipts WHERE statement_id = ? ORDER BY receipt_date DESC',
+        (stmt_id,)
+    ).fetchall()
+    conn.close()
+
+    data = dict(stmt)
+    currency = data.get('currency') or 'PLN'
+    _enrich_statement_cny(data, currency)
+    rate = data.get('effective_rate_cny')
+    total_received = round(sum((r['amount_pln'] or 0) for r in receipts), 2)
+    outstanding = round((data.get('our_receivable_pln') or 0) - total_received, 2)
+    received_cny = round(total_received * rate, 2) if rate else None
+    outstanding_cny = round(outstanding * rate, 2) if rate else None
+
+    # Live drill-down (status / site / product) — only for system-generated stmts
+    live = None
+    if not data.get('is_manual'):
+        try:
+            live = _calc_partner_recon_detail(
+                data['partner_id'], data['period_year'], data['period_month'])
+        except Exception as e:
+            app.logger.warning(f"export: live detail failed for stmt {stmt_id}: {e}")
+
+    STATUS_LABELS = {
+        'draft': '草稿', 'generated': '已生成', 'disputed': '合伙人有异议',
+        'confirmed': '合伙人已确认', 'locked': '已锁定', 'settled': '已结清',
+    }
+
+    # ---- shared styles ----
+    FONT = '微软雅黑'
+    title_font = Font(name=FONT, size=15, bold=True, color='FFFFFF')
+    title_fill = PatternFill('solid', fgColor='1E3A8A')
+    hdr_font   = Font(name=FONT, size=11, bold=True, color='FFFFFF')
+    hdr_fill   = PatternFill('solid', fgColor='374151')
+    key_font   = Font(name=FONT, size=11, bold=True)
+    key_fill   = PatternFill('solid', fgColor='F3F4F6')
+    val_font   = Font(name=FONT, size=11)
+    total_font = Font(name=FONT, size=11, bold=True, color='1D4ED8')
+    total_fill = PatternFill('solid', fgColor='EFF6FF')
+    MONEY = '#,##0.00'
+    thin = Side(style='thin', color='D1D5DB')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    C = Alignment(horizontal='center', vertical='center')
+    R = Alignment(horizontal='right', vertical='center')
+    L = Alignment(horizontal='left', vertical='center', wrap_text=True)
+
+    def put(ws, r, c, value=None, font=None, fill=None, align=None, fmt=None, bd=True):
+        cell = ws.cell(row=r, column=c, value=value)
+        if font: cell.font = font
+        if fill: cell.fill = fill
+        if align: cell.alignment = align
+        if fmt: cell.number_format = fmt
+        if bd: cell.border = border
+        return cell
+
+    def disp_w(s):
+        # CJK chars take ~2 cells of width
+        return sum(2 if ord(ch) > 0x2E7F else 1 for ch in str(s))
+
+    def write_table(ws, columns, rows, money_cols=(), int_cols=(), total_last=False):
+        ws.sheet_view.showGridLines = False
+        for ci, h in enumerate(columns, 1):
+            put(ws, 1, ci, h, font=hdr_font, fill=hdr_fill, align=C)
+        n = len(rows)
+        for ri, rowvals in enumerate(rows, 2):
+            is_tot = total_last and ri == n + 1
+            for ci, v in enumerate(rowvals, 1):
+                num = ci in money_cols or ci in int_cols
+                cell = put(ws, ri, ci, v,
+                           font=(total_font if is_tot else val_font),
+                           fill=(total_fill if is_tot else None),
+                           align=(R if num else L))
+                if ci in money_cols and isinstance(v, (int, float)):
+                    cell.number_format = MONEY
+                elif ci in int_cols and isinstance(v, (int, float)):
+                    cell.number_format = '#,##0'
+        for ci in range(1, len(columns) + 1):
+            vals = [columns[ci - 1]] + [r[ci - 1] for r in rows]
+            w = max((disp_w(x) for x in vals), default=10)
+            ws.column_dimensions[get_column_letter(ci)].width = min(46, max(10, w + 3))
+        ws.freeze_panes = 'A2'
+
+    wb = Workbook()
+
+    # ===================== Sheet 1: 对账单汇总 =====================
+    ws = wb.active
+    ws.title = '对账单汇总'
+    ws.sheet_view.showGridLines = False
+    for i, w in enumerate([26, 18, 18, 18], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.merge_cells('A1:D1')
+    put(ws, 1, 1, '合伙人对账单', font=title_font, fill=title_fill, align=C, bd=False)
+    for c in range(2, 5):
+        put(ws, 1, c, None, fill=title_fill, bd=False)
+    ws.row_dimensions[1].height = 30
+
+    rate_txt = f'1 {currency} = {rate} CNY' if rate else '未配置'
+    confirm_txt = '—'
+    if data.get('confirmed_name') or data.get('confirmed_at'):
+        nm = data.get('confirmed_name') or ''
+        at = data.get('confirmed_at')
+        confirm_txt = (f'{nm}（{at}）' if at else nm) or '—'
+    info_pairs = [
+        ('合伙人', data.get('partner_name') or '', '期间', f"{data['period_year']}-{data['period_month']:02d}"),
+        ('货币', currency, '汇率', rate_txt),
+        ('状态', STATUS_LABELS.get(data.get('status'), data.get('status') or ''),
+         '类型', '手工录入' if data.get('is_manual') else '系统生成'),
+        ('生成时间', str(data.get('created_at') or ''), '确认签字', confirm_txt),
+    ]
+    r = 2
+    for k1, v1, k2, v2 in info_pairs:
+        put(ws, r, 1, k1, font=key_font, fill=key_fill, align=L)
+        put(ws, r, 2, v1, font=val_font, align=L)
+        put(ws, r, 3, k2, font=key_font, fill=key_fill, align=L)
+        put(ws, r, 4, v2, font=val_font, align=L)
+        r += 1
+
+    r += 1  # spacer
+    put(ws, r, 1, '项目', font=hdr_font, fill=hdr_fill, align=C)
+    put(ws, r, 2, f'金额（{currency}）', font=hdr_font, fill=hdr_fill, align=C)
+    put(ws, r, 3, '金额（CNY）', font=hdr_font, fill=hdr_fill, align=C)
+    put(ws, r, 4, None, fill=hdr_fill)
+    ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=4)
+    r += 1
+
+    net = data.get('total_net_pln') or 0
+
+    def pctlabel(amount):
+        return f'（{(amount or 0) / net * 100:.0f}%）' if net else ''
+
+    summary_rows = []
+    summary_rows.append(('订单数', data.get('total_orders') or 0, None, False, True))
+    summary_rows.append(('总销售额', data.get('total_gross_pln'), data.get('total_gross_cny'), False, False))
+    if live:
+        ss = (live.get('by_status', {}) or {}).get('success', {}) or {}
+        ship_succ = ss.get('shipping', 0) or 0
+        loss = live.get('shipping_loss') or 0
+        summary_rows.append(('减：运费成本（成功订单）', -ship_succ, round(-ship_succ * rate, 2) if rate else None, False, False))
+        summary_rows.append(('减：运费损失（未送达）', -loss, round(-loss * rate, 2) if rate else None, False, False))
+    summary_rows.append(('净销售额', data.get('total_net_pln'), data.get('total_net_cny'), True, False))
+    summary_rows.append(('约定成本' + pctlabel(data.get('cost_amount_pln')), data.get('cost_amount_pln'), data.get('cost_amount_cny'), False, False))
+    summary_rows.append(('合伙人利润' + pctlabel(data.get('partner_profit_pln')), data.get('partner_profit_pln'), data.get('partner_profit_cny'), False, False))
+    summary_rows.append(('我方应收' + pctlabel(data.get('our_receivable_pln')), data.get('our_receivable_pln'), data.get('our_receivable_cny'), True, False))
+    if live and live.get('actual_cost_pln') is not None:
+        ac = live.get('actual_cost_pln') or 0
+        summary_rows.append(('实际产品成本（参考）', ac, round(ac * rate, 2) if rate else None, False, False))
+    summary_rows.append(('已收', total_received, received_cny, False, False))
+    summary_rows.append(('未收', outstanding, outstanding_cny, True, False))
+
+    for label, pln, cny, is_total, is_count in summary_rows:
+        fl = total_fill if is_total else None
+        vf = total_font if is_total else val_font
+        put(ws, r, 1, label, font=(total_font if is_total else key_font), fill=fl, align=L)
+        put(ws, r, 2, pln, font=vf, fill=fl, align=R, fmt=('#,##0' if is_count else MONEY))
+        put(ws, r, 3, (cny if cny is not None else None), font=vf, fill=fl, align=R, fmt=(None if is_count else MONEY))
+        put(ws, r, 4, None, fill=fl)
+        ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=4)
+        r += 1
+
+    if data.get('notes'):
+        r += 1
+        put(ws, r, 1, '备注', font=key_font, fill=key_fill, align=L)
+        put(ws, r, 2, data.get('notes'), font=val_font, align=L)
+        put(ws, r, 3, None)
+        put(ws, r, 4, None)
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=4)
+        ws.row_dimensions[r].height = 40
+
+    # ===================== Sheet 2: 按站点 =====================
+    if live and live.get('by_site'):
+        site_cols = ['站点', '国家', '负责人', '订单数', '成功单', '未送达单',
+                     f'总销售（{currency}）', '运费', '净销售', '运费损失']
+        site_rows = []
+        for s in live['by_site']:
+            site_rows.append([
+                s.get('site_url', ''), s.get('country', ''), s.get('manager', ''),
+                s.get('orders', 0), s.get('success_orders', 0), s.get('undelivered_orders', 0),
+                round(s.get('gross', 0), 2), round(s.get('shipping', 0), 2),
+                round(s.get('net', 0), 2), round(s.get('shipping_loss', 0), 2),
+            ])
+        if site_rows:
+            site_rows.append([
+                '合计', '', '',
+                sum(x[3] for x in site_rows), sum(x[4] for x in site_rows), sum(x[5] for x in site_rows),
+                round(sum(x[6] for x in site_rows), 2), round(sum(x[7] for x in site_rows), 2),
+                round(sum(x[8] for x in site_rows), 2), round(sum(x[9] for x in site_rows), 2),
+            ])
+        write_table(wb.create_sheet('按站点'), site_cols, site_rows,
+                    money_cols=(7, 8, 9, 10), int_cols=(4, 5, 6), total_last=True)
+
+    # ===================== Sheet 3: 按产品 =====================
+    if live and live.get('by_product'):
+        prod_cols = ['产品', '品牌', '口数', '口味', '销量',
+                     f'销售额（{currency}）', '成本', '毛利', '毛利率%', '有成本']
+        prod_rows = []
+        for p in live['by_product']:
+            mp = p.get('margin_pct')
+            prod_rows.append([
+                p.get('label', ''), p.get('brand') or '', p.get('puff_count') or '', p.get('flavor') or '',
+                p.get('qty', 0), round(p.get('revenue', 0), 2), round(p.get('cost', 0), 2),
+                round(p.get('margin', 0), 2), (round(mp, 1) if mp is not None else ''),
+                ('是' if p.get('has_cost') else '否'),
+            ])
+        write_table(wb.create_sheet('按产品'), prod_cols, prod_rows,
+                    money_cols=(6, 7, 8), int_cols=(3, 5))
+
+    # ===================== Sheet 4: 收款记录 =====================
+    if receipts:
+        rcpt_cols = ['收款日期', f'金额（{currency}）', '汇率', '金额（CNY）', '收款方式', '参考号', '备注']
+        rcpt_rows = []
+        for rc in receipts:
+            rcpt_rows.append([
+                rc['receipt_date'] or '', round(rc['amount_pln'] or 0, 2),
+                rc['exchange_rate_cny'] or '',
+                (round(rc['amount_cny'], 2) if rc['amount_cny'] is not None else ''),
+                rc['payment_method'] or '', rc['reference_no'] or '', rc['notes'] or '',
+            ])
+        write_table(wb.create_sheet('收款记录'), rcpt_cols, rcpt_rows, money_cols=(2, 4))
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    filename = f"对账单_{data.get('partner_name') or ''}_{data['period_year']}-{data['period_month']:02d}.xlsx"
+    return send_file(
+        output,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=filename
+    )
+
+
 @app.route('/api/reconciliation/statements/<int:stmt_id>', methods=['PUT'])
 @login_required
 @reconciliation_api_required
@@ -15895,17 +16159,21 @@ def order_carrier_status(order_id):
                         key=lambda e: e['time'], reverse=True)
         return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
                         'raw': raw, 'outcome': ct.INPOST_STATUS_MAP.get(raw, 'in_transit'), 'events': events})
-    if carrier == 'dpd':
-        if not key718:
-            return jsonify({'success': False, 'error': '未配置 Track718 key'}), 400
-        res = ct.track718_detail(number, key718)
-        if res.get('events'):
-            return jsonify({'success': True, 'carrier': 'DPD', 'tracking_number': number,
-                            'outcome': res.get('outcome', 'unknown'), 'events': res['events']})
-        return jsonify({'success': True, 'carrier': 'DPD', 'tracking_number': number,
-                        'outcome': res.get('outcome', 'unknown'), 'events': [],
-                        'note': 'Track718 正在抓取轨迹，请稍后再查（DPD 单需登记后等几分钟）'})
-    return jsonify({'success': False, 'error': f'未识别物流商（provider={provider}）'}), 400
+    # Everything that isn't InPost goes through Track718: DPD with its code,
+    # any other carrier (EMS/中国邮政, Australia Post, GLS, …) via auto-detect.
+    if not key718:
+        return jsonify({'success': False, 'error': '未配置 Track718 key'}), 400
+    res = ct.track718_detail(number, key718, code=('dpd-pl' if carrier == 'dpd' else None))
+    name_map = {'dpd-pl': 'DPD', 'china-post': '中国邮政/EMS', 'australia-post': 'Australia Post',
+                'inpost-paczkomaty': 'InPost', 'gls': 'GLS', 'poczta-polska': 'Poczta Polska'}
+    cname = 'DPD' if carrier == 'dpd' else name_map.get((res.get('carrier') or '').lower(),
+                                                         (res.get('carrier') or '物流').upper())
+    if res.get('events'):
+        return jsonify({'success': True, 'carrier': cname, 'tracking_number': number,
+                        'outcome': res.get('outcome', 'unknown'), 'events': res['events']})
+    return jsonify({'success': True, 'carrier': cname, 'tracking_number': number,
+                    'outcome': res.get('outcome', 'unknown'), 'events': [],
+                    'note': '物流商正在抓取轨迹或暂无记录（新登记的单需等几分钟），请稍后再查'})
 
 
 @app.route('/api/order/<int:order_id>/unmark-undelivered', methods=['POST'])

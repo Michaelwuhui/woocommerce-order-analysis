@@ -3826,6 +3826,7 @@ async function loadStatements() {
                 <td>${statusBadge}</td>
                 <td class="text-end pe-4">
                     <button class="btn btn-sm btn-outline-info btn-view-stmt" data-id="${s.id}"><i class="bi bi-eye"></i></button>
+                    <button class="btn btn-sm btn-outline-success btn-exp-stmt" data-id="${s.id}" title="导出 Excel"><i class="bi bi-file-earmark-excel"></i></button>
                     ${IS_RECON_ADMIN && !['locked','settled'].includes(s.status) ? `<button class="btn btn-sm btn-outline-danger btn-del-stmt" data-id="${s.id}"><i class="bi bi-trash"></i></button>` : ''}
                 </td>
             </tr>`;
@@ -3833,6 +3834,7 @@ async function loadStatements() {
 
         // Bind events
         tbody.querySelectorAll('.btn-view-stmt').forEach(b => b.addEventListener('click', () => openStatementDetail(parseInt(b.dataset.id))));
+        tbody.querySelectorAll('.btn-exp-stmt').forEach(b => b.addEventListener('click', () => exportStatement(parseInt(b.dataset.id))));
         tbody.querySelectorAll('.btn-del-stmt').forEach(b => b.addEventListener('click', () => deleteStatement(parseInt(b.dataset.id))));
 
         // Load received amounts per statement
@@ -3904,6 +3906,13 @@ async function deleteStatement(id) {
         loadStatements();
         loadOverview();
     } catch (e) { showToast('删除失败: ' + e.message, 'danger'); }
+}
+
+function exportStatement(id) {
+    // Download via direct navigation — the session cookie authenticates the GET,
+    // and Content-Disposition: attachment makes the browser save the file
+    // without navigating away from the page.
+    window.location.href = `/api/reconciliation/statements/${id}/export`;
 }
 
 async function openStatementDetail(id) {
@@ -4171,6 +4180,7 @@ async function openStatementDetail(id) {
 
         // Footer actions — state-machine driven, supports P2 dispute workflow
         let actions = `<button class="btn btn-outline-light" data-bs-dismiss="modal">关闭</button>`;
+        actions += ` <button class="btn btn-outline-success" id="btnExportStmt"><i class="bi bi-file-earmark-excel me-1"></i>导出 Excel</button>`;
         if (IS_RECON_ADMIN) {
             if (s.status === 'disputed') {
                 // Admin must process the dispute
@@ -4192,6 +4202,9 @@ async function openStatementDetail(id) {
             }
         }
         footer.innerHTML = actions;
+
+        const btnExportStmt = document.getElementById('btnExportStmt');
+        if (btnExportStmt) btnExportStmt.addEventListener('click', () => exportStatement(id));
 
         // Bind actions
         const btnSave = document.getElementById('btnSaveStmt');
