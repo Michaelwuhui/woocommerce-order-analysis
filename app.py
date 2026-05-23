@@ -6007,6 +6007,11 @@ def init_partner_reconciliation_tables():
         ('confirmed_name', 'TEXT'),
         ('confirmed_ip', 'TEXT'),
         ('actual_cost_pln_snapshot', 'REAL'),
+        # Settlement basis this statement was generated on:
+        #   'contract' = 约定毛利 (净销售 × 固定比例)
+        #   'actual'   = 实际毛利 (合伙人先收回真实进价，剩余毛利按 pp:op 分)
+        # Default 'contract' so all existing statements keep their meaning.
+        ('calc_mode', "TEXT DEFAULT 'contract'"),
     ]:
         try:
             conn.execute(f"ALTER TABLE reconciliation_statements ADD COLUMN {col_def[0]} {col_def[1]}")
@@ -11631,6 +11636,32 @@ def api_recon_dashboard_comparison():
     })
 
 
+def _compute_statement_split(net, actual_cost, cost_ratio, pp_ratio, op_ratio, mode='contract'):
+    """Return (cost_amount, partner_profit, our_receivable) for a statement.
+
+    'contract' (约定毛利): split net sales by the fixed contract ratios —
+        cost = 净销售 × cost_ratio, partner = 净销售 × pp_ratio, ours = 净销售 × op_ratio.
+    'actual' (实际毛利): the partner first recovers their real product cost, then
+        the remaining margin (净销售 − 实际成本) is split between partner and us in
+        proportion to (pp_ratio : op_ratio). Mirrors the 'actual' formula shown in
+        the 概览/计算公式 preview, and reduces to the contract result when the real
+        cost happens to equal 净销售 × cost_ratio. Falls back to 50/50 when pp+op == 0.
+
+    None ratios mean "unset" → contract defaults (0.5 / 0.25 / 0.25); a real 0 is kept.
+    """
+    net = net or 0
+    cr = 0.5 if cost_ratio is None else float(cost_ratio)
+    pp = 0.25 if pp_ratio is None else float(pp_ratio)
+    op = 0.25 if op_ratio is None else float(op_ratio)
+    if mode == 'actual':
+        cost = round(actual_cost or 0, 2)
+        remainder = net - cost
+        denom = pp + op
+        pp_share, op_share = (pp / denom, op / denom) if denom > 0 else (0.5, 0.5)
+        return cost, round(remainder * pp_share, 2), round(remainder * op_share, 2)
+    return round(net * cr, 2), round(net * pp, 2), round(net * op, 2)
+
+
 @app.route('/api/reconciliation/statements/generate', methods=['POST'])
 @login_required
 @reconciliation_api_required
@@ -11663,10 +11694,16 @@ def api_generate_statement():
         conn.close()
         return jsonify({'error': '合伙人数据计算失败'}), 500
     net = detail['total_net_pln']
-    cost = round(net * partner['cost_ratio'], 2)
-    p_profit = round(net * partner['partner_profit_ratio'], 2)
-    our_recv = round(net * partner['our_profit_ratio'], 2)
     actual_cost_snapshot = detail['actual_cost_pln']
+    mode = data.get('mode') or 'contract'
+    if mode not in ('contract', 'actual'):
+        mode = 'contract'
+    cost, p_profit, our_recv = _compute_statement_split(
+        net, actual_cost_snapshot, partner['cost_ratio'],
+        partner['partner_profit_ratio'], partner['our_profit_ratio'], mode)
+    # In 实际毛利 mode the margin is only trustworthy if every product has a real
+    # cost; unmapped lines fall back to a 50% estimate (would inflate margin).
+    unmapped_qty = detail.get('cost_unmapped_qty') or 0
 
     # Auto-lookup exchange rate from system settings
     rate, _ = _lookup_partner_rate(partner['currency'], year, month)
@@ -11679,34 +11716,36 @@ def api_generate_statement():
                 SET total_orders=?, total_gross_pln=?, total_net_pln=?,
                     cost_amount_pln=?, partner_profit_pln=?, our_receivable_pln=?,
                     exchange_rate_cny=?, our_receivable_cny=?,
-                    actual_cost_pln_snapshot=?,
+                    actual_cost_pln_snapshot=?, calc_mode=?,
                     status='generated', updated_at=CURRENT_TIMESTAMP
                 WHERE id=?''',
                 (detail['total_orders'], detail['total_gross_pln'], net,
                  cost, p_profit, our_recv, rate, our_recv_cny,
-                 actual_cost_snapshot, existing['id']))
+                 actual_cost_snapshot, mode, existing['id']))
             stmt_id = existing['id']
         else:
             cursor = conn.execute('''INSERT INTO reconciliation_statements
                 (partner_id, period_year, period_month, total_orders, total_gross_pln, total_net_pln,
                  cost_amount_pln, partner_profit_pln, our_receivable_pln,
-                 exchange_rate_cny, our_receivable_cny, actual_cost_pln_snapshot, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generated')''',
+                 exchange_rate_cny, our_receivable_cny, actual_cost_pln_snapshot, calc_mode, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generated')''',
                 (partner_id, year, month, detail['total_orders'], detail['total_gross_pln'], net,
                  cost, p_profit, our_recv, rate, our_recv_cny,
-                 actual_cost_snapshot))
+                 actual_cost_snapshot, mode))
             stmt_id = cursor.lastrowid
 
         # P2: snapshot the orders that contributed to this statement
         snapshot_count = _snapshot_statement_orders(stmt_id, partner_id, year, month, conn)
 
         # P2: audit log
+        mode_label = '实际毛利' if mode == 'actual' else '约定毛利'
         _audit_log(stmt_id, 'regenerate' if is_regenerate else 'create',
-                   note=f'净销售={net} {partner["currency"] or "PLN"}, 实际成本={actual_cost_snapshot}, 快照订单 {snapshot_count} 条', conn=conn)
+                   note=f'口径={mode_label}, 净销售={net} {partner["currency"] or "PLN"}, 实际成本={actual_cost_snapshot}, 快照订单 {snapshot_count} 条', conn=conn)
 
         conn.commit()
         return jsonify({'success': True, 'id': stmt_id, 'exchange_rate_cny': rate,
-                        'snapshot_orders': snapshot_count, 'actual_cost_pln': actual_cost_snapshot})
+                        'snapshot_orders': snapshot_count, 'actual_cost_pln': actual_cost_snapshot,
+                        'calc_mode': mode, 'unmapped_qty': unmapped_qty})
     finally:
         conn.close()
 
@@ -11730,9 +11769,10 @@ def api_manual_statement():
         conn.close()
         return jsonify({'error': '合伙人不存在'}), 404
 
-    cost = round(net * partner['cost_ratio'], 2)
-    p_profit = round(net * partner['partner_profit_ratio'], 2)
-    our_recv = round(net * partner['our_profit_ratio'], 2)
+    # Manual entries are historical (no order data → no real cost) → contract basis.
+    cost, p_profit, our_recv = _compute_statement_split(
+        net, 0, partner['cost_ratio'],
+        partner['partner_profit_ratio'], partner['our_profit_ratio'], 'contract')
 
     # Auto-lookup exchange rate from system settings
     rate, _ = _lookup_partner_rate(partner['currency'], year, month)
@@ -11742,8 +11782,8 @@ def api_manual_statement():
         conn.execute('''INSERT OR REPLACE INTO reconciliation_statements
             (partner_id, period_year, period_month, total_orders, total_gross_pln, total_net_pln,
              cost_amount_pln, partner_profit_pln, our_receivable_pln,
-             exchange_rate_cny, our_receivable_cny, status, is_manual, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generated', 1, ?)''',
+             exchange_rate_cny, our_receivable_cny, calc_mode, status, is_manual, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'contract', 'generated', 1, ?)''',
             (partner_id, year, month,
              int(data.get('total_orders', 0)),
              float(data.get('total_gross_pln', net)),
@@ -11953,12 +11993,14 @@ def api_export_statement(stmt_id):
         nm = data.get('confirmed_name') or ''
         at = data.get('confirmed_at')
         confirm_txt = (f'{nm}（{at}）' if at else nm) or '—'
+    mode_label = '实际毛利' if (data.get('calc_mode') == 'actual') else '约定毛利'
     info_pairs = [
         ('合伙人', data.get('partner_name') or '', '期间', f"{data['period_year']}-{data['period_month']:02d}"),
         ('货币', currency, '汇率', rate_txt),
+        ('计算口径', mode_label, '类型', '手工录入' if data.get('is_manual') else '系统生成'),
         ('状态', STATUS_LABELS.get(data.get('status'), data.get('status') or ''),
-         '类型', '手工录入' if data.get('is_manual') else '系统生成'),
-        ('生成时间', str(data.get('created_at') or ''), '确认签字', confirm_txt),
+         '生成时间', str(data.get('created_at') or '')),
+        ('确认签字', confirm_txt, '', ''),
     ]
     r = 2
     for k1, v1, k2, v2 in info_pairs:
@@ -11991,12 +12033,26 @@ def api_export_statement(stmt_id):
         summary_rows.append(('减：运费成本（成功订单）', -ship_succ, round(-ship_succ * rate, 2) if rate else None, False, False))
         summary_rows.append(('减：运费损失（未送达）', -loss, round(-loss * rate, 2) if rate else None, False, False))
     summary_rows.append(('净销售额', data.get('total_net_pln'), data.get('total_net_cny'), True, False))
-    summary_rows.append(('约定成本' + pctlabel(data.get('cost_amount_pln')), data.get('cost_amount_pln'), data.get('cost_amount_cny'), False, False))
-    summary_rows.append(('合伙人利润' + pctlabel(data.get('partner_profit_pln')), data.get('partner_profit_pln'), data.get('partner_profit_cny'), False, False))
-    summary_rows.append(('我方应收' + pctlabel(data.get('our_receivable_pln')), data.get('our_receivable_pln'), data.get('our_receivable_cny'), True, False))
-    if live and live.get('actual_cost_pln') is not None:
-        ac = live.get('actual_cost_pln') or 0
-        summary_rows.append(('实际产品成本（参考）', ac, round(ac * rate, 2) if rate else None, False, False))
+    if (data.get('calc_mode') or 'contract') == 'actual':
+        # 实际毛利口径: cost leg = real product cost; profit/receivable are shares
+        # of the actual margin (净销售 − 实际成本).
+        cost_amt = data.get('cost_amount_pln') or 0
+        margin = (net or 0) - cost_amt
+
+        def margin_pct(amount):
+            return f'（实际毛利的 {(amount or 0) / margin * 100:.0f}%）' if margin else ''
+
+        summary_rows.append(('实际产品成本（合伙人留）', data.get('cost_amount_pln'), data.get('cost_amount_cny'), False, False))
+        summary_rows.append(('实际毛利（净销售−实际成本）', round(margin, 2), round(margin * rate, 2) if rate else None, True, False))
+        summary_rows.append(('合伙人利润' + margin_pct(data.get('partner_profit_pln')), data.get('partner_profit_pln'), data.get('partner_profit_cny'), False, False))
+        summary_rows.append(('我方应收' + margin_pct(data.get('our_receivable_pln')), data.get('our_receivable_pln'), data.get('our_receivable_cny'), True, False))
+    else:
+        summary_rows.append(('约定成本' + pctlabel(data.get('cost_amount_pln')), data.get('cost_amount_pln'), data.get('cost_amount_cny'), False, False))
+        summary_rows.append(('合伙人利润' + pctlabel(data.get('partner_profit_pln')), data.get('partner_profit_pln'), data.get('partner_profit_cny'), False, False))
+        summary_rows.append(('我方应收' + pctlabel(data.get('our_receivable_pln')), data.get('our_receivable_pln'), data.get('our_receivable_cny'), True, False))
+        if live and live.get('actual_cost_pln') is not None:
+            ac = live.get('actual_cost_pln') or 0
+            summary_rows.append(('实际产品成本（参考）', ac, round(ac * rate, 2) if rate else None, False, False))
     summary_rows.append(('已收', total_received, received_cny, False, False))
     summary_rows.append(('未收', outstanding, outstanding_cny, True, False))
 
@@ -12267,10 +12323,12 @@ def api_resolve_dispute(stmt_id):
             if detail is None:
                 return jsonify({'error': '重生成失败：无法计算'}), 500
             net = detail['total_net_pln']
-            cost = round(net * partner['cost_ratio'], 2)
-            p_profit = round(net * partner['partner_profit_ratio'], 2)
-            our_recv = round(net * partner['our_profit_ratio'], 2)
             actual_cost_snapshot = detail['actual_cost_pln']
+            # Re-run in the SAME basis the statement was originally generated on.
+            mode = stmt['calc_mode'] or 'contract'
+            cost, p_profit, our_recv = _compute_statement_split(
+                net, actual_cost_snapshot, partner['cost_ratio'],
+                partner['partner_profit_ratio'], partner['our_profit_ratio'], mode)
             rate, _ = _lookup_partner_rate(partner['currency'], year, month)
             our_recv_cny = round(our_recv * rate, 2) if rate else None
             conn.execute('''UPDATE reconciliation_statements

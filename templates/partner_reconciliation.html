@@ -1246,7 +1246,21 @@
                 <div class="col-6"><label class="form-label text-white-50">年份</label><select id="genYear" class="form-select bg-dark text-white border-secondary"></select></div>
                 <div class="col-6"><label class="form-label text-white-50">月份</label><select id="genMonth" class="form-select bg-dark text-white border-secondary"></select></div>
             </div>
-            <div class="alert alert-info bg-info bg-opacity-10 text-info border-info border-opacity-25 mt-3 small mb-0"><i class="bi bi-info-circle me-1"></i>系统会自动从订单数据中聚合该月该合伙人绑定站点的 PLN 净销售额，按分成比例计算。</div>
+            <div class="mt-3">
+                <label class="form-label text-white-50">计算口径</label>
+                <div class="d-flex gap-4">
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="genCalcMode" id="genModeContract" value="contract" checked onchange="document.getElementById('genModeHint').style.display='none';">
+                        <label class="form-check-label text-white" for="genModeContract">约定毛利 <span class="text-white-50 small">（净销售 × 约定比例）</span></label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="genCalcMode" id="genModeActual" value="actual" onchange="document.getElementById('genModeHint').style.display='block';">
+                        <label class="form-check-label text-white" for="genModeActual">实际毛利 <span class="text-white-50 small">（按真实进价）</span></label>
+                    </div>
+                </div>
+                <div id="genModeHint" class="small mt-2 mb-0" style="display:none;color:#fbbf24;"><i class="bi bi-exclamation-triangle me-1"></i>实际毛利口径：合伙人先收回真实进价成本，剩余毛利再按利润比例分账。需产品成本配置完整，否则未配成本的产品会按 50% 估算、使毛利虚高。</div>
+            </div>
+            <div class="alert alert-info bg-info bg-opacity-10 text-info border-info border-opacity-25 mt-3 small mb-0"><i class="bi bi-info-circle me-1"></i>系统会自动从订单数据中聚合该月该合伙人绑定站点的净销售额，按所选口径计算分账。</div>
         </div>
         <div class="modal-footer border-top border-secondary"><button class="btn btn-outline-light" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="btnGenStmt">生成</button></div>
     </div></div>
@@ -3810,12 +3824,13 @@ async function loadStatements() {
         tbody.innerHTML = statementsCache.map(s => {
             const statusBadge = getStatusBadge(s.status);
             const manualTag = s.is_manual ? '<span class="badge bg-warning text-dark ms-1">手工</span>' : '';
+            const modeTag = s.calc_mode === 'actual' ? '<span class="badge ms-1" style="background:rgba(56,189,248,0.85);color:#04293a;">实际毛利</span>' : '';
             const curr = s.currency || 'PLN';
             const rateDisplay = s.effective_rate_cny
                 ? `<span class="badge bg-secondary">1 ${curr} = ${s.effective_rate_cny}</span>`
                 : `<span class="text-warning small"><i class="bi bi-exclamation-triangle"></i> 未配置</span>`;
             return `<tr>
-                <td class="ps-4 text-white">${s.period_year}-${String(s.period_month).padStart(2,'0')}${manualTag}</td>
+                <td class="ps-4 text-white">${s.period_year}-${String(s.period_month).padStart(2,'0')}${manualTag}${modeTag}</td>
                 <td class="text-white-50">${partnerMap[s.partner_id] || '-'}</td>
                 <td class="text-end text-white-50">${s.total_orders || 0}</td>
                 <td class="text-end text-info">${dual(s.total_net_pln, s.total_net_cny, curr)}</td>
@@ -3870,10 +3885,17 @@ async function generateStatement() {
     const partner_id = parseInt(document.getElementById('genPartner').value);
     const year = parseInt(document.getElementById('genYear').value);
     const month = parseInt(document.getElementById('genMonth').value);
+    const modeEl = document.querySelector('input[name="genCalcMode"]:checked');
+    const mode = modeEl ? modeEl.value : 'contract';
     try {
-        await api('/api/reconciliation/statements/generate', {method:'POST', body: JSON.stringify({partner_id, year, month})});
+        const res = await api('/api/reconciliation/statements/generate', {method:'POST', body: JSON.stringify({partner_id, year, month, mode})});
         bootstrap.Modal.getInstance(document.getElementById('genStmtModal')).hide();
-        showToast('对账单已生成', 'success');
+        const modeLabel = mode === 'actual' ? '实际毛利' : '约定毛利';
+        if (mode === 'actual' && res && res.unmapped_qty > 0) {
+            showToast(`对账单已生成（${modeLabel}）。注意：有 ${res.unmapped_qty} 件产品未配置成本，已按 50% 估算，毛利可能偏高`, 'warning');
+        } else {
+            showToast(`对账单已生成（${modeLabel}）`, 'success');
+        }
         loadStatements();
         loadOverview();
     } catch (e) { showToast('生成失败: ' + e.message, 'danger'); }
@@ -3925,8 +3947,15 @@ async function openStatementDetail(id) {
         const curr = s.currency || 'PLN';
         const rate = s.effective_rate_cny;
         const ld = s.live_detail;  // live drill-down (null for manual entries)
+        const stmtMode = s.calc_mode || 'contract';  // 'contract' (约定毛利) | 'actual' (实际毛利)
+        const sNet = s.total_net_pln || 0;
+        const sMargin = sNet - (s.cost_amount_pln || 0);  // 实际毛利 (meaningful in actual mode)
+        // Percentages are derived from the saved amounts (the statement doesn't store
+        // ratios), so they stay correct per partner and per mode.
+        const pctOfNet = (amt) => sNet ? ` (${((amt || 0) / sNet * 100).toFixed(0)}%)` : '';
+        const pctOfMargin = (amt) => sMargin ? ` (实际毛利的 ${((amt || 0) / sMargin * 100).toFixed(0)}%)` : '';
 
-        titleEl.textContent = `${s.partner_name} · ${s.period_year}-${String(s.period_month).padStart(2,'0')}`;
+        titleEl.textContent = `${s.partner_name} · ${s.period_year}-${String(s.period_month).padStart(2,'0')} · ${stmtMode === 'actual' ? '实际毛利' : '约定毛利'}`;
 
         const rateBlock = rate
             ? `<div class="d-flex align-items-center gap-2 flex-wrap">
@@ -3977,18 +4006,33 @@ async function openStatementDetail(id) {
         ` : '';
 
         // ---- Section 3: Cost — Ratio vs Actual ----
-        const ratioSplit = `
+        const ratioSplit = stmtMode === 'actual' ? `
             <div class="row g-2">
                 <div class="col-md-4">
-                    <div class="text-white-50 small">约定成本 (${(s.cost_ratio !== undefined ? (s.cost_ratio * 100) : 50).toFixed(0)}%)</div>
+                    <div class="text-white-50 small">实际产品成本（合伙人留）</div>
                     <div class="h6 text-warning mb-0">${dual(s.cost_amount_pln, s.cost_amount_cny, curr)}</div>
                 </div>
                 <div class="col-md-4">
-                    <div class="text-white-50 small">合伙人利润 (${((s.partner_profit_ratio !== undefined ? s.partner_profit_ratio : 0.25) * 100).toFixed(0)}%)</div>
+                    <div class="text-white-50 small">合伙人利润${pctOfMargin(s.partner_profit_pln)}</div>
                     <div class="h6 text-warning mb-0">${dual(s.partner_profit_pln, s.partner_profit_cny, curr)}</div>
                 </div>
                 <div class="col-md-4">
-                    <div class="text-white-50 small">我方应收 (${((s.our_profit_ratio !== undefined ? s.our_profit_ratio : 0.25) * 100).toFixed(0)}%)</div>
+                    <div class="text-white-50 small">我方应收${pctOfMargin(s.our_receivable_pln)}</div>
+                    <div class="h6 text-success mb-0">${dual(s.our_receivable_pln, s.our_receivable_cny, curr)}</div>
+                </div>
+            </div>
+        ` : `
+            <div class="row g-2">
+                <div class="col-md-4">
+                    <div class="text-white-50 small">约定成本${pctOfNet(s.cost_amount_pln)}</div>
+                    <div class="h6 text-warning mb-0">${dual(s.cost_amount_pln, s.cost_amount_cny, curr)}</div>
+                </div>
+                <div class="col-md-4">
+                    <div class="text-white-50 small">合伙人利润${pctOfNet(s.partner_profit_pln)}</div>
+                    <div class="h6 text-warning mb-0">${dual(s.partner_profit_pln, s.partner_profit_cny, curr)}</div>
+                </div>
+                <div class="col-md-4">
+                    <div class="text-white-50 small">我方应收${pctOfNet(s.our_receivable_pln)}</div>
                     <div class="h6 text-success mb-0">${dual(s.our_receivable_pln, s.our_receivable_cny, curr)}</div>
                 </div>
             </div>
