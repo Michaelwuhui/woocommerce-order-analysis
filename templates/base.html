@@ -169,7 +169,7 @@
                             <i class="bi bi-exclamation-triangle me-1"></i>问题分析
                         </a>
                     </li>
-                    {% if current_user.is_admin() or current_user.can_ship() %}
+                    {% if current_user.is_admin() or current_user.can_ship() or current_user.can_view_shipping() %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint == 'shipping' else '' }}"
                             href="{{ url_for('shipping') }}">
@@ -177,7 +177,7 @@
                         </a>
                     </li>
                     {% endif %}
-                    {% if current_user.can_view_sales_board() %}
+                    {% if current_user.can_view_sales_board() or current_user.can_view_own_sales_board() %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint == 'sales_board' else '' }}"
                             href="{{ url_for('sales_board') }}">
@@ -627,11 +627,37 @@
             ['Magazyn', '仓库'],
             ['doręczona', '已送达'],
         ];
+        // InPost via Track718 returns the carrier's standardized ENGLISH event
+        // sentences (not the status codes the native ShipX API gives), so map those
+        // by keyword too. Order: most-specific/distinctive substrings first.
+        const INPOST_EN_PHRASES = [
+            ['journey of the shipment', '✅ 已签收/送达'],
+            ['Ready for collection', '到件待取（智能柜）'],
+            ['parcel has arrived', '到件待取（智能柜）'],
+            ['Handed over for delivery', '派送中'],
+            ['Out for delivery', '派送中'],
+            ['Accepted at the Logistics Centre', '到达分拣中心'],
+            ['Accepted at the Logistics Center', '到达分拣中心'],
+            ['on its way between', '运输途中'],
+            ['On the way', '运输途中'],
+            ['Collected by the Courier', '快递员已揽收'],
+            ['Sent through Paczkomat', '已从智能柜/代收点寄出'],
+            ['Sent through ParcelPoint', '已从代收点寄出'],
+            ['data has been registered', '已登记包裹数据'],
+            ['has been created', '已创建运单'],
+            ['returned to the Sender', '↩ 退回寄件人'],
+            ['will be returned', '⚠ 超时未取将退回'],
+            ['being returned', '↩ 退回中'],
+            ['Delivered,', '✅ 已签收/送达'],
+        ];
         function carrierEventLabel(s) {
             const stripped = (s || '').replace(/^WA\d+(\/PL\d+)?,\s*/i, '').trim();
             if (INPOST_EVENT_LABELS[stripped]) return INPOST_EVENT_LABELS[stripped];
             for (const [pl, zh] of DPD_PL_PHRASES) {
                 if (stripped.indexOf(pl) !== -1) return zh;
+            }
+            for (const [en, zh] of INPOST_EN_PHRASES) {
+                if (stripped.indexOf(en) !== -1) return zh;
             }
             return stripped || (s || '');
         }
@@ -645,12 +671,44 @@
             if (c.indexOf('australia') !== -1 || c.indexOf('auspost') !== -1) return 'https://auspost.com.au/mypost/track/details/' + num;
             return 'https://www.17track.net/zh-CN/track#nums=' + num;
         }
+        // Carrier-status badge (cached orders.carrier_status). Uniquely named to
+        // avoid clashing with shipping.html's page-local renderCarrierBadge; used
+        // by the customer-detail 购买记录 table (global so any page can call it).
+        function carrierStatusBadge(cs) {
+            const map = {
+                delivered:  ['🟢 已签收', 'rgba(25,135,84,0.25)', '#34d399'],
+                returned:   ['🔴 退回',   'rgba(220,53,69,0.25)', '#f87171'],
+                attention:  ['🟡 异常',   'rgba(245,158,11,0.25)', '#fbbf24'],
+                in_transit: ['🔵 在途',   'rgba(13,110,253,0.20)', '#60a5fa'],
+            };
+            const m = map[cs];
+            if (!m) return cs ? '<span class="badge bg-secondary">⚪ ' + cs + '</span>'
+                              : '<span class="text-muted small">⚪ 未查询</span>';
+            return '<span class="badge" style="background:' + m[1] + ';color:' + m[2] + ';">' + m[0] + '</span>';
+        }
         function queryCarrier(orderId, orderNumber) {
-            if (typeof showToast === 'function') showToast('正在查询物流…', 'info');
+            // Pop the modal open IMMEDIATELY with a spinner. EMS (and other
+            // Track718-aggregated carriers) often need 10–30s on the first query
+            // while the platform crawls the carrier, so the user needs a clear
+            // "still working" indicator instead of a silent wait.
+            const startedAt = Date.now();
+            showCarrierModal(`
+                <div class="text-center py-4">
+                    <div class="spinner-border text-info mb-3" role="status"><span class="visually-hidden">Loading…</span></div>
+                    <div class="text-light mb-1">正在查询物流轨迹…<span id="carrierElapsed" class="text-muted"></span></div>
+                    <div class="small text-muted">#${orderNumber} · EMS 等物流首次查询需到聚合平台实时抓取，可能要 10–30 秒，请稍候…</div>
+                </div>`);
+            const timer = setInterval(function () {
+                const el = document.getElementById('carrierElapsed');
+                if (!el) { clearInterval(timer); return; }
+                el.textContent = '（已等待 ' + Math.round((Date.now() - startedAt) / 1000) + ' 秒）';
+            }, 1000);
+            const stopTimer = function () { clearInterval(timer); };
             fetch(`/api/order/${orderId}/carrier-status`)
                 .then(res => res.json())
                 .then(data => {
-                    if (!data.success) { alert('查询失败: ' + (data.error || '未知错误')); return; }
+                    stopTimer();
+                    if (!data.success) { showCarrierModal('<div class="text-danger py-3 text-center">查询失败: ' + (data.error || '未知错误') + '</div>'); return; }
                     const outMap = { delivered: '🟢 已签收', returned: '🔴 退回', attention: '🟡 异常', in_transit: '🔵 在途', unknown: '⚪ 未知' };
                     const webUrl = carrierWebUrl(data.carrier, data.tracking_number);
                     let html = `<div class="mb-2 pb-2 border-bottom border-secondary border-opacity-25">
@@ -679,8 +737,13 @@
                         html += `<a href="${webUrl}" target="_blank" class="btn btn-sm btn-outline-info"><i class="bi bi-box-arrow-up-right me-1"></i>去物流商官网查询</a>`;
                     }
                     showCarrierModal(html);
+                    // The backend cached the detected status — refresh the list so the
+                    // 待确认结局 badge updates (delivered → 🟢, batch-confirmable) right away.
+                    if (data.outcome && data.outcome !== 'unknown' && typeof refreshActiveViews === 'function') {
+                        refreshActiveViews();
+                    }
                 })
-                .catch(err => alert('请求失败: ' + err));
+                .catch(err => { stopTimer(); showCarrierModal('<div class="text-danger py-3 text-center">请求失败: ' + err + '</div>'); });
         }
         function showCarrierModal(html) {
             let el = document.getElementById('carrierModal');
@@ -1104,24 +1167,10 @@
                             if (meta.key === '_wc_shipment_tracking_items' && Array.isArray(meta.value)) {
                                 meta.value.forEach(function (item) {
                                     if (item.tracking_number) {
-                                        var carrierInfo = detectCarrier(item.tracking_number);
-                                        var url = '';
-                                        // Use plugin provided URL if available, otherwise heuristic
-                                        if (item.tracking_provider && item.tracking_provider.indexOf('inpost') !== -1) {
-                                            url = 'https://inpost.pl/sledzenie-przesylek?number=' + item.tracking_number;
-                                        } else if (item.tracking_provider && item.tracking_provider.indexOf('dpd') !== -1) {
-                                            url = 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + item.tracking_number;
-                                        } else {
-                                            url = carrierInfo.url;
-                                        }
-
-                                        allTracking.push({
-                                            tracking_number: item.tracking_number,
-                                            carrier_name: (item.tracking_provider || carrierInfo.name).replace(/-/g, ' ').replace(/\b\w/g, function (l) { return l.toUpperCase(); }),
-                                            carrier_url: url,
-                                            time: item.date_shipped,
-                                            source: 'Order Info'
-                                        });
+                                        // Carrier + URL come from the explicit provider (ems / inpost /
+                                        // dpd / australia-post …), NOT a digit-length heuristic — that
+                                        // mis-tagged EMS numbers like LM…CN as DPD. Dedup-aware.
+                                        addCustomTracking(item.tracking_number, 'Order Info', item.tracking_provider, item.date_shipped);
                                     }
                                 });
                             }
@@ -1134,44 +1183,68 @@
 
                     // 4. Local Shipping Log (for manually shipped orders not yet synced)
                     if (order.shipping_log && order.shipping_log.tracking_number) {
-                        var tn = order.shipping_log.tracking_number;
-                        var carrier = detectCarrier(tn);
-                        var url = '';
-
-                        if (order.shipping_log.carrier_slug) {
-                            if (order.shipping_log.carrier_slug === 'inpost') {
-                                url = 'https://inpost.pl/sledzenie-przesylek?number=' + tn;
-                                carrier.name = 'InPost';
-                            } else if (order.shipping_log.carrier_slug === 'dpd') {
-                                url = 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + tn;
-                                carrier.name = 'DPD';
-                            }
-                        }
-
-                        if (!url) url = carrier.url;
-
-                        addCustomTracking(tn, 'Shipping Log');
+                        addCustomTracking(order.shipping_log.tracking_number, 'Shipping Log', order.shipping_log.carrier_slug);
                     }
-                    function addCustomTracking(tn, sourceName) {
-                        tn = String(tn).trim();
+                    function addCustomTracking(tn, sourceName, provider, time) {
+                        tn = String(tn || '').trim();
                         if (!tn) return;
-                        // Avoid duplicates
-                        if (allTracking.some(function (t) { return t.tracking_number === tn; })) return;
-
-                        var carrier = detectCarrier(tn);
+                        // Resolve carrier from the explicit provider/slug first; fall back to a
+                        // number-pattern heuristic only when no provider is known.
+                        var resolved = carrierFromProvider(provider, tn) || detectCarrier(tn);
+                        // Dedup by tracking number (case-insensitive). Enrich an existing
+                        // heuristic entry once a real provider/time arrives.
+                        var existing = allTracking.find(function (t) {
+                            return String(t.tracking_number).toLowerCase() === tn.toLowerCase();
+                        });
+                        if (existing) {
+                            if (provider) { existing.carrier_name = resolved.name; existing.carrier_url = resolved.url; }
+                            if (!existing.time && time) existing.time = time;
+                            return;
+                        }
                         allTracking.push({
                             tracking_number: tn,
-                            carrier_name: carrier.name,
-                            carrier_url: carrier.url,
-                            time: null,
+                            carrier_name: resolved.name,
+                            carrier_url: resolved.url,
+                            time: time || null,
                             source: sourceName
                         });
                     }
 
+                    // Map an explicit carrier provider/slug → display name + external tracking
+                    // URL. Returns null when the provider is empty so callers fall back to
+                    // detectCarrier(). This is the authoritative source — the order already
+                    // knows its carrier (ems / dpd / inpost …), so we never guess from the
+                    // number when a provider is present.
+                    function carrierFromProvider(provider, tn) {
+                        var p = (provider || '').toLowerCase();
+                        if (!p) return null;
+                        if (p.indexOf('inpost') !== -1 || p.indexOf('paczkomat') !== -1)
+                            return { name: 'InPost', url: 'https://inpost.pl/sledzenie-przesylek?number=' + tn };
+                        if (p.indexOf('dpd') !== -1)
+                            return { name: 'DPD', url: 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + tn };
+                        if (p.indexOf('ems') !== -1 || p.indexOf('china') !== -1)
+                            return { name: 'EMS', url: 'https://t.17track.net/zh-cn#nums=' + tn };
+                        if (p.indexOf('australia') !== -1 || p.indexOf('auspost') !== -1)
+                            return { name: 'Australia Post', url: 'https://auspost.com.au/mypost/track/details/' + tn };
+                        if (p.indexOf('gls') !== -1)
+                            return { name: 'GLS', url: 'https://gls-group.eu/track?match=' + tn };
+                        // Known-but-unmapped provider: show its label, route lookup via 17track.
+                        return { name: provider.replace(/-/g, ' ').replace(/\b\w/g, function (l) { return l.toUpperCase(); }),
+                                 url: 'https://t.17track.net/zh-cn#nums=' + tn };
+                    }
+
                     function detectCarrier(tn) {
-                        if (tn.length === 24 && /^\d+$/.test(tn)) return { name: 'InPost', url: 'https://inpost.pl/sledzenie-przesylek?number=' + tn };
-                        if ((tn.length >= 10 && tn.length <= 14 && /^[a-zA-Z0-9]+$/.test(tn)) || tn.endsWith('U')) return { name: 'DPD', url: 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + tn };
-                        return { name: 'Custom', url: '' };
+                        // Postal items (EMS / China Post / registered mail) use the UPU S10
+                        // format: 2 letters + 9 digits + 2 letters, e.g. LM139993574CN. Check
+                        // this BEFORE the DPD guess so EMS numbers aren't mislabeled as DPD.
+                        if (/^[A-Z]{2}\d{9}[A-Z]{2}$/i.test(tn))
+                            return { name: 'EMS', url: 'https://t.17track.net/zh-cn#nums=' + tn };
+                        if (tn.length === 24 && /^\d+$/.test(tn))
+                            return { name: 'InPost', url: 'https://inpost.pl/sledzenie-przesylek?number=' + tn };
+                        if (tn.toUpperCase().endsWith('U'))
+                            return { name: 'DPD', url: 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + tn };
+                        // Unknown: route through 17track (multi-carrier, handles EMS/China Post).
+                        return { name: 'Custom', url: 'https://t.17track.net/zh-cn#nums=' + tn };
                     }
 
                     if (allTracking.length > 0) {
@@ -1876,7 +1949,7 @@
                     html += '<div class="col-12">';
                     html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-clock-history me-2"></i>购买记录</h6></div>';
                     html += '<div class="card-body p-0"><div class="table-responsive"><table class="table product-table mb-0">';
-                    html += '<thead><tr><th>订单号</th><th>日期</th><th>网站</th>' + (showEmailCol ? '<th>邮箱</th>' : '') + '<th>状态</th><th>商品数</th><th class="text-end">金额</th><th>操作</th></tr></thead><tbody>';
+                    html += '<thead><tr><th>订单号</th><th>日期</th><th>网站</th>' + (showEmailCol ? '<th>邮箱</th>' : '') + '<th>状态</th><th>物流状态</th><th>结局</th><th>商品数</th><th class="text-end">金额</th><th>操作</th></tr></thead><tbody>';
 
                     var statusColors = {
                         'pending': '#f59e0b', 'processing': '#3b82f6', 'on-hold': '#6b7280',
@@ -1898,6 +1971,20 @@
                             html += '<td><span class="small ' + (isPrimary ? 'text-white-50' : '') + '" style="' + (isPrimary ? '' : 'color:#a78bfa;') + '" title="' + oe + '">' + oe + '</span></td>';
                         }
                         html += '<td><span style="color:' + (statusColors[order.status] || '#ccc') + '">' + (statusLabels[order.status] || order.status) + '</span></td>';
+                        // 物流状态 — cached carrier_status (🟢已签收/🔵在途/🔴退回/⚪未查询)
+                        html += '<td>' + carrierStatusBadge(order.carrier_status) + '</td>';
+                        // 结局 / 特殊状态 — 拒收/退回 · 问题退货 · 已签收（来自本地标记，独立于站点状态）
+                        var outcomeHtml = '<span class="text-muted">—</span>';
+                        if (order.is_undelivered) {
+                            var undNote = (order.undelivered_note || '').replace(/"/g, '&quot;');
+                            var lossTip = order.shipping_loss_amount ? (' · 运费损失 ' + order.shipping_loss_amount + ' ' + (order.currency || '')) : '';
+                            outcomeHtml = '<span class="badge" style="background:rgba(220,53,69,0.25);color:#f87171;" title="' + (undNote || '客户拒收 / 包裹退回') + lossTip + '">🔴 拒收/退回</span>';
+                        } else if (order.is_problem_return) {
+                            outcomeHtml = '<span class="badge" style="background:rgba(245,158,11,0.25);color:#fbbf24;" title="调包/少件/损坏">🟠 问题退货</span>';
+                        } else if (order.delivery_confirmed) {
+                            outcomeHtml = '<span class="badge" style="background:rgba(25,135,84,0.25);color:#34d399;">🟢 已签收</span>';
+                        }
+                        html += '<td>' + outcomeHtml + '</td>';
                         html += '<td>' + order.product_count + '</td>';
                         html += '<td class="text-end">' + order.total.toFixed(2) + ' ' + (order.currency || '') + '</td>';
                         html += '<td><button class="btn btn-sm btn-outline-info" onclick="showOrderDetail(\'' + order.id + '\')">查看</button></td>';

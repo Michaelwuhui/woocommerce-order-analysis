@@ -17,6 +17,9 @@
             </p>
         </div>
         <div class="btn-group">
+            <button type="button" class="btn btn-sm btn-outline-danger" onclick="openLossCustomers()" title="所有造成货值损失（问题退货：调包/少件/损坏）的客户名单。他们再次下单会在发货管理高亮报警。">
+                <i class="bi bi-exclamation-octagon-fill me-1"></i>货值损失客户
+            </button>
             <button type="button" class="btn btn-sm btn-outline-secondary">导出 Excel</button>
         </div>
     </div>
@@ -394,6 +397,22 @@
             </div>
         </div>
     </div>
+
+    <!-- 货值损失客户名单 (problem-return customers) -->
+    <div class="modal fade" id="lossCustomersModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content bg-dark border border-secondary border-opacity-25 text-light">
+                <div class="modal-header border-secondary border-opacity-25">
+                    <h6 class="modal-title"><i class="bi bi-exclamation-octagon-fill text-danger me-2"></i>货值损失客户名单 <span id="lossCustomersCount" class="badge bg-danger bg-opacity-25 text-danger ms-2"></span></h6>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="small text-white-50 mb-2"><i class="bi bi-info-circle me-1"></i>因「问题退货」（调包/少件/损坏）造成货值损失的客户，按 邮箱/手机/地址 识别。他们再次下单时，发货管理会自动以「⚠ 高风险客户」高亮报警。</div>
+                    <div id="lossCustomersBody"><div class="text-center py-4 text-muted"><span class="spinner-border spinner-border-sm me-1"></span>加载中…</div></div>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 {% endblock %}
 
@@ -459,6 +478,38 @@
 </style>
 
 <script>
+    // 货值损失客户名单: customers who caused a 问题退货 (goods-value) loss. They are
+    // auto-flagged as high-risk in 发货管理 when they re-order.
+    function openLossCustomers() {
+        var body = document.getElementById('lossCustomersBody');
+        var cnt = document.getElementById('lossCustomersCount');
+        body.innerHTML = '<div class="text-center py-4 text-muted"><span class="spinner-border spinner-border-sm me-1"></span>加载中…</div>';
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('lossCustomersModal')).show();
+        fetch('/api/customers/loss-list').then(function (r) { return r.json(); }).then(function (list) {
+            cnt.textContent = (list.length || 0) + ' 人';
+            if (!list.length) { body.innerHTML = '<div class="text-center py-4 text-success">🎉 暂无货值损失客户</div>'; return; }
+            body.innerHTML = list.map(function (c) {
+                var orders = (c.orders || []).map(function (o) { return '#' + o.number + (o.loss ? ' (' + o.loss.toFixed(2) + ')' : ''); }).join('、');
+                var emailJs = (c.email || '').replace(/'/g, "\\'");
+                return '<div class="d-flex justify-content-between align-items-start border-bottom border-secondary border-opacity-25 py-2">'
+                    + '<div class="me-2">'
+                    + '<div class="fw-bold text-white">' + (c.name || 'Unknown')
+                    + ' <span class="badge bg-danger ms-1">问题退货 ' + c.count + ' 单</span>'
+                    + (c.types && c.types.length ? ' <span class="text-warning small">' + c.types.join(' · ') + '</span>' : '')
+                    + '</div>'
+                    + (c.phone ? '<div class="small text-white-50"><i class="bi bi-telephone me-1"></i>' + c.phone + '</div>' : '')
+                    + (c.email ? '<div class="small text-white-50"><i class="bi bi-envelope me-1"></i>' + c.email + '</div>' : '')
+                    + (c.address ? '<div class="small text-white-50"><i class="bi bi-geo-alt me-1"></i>' + c.address + '</div>' : '')
+                    + '<div class="small text-muted mt-1">订单: ' + orders + (c.last_at ? ' · 最近 ' + c.last_at : '') + '</div>'
+                    + '</div>'
+                    + '<div class="text-end text-nowrap">'
+                    + '<div class="fw-bold" style="color:#f87171;">货值损失 ' + (c.loss || 0).toFixed(2) + ' ' + (c.currency || '') + '</div>'
+                    + (c.email ? '<button class="btn btn-sm btn-outline-info mt-1" onclick="showCustomerDetail(\'' + emailJs + '\')">详情</button>' : '')
+                    + '</div>'
+                    + '</div>';
+            }).join('');
+        }).catch(function (e) { body.innerHTML = '<div class="text-danger py-3">加载失败: ' + e + '</div>'; });
+    }
     // Date range pickers for the filter bar (flatpickr is loaded globally in base.html).
     document.addEventListener('DOMContentLoaded', function () {
         if (window.flatpickr) {

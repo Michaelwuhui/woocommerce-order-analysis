@@ -55,7 +55,8 @@ class User(UserMixin):
         return self.role in ('admin', 'user')
     
     def can_ship(self):
-        """Check if user has shipping permission"""
+        """Check if user has shipping EDIT permission (operate: ship / confirm /
+        mark refused / problem-return / batch / etc.)."""
         if self.role == 'admin':
             return True
         # Check database for can_ship flag
@@ -64,6 +65,20 @@ class User(UserMixin):
         user = conn.execute('SELECT can_ship FROM users WHERE id = ?', (self.id,)).fetchone()
         conn.close()
         return user and user['can_ship'] == 1
+
+    def can_view_shipping(self):
+        """Shipping VIEW permission: can open 发货管理 and see the lists / tracking
+        / status / 查物流 / print / export, but cannot operate. Anyone who can ship
+        (edit) implicitly can view."""
+        if self.can_ship():
+            return True
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_view_shipping FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return bool(user and user['can_view_shipping'] == 1)
+        except Exception:
+            return False
 
     def can_view_report(self):
         """Check if user has report viewing permission"""
@@ -89,6 +104,31 @@ class User(UserMixin):
             return user and user['can_view_sales_board'] == 1
         except:
             return False
+
+    def can_view_own_sales_board(self):
+        """Self-only sales board: user may open the board but sees ONLY their own
+        sites (sites whose manager == this user's name). Distinct from the full
+        can_view_sales_board (whole team). Granted in 用户管理, super-admin only."""
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_view_own_sales_board FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return bool(user and user['can_view_own_sales_board'] == 1)
+        except Exception:
+            return False
+
+    def sales_board_own_manager(self):
+        """The manager-name this user is scoped to on the self-only board (their
+        own name). Returns the name only if they actually have sites under it."""
+        try:
+            conn = get_db_connection()
+            row = conn.execute('SELECT name FROM users WHERE id = ?', (self.id,)).fetchone()
+            nm = (row['name'] if row else '') or ''
+            has = conn.execute('SELECT 1 FROM sites WHERE manager = ? LIMIT 1', (nm,)).fetchone()
+            conn.close()
+            return nm if (nm and has) else None
+        except Exception:
+            return None
 
     def can_manage_products(self):
         """Check if user can access the multi-site product manager (Layer 1).
@@ -607,29 +647,60 @@ def extract_puffs_from_meta(item):
     return None
 
 
-def calculate_customer_tier(successful_orders, total_spending, avg_days_between):
-    """Calculate customer tier based on orders, spending, and frequency"""
+def calculate_customer_tier(successful_orders, total_spending, avg_days_between,
+                            bad_orders=0, meaningful_orders=0):
+    """Calculate customer tier from orders, spending, frequency — then apply a
+    refusal/return-rate PENALTY so a serial refuser can't rank high just because
+    a few early orders + frequency padded the score.
+
+    bad_orders / meaningful_orders define the refusal rate (see _bad_order_case /
+    _meaningful_order_case). The base score (and the revenue numbers it's derived
+    from) is unchanged; the penalty only caps/downgrades the resulting tier.
+    """
     quality_score = 0
     quality_score += min(successful_orders * 10, 30)  # Max 30 for orders
     quality_score += min(total_spending / 100, 40)    # Max 40 for spending
-    
+
     # Frequency bonus
     if avg_days_between > 0:
         if avg_days_between < 60:
             quality_score += 30
         elif avg_days_between < 120:
             quality_score += 15
-    
+
     quality_score = min(quality_score, 100)
-    
+
     if quality_score >= 80:
-        return 'vip'
+        tier = 'vip'
     elif quality_score >= 60:
-        return 'good'
+        tier = 'good'
     elif quality_score >= 40:
-        return 'normal'
+        tier = 'normal'
     else:
-        return 'new'
+        tier = 'new'
+
+    # ── Refusal / return-rate penalty ───────────────────────────────────────
+    # Denominator = meaningful orders (shipped/attempted/completed; excludes
+    # unpaid-cancelled). Fall back to bad+successful if not supplied.
+    try:
+        bad_orders = int(bad_orders or 0)
+    except (TypeError, ValueError):
+        bad_orders = 0
+    denom = meaningful_orders if meaningful_orders else (bad_orders + (successful_orders or 0))
+    bad_rate = (bad_orders / denom) if denom else 0.0
+
+    rank = ['new', 'normal', 'good', 'vip']
+
+    def _cap(t, ceiling):
+        return t if rank.index(t) <= rank.index(ceiling) else ceiling
+
+    if bad_orders >= 3 and bad_rate >= 0.5:
+        return 'bad'                 # 劣质：惯性拒收/退货
+    if bad_rate >= 0.5:
+        tier = _cap(tier, 'normal')  # 拒收率≥50%：最高普通
+    elif bad_rate >= 0.3:
+        tier = _cap(tier, 'good')    # 拒收率≥30%：不给 VIP
+    return tier
 
 
 def get_full_product_name(item):
@@ -928,7 +999,7 @@ def super_admin_required(f):
 
 
 def shipper_required(f):
-    """Decorator to require shipping permission"""
+    """Decorator to require shipping EDIT permission (operate)."""
     from functools import wraps
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -936,6 +1007,21 @@ def shipper_required(f):
             return redirect(url_for('login'))
         if not current_user.can_ship():
             return jsonify({'error': '无发货权限', 'permission': 'shipping'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def shipping_view_required(f):
+    """Decorator for READ-ONLY shipping endpoints (page, lists, print, export,
+    查物流). Allows shipping VIEW or EDIT. Mutation endpoints keep
+    shipper_required (edit only)."""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login'))
+        if not current_user.can_view_shipping():
+            return jsonify({'error': '无发货查看权限', 'permission': 'shipping_view'}), 403
         return f(*args, **kwargs)
     return decorated_function
 
@@ -1002,21 +1088,29 @@ def costs_edit_required(f):
     return decorated_function
 
 
-def _user_allowed_warehouse_ids():
-    """Return the list of warehouse_ids the current user is allowed to manage
-    costs in. Drives the country/warehouse scope for partner-bound users.
+def _user_allowed_warehouse_ids(for_view=False):
+    """Return the list of warehouse_ids the current user is scoped to for cost
+    management. Drives the country/warehouse scope for partner-bound users.
+
+    Two scopes:
+      • EDIT scope  (for_view=False, default) — which warehouses' costs the user
+        may add/edit/delete. A non-partner non-admin gets [] (manages none).
+      • VIEW scope  (for_view=True) — which warehouses' costs the user may SEE.
+        Viewing is independently gated by can_view_costs; an internal read-only
+        viewer (no partner binding) should see ALL costs even though they edit
+        none, so the no-partner case returns None (unrestricted) instead of [].
 
     Returns:
-      None  → unrestricted (super admin, or admin role)
+      None  → unrestricted (super admin, admin role; or for_view + no binding)
       [...] → restricted to these warehouse ids (non-admin with partner bindings)
-      []    → no access (non-admin without any partner binding)
+      []    → no access (edit scope, non-admin without any partner binding)
 
     Logic:
       • super admin (username 'admin')                → None
       • admin role (e.g. internal finance)            → None
       • non-admin with partner_users binding(s)       → warehouses in the
         countries of all bound partners' bound sites
-      • non-admin without partner binding             → []
+      • non-admin without partner binding             → None if for_view else []
     """
     if not current_user.is_authenticated:
         return []
@@ -1031,7 +1125,7 @@ def _user_allowed_warehouse_ids():
             'SELECT partner_id FROM partner_users WHERE user_id = ?', (current_user.id,)
         ).fetchall()]
         if not partner_ids:
-            return []
+            return None if for_view else []
         placeholders = ','.join(['?'] * len(partner_ids))
         countries = [r['country'] for r in conn.execute(f'''
             SELECT DISTINCT s.country FROM partner_sites ps
@@ -1631,12 +1725,14 @@ def dashboard():
                     COUNT(*) as total_orders,
                     SUM({_success_status_case()}) as successful_orders,
                     {_success_amount_case('total')} as total_spending,
+                    SUM({_bad_order_case()}) as bad_orders,
+                    SUM({_meaningful_order_case()}) as meaningful_orders,
                     MAX(date_created) as last_order_date,
                     MIN(date_created) as first_order_date
                 FROM orders
                 WHERE json_extract(billing, '$.email') = ?
             ''', (email,)).fetchone()
-            
+
             total_orders = stats_row['total_orders'] or 0
             successful_orders = stats_row['successful_orders'] or 0
             total_spending = stats_row['total_spending'] or 0
@@ -1657,8 +1753,11 @@ def dashboard():
                     except:
                         avg_days_between = 0
                 
-                tier = calculate_customer_tier(successful_orders, total_spending, avg_days_between)
-            
+                tier = calculate_customer_tier(
+                    successful_orders, total_spending, avg_days_between,
+                    bad_orders=stats_row['bad_orders'] or 0,
+                    meaningful_orders=stats_row['meaningful_orders'] or 0)
+
             if tier == 'vip':
                 customer_attributes[email]['quality'] = {'label': 'VIP', 'class': 'text-warning', 'icon': 'star-fill'}
             elif tier == 'good':
@@ -1815,20 +1914,23 @@ def orders():
         params.append(date_to + 'T23:59:59')
     if search:
         like_term = f'%{search}%'
-        # When the input is long enough to plausibly be a tracking number,
-        # also search inside JSON columns (AST plugin → meta_data, VillaTheme
-        # plugin → line_items, generic shipping_lines) and our shipping_logs.
-        # Short inputs stay on the fast number/id path to avoid false positives.
+        # When the input is long enough to plausibly be a tracking number, email,
+        # or customer detail, also search inside JSON columns (billing/shipping →
+        # customer email/name/phone; AST plugin → meta_data; VillaTheme →
+        # line_items; generic shipping_lines) and our shipping_logs. Short inputs
+        # stay on the fast number/id path to avoid false positives.
         if len(search) >= 6:
             conditions.append('''(
                 number LIKE ?
                 OR id LIKE ?
+                OR billing LIKE ?
+                OR shipping LIKE ?
                 OR meta_data LIKE ?
                 OR line_items LIKE ?
                 OR shipping_lines LIKE ?
                 OR id IN (SELECT order_id FROM shipping_logs WHERE tracking_number LIKE ?)
             )''')
-            params.extend([like_term] * 6)
+            params.extend([like_term] * 8)
         else:
             conditions.append('(number LIKE ? OR id LIKE ?)')
             params.extend([like_term, like_term])
@@ -2219,6 +2321,8 @@ def orders():
                     COUNT(*) as total_orders,
                     SUM({_success_status_case()}) as successful_orders,
                     {_success_amount_case('total')} as total_spending,
+                    SUM({_bad_order_case()}) as bad_orders,
+                    SUM({_meaningful_order_case()}) as meaningful_orders,
                     MAX(date_created) as last_order_date,
                     MIN(date_created) as first_order_date
                 FROM orders
@@ -2271,8 +2375,11 @@ def orders():
                     except:
                         avg_days_between = 0
                 
-                tier = calculate_customer_tier(successful_orders, total_spending, avg_days_between)
-            
+                tier = calculate_customer_tier(
+                    successful_orders, total_spending, avg_days_between,
+                    bad_orders=stats.get('bad_orders') or 0,
+                    meaningful_orders=stats.get('meaningful_orders') or 0)
+
             # Set attributes based on tier
             if tier == 'vip':
                 customer_attributes[email]['quality'] = {'label': 'VIP', 'class': 'text-warning', 'icon': 'star-fill'}
@@ -4415,6 +4522,75 @@ def customers():
                            current_filters=current_filters, period_active=period_active)
 
 
+@app.route('/api/customers/loss-list')
+@login_required
+def loss_customers_list():
+    """货值损失客户名单: every customer with a 问题退货 (is_problem_return) order —
+    调包/少件/损坏 — deduped by identity (email/phone/address) with loss totals.
+    Scoped to the user's allowed sources. These are the customers the high-risk
+    badge flags on re-order in 待发货/已发货."""
+    conn = get_db_connection()
+    allowed = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    where = "WHERE COALESCE(is_problem_return, 0) = 1"
+    params = []
+    if allowed is not None:
+        if not allowed:
+            conn.close()
+            return jsonify([])
+        ph = ','.join(['?'] * len(allowed))
+        where += f" AND source IN ({ph})"
+        params = list(allowed)
+    rows = conn.execute(f"""
+        SELECT id, number, billing, shipping, source, problem_return_type,
+               product_loss_amount, problem_return_at, currency
+        FROM orders {where}
+        ORDER BY problem_return_at DESC
+    """, params).fetchall()
+    conn.close()
+
+    TYPE_MAP = {'swap': '调包/假货', 'short': '少件/空盒', 'damaged': '损坏', 'other': '其它'}
+    customers = {}
+    for r in rows:
+        billing = parse_json_field(r['billing']) or {}
+        shipping = parse_json_field(r['shipping']) or {}
+        addr_d = _addr_for_order(billing, shipping)
+        email = _normalize_email(billing.get('email') or shipping.get('email'))
+        phone = _normalize_phone(addr_d.get('phone') or billing.get('phone'))
+        addr_key = _normalize_address(addr_d)
+        key = email or phone or addr_key or f"o{r['id']}"
+        name = (f"{addr_d.get('first_name', '')} {addr_d.get('last_name', '')}".strip()
+                or f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip())
+        disp_addr = ', '.join(filter(None, [addr_d.get('address_1', ''), addr_d.get('address_2', ''),
+                                            addr_d.get('postcode', ''), addr_d.get('city', ''), addr_d.get('country', '')]))
+        c = customers.get(key)
+        if not c:
+            c = {'name': name, 'email': billing.get('email') or '',
+                 'phone': addr_d.get('phone') or billing.get('phone') or '',
+                 'address': disp_addr, 'count': 0, 'loss': 0.0, 'types': set(),
+                 'orders': [], 'last_at': '', 'currency': ''}
+            customers[key] = c
+        c['count'] += 1
+        c['loss'] += float(r['product_loss_amount'] or 0)
+        if r['problem_return_type']:
+            c['types'].add(r['problem_return_type'])
+        if not c['currency'] and r['currency']:
+            c['currency'] = r['currency']
+        c['orders'].append({'number': r['number'],
+                            'at': (r['problem_return_at'] or '')[:16].replace('T', ' '),
+                            'loss': float(r['product_loss_amount'] or 0),
+                            'source': (r['source'] or '').replace('https://www.', '').replace('https://', '')})
+        if (r['problem_return_at'] or '') > c['last_at']:
+            c['last_at'] = r['problem_return_at'] or ''
+    out = []
+    for c in customers.values():
+        c['types'] = [TYPE_MAP.get(t, t) for t in sorted(c['types'])]
+        c['loss'] = round(c['loss'], 2)
+        c['last_at'] = (c['last_at'] or '')[:16].replace('T', ' ')
+        out.append(c)
+    out.sort(key=lambda x: (-x['loss'], -x['count']))
+    return jsonify(out)
+
+
 @app.route('/api/chart-data')
 @login_required
 def chart_data():
@@ -4613,7 +4789,8 @@ def get_customer_details(email):
         ident_ph = ','.join(['?'] * len(identity_emails))
         order_sql = f'''
             SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing,
-                   payment_method, is_undelivered, shipping_loss_amount
+                   payment_method, is_undelivered, shipping_loss_amount,
+                   is_problem_return, delivery_confirmed, undelivered_note, carrier_status
             FROM orders
             WHERE lower(trim(json_extract(billing, '$.email'))) IN ({ident_ph})
               AND {' AND '.join(scope_conditions)}
@@ -4623,7 +4800,8 @@ def get_customer_details(email):
     else:
         orders = conn.execute('''
             SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing,
-                   payment_method, is_undelivered, shipping_loss_amount
+                   payment_method, is_undelivered, shipping_loss_amount,
+                   is_problem_return, delivery_confirmed, undelivered_note, carrier_status
             FROM orders
             WHERE json_extract(billing, '$.email') = ? AND status NOT IN ('checkout-draft', 'trash')
             ORDER BY date_created DESC
@@ -4651,6 +4829,8 @@ def get_customer_details(email):
     failed_orders = 0
     cancelled_orders = 0
     undelivered_orders = 0
+    bad_orders = 0          # refused/returned/problem/COD-failed — drives the tier penalty
+    meaningful_orders = 0   # shipped/attempted/completed (excl. unpaid-cancelled) — tier denominator
     shipping_loss_total = 0.0
     dates = []
     
@@ -4724,7 +4904,17 @@ def get_customer_details(email):
             failed_orders += 1
         elif status == 'cancelled':
             cancelled_orders += 1
-        
+
+        # Customer-quality penalty inputs (tier-only; not revenue):
+        # bad = refused/returned (manual) | carrier-returned | problem return | COD failed.
+        carrier_st = (order['carrier_status'] if 'carrier_status' in order.keys() else None)
+        is_problem = bool(order['is_problem_return']) if 'is_problem_return' in order.keys() else False
+        if is_undelivered or carrier_st == 'returned' or is_problem \
+                or (status == 'failed' and (payment_method or 'cod') == 'cod'):
+            bad_orders += 1
+        if status not in ('cancelled', 'checkout-draft', 'trash'):
+            meaningful_orders += 1
+
         # Dates
         if order['date_created']:
             dates.append(order['date_created'][:10])
@@ -4740,6 +4930,14 @@ def get_customer_details(email):
             'product_count': order_qty,
             'products': order_products,
             'email': (billing.get('email') or '').strip(),
+            # Outcome / special status — so a suspicious customer's refused orders
+            # are visible at a glance (these live in local flags, NOT the WC status).
+            'is_undelivered': is_undelivered,
+            'is_problem_return': bool(order['is_problem_return']) if 'is_problem_return' in order.keys() else False,
+            'delivery_confirmed': bool(order['delivery_confirmed']) if 'delivery_confirmed' in order.keys() else False,
+            'undelivered_note': (order['undelivered_note'] or '') if 'undelivered_note' in order.keys() else '',
+            'shipping_loss_amount': float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in order.keys() else 0,
+            'carrier_status': (order['carrier_status'] if 'carrier_status' in order.keys() else None),
         })
     
     # Calculate frequency
@@ -4794,16 +4992,19 @@ def get_customer_details(email):
             manual_tier = 'auto'
             
     if manual_tier == 'auto':
-        tier = calculate_customer_tier(successful_orders, total_spending, avg_days_between)
+        tier = calculate_customer_tier(successful_orders, total_spending, avg_days_between,
+                                       bad_orders=bad_orders, meaningful_orders=meaningful_orders)
         if tier == 'vip':
             customer_tier = {'level': 'VIP', 'color': '#f59e0b', 'icon': 'star-fill', 'manual': False}
         elif tier == 'good':
             customer_tier = {'level': '优质', 'color': '#10b981', 'icon': 'gem', 'manual': False}
         elif tier == 'normal':
             customer_tier = {'level': '普通', 'color': '#3b82f6', 'icon': 'person-check', 'manual': False}
+        elif tier == 'bad':
+            customer_tier = {'level': '劣质', 'color': '#ef4444', 'icon': 'x-circle', 'manual': False}
         else:
             customer_tier = {'level': '新客', 'color': '#0dcaf0', 'icon': 'stars', 'manual': False}
-            
+
     customer_tier['value'] = manual_tier
     
     # Calculate CNY total for customer spending
@@ -4979,6 +5180,29 @@ def _success_status_case(prefix='', as_name='is_success'):
                     AND COALESCE({p}is_undelivered, 0) = 0
                     AND COALESCE({p}is_problem_return, 0) = 0
                THEN 1 ELSE 0 END)"""
+
+
+def _bad_order_case(prefix='', as_name='is_bad'):
+    """SQL CASE: 1 if the order is a 'bad' outcome for customer-quality scoring.
+    Bad = refused/returned (manual flag), carrier-detected return, problem return
+    (swap/short/damaged), or a COD order that failed (refused at the door).
+    This is ONLY used by the customer-tier penalty — it does NOT touch revenue or
+    reconciliation (those keep using _success_/_revenue_ helpers unchanged)."""
+    p = f'{prefix}.' if prefix else ''
+    return f"""(CASE WHEN COALESCE({p}is_undelivered, 0) = 1
+                    OR {p}carrier_status = 'returned'
+                    OR COALESCE({p}is_problem_return, 0) = 1
+                    OR ({p}status = 'failed' AND COALESCE({p}payment_method,'cod') = 'cod')
+               THEN 1 ELSE 0 END)"""
+
+
+def _meaningful_order_case(prefix=''):
+    """SQL CASE: 1 if the order counts toward the customer-quality denominator —
+    i.e. a real fulfillment attempt/outcome. Excludes unpaid-cancelled (abandoned)
+    and drafts/trash, which would otherwise dilute the refusal rate."""
+    p = f'{prefix}.' if prefix else ''
+    return (f"(CASE WHEN {p}status NOT IN ('cancelled','checkout-draft','trash') "
+            f"THEN 1 ELSE 0 END)")
 
 
 def _success_status_cond(prefix=''):
@@ -5394,7 +5618,15 @@ def init_shipping_tables():
         conn.commit()
     except:
         pass  # Column already exists
-    
+
+    # Add can_view_shipping — view-only access to 发货管理 (see lists/status but
+    # cannot operate). Anyone with can_ship implicitly has view.
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_view_shipping INTEGER DEFAULT 0')
+        conn.commit()
+    except:
+        pass  # Column already exists
+
     # Shipping logs table
     conn.execute('''
         CREATE TABLE IF NOT EXISTS shipping_logs (
@@ -5441,6 +5673,14 @@ def init_shipping_tables():
         VALUES ('ems', 'EMS', 'https://t.17track.net/en#nums={tracking}')
     ''')
     conn.commit()
+
+    # Default the AU scheduled carrier-tracking toggle ON. INSERT OR IGNORE means
+    # any value the operator later sets in 系统设置 is preserved across reboots.
+    try:
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_track_au', '1')")
+        conn.commit()
+    except Exception:
+        pass
 
     conn.close()
 
@@ -5698,6 +5938,14 @@ def init_sales_board_tables():
     # Add can_view_sales_board column to users table
     try:
         conn.execute('ALTER TABLE users ADD COLUMN can_view_sales_board INTEGER DEFAULT 0')
+        conn.commit()
+    except:
+        pass  # Column already exists
+
+    # Add can_view_own_sales_board — self-only board (sees just the user's own
+    # sites). Distinct from the full can_view_sales_board.
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_view_own_sales_board INTEGER DEFAULT 0')
         conn.commit()
     except:
         pass  # Column already exists
@@ -6302,8 +6550,9 @@ def delete_exchange_rate(rate_id):
 
 @app.route('/api/sites/import-from-script', methods=['POST'])
 @login_required
+@admin_required
 def import_sites_from_script():
-    """从 1.wooorders_sqlite.py 的硬编码配置导入站点到数据库"""
+    """从 1.wooorders_sqlite.py 的硬编码配置导入站点到数据库（管理员专用：同样会批量建站）"""
     import ast
     import re
     
@@ -7490,8 +7739,11 @@ def product_manager():
 
 @app.route('/api/sites', methods=['POST'])
 @login_required
+@admin_required
 def add_site():
-    """Add a new WooCommerce site"""
+    """Add a new WooCommerce site. Admin-only: a site stores read/WRITE API
+    credentials and config (country/master/manager) that feeds revenue &
+    reconciliation — the UI is admin-gated, so the API must be too."""
     data = request.json
     url = data.get('url')
     ck = data.get('consumer_key')
@@ -7527,8 +7779,9 @@ def add_site():
 
 @app.route('/api/sites/<int:site_id>', methods=['PUT'])
 @login_required
+@admin_required
 def update_site(site_id):
-    """Update a WooCommerce site"""
+    """Update a WooCommerce site. Admin-only (edits API credentials/config)."""
     data = request.json
     url = data.get('url')
     ck = data.get('consumer_key')
@@ -7577,8 +7830,9 @@ def update_site(site_id):
 
 @app.route('/api/sites/<int:site_id>', methods=['DELETE'])
 @login_required
+@admin_required
 def delete_site(site_id):
-    """Delete a WooCommerce site"""
+    """Delete a WooCommerce site. Admin-only."""
     print(f"Received delete request for site_id: {site_id}") # Debug log
     conn = get_db_connection()
     try:
@@ -9252,8 +9506,8 @@ def get_users():
     # back if columns are missing. The init_*_tables() functions always add
     # them on startup, so in practice the first SELECT succeeds.
     SCHEMAS = [
-        # 0: latest — both can_view_costs and can_edit_costs
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, created_at FROM users',
+        # 0: latest — both can_view_costs and can_edit_costs (+ can_view_own_sales_board)
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, created_at FROM users',
         # 1: missing can_edit_costs
         'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, 0 as can_edit_costs, created_at FROM users',
         # 2: missing can_view_costs
@@ -9278,11 +9532,19 @@ def get_users():
             continue
     if users is None:
         users = []
+    # Per-user site count — sites are linked to a person via sites.manager == name.
+    # Drives the 销售看板(仅本人站点) toggle: a user with 0 sites can't be granted it.
+    site_counts = {r['manager']: r['c'] for r in conn.execute(
+        "SELECT manager, COUNT(*) c FROM sites WHERE manager IS NOT NULL AND manager != '' GROUP BY manager"
+    ).fetchall()}
     conn.close()
     is_super_admin = (current_user.username == 'admin')
     result = []
     for row in users:
         u = dict(row)
+        u.setdefault('can_view_own_sales_board', 0)
+        u.setdefault('can_view_shipping', 0)
+        u['site_count'] = site_counts.get(u.get('name') or '', 0)
         # Mark users that the current operator cannot modify
         u['is_super_admin'] = (u['username'] == 'admin')
         u['is_protected'] = u['is_super_admin'] or (u['role'] == 'admin' and not is_super_admin)
@@ -9337,7 +9599,10 @@ def update_user(user_id):
     can_ship = data.get('can_ship', 0)
     can_view_report = data.get('can_view_report', 0)
     can_view_sales_board = data.get('can_view_sales_board', 0)
+    can_view_own_sales_board = data.get('can_view_own_sales_board', 0)
     can_manage_products = 1 if data.get('can_manage_products') else 0
+    # Shipping perm pair (operator-level, like can_ship): "ship" implies "view".
+    can_view_shipping_val = 1 if (data.get('can_view_shipping') or can_ship) else 0
 
     if role not in ['admin', 'user', 'viewer']:
         role = 'user'
@@ -9345,7 +9610,7 @@ def update_user(user_id):
     conn = get_db_connection()
     try:
         # Look up the target user to enforce hierarchy
-        target_user = conn.execute('SELECT username, role FROM users WHERE id = ?', (user_id,)).fetchone()
+        target_user = conn.execute('SELECT username, role, name FROM users WHERE id = ?', (user_id,)).fetchone()
         if not target_user:
             return jsonify({'error': '用户不存在'}), 404
 
@@ -9382,21 +9647,27 @@ def update_user(user_id):
                 can_view_reconciliation_val = 1
             if can_edit_costs_val and not can_view_costs_val:
                 can_view_costs_val = 1
+            # 销售看板（仅本人站点）: only grantable when the user actually has sites
+            # (sites.manager == their name). Server-side guard behind the UI gray-out.
+            can_view_own_sales_board_val = 1 if data.get('can_view_own_sales_board') else 0
+            if can_view_own_sales_board_val and not conn.execute(
+                    'SELECT 1 FROM sites WHERE manager = ? LIMIT 1', (name,)).fetchone():
+                can_view_own_sales_board_val = 0
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_view_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, user_id))
         else:
             # Non-superadmin: cannot change can_manage_users, can_view_sales_board, or set role to admin
             # but CAN grant can_manage_products (a regular operator-level permission)
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_manage_products=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_manage_products, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_manage_products=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_manage_products, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_report=?, can_manage_products=? WHERE id=?',
-                            (name, role, can_ship, can_view_report, can_manage_products, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_manage_products=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_manage_products, user_id))
         conn.commit()
         return jsonify({'success': True})
     finally:
@@ -14066,6 +14337,10 @@ def settings_api():
                 elif key in ['big_order_qty_threshold', 'big_order_amount_threshold']:
                     # Big-order alert thresholds (global)
                     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+                elif key == 'auto_track_au':
+                    # AU scheduled carrier-tracking toggle ('1'/'0'), read by the
+                    # nightly resolve_outcomes.py cron job.
+                    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
             conn.commit()
             
             # 如果自动同步设置发生变更，同步更新 Crontab 定时任务
@@ -14154,7 +14429,7 @@ def user_preferences_api():
 
 @app.route('/shipping')
 @login_required
-@shipper_required
+@shipping_view_required
 def shipping():
     """Shipping management page"""
     conn = get_db_connection()
@@ -14180,7 +14455,270 @@ def shipping():
     all_countries = [c['country'] for c in all_countries]
     
     conn.close()
-    return render_template('shipping.html', carriers=carriers, managers=managers, sites=sites, all_countries=all_countries)
+    return render_template('shipping.html', carriers=carriers, managers=managers, sites=sites,
+                           all_countries=all_countries, is_super_admin=(current_user.username == 'admin'),
+                           has_au_access=_has_au_access())
+
+
+def _has_au_access():
+    """True if the user may see the AU shipping sheet: the super admin, or anyone
+    holding an explicit Australian-site permission. NOTE: viewer/admin role-based
+    all-access does NOT count here — this gate is intentionally stricter than the
+    rest of the system so only AU-relevant staff (and the owner) see this sheet."""
+    if getattr(current_user, 'username', None) == 'admin':
+        return True
+    conn = get_db_connection()
+    try:
+        row = conn.execute('''SELECT 1 FROM user_site_permissions p
+            JOIN sites s ON p.site_id = s.id
+            WHERE p.user_id = ? AND s.country = 'AU' LIMIT 1''', (current_user.id,)).fetchone()
+    finally:
+        conn.close()
+    return bool(row)
+
+
+@app.route('/au-orders')
+@login_required
+def au_orders_sheet():
+    """Clean, light spreadsheet-style view of ALL Australian-market orders, laid
+    out like the team's old Tencent sheet (是否发货 / 运单号 / 发货日期 / 订单号 /
+    下单时间 / 站点 / 产品 / 总金额 / 支付方式 / 运输方式 / 客户 / 电话 / 地址 /
+    客户备注 / 内部备注). Read-only — the AU team prefers a spreadsheet over the
+    full system UI. Access is gated to AU-site-permission holders (+ super admin)."""
+    from datetime import datetime as _dt
+    if not _has_au_access():
+        return render_template_string(
+            '<div style="font-family:-apple-system,Microsoft YaHei,sans-serif;padding:48px;color:#555;text-align:center;">'
+            '<h2 style="color:#333;">无权访问</h2>'
+            '<p>「澳洲发货表」仅限拥有澳洲站点权限的账号查看。</p></div>'), 403
+    conn = get_db_connection()
+    au_sites = [r['url'] for r in conn.execute("SELECT url FROM sites WHERE country='AU'").fetchall()]
+    allowed = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    if allowed is not None:
+        au_sites = [u for u in au_sites if u in allowed]
+    if not au_sites:
+        conn.close()
+        return render_template('au_orders.html', rows=[], count=0,
+                               generated_at=_dt.now().strftime('%Y-%m-%d %H:%M'))
+    ph = ','.join(['?'] * len(au_sites))
+    orders = conn.execute(f"""
+        SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, o.date_modified,
+               o.source, o.billing, o.shipping, o.line_items, o.shipping_lines, o.meta_data,
+               o.customer_note, o.payment_method,
+               n.note AS internal_note
+        FROM orders o
+        LEFT JOIN (
+            SELECT order_id, note, date_created FROM order_notes
+            WHERE customer_note = 0 AND added_by_user = 1
+            GROUP BY order_id HAVING date_created = MAX(date_created)
+        ) n ON o.id = n.order_id
+        WHERE o.source IN ({ph})
+          AND o.status NOT IN ('checkout-draft', 'trash')
+        ORDER BY o.date_created DESC
+    """, au_sites).fetchall()
+
+    # All parcels per order (split shipment / 分批发货) from our local shipping_logs.
+    # This is the immediate source of truth for orders shipped via this system;
+    # the order's AST meta is merged in below to also cover tracking added
+    # directly in WP-admin (and post-sync state).
+    logs_map = {}
+    _oids = [o['id'] for o in orders]
+    if _oids:
+        ph2 = ','.join(['?'] * len(_oids))
+        for r in conn.execute(f"""
+            SELECT sl.order_id, sl.tracking_number, sl.carrier_slug, sl.shipped_at,
+                   sc.name AS carrier_name
+            FROM shipping_logs sl
+            LEFT JOIN shipping_carriers sc ON sc.slug = sl.carrier_slug
+            WHERE sl.order_id IN ({ph2}) ORDER BY sl.id""", _oids).fetchall():
+            logs_map.setdefault(r['order_id'], []).append({
+                'tracking_number': (r['tracking_number'] or '').strip(),
+                'carrier_slug': r['carrier_slug'] or '',
+                'shipped_at': r['shipped_at'] or '',
+            })
+
+    brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
+    conn.close()
+    # Brand cache for compact product labels (built once, reused per line item).
+    brands_cache = []
+    for br in brands_rows:
+        try:
+            aliases = json.loads(br['aliases']) if br['aliases'] else []
+        except Exception:
+            aliases = []
+        if not isinstance(aliases, list):
+            aliases = []
+        brands_cache.append({'id': br['id'], 'name': br['name'], 'aliases': aliases,
+                             'patterns': [(br['name'] or '').upper()] + [str(a).upper() for a in aliases]})
+
+    def pay_label(pm):
+        p = (pm or '').lower()
+        if 'stripe' in p:
+            return '条纹支付'
+        if p == 'bacs':
+            return '银行转账'
+        if 'cod' in p:
+            return '货到付款'
+        if 'paypal' in p:
+            return 'PayPal'
+        if p == 'custom_gateway':
+            return '在线支付'
+        return pm or ''
+
+    def product_cell(it):
+        # Display = 品牌 + 口数 + 口味（完整，方便看清是哪个口味）。
+        # color_key = 品牌 + 口数 ONLY —— 发货员按"同品牌同口数"分色拣货，不按口味
+        # （口味太多、按口味上色太花、记不住）。
+        nm = it.get('name', '') or ''
+        try:
+            p = parse_product_name(nm, brands_cache, series_cache=[])
+            brand = p.get('brand') or ''
+            puffs = str(p['puffs']) if p.get('puffs') else ''
+            flavor = p.get('flavor') or ''
+        except Exception:
+            brand = puffs = flavor = ''
+        # Robust puff fallback: the strict parser misses glued numbers like
+        # "INGOT9000"; grab the first 4-6 digit run so the same physical product
+        # groups under one color regardless of name formatting.
+        if not puffs:
+            mm = re.search(r'\d{4,6}', nm)
+            if mm:
+                puffs = mm.group()
+        display = ' - '.join(x for x in (brand, puffs, flavor) if x).strip() or nm
+        key = ' '.join(x for x in (brand, puffs) if x).strip() or display
+        return {'name': display, 'key': key, 'brand': brand, 'qty': it.get('quantity', 1)}
+
+    def extract_trackings(meta_list):
+        # Return ALL tracking records from the order meta. AST stores a LIST
+        # (_wc_shipment_tracking_items) — for a split shipment that's multiple
+        # records, so we iterate the whole list, not just the first. Falls back
+        # to the generic single _tracking_number. Each = (number, provider, date).
+        out = []
+        for m in (meta_list or []):
+            if isinstance(m, dict) and m.get('key') == '_wc_shipment_tracking_items':
+                v = m.get('value') or []
+                if isinstance(v, list):
+                    for rec in v:
+                        if isinstance(rec, dict) and str(rec.get('tracking_number', '')).strip():
+                            out.append((str(rec['tracking_number']).strip(),
+                                        str(rec.get('tracking_provider', '') or ''),
+                                        str(rec.get('date_shipped', '') or '')))
+                if out:
+                    return out
+        for m in (meta_list or []):
+            if isinstance(m, dict) and m.get('key') == '_tracking_number' and str(m.get('value', '')).strip():
+                prov = ''
+                for mm in (meta_list or []):
+                    if isinstance(mm, dict) and mm.get('key') == '_tracking_provider':
+                        prov = str(mm.get('value', '') or '')
+                return [(str(m['value']).strip(), prov, '')]
+        return []
+
+    def carrier_label(provider, method_title):
+        # Show the ACTUAL carrier (from the tracking provider) over the checkout
+        # shipping method — e.g. provider 'ems' → EMS even when the order's
+        # shipping method is 'Australia Post'.
+        p = (provider or '').lower().replace('_', '-')
+        m = {'ems': 'EMS', 'australia-post': 'Australia Post', 'auspost': 'Australia Post',
+             'inpost-paczkomaty': 'InPost', 'inpost': 'InPost', 'dpd': 'DPD', 'dpd-pl': 'DPD',
+             'china-post': 'EMS/中国邮政', 'gls': 'GLS', 'poczta-polska': 'Poczta Polska'}
+        if p in m:
+            return m[p]
+        if provider:
+            return provider.upper() if len(provider) <= 4 else provider
+        return method_title or ''
+
+    SHIPPED = ('completed', 'shipped', 'partial-shipped')
+    rows = []
+    for o in orders:
+        billing = parse_json_field(o['billing'])
+        shipping_info = parse_json_field(o['shipping'])
+        line_items = parse_json_field(o['line_items'])
+        shipping_lines = parse_json_field(o['shipping_lines'])
+        meta_list = parse_json_field(o['meta_data'])
+        meta_tracks = extract_trackings(meta_list)
+        logs = logs_map.get(o['id'], [])
+        # Merge parcels: our shipping_logs first (immediate, ordered #1..N), then
+        # any AST-meta records not already present (WP-admin entries / post-sync).
+        trackings, seen = [], set()
+        for lg in logs:
+            tn = lg['tracking_number']
+            if tn and tn.lower() not in seen:
+                seen.add(tn.lower())
+                trackings.append({'number': tn, 'carrier': carrier_label(lg['carrier_slug'], '')})
+        for tn, prov, _ds in meta_tracks:
+            if tn and tn.lower() not in seen:
+                seen.add(tn.lower())
+                trackings.append({'number': tn, 'carrier': carrier_label(prov, '')})
+        addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
+        std_parts = [addr.get('address_1', ''), addr.get('address_2', ''),
+                     addr.get('postcode', ''), addr.get('city', ''), addr.get('country', '')]
+        tracking = trackings[0]['number'] if trackings else ''
+        is_shipped = bool(trackings) or (o['status'] in SHIPPED)
+        # Hide orders cancelled before ever shipping — typically the customer
+        # never paid and WooCommerce auto-cancelled on timeout. They just clutter
+        # the shipping sheet. If goods actually went out (has a tracking number),
+        # keep the row so dispatched stock stays visible.
+        if o['status'] == 'cancelled' and not is_shipped:
+            continue
+        # 发货日期: earliest local parcel date, else AST date_shipped, else date_modified.
+        ship_date = ''
+        log_dates = [lg['shipped_at'][:10] for lg in logs if lg.get('shipped_at')]
+        if log_dates:
+            ship_date = min(log_dates)
+        if not ship_date:
+            ast_ts = meta_tracks[0][2] if meta_tracks else ''
+            if ast_ts and ast_ts.isdigit():
+                try:
+                    ship_date = _dt.fromtimestamp(int(ast_ts)).strftime('%Y-%m-%d')
+                except Exception:
+                    pass
+        if not ship_date and is_shipped:
+            ship_date = (o['date_modified'] or '')[:10]
+        name = f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip() \
+            or f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip()
+        rows.append({
+            'shipped': is_shipped,
+            'tracking': tracking,
+            'trackings': trackings,
+            'ship_date': ship_date,
+            'number': o['number'],
+            'order_time': (o['date_created'] or '').replace('T', ' ')[:16],
+            'source': (o['source'] or '').replace('https://www.', '').replace('https://', ''),
+            'products': [product_cell(it) for it in (line_items or [])],
+            'total': f"{float(o['total'] or 0):.2f}",
+            'currency': o['currency'] or 'AUD',
+            'payment': pay_label(o['payment_method']),
+            'shipping_method': (trackings[0]['carrier'] if trackings
+                                else carrier_label('', shipping_lines[0].get('method_title', '') if shipping_lines else '')),
+            'customer': name,
+            'phone': addr.get('phone') or billing.get('phone', ''),
+            'address': ', '.join(filter(None, std_parts)),
+            'customer_note': o['customer_note'] or '',
+            'internal_note': o['internal_note'] or '',
+        })
+
+    # Color-code products by 品牌+口数 (NOT flavor): same brand+puff → same color,
+    # so the picker grabs the right box. Specific brands have a fixed, memorable
+    # color (per request); every other brand+puff key gets a stable auto hue spaced
+    # by the golden angle (137.5°) for good separation.
+    BRAND_CHIP = {
+        'alibarbar': ('#f6e7a0', '#7d5e10'),   # 金色
+        'umin':      ('#d6ebfb', '#1f5d8c'),   # 淡蓝色
+    }
+    keys = sorted({p['key'] for r in rows for p in r['products']})
+    hue_map = {k: round((i * 137.508) % 360) for i, k in enumerate(keys)}
+    for r in rows:
+        for p in r['products']:
+            ov = BRAND_CHIP.get((p.get('brand') or '').lower())
+            if ov:
+                p['bg'], p['fg'] = ov
+            else:
+                hue = hue_map.get(p['key'], 0)
+                p['bg'], p['fg'] = f'hsl({hue},70%,91%)', f'hsl({hue},52%,30%)'
+
+    return render_template('au_orders.html', rows=rows, count=len(rows),
+                           generated_at=_dt.now().strftime('%Y-%m-%d %H:%M'))
 
 
 def extract_custom_billing_fields(meta_data):
@@ -14257,7 +14795,7 @@ def evaluate_big_order(product_count, total, qty_threshold, amount_threshold):
 
 @app.route('/api/shipping/pending')
 @login_required
-@shipper_required
+@shipping_view_required
 def get_pending_orders():
     """Get orders pending shipment (status=processing)"""
     conn = get_db_connection()
@@ -14332,6 +14870,28 @@ def get_pending_orders():
     query += ' ORDER BY o.date_created DESC'
     
     orders = conn.execute(query, params).fetchall()
+
+    # Parcels already shipped for these orders (split shipment / 分批发货).
+    # shipping_logs is local-only and untouched by sync, so a partial order
+    # keeps its 'processing' status and stays in this queue; the parcel rows
+    # tell us how many packages already went out.
+    order_ids = [o['id'] for o in orders]
+    parcels_map = {}
+    if order_ids:
+        ph = ','.join(['?'] * len(order_ids))
+        for r in conn.execute(
+            f'''SELECT sl.order_id, sl.tracking_number, sl.carrier_slug, sl.shipped_at,
+                       sc.name AS carrier_name
+                FROM shipping_logs sl
+                LEFT JOIN shipping_carriers sc ON sc.slug = sl.carrier_slug
+                WHERE sl.order_id IN ({ph}) ORDER BY sl.id''', order_ids).fetchall():
+            parcels_map.setdefault(r['order_id'], []).append({
+                'tracking_number': r['tracking_number'],
+                'carrier_slug': r['carrier_slug'],
+                'carrier_name': r['carrier_name'] or r['carrier_slug'],
+                'shipped_at': r['shipped_at'],
+            })
+
     # Build the risk index once (small scan over flagged orders only) and
     # reuse it for every row in this listing. Closing conn AFTER the build.
     risk_idx = _build_risk_index(conn)
@@ -14399,6 +14959,8 @@ def get_pending_orders():
             'warehouse_id': order['warehouse_id'],
             'warehouse_name': order['warehouse_name'] or '',
             'customer_risk': customer_risk,
+            'parcels': parcels_map.get(order['id'], []),
+            'parcels_shipped': len(parcels_map.get(order['id'], [])),
             'latest_note': order['latest_note'] or '',
             'latest_note_date': order['latest_note_date'] or '',
             'latest_note_author': order['latest_note_author'] or ''
@@ -14409,7 +14971,7 @@ def get_pending_orders():
 
 @app.route('/api/shipping/pending-outcome')
 @login_required
-@shipper_required
+@shipping_view_required
 def get_pending_outcome_orders():
     """「待确认结局」queue: COD orders that were shipped (on-hold/shipped) some
     days ago but whose fate was never recorded — neither 已签收 nor 拒收 nor
@@ -14445,7 +15007,9 @@ def get_pending_outcome_orders():
         FROM orders o
         LEFT JOIN sites s ON o.source = s.url
         LEFT JOIN warehouses w ON o.warehouse_id = w.id
-        LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        LEFT JOIN shipping_logs sl ON sl.id = (
+            SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
+        )
         LEFT JOIN (
             SELECT order_id, note, date_created, author
             FROM order_notes
@@ -14548,9 +15112,51 @@ def get_pending_outcome_orders():
     return jsonify(result)
 
 
-@app.route('/api/shipping/shipped')
+@app.route('/api/shipping/pending-outcome/ids-before')
 @login_required
 @shipper_required
+def pending_outcome_ids_before():
+    """Admin-only. List 待确认结局 candidate order IDs created strictly BEFORE a
+    cutoff date — powers the 「一刀切」 bulk historical close-out: confirm all
+    unconfirmed COD orders before <date> as delivered.
+
+    Uses the EXACT same candidate definition as the 待确认结局 queue, so it
+    inherently skips orders already marked undelivered / problem-return /
+    confirmed, plus non-COD and failed/cancelled orders. The result therefore
+    includes carrier_status 'returned'/'unknown'/'in_transit' rows (detected but
+    not human-actioned) — which the operator explicitly wants closed out too."""
+    if current_user.username != 'admin':
+        return jsonify({'error': '只有超级管理员可使用一刀切'}), 403
+    import re as _re
+    date = (request.args.get('date') or '').strip()
+    if not _re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+        return jsonify({'error': '日期格式应为 YYYY-MM-DD'}), 400
+
+    conn = get_db_connection()
+    conds = ["payment_method = 'cod'",
+             "status IN ('on-hold', 'shipped', 'partial-shipped')",
+             "COALESCE(is_undelivered, 0) = 0",
+             "COALESCE(is_problem_return, 0) = 0",
+             "COALESCE(delivery_confirmed, 0) = 0",
+             "date_created < ?"]   # 'YYYY-MM-DD' < 'YYYY-MM-DDT..' → excludes the day itself
+    params = [date]
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    if allowed_sources is not None:
+        if not allowed_sources:
+            conn.close()
+            return jsonify({'date': date, 'count': 0, 'ids': []})
+        ph = ','.join(['?'] * len(allowed_sources))
+        conds.append(f'source IN ({ph})')
+        params.extend(allowed_sources)
+    rows = conn.execute(f"SELECT id FROM orders WHERE {' AND '.join(conds)} ORDER BY date_created", params).fetchall()
+    conn.close()
+    ids = [r['id'] for r in rows]
+    return jsonify({'date': date, 'count': len(ids), 'ids': ids})
+
+
+@app.route('/api/shipping/shipped')
+@login_required
+@shipping_view_required
 def get_shipped_orders():
     """Get shipped orders (status=on-hold) with tracking info"""
     conn = get_db_connection()
@@ -14564,7 +15170,7 @@ def get_shipped_orders():
                o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_lines, o.shipping_total,
                o.customer_note, o.warehouse_id,
                o.is_undelivered, o.shipping_loss_amount, o.undelivered_at, o.undelivered_note,
-               o.is_problem_return,
+               o.is_problem_return, o.carrier_status, o.carrier_status_at,
                s.manager,
                w.name AS warehouse_name,
                sl.tracking_number, sl.carrier_slug, sl.shipped_at,
@@ -14573,7 +15179,12 @@ def get_shipped_orders():
         FROM orders o
         LEFT JOIN sites s ON o.source = s.url
         LEFT JOIN warehouses w ON o.warehouse_id = w.id
-        LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        -- Join only the LATEST parcel as the representative tracking row, so a
+        -- split-shipment order (multiple shipping_logs rows) appears ONCE here.
+        -- The full parcel list is attached separately below.
+        LEFT JOIN shipping_logs sl ON sl.id = (
+            SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
+        )
         LEFT JOIN users u ON o.undelivered_by = u.id
         LEFT JOIN (
             SELECT order_id, note, date_created, author
@@ -14626,7 +15237,7 @@ def get_shipped_orders():
             o.number LIKE ?
             OR o.billing LIKE ?
             OR o.shipping LIKE ?
-            OR sl.tracking_number LIKE ?
+            OR EXISTS (SELECT 1 FROM shipping_logs slx WHERE slx.order_id = o.id AND slx.tracking_number LIKE ?)
             OR o.meta_data LIKE ?
             OR o.shipping_lines LIKE ?
             OR o.line_items LIKE ?
@@ -14636,7 +15247,29 @@ def get_shipped_orders():
     query += ' ORDER BY sl.shipped_at DESC, o.date_modified DESC, o.date_created DESC'
     
     orders = conn.execute(query, params).fetchall()
-    
+
+    # All parcels per order (split shipment / 分批发货) so a completed multi-
+    # parcel order can show every tracking number, not just the latest.
+    shipped_ids = [o['id'] for o in orders]
+    shipped_parcels_map = {}
+    if shipped_ids:
+        ph = ','.join(['?'] * len(shipped_ids))
+        for r in conn.execute(
+            f'''SELECT sl.order_id, sl.tracking_number, sl.carrier_slug, sl.shipped_at,
+                       sc.name AS carrier_name, sc.tracking_url
+                FROM shipping_logs sl
+                LEFT JOIN shipping_carriers sc ON sc.slug = sl.carrier_slug
+                WHERE sl.order_id IN ({ph}) ORDER BY sl.id''', shipped_ids).fetchall():
+            tn = r['tracking_number'] or ''
+            tmpl = r['tracking_url'] or ''
+            shipped_parcels_map.setdefault(r['order_id'], []).append({
+                'tracking_number': tn,
+                'carrier_slug': r['carrier_slug'],
+                'carrier_name': r['carrier_name'] or r['carrier_slug'],
+                'tracking_url': (tmpl.replace('{tracking}', tn).replace('{tracking_number}', tn) if tmpl and tn else ''),
+                'shipped_at': r['shipped_at'],
+            })
+
     # Get carriers for tracking URL
     carriers = {c['slug']: c for c in conn.execute('SELECT * FROM shipping_carriers').fetchall()}
     conn.close()
@@ -14659,6 +15292,12 @@ def get_shipped_orders():
     for order in orders:
         try:
             payload = process_shipped_order(order, conn, carriers, ast_provider_mapping)
+            payload['date_created'] = order['date_created']  # 下单日期 (shown in the 订单 column)
+            _ps = shipped_parcels_map.get(order['id'], [])
+            payload['parcels'] = _ps
+            payload['parcels_shipped'] = len(_ps)
+            payload['carrier_status'] = order['carrier_status']
+            payload['carrier_status_at'] = order['carrier_status_at']
             payload['customer_risk'] = _assess_customer_risk(
                 parse_json_field(order['billing']),
                 parse_json_field(order['shipping']),
@@ -14675,7 +15314,7 @@ def get_shipped_orders():
 
 @app.route('/api/shipping/find-by-tracking')
 @login_required
-@shipper_required
+@shipping_view_required
 def find_orders_by_tracking():
     """Status-agnostic lookup by tracking number.
 
@@ -14706,7 +15345,9 @@ def find_orders_by_tracking():
                n.note as latest_note, n.date_created as latest_note_date, n.author as latest_note_author
         FROM orders o
         LEFT JOIN sites s ON o.source = s.url
-        LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        LEFT JOIN shipping_logs sl ON sl.id = (
+            SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
+        )
         LEFT JOIN users u ON o.undelivered_by = u.id
         LEFT JOIN (
             SELECT order_id, note, date_created, author
@@ -14891,6 +15532,81 @@ def build_villatheme_lineitem_payload(tracking_number, carrier_slug, carrier_nam
     return out
 
 
+# ── Multi-parcel (split shipment / 分批发货) builders ──────────────────────────
+# A "parcel" dict carries everything a tracking record needs:
+#   {tracking_number, carrier_slug, carrier_name, tracking_url, date_shipped}
+# date_shipped is a unix-timestamp string. shipping_logs is the source of truth
+# for which parcels an order has — we always rebuild the FULL tracking value
+# from the parcel list and PUT it (the PUT replaces the meta), so AST/VillaTheme
+# end up holding every parcel's tracking number, not just the latest.
+
+def build_ast_tracking_items(parcels, line_items):
+    """Build _wc_shipment_tracking_items as a list with ONE record per parcel.
+
+    AST natively renders each list entry as a separate shipment, so a split
+    order shows all its tracking numbers. Single-parcel orders pass a 1-element
+    list and behave exactly as before.
+    """
+    import time, hashlib
+    products = []
+    for it in line_items or []:
+        if isinstance(it, dict) and it.get('id'):
+            products.append({
+                'product': str(it.get('product_id', '')),
+                'item_id': str(it.get('id')),
+                'qty': str(it.get('quantity', 1))
+            })
+    items = []
+    for p in parcels or []:
+        tn = (p.get('tracking_number') or '').strip()
+        if not tn:
+            continue
+        ds = str(p.get('date_shipped') or int(time.time()))
+        items.append({
+            'tracking_number': tn,
+            'shipping_note': '',
+            'tracking_provider': _ast_provider_for_carrier(p.get('carrier_slug')),
+            'custom_tracking_link': '',
+            'tracking_product_code': '',
+            'date_shipped': ds,
+            'products_list': products,
+            'status_shipped': '1',
+            # Stable per (number, date) so re-PUTs don't churn the id.
+            'tracking_id': hashlib.md5(f"{tn}{ds}".encode()).hexdigest(),
+        })
+    return items
+
+
+def build_villatheme_lineitem_payload_multi(parcels, line_items):
+    """VillaTheme stores _vi_wot_order_item_tracking_data as a JSON array per
+    line item. We write the SAME array (one entry per parcel) onto every item,
+    so a split order keeps all tracking numbers."""
+    import json as _json
+    records = []
+    for p in parcels or []:
+        tn = (p.get('tracking_number') or '').strip()
+        if not tn:
+            continue
+        url_template = (p.get('tracking_url_template') or '').replace('{tracking}', '{tracking_number}')
+        records.append({
+            'tracking_number': tn,
+            'carrier_slug': p.get('carrier_slug') or 'custom',
+            'carrier_name': p.get('carrier_name') or (p.get('carrier_slug') or 'Custom'),
+            'carrier_url': url_template,
+            'carrier_type': 'custom-carrier',
+            'time': int(p.get('date_shipped') or 0),
+        })
+    tracking_value = _json.dumps(records)
+    out = []
+    for it in line_items or []:
+        if isinstance(it, dict) and it.get('id'):
+            out.append({
+                'id': it.get('id'),
+                'meta_data': [{'key': '_vi_wot_order_item_tracking_data', 'value': tracking_value}]
+            })
+    return out
+
+
 def _post_fallback_customer_note(req, site, order, carrier_name, tracking_number, tracking_url, api_headers, warnings):
     """Last-resort fallback when the trigger-shipment-email endpoint is missing
     on the site (mu-plugin not installed yet). Posts a customer_note=true so
@@ -14963,6 +15679,15 @@ def ship_order():
     tracking_number = (data.get('tracking_number') or '').strip()
     carrier_slug = (data.get('carrier_slug') or '').strip()
     send_email = data.get('send_email', True)
+    # 分批发货 (split shipment) flags:
+    #   new_parcel   → this action adds ANOTHER parcel: append a shipping_logs
+    #                  row and rebuild the WP tracking value from ALL parcels.
+    #   more_batches → not the final batch: leave the order status untouched so
+    #                  it stays in the 待发货 queue and survives WC re-sync
+    #                  (sync overwrites status). Status only advances on the
+    #                  final batch (more_batches=False).
+    new_parcel = bool(data.get('new_parcel'))
+    more_batches = bool(data.get('more_batches'))
 
     if not all([order_id, tracking_number, carrier_slug]):
         return jsonify({'success': False, 'error': '缺少必填字段'}), 400
@@ -15004,23 +15729,66 @@ def ship_order():
         "Accept": "application/json"
     }
 
-    # Build the single PUT payload: status + correct tracking meta shape.
+    # Assemble the FULL parcel list to write to WP. shipping_logs is the source
+    # of truth for already-shipped parcels; on a new_parcel action we append,
+    # otherwise (normal ship / correction) we replace with just this one.
+    new_ds = int(time.time())
+    carriers_by_slug = {r['slug']: r for r in conn.execute(
+        'SELECT slug, name, tracking_url FROM shipping_carriers').fetchall()}
+
+    def _mk_parcel(slug, tn, ds):
+        c = carriers_by_slug.get(slug)
+        tmpl = ((c['tracking_url'] if c else '') or '')
+        return {
+            'tracking_number': tn,
+            'carrier_slug': slug,
+            'carrier_name': (c['name'] if c else slug),
+            'tracking_url_template': tmpl,
+            'date_shipped': ds,
+        }
+
+    def _shipped_at_unix(s):
+        if not s:
+            return new_ds
+        for f in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return int(datetime.strptime(str(s)[:19], f).timestamp())
+            except Exception:
+                pass
+        return new_ds
+
+    if new_parcel:
+        prior = conn.execute(
+            'SELECT tracking_number, carrier_slug, shipped_at FROM shipping_logs WHERE order_id=? ORDER BY id',
+            (order_id,)).fetchall()
+        parcels = [_mk_parcel(r['carrier_slug'], r['tracking_number'], _shipped_at_unix(r['shipped_at']))
+                   for r in prior if (r['tracking_number'] or '').strip()]
+        parcels.append(_mk_parcel(carrier_slug, tracking_number, new_ds))
+    else:
+        parcels = [_mk_parcel(carrier_slug, tracking_number, new_ds)]
+
+    # Build the PUT payload: tracking meta (+ status, unless more batches follow).
     # Status varies by site: AST uses its custom 'shipped' status; VillaTheme
     # and poland.php sites stay at the standard 'on-hold' status after shipping.
-    put_payload = {'status': target_status}
+    # During a partial shipment (more_batches) we DON'T send status, so the
+    # order stays in its pre-ship state (待发货) until the final batch.
+    put_payload = {}
+    if not more_batches:
+        put_payload['status'] = target_status
     base_meta = [
         {'key': '_tracking_number', 'value': tracking_number},
         {'key': '_tracking_provider', 'value': carrier_slug},
-        {'key': '_date_shipped', 'value': str(int(time.time()))},
+        {'key': '_date_shipped', 'value': str(new_ds)},
     ]
 
     if fmt == 'villatheme':
         put_payload['meta_data'] = base_meta
-        put_payload['line_items'] = build_villatheme_lineitem_payload(
-            tracking_number, carrier_slug, carrier_name, tracking_url_template, line_items
-        )
+        put_payload['line_items'] = build_villatheme_lineitem_payload_multi(parcels, line_items)
     elif fmt == 'custom_lineitem':
         put_payload['meta_data'] = base_meta
+        # custom_lineitem stores a single tracking meta per item; multi-parcel
+        # isn't representable there, so we write the latest parcel (the full
+        # parcel history is always kept locally in shipping_logs).
         put_payload['line_items'] = build_custom_lineitem_payload(tracking_number, carrier_slug, tracking_url, line_items)
     else:
         # ast or unknown — write AST format. Even if AST plugin isn't installed,
@@ -15028,7 +15796,7 @@ def ship_order():
         # already understand _wc_shipment_tracking_items.
         put_payload['meta_data'] = base_meta + [
             {'key': '_wc_shipment_tracking_items',
-             'value': build_ast_tracking_value(tracking_number, carrier_slug, line_items)},
+             'value': build_ast_tracking_items(parcels, line_items)},
         ]
 
     status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}"
@@ -15060,9 +15828,13 @@ def ship_order():
             # response never made it back.
             try:
                 check = req.get(status_url, auth=(site['consumer_key'], site['consumer_secret']), timeout=30)
-                if check.status_code == 200 and check.json().get('status') == target_status:
+                # On a final batch we confirm via the status flip; during a
+                # partial batch (more_batches) status is intentionally unchanged,
+                # so a reachable 200 is the best confirmation we can get (the PUT
+                # is idempotent, so retrying is harmless anyway).
+                if check.status_code == 200 and (more_batches or check.json().get('status') == target_status):
                     remote_success = True
-                    warnings.append("PUT 响应超时，但二次查询确认状态已更新")
+                    warnings.append("PUT 响应超时，但二次查询确认订单可达")
                     break
             except Exception as verify_err:
                 print(f"[SHIP] verify after timeout failed: {verify_err}")
@@ -15073,25 +15845,29 @@ def ship_order():
             break
 
     if not remote_success:
-        # Persist the tracking number locally so the user doesn't have to
-        # retype it on retry. Status stays as-is to avoid drift.
-        existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
-        if existing_log:
-            conn.execute(
-                "UPDATE shipping_logs SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now') WHERE order_id=?",
-                (tracking_number, carrier_slug, current_user.id, order_id)
-            )
-        else:
-            conn.execute(
-                '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
-                   VALUES (?, ?, ?, ?, ?, ?)''',
-                (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
-            )
-        conn.commit()
+        # For a NEW parcel (split shipment) we don't stash anything: the parcel
+        # didn't actually ship, and inserting a row would create a phantom
+        # parcel. The user just retries. For a normal/first shipment we stash
+        # the tracking number locally so it doesn't have to be retyped on retry.
+        if not new_parcel:
+            existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
+            if existing_log:
+                conn.execute(
+                    "UPDATE shipping_logs SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now') WHERE order_id=?",
+                    (tracking_number, carrier_slug, current_user.id, order_id)
+                )
+            else:
+                conn.execute(
+                    '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
+                       VALUES (?, ?, ?, ?, ?, ?)''',
+                    (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
+                )
+            conn.commit()
+        stash_note = '' if new_parcel else '运单号已暂存本地，请稍后重试。'
         conn.close()
         return jsonify({
             'success': False,
-            'error': f"发货失败（{fmt_label}）：{'; '.join(warnings) or '远程未返回成功'}。运单号已暂存本地，请稍后重试。"
+            'error': f"发货失败（{fmt_label}）：{'; '.join(warnings) or '远程未返回成功'}。{stash_note}"
         }), 500
 
     # Trigger the site's native shipment email.
@@ -15137,29 +15913,46 @@ def ship_order():
         except Exception as e:
             warnings.append(f"邮件触发异常: {e}")
 
-    # Local DB: status + shipping_logs (mirror the remote status we just set)
+    # Local DB: status + shipping_logs (mirror the remote state we just set).
     try:
-        conn.execute("UPDATE orders SET status=? WHERE id=?", (target_status, order_id))
-        existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id=?', (order_id,)).fetchone()
-        if existing_log:
-            conn.execute(
-                "UPDATE shipping_logs SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now') WHERE order_id=?",
-                (tracking_number, carrier_slug, current_user.id, order_id)
-            )
-        else:
+        # Advance status only on the final batch. During a partial shipment the
+        # order keeps its pre-ship status so it stays in the 待发货 queue.
+        if not more_batches:
+            conn.execute("UPDATE orders SET status=? WHERE id=?", (target_status, order_id))
+        if new_parcel:
+            # Split shipment: record this parcel as its own row.
             conn.execute(
                 '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
                    VALUES (?, ?, ?, ?, ?, ?)''',
                 (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
             )
+        else:
+            existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id=?', (order_id,)).fetchone()
+            if existing_log:
+                conn.execute(
+                    "UPDATE shipping_logs SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now') WHERE order_id=?",
+                    (tracking_number, carrier_slug, current_user.id, order_id)
+                )
+            else:
+                conn.execute(
+                    '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
+                       VALUES (?, ?, ?, ?, ?, ?)''',
+                    (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
+                )
         conn.commit()
     except Exception as e:
         conn.close()
         return jsonify({'success': False, 'error': f"本地数据库更新失败: {e}"}), 500
     conn.close()
 
-    # Annotate the success message with what the email trigger reported
-    msg = f"发货成功（{fmt_label} 格式）"
+    # Annotate the success message — split-shipment aware.
+    parcel_count = len(parcels)
+    if more_batches:
+        msg = f"第 {parcel_count} 个包裹已发货（分批中，订单仍在待发货，可继续添加包裹）"
+    elif new_parcel and parcel_count > 1:
+        msg = f"最后一个包裹已发货，共 {parcel_count} 个包裹，订单已完成发货（{fmt_label} 格式）"
+    else:
+        msg = f"发货成功（{fmt_label} 格式）"
     if email_trigger_info:
         plugin = email_trigger_info.get('plugin', '?')
         sent = email_trigger_info.get('email_sent')
@@ -15169,13 +15962,12 @@ def ship_order():
             msg += "，AST 已自动安排发货邮件"
         elif sent is False:
             msg += f"，邮件未发送：{email_trigger_info.get('note', '未识别物流插件')}"
+    resp_extra = {'format': fmt, 'email_trigger': email_trigger_info,
+                  'parcel_count': parcel_count, 'more_batches': more_batches}
     if warnings:
-        return jsonify({
-            'success': True, 'warning': True, 'format': fmt,
-            'message': msg + ' — 警告: ' + '; '.join(warnings),
-            'email_trigger': email_trigger_info,
-        })
-    return jsonify({'success': True, 'message': msg, 'format': fmt, 'email_trigger': email_trigger_info})
+        return jsonify({'success': True, 'warning': True,
+                        'message': msg + ' — 警告: ' + '; '.join(warnings), **resp_extra})
+    return jsonify({'success': True, 'message': msg, **resp_extra})
 
 
 @app.route('/api/shipping/debug/<int:order_id>', methods=['POST'])
@@ -15191,7 +15983,9 @@ def debug_tracking_sync(order_id):
     order = conn.execute('''
         SELECT o.*, sl.tracking_number, sl.carrier_slug
         FROM orders o
-        LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        LEFT JOIN shipping_logs sl ON sl.id = (
+            SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
+        )
         WHERE o.id = ?
     ''', (order_id,)).fetchone()
     
@@ -15319,7 +16113,7 @@ def complete_order(order_id):
 
 @app.route('/api/shipping/carriers')
 @login_required
-@shipper_required
+@shipping_view_required
 def get_carriers():
     """Carriers visible to the current user.
 
@@ -15486,7 +16280,7 @@ def detect_carriers_for_site(conn, site_url, lookback_orders=80):
 
 @app.route('/api/shipping/carriers-for-site')
 @login_required
-@shipper_required
+@shipping_view_required
 def get_carriers_for_site():
     """Return the carriers actually in use on a given site (auto-detected
     from recent shipped orders). Used by the ship modal so each site only
@@ -16144,12 +16938,32 @@ def confirm_order_delivery(order_id):
     return jsonify({'success': True, 'message': '已确认签收' + sync_msg})
 
 
+def _persist_carrier_status(order_id, outcome):
+    """Cache a freshly-detected carrier outcome onto the order — same write the
+    nightly auto-resolver does — so an on-demand 查物流 immediately updates the
+    待确认结局 badge and makes a delivered parcel batch-confirmable, without
+    waiting for cron. Detection only: never confirms delivery or touches
+    WooCommerce. No-ops for non-terminal / unknown outcomes."""
+    if outcome not in ('delivered', 'returned', 'attention', 'in_transit'):
+        return
+    try:
+        c = get_db_connection()
+        c.execute("UPDATE orders SET carrier_status=?, carrier_status_at=datetime('now') WHERE id=?",
+                  (outcome, order_id))
+        c.commit()
+        c.close()
+    except Exception as e:
+        app.logger.warning(f"persist carrier_status for {order_id} failed: {e}")
+
+
 @app.route('/api/order/<int:order_id>/carrier-status')
 @login_required
-@shipper_required
+@shipping_view_required
 def order_carrier_status(order_id):
-    """On-demand 查物流: live carrier lookup for ONE order (read-only).
-    InPost = synchronous public API (full timeline). DPD = via 17track."""
+    """On-demand 查物流: live carrier lookup for ONE order. Read-only w.r.t.
+    delivery confirmation / WooCommerce, but it DOES cache the detected
+    carrier_status (like the resolver) so the queue badge updates immediately.
+    InPost = ShipX (+ Track718 'in-post' fallback). DPD/others = Track718."""
     import requests as req
     import carrier_tracking as ct
     conn = get_db_connection()
@@ -16206,22 +17020,45 @@ def order_carrier_status(order_id):
         except Exception as e:
             return jsonify({'success': False, 'error': f'InPost 查询失败: {e}'}), 502
         if r.status_code == 404:
+            # ShipX (InPost business API) has no record — common for parcels sent
+            # via Paczkomat self-service. Fall back to Track718 under the InPost-PL
+            # courier code ('in-post'), which tracks the consumer-side data the
+            # official inpost.pl site shows.
+            if key718:
+                # Longer poll: a fresh number's crawl can take ~10-20s; break early
+                # once a status lands (see track718_detail) so most clicks resolve.
+                res = ct.track718_detail(number, key718, code=ct.TRACK718_INPOST_PL, poll=8, poll_wait=3)
+                _persist_carrier_status(order_id, res.get('outcome'))
+                if res.get('events'):
+                    return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
+                                    'outcome': res.get('outcome', 'unknown'), 'events': res['events'],
+                                    'note': '来自 Track718（InPost 商家接口无此单）'})
+                if res.get('outcome') and res.get('outcome') != 'unknown':
+                    return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
+                                    'outcome': res.get('outcome'), 'events': [],
+                                    'note': 'Track718 已识别状态，详细轨迹抓取中，请稍后再查'})
+                return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
+                                'outcome': 'unknown', 'events': [],
+                                'note': 'InPost 商家接口查无；Track718 正在抓取，请稍后再查或点「官网」核对'})
             return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
                             'outcome': 'unknown', 'events': [], 'note': 'InPost 查无此单（可能太老已清除）'})
         if r.status_code != 200:
             return jsonify({'success': False, 'error': f'InPost API {r.status_code}'}), 502
         d = r.json()
         raw = d.get('status', '')
+        outcome = ct.INPOST_STATUS_MAP.get(raw, 'in_transit')
+        _persist_carrier_status(order_id, outcome)
         events = sorted([{'time': ev.get('datetime', ''), 'status': ev.get('status', '')}
                          for ev in (d.get('tracking_details') or [])],
                         key=lambda e: e['time'], reverse=True)
         return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
-                        'raw': raw, 'outcome': ct.INPOST_STATUS_MAP.get(raw, 'in_transit'), 'events': events})
+                        'raw': raw, 'outcome': outcome, 'events': events})
     # Everything that isn't InPost goes through Track718: DPD with its code,
     # any other carrier (EMS/中国邮政, Australia Post, GLS, …) via auto-detect.
     if not key718:
         return jsonify({'success': False, 'error': '未配置 Track718 key'}), 400
-    res = ct.track718_detail(number, key718, code=('dpd-pl' if carrier == 'dpd' else None))
+    res = ct.track718_detail(number, key718, code=('dpd-pl' if carrier == 'dpd' else None), poll=8, poll_wait=3)
+    _persist_carrier_status(order_id, res.get('outcome'))
     name_map = {'dpd-pl': 'DPD', 'china-post': '中国邮政/EMS', 'australia-post': 'Australia Post',
                 'inpost-paczkomaty': 'InPost', 'gls': 'GLS', 'poczta-polska': 'Poczta Polska'}
     cname = 'DPD' if carrier == 'dpd' else name_map.get((res.get('carrier') or '').lower(),
@@ -16443,7 +17280,7 @@ def unmark_order_problem_return(order_id):
 
 @app.route('/api/shipping/print/label/<int:order_id>')
 @login_required
-@shipper_required
+@shipping_view_required
 def print_shipping_label(order_id):
     """Get order data for printing shipping label"""
     conn = get_db_connection()
@@ -16451,7 +17288,9 @@ def print_shipping_label(order_id):
     order = conn.execute('''
         SELECT o.*, sl.tracking_number, sl.carrier_slug, sc.name as carrier_name
         FROM orders o
-        LEFT JOIN shipping_logs sl ON o.id = sl.order_id
+        LEFT JOIN shipping_logs sl ON sl.id = (
+            SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
+        )
         LEFT JOIN shipping_carriers sc ON sl.carrier_slug = sc.slug
         WHERE o.id = ?
     ''', (order_id,)).fetchone()
@@ -16502,7 +17341,7 @@ def print_shipping_label(order_id):
 
 @app.route('/api/shipping/print/list')
 @login_required
-@shipper_required
+@shipping_view_required
 def print_shipping_list():
     """Get last 24 hours pending orders for printing - reuses get_pending_orders logic"""
     from datetime import datetime, timedelta
@@ -16551,7 +17390,7 @@ def print_shipping_list():
 
 @app.route('/api/shipping/print/pending')
 @login_required
-@shipper_required
+@shipping_view_required
 def print_pending_list():
     """Get all pending orders for printing - reuses get_pending_orders logic"""
     from datetime import datetime
@@ -16594,7 +17433,7 @@ def print_pending_list():
 
 @app.route('/api/shipping/export/list')
 @login_required
-@shipper_required
+@shipping_view_required
 def export_shipping_list():
     """Export last 24 hours pending orders to CSV"""
     import csv
@@ -16661,7 +17500,7 @@ def export_shipping_list():
 
 @app.route('/api/shipping/export/pending')
 @login_required
-@shipper_required
+@shipping_view_required
 def export_pending_list():
     """Export all pending orders to CSV"""
     import csv
@@ -17559,7 +18398,9 @@ def sales_board_required(f):
     def decorated_function(*args, **kwargs):
         if not current_user.is_authenticated:
             return redirect(url_for('login'))
-        if not current_user.can_view_sales_board():
+        # Full team view OR self-only view both grant access here; data scoping
+        # for self-only happens in the route (others' rows/salary never sent).
+        if not (current_user.can_view_sales_board() or current_user.can_view_own_sales_board()):
             return render_template_string('''
 <!DOCTYPE html>
 <html lang="zh"><head><meta charset="UTF-8"><title>访问受限</title>
@@ -17601,8 +18442,12 @@ def _get_board_cny_rate(currency, year_month, overrides=None):
     return (rate or 0), 'system'
 
 
-def _compute_sales_board_data(selected_month):
+def _compute_sales_board_data(selected_month, restrict_manager=None):
     """Compute sales board data (shared by view and export).
+
+    restrict_manager: when set (self-only view), the board is limited to just
+    that one manager's sites — no other people's rows/salary are computed, so a
+    self-view user never receives anyone else's data.
 
     Returns a dict with all the data needed to render the sales board.
     """
@@ -17628,6 +18473,10 @@ def _compute_sales_board_data(selected_month):
     manager_sites = defaultdict(list)
     for s in sites:
         manager_sites[s['manager']].append(s['url'])
+
+    # Self-only view: keep just this manager (drop everyone else entirely).
+    if restrict_manager is not None:
+        manager_sites = defaultdict(list, {restrict_manager: manager_sites.get(restrict_manager, [])})
 
     managers = sorted(manager_sites.keys())
 
@@ -18233,7 +19082,19 @@ def sales_board():
         today = datetime.date.today()
         selected_month = today.strftime('%Y-%m')
 
-    data = _compute_sales_board_data(selected_month)
+    # 仅本人站点 takes PRECEDENCE: if a user is granted the self-only permission
+    # they are scoped to their own sites — even if they also hold the full-board
+    # permission or an admin role. Full team view is for users WITHOUT this flag.
+    self_view = current_user.can_view_own_sales_board()
+    own_manager = current_user.sales_board_own_manager() if self_view else None
+    # When self-only but the user has no sites (e.g. sites reassigned after the
+    # grant), restrict to a sentinel that matches no manager → empty board, NOT
+    # the full team (never fall back to None here, that would show everyone).
+    restrict_manager = (own_manager or '\x00__no_sites__') if self_view else None
+
+    data = _compute_sales_board_data(selected_month, restrict_manager=restrict_manager)
+    data['self_view'] = self_view
+    data['own_manager'] = own_manager or ''
     return render_template('sales_board.html', **data)
 
 
@@ -19326,14 +20187,19 @@ def product_costs_page():
     countries = [r['country'] for r in countries]
     warehouses = [dict(r) for r in conn.execute('SELECT * FROM warehouses WHERE is_active=1 ORDER BY country, name').fetchall()]
     conn.close()
-    # Pass scope info: allowed_warehouse_ids tells JS which rows the user can
-    # edit/delete. None = unrestricted.
+    # Pass scope info. Two distinct scopes:
+    #   allowed_warehouse_ids → EDIT scope: which rows the user can edit/delete.
+    #   view_warehouse_ids     → VIEW scope: which rows/countries the user can see.
+    # A read-only viewer (can_view_costs, no partner binding) has edit scope []
+    # but view scope None (sees all costs). None = unrestricted.
     allowed_wh = _user_allowed_warehouse_ids()
+    view_wh = _user_allowed_warehouse_ids(for_view=True)
     return render_template('product_costs.html',
                            countries=countries,
                            warehouses=warehouses,
                            can_edit_costs=current_user.can_edit_costs(),
-                           allowed_warehouse_ids=allowed_wh)
+                           allowed_warehouse_ids=allowed_wh,
+                           view_warehouse_ids=view_wh)
 
 
 @app.route('/api/product-costs/options', methods=['GET'])

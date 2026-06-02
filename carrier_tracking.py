@@ -128,6 +128,11 @@ def inpost_status(tracking_number, timeout=12, session=None):
 TRACK718_ADD_URL = "https://apigetway.track718.net/v2/tracks"
 TRACK718_QUERY_URL = "https://apigetway.track718.net/v2/tracking/query"
 TRACK718_DPD_PL = "dpd-pl"          # Track718 courier code for DPD Poland
+TRACK718_INPOST_PL = "in-post"      # Track718 courier code for InPost Poland (波兰Inpost, id 358).
+                                    # Fallback when InPost's own ShipX business API 404s — e.g.
+                                    # Paczkomat self-service parcels that aren't in ShipX at all.
+                                    # (NB: 'paczkomaty'/id 1101 exists too but returned no data in
+                                    # testing; 'in-post' is what the consumer site/website uses.)
 TRACK718_ADD_BATCH = 100            # API max per /v2/tracks call
 TRACK718_QUERY_BATCH = 20           # API max per /v2/tracking/query call
 
@@ -247,7 +252,10 @@ def track718_detail(number, key, code=None, timeout=25, session=None, poll=3, po
         last = {'ok': bool(events or outcome), 'result': result, 'outcome': outcome or 'unknown',
                 'carrier': row.get('code') or code or '', 'events': events,
                 'error': None if (events or outcome) else 'no_info'}
-        if events:           # got the timeline → stop polling
+        # Stop as soon as we have the timeline OR a definitive status. Track718
+        # often returns the result code (e.g. 40=delivered) a few polls before the
+        # event list fills in, so don't keep waiting once the outcome is known.
+        if events or (outcome and outcome != 'unknown'):
             break
     return last
 

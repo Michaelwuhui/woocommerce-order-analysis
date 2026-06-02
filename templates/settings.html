@@ -301,6 +301,26 @@
     </div>
 </div>
 
+<!-- AU Scheduled Carrier Tracking -->
+<div class="card data-card mb-4">
+    <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
+        <h5 class="card-title text-white mb-0">
+            <i class="bi bi-truck me-2" style="color:#22d3ee;"></i>澳洲订单定时查物流
+        </h5>
+    </div>
+    <div class="card-body">
+        <div class="alert alert-info bg-info bg-opacity-10 border-0 small mb-3 px-3 py-2">
+            <i class="bi bi-info-circle me-1"></i>
+            开启后，每晚 5:00 的定时任务会自动为<strong>澳洲站点</strong>的已发货订单查询物流状态（EMS 等，经 Track718），把结果填入「发货管理 · 已发货」列表的「物流状态」列。澳洲订单是在线支付（非货到付款），<strong>默认不在自动查询范围</strong>，需在此开启。仅查询下单满 7 天的订单；已签收/退回的不再重复查；会消耗 Track718 查询额度。
+        </div>
+        <div class="form-check form-switch mb-0">
+            <input class="form-check-input" type="checkbox" id="auTrackToggle">
+            <label class="form-check-label text-white-50" for="auTrackToggle">启用澳洲订单定时查物流</label>
+            <span id="auTrackSaveHint" class="ms-2 small"></span>
+        </div>
+    </div>
+</div>
+
 <!-- Product Masters Management Card -->
 <div class="card data-card mb-4">
     <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
@@ -1647,6 +1667,41 @@
             });
             bigOrderAmount.addEventListener('change', function () {
                 saveBigOrderThreshold('big_order_amount_threshold', Math.max(0, parseFloat(this.value) || 0));
+            });
+        }
+
+        // 澳洲订单定时查物流开关
+        const auTrackToggle = document.getElementById('auTrackToggle');
+        if (auTrackToggle) {
+            fetch('/api/settings')
+                .then(res => res.json())
+                .then(data => {
+                    const v = (data.auto_track_au || '').toString().toLowerCase();
+                    auTrackToggle.checked = (v === '1' || v === 'true' || v === 'on' || v === 'yes');
+                });
+            auTrackToggle.addEventListener('change', function () {
+                const hint = document.getElementById('auTrackSaveHint');
+                const on = this.checked;
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ auto_track_au: on ? '1' : '0' })
+                })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            hint.textContent = on ? '✓ 已开启' : '✓ 已关闭';
+                            hint.className = 'ms-2 small text-success';
+                            setTimeout(() => { hint.textContent = ''; }, 2500);
+                        } else {
+                            hint.textContent = '保存失败';
+                            hint.className = 'ms-2 small text-danger';
+                        }
+                    })
+                    .catch(() => {
+                        hint.textContent = '保存错误';
+                        hint.className = 'ms-2 small text-danger';
+                    });
             });
         }
 

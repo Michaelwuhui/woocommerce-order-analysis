@@ -158,7 +158,13 @@
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="editCanShip">
                             <label class="form-check-label text-white-50" for="editCanShip">
-                                <i class="bi bi-truck me-1"></i>发货权限
+                                <i class="bi bi-truck me-1"></i>发货权限 <small class="text-muted">（可操作：发货/确认签收/标记拒收等，含查看）</small>
+                            </label>
+                        </div>
+                        <div class="form-check mt-1 ms-4">
+                            <input class="form-check-input" type="checkbox" id="editCanViewShipping">
+                            <label class="form-check-label text-white-50" for="editCanViewShipping">
+                                <i class="bi bi-eye me-1"></i>发货 · 仅查看 <small class="text-muted">（只能看发货情况/物流/打印导出，不能操作）</small>
                             </label>
                         </div>
                         <div class="form-check mt-2">
@@ -178,7 +184,14 @@
                         <div class="form-check mt-2">
                             <input class="form-check-input" type="checkbox" id="editCanViewSalesBoard">
                             <label class="form-check-label text-white-50" for="editCanViewSalesBoard">
-                                <i class="bi bi-kanban me-1"></i>销售看板权限
+                                <i class="bi bi-kanban me-1"></i>销售看板权限 <small class="text-muted">（看整个团队）</small>
+                            </label>
+                        </div>
+                        <div class="form-check mt-1 ms-4" id="wrapCanViewOwnSalesBoard">
+                            <input class="form-check-input" type="checkbox" id="editCanViewOwnSalesBoard">
+                            <label class="form-check-label text-white-50" for="editCanViewOwnSalesBoard">
+                                <i class="bi bi-person-badge me-1"></i>销售看板 · 仅本人站点
+                                <small class="text-muted" id="ownSalesBoardHint">（只看自己负责站点的业绩与本人薪资）</small>
                             </label>
                         </div>
                         <div class="form-check mt-2">
@@ -286,7 +299,7 @@
             } else if (btn.classList.contains('btn-edit')) {
                 const user = window._usersData && window._usersData[userId];
                 if (user) {
-                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0);
+                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0, user.can_view_own_sales_board || 0, user.site_count || 0, user.can_view_shipping || 0);
                 }
             } else if (btn.classList.contains('btn-delete')) {
                 deleteUser(userId);
@@ -383,17 +396,34 @@
         });
 
         // Edit User
-        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs) {
+        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, site_count, can_view_shipping) {
             document.getElementById('editUserId').value = id;
             document.getElementById('editUsername').value = username;
             document.getElementById('editName').value = name;
             document.getElementById('editRole').value = role;
             document.getElementById('editCanShip').checked = can_ship == 1;
+            var vsEl = document.getElementById('editCanViewShipping');
+            if (vsEl) vsEl.checked = (can_view_shipping == 1) || (can_ship == 1);
+            updateShipViewState();
             document.getElementById('editCanViewReport').checked = can_view_report == 1;
             var pmEl = document.getElementById('editCanManageProducts');
             if (pmEl) pmEl.checked = can_manage_products == 1;
             var sbEl = document.getElementById('editCanViewSalesBoard');
             if (sbEl) sbEl.checked = can_view_sales_board == 1;
+            // 销售看板·仅本人站点: only enableable when the user has sites under them
+            // (site_count > 0); otherwise gray out + unchecked.
+            var ownSbEl = document.getElementById('editCanViewOwnSalesBoard');
+            if (ownSbEl) {
+                var hasSites = (parseInt(site_count) || 0) > 0;
+                ownSbEl.disabled = !hasSites;
+                ownSbEl.checked = hasSites && (can_view_own_sales_board == 1);
+                var hint = document.getElementById('ownSalesBoardHint');
+                var wrap = document.getElementById('wrapCanViewOwnSalesBoard');
+                if (wrap) wrap.style.opacity = hasSites ? '1' : '0.5';
+                if (hint) hint.textContent = hasSites
+                    ? '（只看自己负责站点的业绩与本人薪资 · 名下 ' + site_count + ' 个站点）'
+                    : '（该用户名下没有站点，无法开启）';
+            }
             var rcEl = document.getElementById('editCanViewReconciliation');
             if (rcEl) rcEl.checked = can_view_reconciliation == 1;
             var recEl = document.getElementById('editCanEditReconciliation');
@@ -410,6 +440,17 @@
             updateCostsEditState();
             bootstrap.Modal.getOrCreateInstance(document.getElementById('editUserModal')).show();
         };
+
+        // 销售看板「看整个团队」与「仅本人站点」互斥：勾选一个自动取消另一个，
+        // 避免出现两个都勾导致语义冲突（后端以"仅本人站点"为准）。
+        (function () {
+            var fullEl = document.getElementById('editCanViewSalesBoard');
+            var ownEl = document.getElementById('editCanViewOwnSalesBoard');
+            if (fullEl && ownEl) {
+                fullEl.addEventListener('change', function () { if (fullEl.checked) ownEl.checked = false; });
+                ownEl.addEventListener('change', function () { if (ownEl.checked) fullEl.checked = false; });
+            }
+        })();
 
         // Keep "edit reconciliation" gated by "view reconciliation"
         function updateReconEditState() {
@@ -435,6 +476,19 @@
                 eEl.disabled = false;
             }
         }
+        // 发货权限(操作) implies 发货·仅查看: checking 发货权限 auto-checks + disables
+        // the view box (you can't operate without seeing).
+        function updateShipViewState() {
+            var shipEl = document.getElementById('editCanShip');
+            var viewEl = document.getElementById('editCanViewShipping');
+            if (!shipEl || !viewEl) return;
+            if (shipEl.checked) { viewEl.checked = true; viewEl.disabled = true; }
+            else { viewEl.disabled = false; }
+        }
+        (function wireShipPerms() {
+            var shipEl = document.getElementById('editCanShip');
+            if (shipEl) shipEl.addEventListener('change', updateShipViewState);
+        })();
         (function wireReconPerms() {
             var vEl = document.getElementById('editCanViewReconciliation');
             var eEl = document.getElementById('editCanEditReconciliation');
@@ -463,9 +517,11 @@
                     role: document.getElementById('editRole').value,
                     password: document.getElementById('editPassword').value,
                     can_ship: document.getElementById('editCanShip').checked ? 1 : 0,
+                    can_view_shipping: (document.getElementById('editCanViewShipping') || {}).checked ? 1 : 0,
                     can_view_report: document.getElementById('editCanViewReport').checked ? 1 : 0,
                     can_manage_products: (document.getElementById('editCanManageProducts') || {}).checked ? 1 : 0,
                     can_view_sales_board: (document.getElementById('editCanViewSalesBoard') || {}).checked ? 1 : 0,
+                    can_view_own_sales_board: (document.getElementById('editCanViewOwnSalesBoard') || {}).checked ? 1 : 0,
                     can_view_reconciliation: (document.getElementById('editCanViewReconciliation') || {}).checked ? 1 : 0,
                     can_edit_reconciliation: (document.getElementById('editCanEditReconciliation') || {}).checked ? 1 : 0,
                     can_view_costs: (document.getElementById('editCanViewCosts') || {}).checked ? 1 : 0,

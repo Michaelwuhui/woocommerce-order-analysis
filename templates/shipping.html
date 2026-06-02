@@ -6,8 +6,10 @@
 <div class="container-fluid py-4">
     <div class="d-flex justify-content-between align-items-center mb-4">
         <div>
-            <h1 class="h3 text-white mb-1">发货管理</h1>
-            <p class="text-white-50 mb-0">统一管理所有站点的发货操作</p>
+            <h1 class="h3 text-white mb-1">发货管理
+                {% if not current_user.can_ship() %}<span class="badge bg-info bg-opacity-25 text-info ms-2 align-middle" style="font-size:0.5em;vertical-align:middle;"><i class="bi bi-eye me-1"></i>只读模式</span>{% endif %}
+            </h1>
+            <p class="text-white-50 mb-0">{% if current_user.can_ship() %}统一管理所有站点的发货操作{% else %}只读：可查看发货情况、查物流、打印/导出，不能操作发货{% endif %}</p>
         </div>
         <div class="d-flex gap-2">
             <button class="btn btn-outline-info" id="printListBtn">
@@ -22,6 +24,11 @@
             <button class="btn btn-outline-success" id="exportPendingBtn">
                 <i class="bi bi-file-earmark-excel me-1"></i> 导出未发货
             </button>
+            {% if has_au_access %}
+            <a href="/au-orders" target="_blank" class="btn btn-outline-info" title="按腾讯表格样式查看全部澳洲订单（只读表格）">
+                <i class="bi bi-table me-1"></i> 澳洲发货表
+            </a>
+            {% endif %}
             <button class="btn btn-outline-light" onclick="loadOrders()">
                 <i class="bi bi-arrow-repeat me-1"></i> 刷新
             </button>
@@ -91,7 +98,7 @@
             <div class="d-flex align-items-center mb-2">
                 <i class="bi bi-search text-danger me-2"></i>
                 <span class="text-white fw-bold">运单号查找</span>
-                <small class="text-muted ms-2">用于退回包裹的客户拒收登记，跨所有状态、识别 AST / Orders Tracking 等插件字段</small>
+                <small class="text-white-50 ms-2">用于退回包裹的客户拒收登记，跨所有状态、识别 AST / Orders Tracking 等插件字段</small>
             </div>
             <div class="row g-2 align-items-center">
                 <div class="col-md-6">
@@ -191,6 +198,7 @@
                                     <th class="text-end">运费</th>
                                     <th class="text-end">订单金额</th>
                                     <th class="text-center">运单信息</th>
+                                    <th class="text-center">物流状态</th>
                                     <th>客户留言</th>
                                     <th>最新备注</th>
                                     <th class="text-end pe-3">操作</th>
@@ -198,7 +206,7 @@
                             </thead>
                             <tbody id="shippedOrdersBody">
                                 <tr>
-                                    <td colspan="10" class="text-center py-4 text-muted">加载中...</td>
+                                    <td colspan="11" class="text-center py-4 text-muted">加载中...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -215,10 +223,27 @@
                 🔴退回（置顶，请确认拒收） / 🟢物流已签收（可批量确认） / 🔵在途 / ⚪未查。
                 点「查物流」可实时复核；「确认签收」会同步站点为已完成（发完成邮件），「拒收」计入该客户风险历史。
             </div>
-            <div class="d-flex justify-content-end mb-2">
-                <button class="btn btn-sm btn-success" onclick="batchConfirmDelivered()" title="把列表里所有🟢物流已签收的订单一次性确认">
-                    <i class="bi bi-check2-all me-1"></i>批量确认所有「🟢 物流已签收」
-                </button>
+            <div class="d-flex justify-content-between align-items-center gap-2 mb-2 flex-wrap">
+                <div class="form-check mb-0">
+                    <input class="form-check-input" type="checkbox" id="outcomeOnlyUnknown" onchange="applyOutcomeFilter()">
+                    <label class="form-check-label text-white-50 small" for="outcomeOnlyUnknown">
+                        只看物流查无 <span id="outcomeUnknownCount" class="badge bg-secondary ms-1">0 单</span>
+                        <span class="text-white-50">（系统查不到轨迹，需点「官网」人工核对签收/拒收）</span>
+                    </label>
+                </div>
+                <div class="d-flex gap-2">
+                    <button class="ship-action btn btn-sm btn-outline-success" onclick="batchConfirmDelivered(30)" title="只确认已挂满30天及以上的🟢物流已签收订单——超过这个时长基本不会再退回">
+                        <i class="bi bi-check2-all me-1"></i>批量确认满30天的「🟢 已签收」
+                    </button>
+                    <button class="ship-action btn btn-sm btn-success" onclick="batchConfirmDelivered()" title="把列表里所有🟢物流已签收的订单一次性确认">
+                        <i class="bi bi-check2-all me-1"></i>批量确认所有「🟢 物流已签收」
+                    </button>
+                    {% if is_super_admin %}
+                    <button class="ship-action btn btn-sm btn-outline-danger" onclick="openCutoffModal()" title="一刀切：把某日期之前所有未确认 COD 单一律标记为已签收并同步站点（含退回/查无/在途），用于对账后关闭历史遗留">
+                        <i class="bi bi-scissors me-1"></i>一刀切（历史遗留）
+                    </button>
+                    {% endif %}
+                </div>
             </div>
             <div class="card data-card">
                 <div class="card-body p-0">
@@ -296,6 +321,19 @@
                     <input type="text" class="form-control bg-dark text-white border-secondary" id="shipTrackingNumber"
                         required placeholder="输入运单号">
                 </div>
+                <!-- Already-shipped parcels (split shipment / 分批发货) -->
+                <div id="shipParcelsBlock" class="d-none mb-3">
+                    <label class="form-label text-white-50">本单已发包裹</label>
+                    <div id="shipParcelsList" class="small"></div>
+                </div>
+                <!-- 分批发货 toggle: hidden once the order already has parcels (it's
+                     then implicitly a continuation and the dual buttons show). -->
+                <div class="form-check mb-3" id="shipSplitModeWrap">
+                    <input class="form-check-input" type="checkbox" id="shipSplitMode">
+                    <label class="form-check-label text-white-50" for="shipSplitMode">
+                        分批发货（本单分多个包裹寄出，可多次填运单号）
+                    </label>
+                </div>
                 <div class="form-check mb-3">
                     <input class="form-check-input" type="checkbox" id="shipSendEmail" checked>
                     <label class="form-check-label text-white-50" for="shipSendEmail">发送邮件通知客户</label>
@@ -307,8 +345,18 @@
             </div>
             <div class="modal-footer border-top border-secondary border-opacity-25">
                 <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <!-- Single-shipment button (default) -->
                 <button type="button" class="btn btn-primary" id="confirmShipBtn">
                     <i class="bi bi-truck me-1"></i> 确认发货
+                </button>
+                <!-- Split-shipment buttons (shown in 分批 mode) -->
+                <button type="button" class="btn btn-warning d-none" id="shipContinueBtn"
+                    title="发出本包裹，订单保持在待发货，稍后可继续添加包裹">
+                    <i class="bi bi-box-seam me-1"></i> 发货并继续
+                </button>
+                <button type="button" class="btn btn-success d-none" id="shipFinalBtn"
+                    title="发出最后一个包裹，订单标记为已发货">
+                    <i class="bi bi-check2-circle me-1"></i> 发货并完成
                 </button>
             </div>
         </div>
@@ -356,6 +404,67 @@
         </div>
     </div>
 </div>
+
+<!-- Batch Confirm Progress Modal -->
+<div class="modal fade" id="batchConfirmModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-check2-all me-2"></i>批量确认签收</h5>
+            </div>
+            <div class="modal-body">
+                <div id="batchConfirmScope" class="text-white-50 small mb-2"></div>
+                <div class="progress mb-2" style="height:22px;">
+                    <div id="batchConfirmBar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width:0%">0%</div>
+                </div>
+                <div class="text-white">
+                    已处理 <span id="batchConfirmDone">0</span> / <span id="batchConfirmTotal">0</span>
+                    <span class="ms-3 text-success">✓ 成功 <span id="batchConfirmOk">0</span></span>
+                    <span class="ms-3 text-danger">✗ 失败 <span id="batchConfirmFail">0</span></span>
+                </div>
+                <div class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25 mt-3 mb-0 small" id="batchConfirmRunningHint">
+                    <i class="bi bi-exclamation-triangle me-1"></i>处理中，请勿关闭或刷新页面。每单需同步到站点，几百单可能要几分钟；已处理的会即时保存，点「停止」可随时中断。
+                </div>
+                <div class="alert alert-success bg-success bg-opacity-10 text-success border-success border-opacity-25 mt-3 mb-0 small d-none" id="batchConfirmDoneHint">
+                    <i class="bi bi-check-circle me-1"></i><span id="batchConfirmDoneMsg"></span>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-danger" id="batchConfirmStopBtn"><i class="bi bi-stop-circle me-1"></i>停止</button>
+                <button type="button" class="btn btn-secondary d-none" id="batchConfirmCloseBtn" data-bs-dismiss="modal">关闭</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if is_super_admin %}
+<!-- 一刀切 (historical close-out) Modal -->
+<div class="modal fade" id="cutoffConfirmModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-scissors me-2"></i>一刀切：确认历史遗留订单</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-2">
+                    <label class="form-label text-white-50">把此日期 <strong>之前（不含当天）</strong> 的所有未确认 COD 单一律标记为已签收，并同步站点为「已完成」</label>
+                    <input type="date" id="cutoffDate" class="form-control bg-dark text-white border-secondary">
+                </div>
+                <button class="btn btn-sm btn-outline-info" onclick="previewCutoff()"><i class="bi bi-search me-1"></i>预览数量</button>
+                <div id="cutoffPreview" class="mt-3 small text-white-50"></div>
+                <div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25 mt-3 mb-0 small">
+                    <i class="bi bi-exclamation-triangle me-1"></i>一刀切会把该日期之前所有待确认单（<strong>包括检测到"退回"、"查无"、"在途"的</strong>）全部标记为已签收/完成。<strong>已人工标记的拒收/退货、失败订单不受影响。</strong>此操作不可一键撤销，请确认已与合伙人对账。
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-danger" id="cutoffConfirmBtn" onclick="runCutoffConfirm()" disabled><i class="bi bi-scissors me-1"></i>确认一刀切</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
 
 <!-- Print Label Modal -->
 <div class="modal fade" id="printLabelModal" tabindex="-1">
@@ -444,6 +553,17 @@
     </div>
 
     <script>
+        // Shipping EDIT permission. View-only users (can_view_shipping) see all
+        // lists/tracking/查物流/print/export but no action controls. Every action
+        // button/link carries class "ship-action"; for view-only users we inject a
+        // CSS rule that hides them all (backend also 403s every mutation).
+        const CAN_SHIP = {{ 'true' if current_user.can_ship() else 'false' }};
+        if (!CAN_SHIP) {
+            document.documentElement.classList.add('ship-readonly');
+            var _roStyle = document.createElement('style');
+            _roStyle.textContent = '.ship-readonly .ship-action{display:none !important;}';
+            document.head.appendChild(_roStyle);
+        }
         document.addEventListener('DOMContentLoaded', function () {
             // Initialize date pickers
             var dateConfig = {
@@ -476,16 +596,30 @@
                 tab.addEventListener('shown.bs.tab', loadOrders);
             });
 
-            // Confirm ship button
-            document.getElementById('confirmShipBtn').addEventListener('click', shipOrder);
+            // Ship buttons: single, and the two split-shipment buttons.
+            document.getElementById('confirmShipBtn').addEventListener('click', () => shipOrder('single'));
+            document.getElementById('shipContinueBtn').addEventListener('click', () => shipOrder('continue'));
+            document.getElementById('shipFinalBtn').addEventListener('click', () => shipOrder('final'));
+            // Toggling 分批发货 swaps the single button for the dual buttons.
+            document.getElementById('shipSplitMode').addEventListener('change', function () {
+                setShipMode(this.checked);
+            });
 
-            // Big-order acknowledgment gates the confirm-ship button
+            // Big-order acknowledgment gates the ship buttons
             document.getElementById('bigOrderAck').addEventListener('change', updateShipBtnState);
 
             // confirmNoteBtn is wired by base.html (the noteModal is shared)
 
             // Confirm mark-undelivered button
             document.getElementById('confirmUndeliveredBtn').addEventListener('click', confirmUndelivered);
+
+            // 停止 the in-progress batch-confirm run
+            const batchStopBtn = document.getElementById('batchConfirmStopBtn');
+            if (batchStopBtn) batchStopBtn.addEventListener('click', () => {
+                batchCancelled = true;
+                batchStopBtn.disabled = true;
+                batchStopBtn.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>正在停止…（等待进行中的请求完成）';
+            });
 
             // Tracking-number lookup
             document.getElementById('trackingLookupBtn').addEventListener('click', runTrackingLookup);
@@ -596,8 +730,9 @@
                     return `
                 <tr${rowStyle}>
                     <td class="ps-3">
-                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a>${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}</div>
+                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a>${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : ''}</div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
+                        <small class="text-muted d-block"><i class="bi bi-calendar3 me-1"></i>下单 ${o.date_created ? o.date_created.replace('T', ' ').substring(0, 16) : '-'}</small>
                     </td>
 
                     <td>
@@ -674,14 +809,14 @@
                         ` : '<span class="text-muted small">-</span>'}
                     </td>
                     <td class="text-end pe-3 text-nowrap">
-                        <a href="javascript:void(0)" class="text-secondary me-3 text-decoration-none" onclick="openNoteModal(${o.id}, '${o.number}')" title="备注">
+                        <a href="javascript:void(0)" class="ship-action text-secondary me-3 text-decoration-none" onclick="openNoteModal(${o.id}, '${o.number}')" title="备注">
                             <i class="bi bi-chat-left-text"></i>
                         </a>
                         <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="printLabel(${o.id})" title="打印">
                             <i class="bi bi-printer"></i>
                         </a>
-                        <button class="btn btn-sm btn-primary px-3" onclick='openShipModal(${o.id}, ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)})'>
-                            <i class="bi bi-truck me-1"></i>发货
+                        <button class="ship-action btn btn-sm ${o.parcels_shipped ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal(${o.id}, ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])})'>
+                            <i class="bi bi-truck me-1"></i>${o.parcels_shipped ? '继续发货' : '发货'}
                         </button>
                     </td>
                 </tr>
@@ -696,7 +831,7 @@
                     document.getElementById('shippedCount').textContent = `已发货: ${orders.length}`;
                     const tbody = document.getElementById('shippedOrdersBody');
                     if (orders.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="10" class="text-center py-4 text-muted">暂无已发货订单</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="11" class="text-center py-4 text-muted">暂无已发货订单</td></tr>';
                         return;
                     }
                     tbody.innerHTML = orders.map(o => {
@@ -706,6 +841,7 @@
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a></div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
+                        <small class="text-muted d-block"><i class="bi bi-calendar3 me-1"></i>下单 ${o.date_created ? o.date_created.replace('T', ' ').substring(0, 16) : '-'}</small>
                     </td>
                     <td>
                         <div class="text-white"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name}</a></div>
@@ -725,7 +861,18 @@
                     <td class="text-end text-info">${o.shipping_total.toFixed(2)}</td>
                     <td class="text-end"><strong>${o.total}</strong></td>
                     <td class="text-center">
-                        ${o.has_tracking ? (o.tracking_number ? `
+                        ${(o.parcels && o.parcels.length > 1) ? `
+                            <div class="small text-warning mb-1"><i class="bi bi-boxes me-1"></i>分批 · ${o.parcels.length} 个包裹</div>
+                            ${o.parcels.map((p, i) => `
+                                <div class="mb-1 text-start d-inline-block">
+                                    <span class="badge bg-secondary me-1">#${i + 1}</span>
+                                    <strong class="text-white">${p.carrier_name || p.carrier_slug || ''}</strong>
+                                    ${p.tracking_url ?
+                                        `<a href="${p.tracking_url}" target="_blank" class="text-info text-decoration-none small d-block"><i class="bi bi-link-45deg"></i>${p.tracking_number}</a>` :
+                                        `<small class="text-muted d-block">${p.tracking_number}</small>`}
+                                </div>
+                            `).join('')}
+                        ` : (o.has_tracking ? (o.tracking_number ? `
                             <div><strong class="text-white">${o.carrier_name || o.carrier_slug || ''}</strong></div>
                             ${o.tracking_url ?
                                 `<a href="${o.tracking_url}" target="_blank" class="text-info text-decoration-none small"><i class="bi bi-link-45deg"></i>${o.tracking_number}</a>` :
@@ -733,7 +880,7 @@
                             }
                             <div class="text-muted small">${o.shipped_at || '-'}</div>
                         ` : '<span class="text-muted small">-</span>') :
-                            '<span class="text-warning small"><i class="bi bi-exclamation-triangle me-1"></i>无追踪号</span>'}
+                            '<span class="text-warning small"><i class="bi bi-exclamation-triangle me-1"></i>无追踪号</span>')}
                         ${o.is_undelivered ? `
                             <div class="mt-2">
                                 <span class="badge bg-danger" title="${(o.undelivered_note || '').replace(/"/g, '&quot;')}"><i class="bi bi-arrow-return-left me-1"></i>已退回</span>
@@ -741,6 +888,11 @@
                                 ${o.undelivered_by_name ? `<div class="text-muted" style="font-size:0.75em">${o.undelivered_by_name}${o.undelivered_at ? ' · ' + o.undelivered_at.replace('T',' ').substring(0,16) : ''}</div>` : ''}
                             </div>
                         ` : ''}
+                    </td>
+                    <td class="text-center text-nowrap">
+                        ${o.carrier_status
+                            ? `${renderCarrierBadge(o.carrier_status)}${o.carrier_status_at ? `<div class="text-muted" style="font-size:0.72em;">${String(o.carrier_status_at).replace('T', ' ').substring(0, 16)}</div>` : ''}`
+                            : '<span class="text-muted small" title="尚未查询物流，点右侧「查物流」可更新状态">⚪ 未查询</span>'}
                     </td>
                     <td>
                         ${o.customer_note ? `
@@ -764,27 +916,27 @@
                         ` : '<span class="text-muted small">-</span>'}
                     </td>
                     <td class="text-end pe-3 text-nowrap">
-                        <a href="javascript:void(0)" class="text-secondary me-3 text-decoration-none" onclick="openNoteModal(${o.id}, '${o.number}')" title="备注">
+                        <a href="javascript:void(0)" class="ship-action text-secondary me-3 text-decoration-none" onclick="openNoteModal(${o.id}, '${o.number}')" title="备注">
                             <i class="bi bi-chat-left-text"></i>
                         </a>
                         <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="queryCarrier(${o.id}, '${o.number}')" title="查物流（实时轨迹）">
                             <i class="bi bi-truck"></i>
                         </a>
                         ${o.is_problem_return ? `
-                            <a href="javascript:void(0)" class="text-warning me-3 text-decoration-none" onclick="unmarkProblemReturn(${o.id})" title="撤销问题退货标记">
+                            <a href="javascript:void(0)" class="ship-action text-warning me-3 text-decoration-none" onclick="unmarkProblemReturn(${o.id})" title="撤销问题退货标记">
                                 <i class="bi bi-arrow-counterclockwise"></i>
                             </a>
                         ` : `
-                            <a href="javascript:void(0)" class="text-danger me-3 text-decoration-none" onclick="openProblemReturnModal(${o.id}, '${o.number}', '${(o.currency || '').replace(/'/g, "\\'")}')" title="标记问题退货（调包/少件/损坏）">
+                            <a href="javascript:void(0)" class="ship-action text-danger me-3 text-decoration-none" onclick="openProblemReturnModal(${o.id}, '${o.number}', '${(o.currency || '').replace(/'/g, "\\'")}')" title="标记问题退货（调包/少件/损坏）">
                                 <i class="bi bi-box-seam"></i>
                             </a>
                         `}
                         ${o.is_undelivered ? `
-                            <a href="javascript:void(0)" class="text-warning text-decoration-none" onclick="unmarkUndelivered(${o.id}, '${o.number}')" title="撤销退回标记">
+                            <a href="javascript:void(0)" class="ship-action text-warning text-decoration-none" onclick="unmarkUndelivered(${o.id}, '${o.number}')" title="撤销退回标记">
                                 <i class="bi bi-arrow-counterclockwise"></i>
                             </a>
                         ` : `
-                            <a href="javascript:void(0)" class="text-danger text-decoration-none" onclick="openUndeliveredModal(${o.id}, '${o.number}', ${o.shipping_total || 0}, '${(o.currency || '').replace(/'/g, "\\'")}', '${(o.tracking_number || '').replace(/'/g, "\\'")}')" title="标记客户拒收/包裹退回">
+                            <a href="javascript:void(0)" class="ship-action text-danger text-decoration-none" onclick="openUndeliveredModal(${o.id}, '${o.number}', ${o.shipping_total || 0}, '${(o.currency || '').replace(/'/g, "\\'")}', '${(o.tracking_number || '').replace(/'/g, "\\'")}')" title="标记客户拒收/包裹退回">
                                 <i class="bi bi-arrow-return-left"></i>
                             </a>
                         `}
@@ -808,6 +960,10 @@
                         const riskBadge = renderRiskBadge(o.customer_risk, { compact: true });
                         const cs = o.carrier_status || '';
                         const carrierB = renderCarrierBadge(cs);
+                        // 查无（无任何物流状态）→ 直接给 InPost 官网核对链接（再点查物流也是查无，没意义）
+                        const tn = (o.tracking_number || '').trim();
+                        const isInpost = /inpost|paczko/i.test(o.carrier_slug || '') || (tn.length === 24 && /^\d+$/.test(tn));
+                        const officialUrl = (!cs && isInpost && tn) ? ('https://inpost.pl/sledzenie-przesylek?number=' + encodeURIComponent(tn)) : '';
                         const rowStyle = cs === 'returned'
                             ? ' style="background-color: rgba(220,53,69,0.22);"'
                             : (o.customer_risk && o.customer_risk.level === 'high')
@@ -823,10 +979,11 @@
                                     ? `<span class="badge bg-warning text-dark">${o.days_pending} 天</span>`
                                     : `<span class="text-light">${o.days_pending} 天</span>`));
                         return `
-                <tr${rowStyle}>
+                <tr${rowStyle} data-order-id="${o.id}" data-carrier="${cs}" data-days="${o.days_pending == null ? '' : o.days_pending}">
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail(${o.id})" class="text-info text-decoration-none">#${o.number}</a></div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
+                        <small class="text-muted d-block"><i class="bi bi-calendar3 me-1"></i>下单 ${o.date_created ? o.date_created.replace('T', ' ').substring(0, 16) : '-'}</small>
                     </td>
                     <td>
                         <div class="text-white"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name || '-'}</a></div>
@@ -844,14 +1001,33 @@
                     </td>
                     <td class="text-center pe-3 text-nowrap">
                         ${carrierB ? `<div class="mb-1">${carrierB}</div>` : ''}
+                        ${officialUrl ? `<a class="btn btn-sm btn-outline-light me-1 mb-1" href="${officialUrl}" target="_blank" rel="noopener" title="系统查不到此单，去 InPost 官网核对"><i class="bi bi-box-arrow-up-right"></i> 官网</a>` : ''}
                         <button class="btn btn-sm btn-outline-info me-1 mb-1" onclick="queryCarrier(${o.id}, '${o.number}')" title="实时查询物流签收状态"><i class="bi bi-truck"></i> 查物流</button>
-                        <button class="btn btn-sm btn-success me-1 mb-1" onclick="confirmDelivery(${o.id}, '${o.number}')" title="确认签收：本地标记 + 同步站点为已完成"><i class="bi bi-check-lg"></i> 已签收</button>
-                        <button class="btn btn-sm btn-warning me-1 mb-1" onclick="openUndeliveredModal(${o.id}, '${o.number}', ${o.shipping_total || 0}, '${(o.currency || '').replace(/'/g, "\\'")}', '${(o.tracking_number || '').replace(/'/g, "\\'")}')" title="客户拒收/包裹退回"><i class="bi bi-arrow-return-left"></i> 拒收</button>
-                        <button class="btn btn-sm btn-outline-danger mb-1" onclick="openProblemReturnModal(${o.id}, '${o.number}', '${(o.currency || '').replace(/'/g, "\\'")}')" title="调包/少件/损坏"><i class="bi bi-box-seam"></i> 问题退货</button>
+                        <button class="ship-action btn btn-sm btn-success me-1 mb-1" onclick="confirmDelivery(${o.id}, '${o.number}')" title="确认签收：本地标记 + 同步站点为已完成"><i class="bi bi-check-lg"></i> 已签收</button>
+                        <button class="ship-action btn btn-sm btn-warning me-1 mb-1" onclick="openUndeliveredModal(${o.id}, '${o.number}', ${o.shipping_total || 0}, '${(o.currency || '').replace(/'/g, "\\'")}', '${(o.tracking_number || '').replace(/'/g, "\\'")}')" title="客户拒收/包裹退回"><i class="bi bi-arrow-return-left"></i> 拒收</button>
+                        <button class="ship-action btn btn-sm btn-outline-danger mb-1" onclick="openProblemReturnModal(${o.id}, '${o.number}', '${(o.currency || '').replace(/'/g, "\\'")}')" title="调包/少件/损坏"><i class="bi bi-box-seam"></i> 问题退货</button>
                     </td>
                 </tr>`;
                     }).join('');
+                    applyOutcomeFilter();
                 });
+        }
+
+        // Filter the 待确认结局 list to only the "物流查无" rows (no carrier status
+        // at all). These can't be auto/batch-confirmed and need manual 官网 review,
+        // so the operator can isolate and work through just them.
+        function applyOutcomeFilter() {
+            const cb = document.getElementById('outcomeOnlyUnknown');
+            const onlyUnknown = !!(cb && cb.checked);
+            let unknown = 0;
+            document.querySelectorAll('#outcomeOrdersBody tr').forEach(tr => {
+                if (!tr.dataset.orderId) return;        // skip placeholder/empty rows
+                const isUnknown = !tr.dataset.carrier;  // 查无 = empty carrier_status
+                if (isUnknown) unknown++;
+                tr.style.display = (!onlyUnknown || isUnknown) ? '' : 'none';
+            });
+            const badge = document.getElementById('outcomeUnknownCount');
+            if (badge) badge.textContent = unknown + ' 单';
         }
 
         function renderCarrierBadge(cs) {
@@ -885,28 +1061,131 @@
         // 查物流相关函数(carrierEventLabel / queryCarrier / showCarrierModal +
         // InPost/DPD 翻译表)已移至 base.html 全局,供所有页面共用,此处不再重复定义。
 
-        // Batch-approve every row whose carrier badge says delivered.
-        function batchConfirmDelivered() {
+        // Cancel flag for the in-progress batch confirm (set by the 停止 button).
+        let batchCancelled = false;
+
+        // Batch-confirm rows whose carrier badge says delivered (🟢物流已签收).
+        // minDays (optional): only orders pending >= minDays days (the "满30天"
+        // button). No arg → all delivered currently in the list.
+        function batchConfirmDelivered(minDays) {
             const ids = [];
             document.querySelectorAll('#outcomeOrdersBody tr').forEach(tr => {
-                if (tr.textContent.includes('物流已签收')) {
-                    const b = tr.querySelector('button[onclick^="confirmDelivery"]');
-                    const m = b && (b.getAttribute('onclick') || '').match(/confirmDelivery\((\d+)/);
-                    if (m) ids.push(parseInt(m[1]));
+                if (tr.dataset.carrier !== 'delivered') return;
+                if (minDays != null) {
+                    const d = parseInt(tr.dataset.days, 10);
+                    if (isNaN(d) || d < minDays) return;
                 }
+                const id = parseInt(tr.dataset.orderId, 10);
+                if (!isNaN(id)) ids.push(id);
             });
-            if (!ids.length) { alert('当前列表没有「🟢 物流已签收」的订单'); return; }
-            if (!confirm(`将批量确认 ${ids.length} 个「物流已签收」订单：标记签收 + 同步 WooCommerce 已完成（会触发完成邮件）。继续？`)) return;
-            showToast(`批量确认 ${ids.length} 单中…`, 'info');
+            const scope = (minDays != null) ? `挂满 ${minDays} 天的「🟢 物流已签收」` : `「🟢 物流已签收」`;
+            if (!ids.length) { alert(`当前列表没有${scope}订单`); return; }
+            if (!confirm(`将批量确认 ${ids.length} 个${scope}订单：本地标记签收并同步站点状态为「已完成」。处理中请勿关闭页面，可随时点「停止」。继续？`)) return;
+            runConfirmBatch(ids, scope);
+        }
+
+        // Shared progress-driven confirm loop — used by both the 物流已签收 batch and
+        // the 一刀切 historical close-out. Runs a few in parallel behind the progress
+        // modal; each order is confirmed + WC-synced independently and committed on
+        // its own, so stopping or closing the page keeps whatever's already done
+        // (re-running skips the already-confirmed ones).
+        function runConfirmBatch(ids, scopeText) {
+            const total = ids.length;
+            if (!total) return;
+            let done = 0, ok = 0, fail = 0;
+            batchCancelled = false;
+            const $ = id => document.getElementById(id);
+            $('batchConfirmScope').textContent = `范围：${scopeText}，共 ${total} 单`;
+            $('batchConfirmTotal').textContent = total;
+            $('batchConfirmDone').textContent = '0';
+            $('batchConfirmOk').textContent = '0';
+            $('batchConfirmFail').textContent = '0';
+            const bar = $('batchConfirmBar');
+            bar.style.width = '0%'; bar.textContent = '0%';
+            bar.classList.remove('bg-warning'); bar.classList.add('bg-success', 'progress-bar-animated');
+            $('batchConfirmRunningHint').classList.remove('d-none');
+            $('batchConfirmDoneHint').classList.add('d-none');
+            const stopBtn = $('batchConfirmStopBtn');
+            stopBtn.classList.remove('d-none'); stopBtn.disabled = false;
+            stopBtn.innerHTML = '<i class="bi bi-stop-circle me-1"></i>停止';
+            $('batchConfirmCloseBtn').classList.add('d-none');
+            bootstrap.Modal.getOrCreateInstance($('batchConfirmModal')).show();
+
+            const tick = () => {
+                done++;
+                const pct = Math.round(done / total * 100);
+                bar.style.width = pct + '%'; bar.textContent = pct + '%';
+                $('batchConfirmDone').textContent = done;
+                $('batchConfirmOk').textContent = ok;
+                $('batchConfirmFail').textContent = fail;
+            };
+
+            // Keep below the gunicorn worker count (4) so other users aren't starved.
+            const CONCURRENCY = 3;
+            let cursor = 0;
+            async function runner() {
+                while (cursor < ids.length && !batchCancelled) {
+                    const id = ids[cursor++];
+                    const success = await confirmDelivery(id, '', true);
+                    if (success) ok++; else fail++;
+                    tick();
+                }
+            }
             (async () => {
-                let ok = 0;
-                for (const id of ids) { if (await confirmDelivery(id, '', true)) ok++; }
-                showToast(`批量确认完成：${ok}/${ids.length}`, 'success');
+                await Promise.all(
+                    Array.from({ length: Math.min(CONCURRENCY, ids.length) }, runner)
+                );
+                bar.classList.remove('progress-bar-animated');
+                if (fail > 0) { bar.classList.remove('bg-success'); bar.classList.add('bg-warning'); }
+                $('batchConfirmRunningHint').classList.add('d-none');
+                stopBtn.classList.add('d-none');
+                $('batchConfirmCloseBtn').classList.remove('d-none');
+                $('batchConfirmDoneHint').classList.remove('d-none');
+                $('batchConfirmDoneMsg').textContent = batchCancelled
+                    ? `已停止：成功 ${ok}，失败 ${fail}，已处理 ${done}/${total}。剩余未处理的可重试（已确认的不会重复）。`
+                    : `完成：成功 ${ok}，失败 ${fail}，共 ${total} 单。`;
                 refreshActiveViews();
             })();
         }
 
-        function openShipModal(orderId, orderNumber, customerName, customerAddress, source, isBigOrder, bigOrderReasons, warehouseName, customerRisk) {
+        // ── 一刀切：confirm ALL pending-outcome COD orders created before a cutoff
+        //    date (admin-only). The server returns the authoritative ID list; we run
+        //    them through runConfirmBatch (same WC-synced flow as the buttons).
+        let cutoffIds = [];
+        function openCutoffModal() {
+            const d = new Date();
+            const first = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`;
+            const el = document.getElementById('cutoffDate');
+            if (el) el.value = first;
+            document.getElementById('cutoffPreview').innerHTML = '';
+            document.getElementById('cutoffConfirmBtn').disabled = true;
+            cutoffIds = [];
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('cutoffConfirmModal')).show();
+        }
+        async function previewCutoff() {
+            const date = document.getElementById('cutoffDate').value;
+            if (!date) { alert('请选择日期'); return; }
+            const prev = document.getElementById('cutoffPreview');
+            prev.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>查询中…';
+            document.getElementById('cutoffConfirmBtn').disabled = true;
+            try {
+                const res = await fetch(`/api/shipping/pending-outcome/ids-before?date=${encodeURIComponent(date)}`).then(r => r.json());
+                if (res.error) { prev.innerHTML = `<span class="text-danger">${res.error}</span>`; return; }
+                cutoffIds = res.ids || [];
+                prev.innerHTML = `${date} 之前、未确认的 COD 单共 <strong class="text-warning">${res.count}</strong> 个（含检测到退回/查无/在途的），一刀切会全部标记为已签收 + 同步站点完成。`;
+                document.getElementById('cutoffConfirmBtn').disabled = (res.count === 0);
+            } catch (e) { prev.innerHTML = `<span class="text-danger">查询失败: ${e.message}</span>`; }
+        }
+        function runCutoffConfirm() {
+            if (!cutoffIds.length) { alert('请先点「预览数量」'); return; }
+            const date = document.getElementById('cutoffDate').value;
+            if (!confirm(`确定把 ${date} 之前的 ${cutoffIds.length} 单一律标记为已签收并同步站点为已完成？\n（含检测到退回/查无的；已人工标记的拒收/退货、失败单不受影响。此操作不可一键撤销）`)) return;
+            const inst = bootstrap.Modal.getInstance(document.getElementById('cutoffConfirmModal'));
+            if (inst) inst.hide();
+            runConfirmBatch(cutoffIds.slice(), `${date} 之前的历史遗留单（一刀切）`);
+        }
+
+        function openShipModal(orderId, orderNumber, customerName, customerAddress, source, isBigOrder, bigOrderReasons, warehouseName, customerRisk, parcels) {
             document.getElementById('shipOrderId').value = orderId;
             document.getElementById('shipOrderNumber').value = '#' + orderNumber;
             // Surface the warehouse in the modal so the shipper sees where the
@@ -924,12 +1203,64 @@
     `;
             document.getElementById('shipTrackingNumber').value = '';
             document.getElementById('shipSendEmail').checked = true;
+
+            // Split-shipment (分批发货) state. If the order already has parcels
+            // it's a continuation: force split mode and hide the toggle so the
+            // shipper can only 继续/完成 (never accidentally overwrite history).
+            parcels = parcels || [];
+            renderShipParcels(parcels);
+            const hasParcels = parcels.length > 0;
+            const splitChk = document.getElementById('shipSplitMode');
+            splitChk.checked = hasParcels;
+            document.getElementById('shipSplitModeWrap').classList.toggle('d-none', hasParcels);
+            setShipMode(hasParcels);
+
             applyBigOrderGate(isBigOrder, bigOrderReasons);
             loadCarriersForSite(source, warehouseName || '');
             bootstrap.Modal.getOrCreateInstance(document.getElementById('shipModal')).show();
         }
 
-        // Show/hide the big-order checklist and gate the confirm button on the
+        // Render the already-shipped parcels list inside the modal.
+        function renderShipParcels(parcels) {
+            const block = document.getElementById('shipParcelsBlock');
+            const list = document.getElementById('shipParcelsList');
+            if (!parcels || parcels.length === 0) {
+                block.classList.add('d-none');
+                list.innerHTML = '';
+                return;
+            }
+            list.innerHTML = parcels.map((p, i) => shipParcelRow(i + 1, p.carrier_name || p.carrier_slug || '', p.tracking_number || '', p.shipped_at || '')).join('');
+            block.classList.remove('d-none');
+        }
+
+        function shipParcelRow(n, carrierName, tracking, shippedAt) {
+            return `<div class="d-flex align-items-center mb-1">
+                    <span class="badge bg-secondary me-2">#${n}</span>
+                    <span class="text-info me-2">${carrierName}</span>
+                    <span class="font-monospace text-light">${tracking}</span>
+                    ${shippedAt ? `<span class="text-muted small ms-2">${(shippedAt || '').replace('T', ' ').substring(0, 16)}</span>` : ''}
+                </div>`;
+        }
+
+        // Append a just-shipped parcel to the modal list (used after 发货并继续,
+        // when the modal stays open for the next batch).
+        function appendShipParcel(carrierName, tracking) {
+            const block = document.getElementById('shipParcelsBlock');
+            const list = document.getElementById('shipParcelsList');
+            const n = list.querySelectorAll('div').length + 1;
+            list.insertAdjacentHTML('beforeend', shipParcelRow(n, carrierName, tracking, ''));
+            block.classList.remove('d-none');
+        }
+
+        // Swap between the single-shipment button and the dual split buttons.
+        function setShipMode(split) {
+            document.getElementById('confirmShipBtn').classList.toggle('d-none', split);
+            document.getElementById('shipContinueBtn').classList.toggle('d-none', !split);
+            document.getElementById('shipFinalBtn').classList.toggle('d-none', !split);
+            updateShipBtnState();
+        }
+
+        // Show/hide the big-order checklist and gate the ship buttons on the
         // acknowledgment checkbox. For non-big orders the gate stays off.
         function applyBigOrderGate(isBigOrder, bigOrderReasons) {
             const alertBox = document.getElementById('bigOrderAlert');
@@ -946,9 +1277,11 @@
         }
 
         function updateShipBtnState() {
-            const btn = document.getElementById('confirmShipBtn');
-            const ack = document.getElementById('bigOrderAck');
-            if (btn) btn.disabled = !ack.checked;
+            const disabled = !document.getElementById('bigOrderAck').checked;
+            ['confirmShipBtn', 'shipContinueBtn', 'shipFinalBtn'].forEach(id => {
+                const b = document.getElementById(id);
+                if (b) b.disabled = disabled;
+            });
         }
 
         // Populate the carrier dropdown with the carriers actually used on
@@ -1034,11 +1367,19 @@
             document.getElementById('shipCarrier').value = '';
             document.getElementById('shipTrackingNumber').value = '';
             document.getElementById('shipSendEmail').checked = false; // 不默认发邮件，因为可能已经通知过
+            // Correction/backfill is always single-shipment.
+            renderShipParcels([]);
+            document.getElementById('shipSplitMode').checked = false;
+            document.getElementById('shipSplitModeWrap').classList.add('d-none');
+            setShipMode(false);
             applyBigOrderGate(false, '');
             bootstrap.Modal.getOrCreateInstance(document.getElementById('shipModal')).show();
         }
 
-        function shipOrder() {
+        // mode: 'single' (normal/correction), 'continue' (split, more to come),
+        // 'final' (split, last batch). Maps to the backend new_parcel/more_batches.
+        function shipOrder(mode) {
+            mode = mode || 'single';
             const orderId = document.getElementById('shipOrderId').value;
             const carrier = document.getElementById('shipCarrier').value;
             const trackingNumber = document.getElementById('shipTrackingNumber').value.trim();
@@ -1049,9 +1390,25 @@
                 return;
             }
 
-            const btn = document.getElementById('confirmShipBtn');
-            btn.disabled = true;
-            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>处理中...';
+            const newParcel = (mode === 'continue' || mode === 'final');
+            const moreBatches = (mode === 'continue');
+
+            // Disable every action button + spin the one that was clicked.
+            const btnIds = ['confirmShipBtn', 'shipContinueBtn', 'shipFinalBtn'];
+            const labels = {
+                confirmShipBtn: '<i class="bi bi-truck me-1"></i> 确认发货',
+                shipContinueBtn: '<i class="bi bi-box-seam me-1"></i> 发货并继续',
+                shipFinalBtn: '<i class="bi bi-check2-circle me-1"></i> 发货并完成'
+            };
+            const activeId = mode === 'continue' ? 'shipContinueBtn' : (mode === 'final' ? 'shipFinalBtn' : 'confirmShipBtn');
+            btnIds.forEach(id => { const b = document.getElementById(id); if (b) b.disabled = true; });
+            const activeBtn = document.getElementById(activeId);
+            activeBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>处理中...';
+
+            const restore = () => {
+                btnIds.forEach(id => { const b = document.getElementById(id); if (b) { b.disabled = false; b.innerHTML = labels[id]; } });
+                updateShipBtnState();
+            };
 
             fetch('/api/shipping/ship', {
                 method: 'POST',
@@ -1060,30 +1417,37 @@
                     order_id: orderId,
                     carrier_slug: carrier,
                     tracking_number: trackingNumber,
-                    send_email: sendEmail
+                    send_email: sendEmail,
+                    new_parcel: newParcel,
+                    more_batches: moreBatches
                 })
             })
                 .then(res => res.json())
                 .then(data => {
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="bi bi-truck me-1"></i> 确认发货';
-
+                    restore();
                     if (data.success) {
-                        bootstrap.Modal.getInstance(document.getElementById('shipModal')).hide();
-                        loadOrders();
-
-                        if (data.warning) {
-                            alert(data.message);
-                        } else {
+                        if (moreBatches) {
+                            // Stay on the order: reflect the parcel just sent, then
+                            // clear the field for the next batch's tracking number.
+                            const carrierSel = document.getElementById('shipCarrier');
+                            const carrierName = carrierSel.options[carrierSel.selectedIndex] ? carrierSel.options[carrierSel.selectedIndex].text : carrier;
+                            appendShipParcel(carrierName, trackingNumber);
+                            document.getElementById('shipTrackingNumber').value = '';
+                            document.getElementById('shipTrackingNumber').focus();
                             showToast(data.message, 'success');
+                        } else {
+                            bootstrap.Modal.getInstance(document.getElementById('shipModal')).hide();
+                        }
+                        loadOrders();
+                        if (!moreBatches) {
+                            if (data.warning) { alert(data.message); } else { showToast(data.message, 'success'); }
                         }
                     } else {
                         alert('发货失败: ' + (data.error || '未知错误'));
                     }
                 })
                 .catch(err => {
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="bi bi-truck me-1"></i> 确认发货';
+                    restore();
                     alert('请求失败: ' + err);
                 });
         }
@@ -1182,8 +1546,8 @@
                 </div>
             ` : '';
             const action = o.is_undelivered
-                ? `<a href="javascript:void(0)" class="text-warning text-decoration-none" onclick="unmarkUndelivered(${o.id}, '${safeNum}')" title="撤销退回标记"><i class="bi bi-arrow-counterclockwise me-1"></i>撤销</a>`
-                : `<button class="btn btn-sm btn-outline-danger" onclick="openUndeliveredModal(${o.id}, '${safeNum}', ${o.shipping_total || 0}, '${(o.currency || '').replace(/'/g, "\\'")}', '${(o.tracking_number || '').replace(/'/g, "\\'")}')"><i class="bi bi-arrow-return-left me-1"></i>标记退回</button>`;
+                ? `<a href="javascript:void(0)" class="ship-action text-warning text-decoration-none" onclick="unmarkUndelivered(${o.id}, '${safeNum}')" title="撤销退回标记"><i class="bi bi-arrow-counterclockwise me-1"></i>撤销</a>`
+                : `<button class="ship-action btn btn-sm btn-outline-danger" onclick="openUndeliveredModal(${o.id}, '${safeNum}', ${o.shipping_total || 0}, '${(o.currency || '').replace(/'/g, "\\'")}', '${(o.tracking_number || '').replace(/'/g, "\\'")}')"><i class="bi bi-arrow-return-left me-1"></i>标记退回</button>`;
 
             return `
                 <tr>

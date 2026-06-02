@@ -106,7 +106,7 @@ def extract_tracking(order):
     return None, ''
 
 
-def fetch_candidates(conn, min_age_days, limit, recheck_hours, live):
+def fetch_candidates(conn, min_age_days, limit, recheck_hours, live, au_sites=None):
     cutoff = (datetime.now() - timedelta(days=min_age_days)).strftime('%Y-%m-%dT%H:%M:%S')
     recheck_clause = ''
     if live and recheck_hours is not None:
@@ -117,10 +117,21 @@ def fetch_candidates(conn, min_age_days, limit, recheck_hours, live):
           AND (carrier_status_at IS NULL
                OR carrier_status NOT IN ('delivered','returned')
                AND carrier_status_at <= datetime('now', '-{int(recheck_hours)} hours'))"""
+    # Payment scope: always COD orders (every market). When AU auto-track is on,
+    # ALSO include Australian-site orders — they're online-paid (not COD), so
+    # they'd otherwise never be picked up here.
+    params = []
+    if au_sites:
+        ph = ','.join(['?'] * len(au_sites))
+        pay_clause = f"(payment_method = 'cod' OR source IN ({ph}))"
+        params.extend(au_sites)
+    else:
+        pay_clause = "payment_method = 'cod'"
+    params.append(cutoff)
     q = f"""
         SELECT id, number, date_created, billing, meta_data, line_items, shipping_lines
         FROM orders
-        WHERE payment_method = 'cod'
+        WHERE {pay_clause}
           AND status IN ('on-hold', 'shipped', 'partial-shipped')
           AND COALESCE(is_undelivered, 0) = 0
           AND COALESCE(is_problem_return, 0) = 0
@@ -129,7 +140,7 @@ def fetch_candidates(conn, min_age_days, limit, recheck_hours, live):
           {recheck_clause}
         ORDER BY date_created DESC
     """
-    rows = conn.execute(q, [cutoff]).fetchall()
+    rows = conn.execute(q, params).fetchall()
     return rows[:limit] if limit else rows
 
 
@@ -144,7 +155,7 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--min-age-days', type=int, default=DEFAULT_MIN_AGE_DAYS)
     ap.add_argument('--recheck-hours', type=int, default=12)
-    ap.add_argument('--carrier', choices=['inpost', 'dpd', 'all'], default='all')
+    ap.add_argument('--carrier', choices=['inpost', 'dpd', 'other', 'all'], default='all')
     ap.add_argument('--throttle', type=float, default=INPOST_THROTTLE)
     args = ap.parse_args()
     live = args.live
@@ -156,13 +167,22 @@ def main():
         sys.exit(1)
     key718 = get_setting(conn, 'track718_api_key')
 
-    candidates = fetch_candidates(conn, args.min_age_days, args.limit, args.recheck_hours, live)
+    # AU auto-track toggle (系统设置). When ON, Australian-site orders (online-paid,
+    # non-COD, typically EMS) join the candidate set and are resolved via Track718.
+    au_enabled = (get_setting(conn, 'auto_track_au') or '').strip().lower() in ('1', 'true', 'on', 'yes')
+    au_sites = []
+    if au_enabled:
+        au_sites = [r['url'] for r in conn.execute("SELECT url FROM sites WHERE country='AU'").fetchall()]
+
+    candidates = fetch_candidates(conn, args.min_age_days, args.limit, args.recheck_hours, live, au_sites)
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] resolve_outcomes "
-          f"{'LIVE' if live else 'DRY-RUN'} — {len(candidates)} candidates, carrier={args.carrier}")
+          f"{'LIVE' if live else 'DRY-RUN'} — {len(candidates)} candidates, carrier={args.carrier}, "
+          f"AU auto-track={'ON' if au_enabled else 'OFF'}({len(au_sites)} sites)")
 
     # Bucket by carrier
     inpost = []   # (order_id, number)
-    dpd = []      # (order_id, number)
+    dpd = []      # (order_id, number, row)
+    generic = []  # (order_id, number, provider) — EMS/中国邮政/Australia Post/… via Track718 auto-detect
     skipped = Counter()
     for o in candidates:
         number, provider = extract_tracking(o)
@@ -174,6 +194,8 @@ def main():
             inpost.append((o['id'], number))
         elif carrier == 'dpd' and args.carrier in ('dpd', 'all'):
             dpd.append((o['id'], number, o))
+        elif carrier == 'unknown' and args.carrier in ('other', 'all'):
+            generic.append((o['id'], number, provider))
         else:
             skipped[carrier] += 1
 
@@ -181,11 +203,15 @@ def main():
     written = 0
     session = requests.Session()
 
-    # ---- InPost (synchronous, free) ----
+    # ---- InPost (synchronous, free public ShipX API) ----
+    inpost_fb = []   # ShipX 404 (often Paczkomat self-service) → Track718 fallback
     for oid, num in inpost:
         info = ct.inpost_status(num, session=session)
         if not info['ok']:
-            outcomes['inpost:err:' + info['error']] += 1
+            if info['error'] == 'http_404' and key718:
+                inpost_fb.append((oid, num))   # recover via Track718 'in-post' below
+            else:
+                outcomes['inpost:err:' + info['error']] += 1
             time.sleep(args.throttle)
             continue
         outcomes['inpost:' + info['outcome']] += 1
@@ -193,6 +219,29 @@ def main():
             write_status(conn, oid, info['outcome'])
             written += 1
         time.sleep(args.throttle)
+
+    # ---- InPost ShipX-404 fallback via Track718 (async: add -> crawl -> query) ----
+    # Parcels the ShipX business API doesn't hold (e.g. Paczkomat self-service)
+    # are tracked by Track718 under the 'in-post' courier code. Same pattern as
+    # DPD: register now, a later cron run reads the crawled status. This both
+    # clears these from the queue AND restores refusal visibility (returned→🔴).
+    if inpost_fb and key718:
+        if live:
+            items = [{'trackNum': num, 'code': ct.TRACK718_INPOST_PL,
+                      'innerNum': str(oid), 'country': 'PL'} for oid, num in inpost_fb]
+            added = ct.track718_add(items, key718, session=session)
+            print(f"  Track718 InPost(in-post) add: {added} 个已登记（刚登记的本轮多为未上线，下次 cron 出状态）")
+        nums = [num for _, num in inpost_fb]
+        statuses = ct.track718_query(nums, key718, code=ct.TRACK718_INPOST_PL, session=session)
+        for oid, num in inpost_fb:
+            r = statuses.get(num, {})
+            if not r.get('ok'):
+                outcomes['inpost718:no_info'] += 1
+                continue
+            outcomes['inpost718:' + r['outcome']] += 1
+            if live:
+                write_status(conn, oid, r['outcome'])
+                written += 1
 
     # ---- DPD (Track718, async: add -> crawl -> query) ----
     if dpd:
@@ -224,12 +273,37 @@ def main():
                     write_status(conn, oid, r['outcome'])
                     written += 1
 
+    # ---- Other carriers (EMS/中国邮政, Australia Post, GLS, …) via Track718 ----
+    # Non-InPost/non-DPD shipments — chiefly the AU market's EMS parcels. Track718
+    # AUTO-DETECTS the carrier; track718_detail handles add (+otherCodes retry) and
+    # polls the query. Already-crawled numbers return on the first poll, so steady
+    # state is fast; brand-new numbers may need a later run to surface a status.
+    # It registers numbers (spends quota), so we only call it on --live runs.
+    if generic:
+        if not key718:
+            print("  ⚠ 其他物流(EMS等) 跳过: settings.track718_api_key 未配置")
+        elif not live:
+            print(f"  [DRY-RUN] 其他物流(EMS等) 候选 {len(generic)} 单，未查询（避免 Track718 额度消耗）")
+            for _ in generic:
+                outcomes['other:dry'] += 1
+        else:
+            for oid, num, prov in generic:
+                res = ct.track718_detail(num, key718, code=None, session=session, poll=2, poll_wait=2.0)
+                oc = res.get('outcome')
+                if oc and oc != 'unknown':
+                    outcomes['other:' + oc] += 1
+                    write_status(conn, oid, oc)
+                    written += 1
+                else:
+                    outcomes['other:no_info'] += 1
+                time.sleep(args.throttle)
+
     if live:
         conn.commit()
     conn.close()
 
     print("\n— 候选归类 —")
-    print(f"   InPost {len(inpost)}   DPD {len(dpd)}   跳过 {dict(skipped)}")
+    print(f"   InPost {len(inpost)}   InPost查无→Track718 {len(inpost_fb)}   DPD {len(dpd)}   其他(EMS等) {len(generic)}   跳过 {dict(skipped)}")
     print("\n— 检测结果（normalized outcome）—")
     agg = Counter()
     for k, n in outcomes.most_common():

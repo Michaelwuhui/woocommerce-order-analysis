@@ -10,6 +10,7 @@
         </h5>
         <div class="d-flex align-items-center gap-2">
             <select id="countryFilter" class="form-select form-select-sm bg-dark text-white border-secondary" style="width:auto;min-width:120px;" onchange="saveCountryFilter(); loadCosts()">
+                <option value="">全部国家</option>
                 {% for c in countries %}
                 <option value="{{ c }}">{{ c }}</option>
                 {% endfor %}
@@ -387,8 +388,11 @@ let seriesData = {};
 let productCombos = [];
 let warehousesData = {{ warehouses | tojson }};
 const CAN_EDIT_COSTS = {{ 'true' if can_edit_costs else 'false' }};
-// null = unrestricted; array = whitelist of warehouse_ids the user can edit/delete
+// EDIT scope: null = unrestricted; array = whitelist of warehouse_ids the user can edit/delete
 const ALLOWED_WAREHOUSE_IDS = {{ allowed_warehouse_ids | tojson if allowed_warehouse_ids is not none else 'null' }};
+// VIEW scope: null = sees all costs; array = only these warehouses. A read-only
+// viewer (no partner binding) has VIEW null but EDIT [] — sees all, edits none.
+const VIEW_WAREHOUSE_IDS = {{ view_warehouse_ids | tojson if view_warehouse_ids is not none else 'null' }};
 
 function canEditWarehouse(whId) {
     if (!CAN_EDIT_COSTS) return false;
@@ -396,9 +400,9 @@ function canEditWarehouse(whId) {
     return ALLOWED_WAREHOUSE_IDS.includes(parseInt(whId));
 }
 function isWarehouseInScope(whId) {
-    // Used for filtering visible costs: super-admin sees all, others scoped.
-    if (ALLOWED_WAREHOUSE_IDS === null) return true;
-    return ALLOWED_WAREHOUSE_IDS.includes(parseInt(whId));
+    // Used for filtering visible costs: scoped by VIEW scope, not edit scope.
+    if (VIEW_WAREHOUSE_IDS === null) return true;
+    return VIEW_WAREHOUSE_IDS.includes(parseInt(whId));
 }
 
 function saveCountryFilter() {
@@ -407,20 +411,20 @@ function saveCountryFilter() {
 
 document.addEventListener('DOMContentLoaded', function() {
     // For partner-scoped users, filter the country dropdown to ONLY their
-    // allowed countries. Computed from ALLOWED_WAREHOUSE_IDS via warehousesData.
-    if (ALLOWED_WAREHOUSE_IDS !== null) {
+    // allowed countries. Driven by VIEW scope (not edit scope), so a read-only
+    // viewer with no partner binding keeps the full list.
+    if (VIEW_WAREHOUSE_IDS !== null) {
         var allowedCountries = new Set(
             warehousesData
-                .filter(function(w) { return ALLOWED_WAREHOUSE_IDS.includes(parseInt(w.id)); })
+                .filter(function(w) { return VIEW_WAREHOUSE_IDS.includes(parseInt(w.id)); })
                 .map(function(w) { return w.country; })
         );
         var sel = document.getElementById('countryFilter');
         if (sel) {
-            // Drop any option that isn't allowed
+            // Drop any country option not in scope, but always keep 全部国家 ("")
             Array.from(sel.options).forEach(function(opt) {
-                if (!allowedCountries.has(opt.value)) opt.remove();
+                if (opt.value !== '' && !allowedCountries.has(opt.value)) opt.remove();
             });
-            // If nothing left, leave empty (page will show empty state)
         }
     }
 
@@ -623,8 +627,13 @@ async function loadCosts() {
     try {
         const res = await fetch('/api/product-costs');
         const data = await res.json();
-        const countryWhs = warehousesData.filter(w => w.country === country).map(w => w.id);
-        allCosts = data.filter(c => countryWhs.includes(c.warehouse_id));
+        if (country === '') {
+            // 全部国家: every cost within the user's VIEW scope
+            allCosts = data.filter(c => isWarehouseInScope(c.warehouse_id));
+        } else {
+            const countryWhs = warehousesData.filter(w => w.country === country).map(w => w.id);
+            allCosts = data.filter(c => countryWhs.includes(c.warehouse_id) && isWarehouseInScope(c.warehouse_id));
+        }
         renderCosts();
         updateSummary();
     } catch(e) { console.error('加载成本失败', e); }
