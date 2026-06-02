@@ -5642,7 +5642,20 @@ def init_shipping_tables():
             status TEXT DEFAULT 'shipped'
         )
     ''')
-    
+
+    # Re-shipment (补发货) support. A reship appends a NEW shipping_logs row that
+    # carries the reason while the ORIGINAL parcel row is kept for history.
+    # is_reship distinguishes it from a normal/split parcel so the shipped list
+    # can render the prior tracking as superseded rather than as a 分批 parcel.
+    for ddl in (
+        'ALTER TABLE shipping_logs ADD COLUMN reship_reason TEXT',
+        'ALTER TABLE shipping_logs ADD COLUMN is_reship INTEGER DEFAULT 0',
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
     # Shipping carriers table
     conn.execute('''
         CREATE TABLE IF NOT EXISTS shipping_carriers (
@@ -15256,18 +15269,22 @@ def get_shipped_orders():
         ph = ','.join(['?'] * len(shipped_ids))
         for r in conn.execute(
             f'''SELECT sl.order_id, sl.tracking_number, sl.carrier_slug, sl.shipped_at,
+                       sl.is_reship, sl.reship_reason,
                        sc.name AS carrier_name, sc.tracking_url
                 FROM shipping_logs sl
                 LEFT JOIN shipping_carriers sc ON sc.slug = sl.carrier_slug
                 WHERE sl.order_id IN ({ph}) ORDER BY sl.id''', shipped_ids).fetchall():
             tn = r['tracking_number'] or ''
             tmpl = r['tracking_url'] or ''
+            rk = r.keys()
             shipped_parcels_map.setdefault(r['order_id'], []).append({
                 'tracking_number': tn,
                 'carrier_slug': r['carrier_slug'],
                 'carrier_name': r['carrier_name'] or r['carrier_slug'],
                 'tracking_url': (tmpl.replace('{tracking}', tn).replace('{tracking_number}', tn) if tmpl and tn else ''),
                 'shipped_at': r['shipped_at'],
+                'is_reship': (r['is_reship'] if 'is_reship' in rk else 0) or 0,
+                'reship_reason': (r['reship_reason'] if 'reship_reason' in rk else '') or '',
             })
 
     # Get carriers for tracking URL
@@ -15688,6 +15705,16 @@ def ship_order():
     #                  final batch (more_batches=False).
     new_parcel = bool(data.get('new_parcel'))
     more_batches = bool(data.get('more_batches'))
+    # 补发货 (re-shipment): re-send a NEW tracking after the first parcel was
+    # lost / never sent. A non-empty reship_reason flags it. A reship writes ONLY
+    # the new parcel to WP (replace — the customer sees just the live tracking),
+    # but keeps the original parcel row locally for history and records the
+    # reason in an audit note. It is never a split / partial batch.
+    reship_reason = (data.get('reship_reason') or '').strip()
+    is_reship = bool(reship_reason)
+    if is_reship:
+        new_parcel = False
+        more_batches = False
 
     if not all([order_id, tracking_number, carrier_slug]):
         return jsonify({'success': False, 'error': '缺少必填字段'}), 400
@@ -15849,7 +15876,7 @@ def ship_order():
         # didn't actually ship, and inserting a row would create a phantom
         # parcel. The user just retries. For a normal/first shipment we stash
         # the tracking number locally so it doesn't have to be retyped on retry.
-        if not new_parcel:
+        if not new_parcel and not is_reship:
             existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
             if existing_log:
                 conn.execute(
@@ -15863,12 +15890,22 @@ def ship_order():
                     (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
                 )
             conn.commit()
-        stash_note = '' if new_parcel else '运单号已暂存本地，请稍后重试。'
+        # A failed reship must NOT stash/overwrite the original tracking row.
+        stash_note = '' if (new_parcel or is_reship) else '运单号已暂存本地，请稍后重试。'
         conn.close()
         return jsonify({
             'success': False,
             'error': f"发货失败（{fmt_label}）：{'; '.join(warnings) or '远程未返回成功'}。{stash_note}"
         }), 500
+
+    # Build the re-shipment audit line once; reused for the local order_notes
+    # row and the best-effort remote WC note below.
+    reship_log_line = ''
+    if is_reship:
+        reship_log_line = (
+            f"「补发货」由 {current_user.name} 操作：物流商 {carrier_name}，"
+            f"新运单号 {tracking_number}。补发原因：{reship_reason}"
+        )
 
     # Trigger the site's native shipment email.
     #
@@ -15885,6 +15922,9 @@ def ship_order():
     # The endpoint itself decides which path applies; we just always call it
     # and let it self-detect.
     email_trigger_info = None
+    # Did a customer-facing notification actually go out? Only consumed by the
+    # reship fallback below; harmless for normal ships.
+    customer_notified = False
     if send_email:
         try:
             trig_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['id']}/trigger-shipment-email"
@@ -15900,7 +15940,9 @@ def ship_order():
                 email_trigger_info = td
                 # Surface a warning only if we KNOW the email failed; AST
                 # returns email_sent=null because it's async, that's fine.
-                if td.get('email_sent') is False and td.get('plugin') not in ('AST',):
+                if td.get('email_sent') is True:
+                    customer_notified = True
+                elif td.get('email_sent') is False and td.get('plugin') not in ('AST',):
                     warnings.append(f"邮件触发失败（{td.get('plugin', '?')}）: {td.get('note', '')}")
             elif trig_resp.status_code == 404:
                 # Plugin not installed on this site — fall back to the
@@ -15908,10 +15950,35 @@ def ship_order():
                 # *some* notification.
                 warnings.append("邮件触发端点未找到（请确认 woo-orders-tracking-rest-api mu-plugin 已安装）")
                 _post_fallback_customer_note(req, site, order, carrier_name, tracking_number, tracking_url, api_headers, warnings)
+                customer_notified = True
             else:
                 warnings.append(f"邮件触发返回 {trig_resp.status_code}")
         except Exception as e:
             warnings.append(f"邮件触发异常: {e}")
+
+    # 补发 MUST reach the customer with the NEW tracking. The plugin-native
+    # shipment email only reliably fires for VillaTheme (direct send_mail); AST
+    # emails on a wc-shipped status *transition* that a reship doesn't cause
+    # (the order is already shipped), and custom/unknown sites have no native
+    # trigger at all. So whenever nothing customer-facing went out above, fall
+    # back to a WooCommerce customer note that emails the buyer the new tracking.
+    if is_reship and send_email and not customer_notified:
+        _post_fallback_customer_note(req, site, order, carrier_name, tracking_number, tracking_url, api_headers, warnings)
+
+    # Re-shipment: leave an explicit audit note on the WC order so the WP admin
+    # reflects WHY a second tracking went out (best-effort; mirrors the
+    # mark-undelivered remote-note path).
+    if is_reship and reship_log_line:
+        try:
+            req.post(
+                f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes",
+                json={'note': reship_log_line, 'customer_note': False},
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=10,
+                headers=api_headers,
+            )
+        except Exception as remote_err:
+            app.logger.warning(f"Remote reship note for order {order_id} failed: {remote_err}")
 
     # Local DB: status + shipping_logs (mirror the remote state we just set).
     try:
@@ -15925,6 +15992,22 @@ def ship_order():
                 '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
                    VALUES (?, ?, ?, ?, ?, ?)''',
                 (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
+            )
+        elif is_reship:
+            # Re-shipment: keep the original parcel row(s) untouched and append a
+            # NEW row flagged is_reship with the reason, so the full history is
+            # preserved locally even though WP only carries the new (replacing)
+            # tracking. Also write an order_notes audit row (local source of
+            # truth, always succeeds even if the remote note above failed).
+            conn.execute(
+                '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, reship_reason, is_reship)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1)''',
+                (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id, reship_reason)
+            )
+            conn.execute(
+                '''INSERT INTO order_notes (order_id, note, date_created, customer_note, author, added_by_user)
+                   VALUES (?, ?, datetime('now'), 0, ?, 1)''',
+                (order_id, reship_log_line, current_user.name)
             )
         else:
             existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id=?', (order_id,)).fetchone()
@@ -15947,13 +16030,26 @@ def ship_order():
 
     # Annotate the success message — split-shipment aware.
     parcel_count = len(parcels)
-    if more_batches:
+    if is_reship:
+        msg = f"补发成功（{fmt_label} 格式），新运单 {tracking_number}"
+    elif more_batches:
         msg = f"第 {parcel_count} 个包裹已发货（分批中，订单仍在待发货，可继续添加包裹）"
     elif new_parcel and parcel_count > 1:
         msg = f"最后一个包裹已发货，共 {parcel_count} 个包裹，订单已完成发货（{fmt_label} 格式）"
     else:
         msg = f"发货成功（{fmt_label} 格式）"
-    if email_trigger_info:
+    if is_reship:
+        if not send_email:
+            msg += "，未通知客户（未勾选发邮件）"
+        elif customer_notified:
+            plugin = (email_trigger_info or {}).get('plugin', '')
+            msg += f"，新运单邮件已发送（{plugin}）" if plugin else "，新运单邮件已发送"
+        else:
+            # AST / custom / unknown: the native shipment email can't fire on a
+            # reship (no status transition), so we emailed the buyer via a
+            # WooCommerce customer note instead.
+            msg += "，已通过客户备注邮件通知客户新运单"
+    elif email_trigger_info:
         plugin = email_trigger_info.get('plugin', '?')
         sent = email_trigger_info.get('email_sent')
         if sent is True:

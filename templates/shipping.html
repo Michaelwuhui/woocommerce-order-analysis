@@ -363,6 +363,64 @@
     </div>
 </div>
 
+<!-- Re-shipment (补发货) Modal -->
+<div class="modal fade" id="reshipModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-arrow-repeat me-2"></i>补发货</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="reshipOrderId">
+                <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 text-light py-2 px-3 mb-3 small">
+                    <i class="bi bi-info-circle me-1"></i>
+                    用于物流丢失 / 漏发等需要重新发货的情况。补发会给客户发送<strong>新的运单号</strong>；客户端只显示新运单，原运单在本系统留底备查。
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">订单号</label>
+                    <input type="text" class="form-control bg-dark text-white border-secondary" id="reshipOrderNumber" readonly>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">客户</label>
+                    <div id="reshipCustomerInfo" class="text-white"></div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">物流商 *</label>
+                    <select class="form-select bg-dark text-white border-secondary" id="reshipCarrier" required>
+                        <option value="">选择物流商</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">新运单号 *</label>
+                    <input type="text" class="form-control bg-dark text-white border-secondary" id="reshipTrackingNumber" required placeholder="输入补发的新运单号">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label text-white-50">补发原因 *</label>
+                    <div class="mb-2 d-flex flex-wrap gap-1">
+                        <button type="button" class="btn btn-sm btn-outline-secondary py-0" onclick="fillReshipReason('物流丢失')">物流丢失</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary py-0" onclick="fillReshipReason('漏发')">漏发</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary py-0" onclick="fillReshipReason('地址问题需重寄')">地址问题</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary py-0" onclick="fillReshipReason('客户反馈未收到')">客户未收到</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary py-0" onclick="fillReshipReason('包裹破损')">包裹破损</button>
+                    </div>
+                    <textarea class="form-control bg-dark text-white border-secondary" id="reshipReason" rows="2" required placeholder="必填：为什么要补发？（如：物流显示丢件 / 仓库漏发某商品 等）"></textarea>
+                </div>
+                <div class="form-check mb-0">
+                    <input class="form-check-input" type="checkbox" id="reshipSendEmail" checked>
+                    <label class="form-check-label text-white-50" for="reshipSendEmail">发送邮件通知客户（含新运单号）</label>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-success" id="confirmReshipBtn" onclick="submitReship()">
+                    <i class="bi bi-arrow-repeat me-1"></i> 确认补发
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- noteModal markup is provided by base.html (shared with order detail modal) -->
 
 <!-- Mark Undelivered Modal -->
@@ -861,7 +919,8 @@
                     <td class="text-end text-info">${o.shipping_total.toFixed(2)}</td>
                     <td class="text-end"><strong>${o.total}</strong></td>
                     <td class="text-center">
-                        ${(o.parcels && o.parcels.length > 1) ? `
+                        ${(o.parcels && o.parcels.some(p => p.is_reship)) ? renderReshipTracking(o)
+                          : (o.parcels && o.parcels.length > 1) ? `
                             <div class="small text-warning mb-1"><i class="bi bi-boxes me-1"></i>分批 · ${o.parcels.length} 个包裹</div>
                             ${o.parcels.map((p, i) => `
                                 <div class="mb-1 text-start d-inline-block">
@@ -921,6 +980,9 @@
                         </a>
                         <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="queryCarrier(${o.id}, '${o.number}')" title="查物流（实时轨迹）">
                             <i class="bi bi-truck"></i>
+                        </a>
+                        <a href="javascript:void(0)" class="ship-action text-success me-3 text-decoration-none" onclick="openReshipModal(${o.id}, '${o.number}', '${(o.customer_name || '').replace(/'/g, "\\'")}', '${(o.source || '').replace(/'/g, "\\'")}')" title="补发货（物流丢失/漏发等，重新发一个新运单给客户）">
+                            <i class="bi bi-arrow-repeat"></i>
                         </a>
                         ${o.is_problem_return ? `
                             <a href="javascript:void(0)" class="ship-action text-warning me-3 text-decoration-none" onclick="unmarkProblemReturn(${o.id})" title="撤销问题退货标记">
@@ -1291,8 +1353,8 @@
         // warehouseName: if given, we pick the default selection based on it
         // ("国内发*" → EMS, "澳洲仓*" → Australia Post, etc). The full list of
         // carriers is still shown so the shipper can manually override.
-        function loadCarriersForSite(source, warehouseName) {
-            const sel = document.getElementById('shipCarrier');
+        function loadCarriersForSite(source, warehouseName, selectId = 'shipCarrier') {
+            const sel = document.getElementById(selectId);
             sel.innerHTML = '<option value="">加载中...</option>';
             sel.disabled = true;
 
@@ -1444,6 +1506,100 @@
                         }
                     } else {
                         alert('发货失败: ' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(err => {
+                    restore();
+                    alert('请求失败: ' + err);
+                });
+        }
+
+        // ---- 补发货 (re-shipment) ----
+        // Render the 运单信息 cell for a re-shipped order: the latest parcel is
+        // the active (new) tracking; earlier rows are the superseded original
+        // tracking(s), shown struck-through. Customer only ever sees the new one.
+        function renderReshipTracking(o) {
+            const parcels = o.parcels || [];
+            if (parcels.length === 0) return '<span class="text-muted small">-</span>';
+            const active = parcels[parcels.length - 1];
+            const prior = parcels.slice(0, -1);
+            const reason = active.reship_reason || '';
+            const activeTrack = active.tracking_url
+                ? `<a href="${active.tracking_url}" target="_blank" class="text-info text-decoration-none small"><i class="bi bi-link-45deg"></i>${active.tracking_number}</a>`
+                : `<small class="text-muted">${active.tracking_number}</small>`;
+            const priorHtml = prior.map(p => `
+                <div class="small" style="text-decoration: line-through; opacity: 0.55;">
+                    <span class="text-muted">${p.carrier_name || p.carrier_slug || ''} ${p.tracking_number || ''}</span>
+                </div>`).join('');
+            return `
+                <div class="small text-success mb-1"><i class="bi bi-arrow-repeat me-1"></i>已补发</div>
+                <div><strong class="text-white">${active.carrier_name || active.carrier_slug || ''}</strong></div>
+                ${activeTrack}
+                <div class="text-muted small">${active.shipped_at ? String(active.shipped_at).replace('T', ' ').substring(0, 16) : '-'}</div>
+                ${reason ? `<div class="text-warning small mt-1" title="${reason.replace(/"/g, '&quot;')}"><i class="bi bi-info-circle me-1"></i>补发原因：${reason}</div>` : ''}
+                ${priorHtml ? `<div class="text-muted mt-1" style="font-size:0.75em">原运单（已失效）</div>${priorHtml}` : ''}
+            `;
+        }
+
+        function openReshipModal(orderId, orderNumber, customerName, source) {
+            document.getElementById('reshipOrderId').value = orderId;
+            document.getElementById('reshipOrderNumber').value = '#' + orderNumber;
+            document.getElementById('reshipCustomerInfo').innerHTML = `<div class="fw-bold">${customerName || ''}</div>`;
+            document.getElementById('reshipTrackingNumber').value = '';
+            document.getElementById('reshipReason').value = '';
+            document.getElementById('reshipSendEmail').checked = true;
+            loadCarriersForSite(source, '', 'reshipCarrier');
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('reshipModal')).show();
+        }
+
+        // Quick-fill a common reship reason (still editable afterwards).
+        function fillReshipReason(text) {
+            document.getElementById('reshipReason').value = text;
+            document.getElementById('reshipReason').focus();
+        }
+
+        function submitReship() {
+            const orderId = document.getElementById('reshipOrderId').value;
+            const carrier = document.getElementById('reshipCarrier').value;
+            const trackingNumber = document.getElementById('reshipTrackingNumber').value.trim();
+            const reason = document.getElementById('reshipReason').value.trim();
+            const sendEmail = document.getElementById('reshipSendEmail').checked;
+
+            if (!carrier || !trackingNumber) {
+                alert('请填写物流商和新运单号');
+                return;
+            }
+            if (!reason) {
+                alert('请填写补发原因');
+                return;
+            }
+
+            const btn = document.getElementById('confirmReshipBtn');
+            const orig = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>补发中...';
+            const restore = () => { btn.disabled = false; btn.innerHTML = orig; };
+
+            fetch('/api/shipping/ship', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    order_id: orderId,
+                    carrier_slug: carrier,
+                    tracking_number: trackingNumber,
+                    send_email: sendEmail,
+                    reship_reason: reason
+                })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    restore();
+                    if (data.success) {
+                        bootstrap.Modal.getInstance(document.getElementById('reshipModal')).hide();
+                        loadOrders();
+                        if (data.warning) { alert(data.message); } else { showToast(data.message, 'success'); }
+                    } else {
+                        alert('补发失败: ' + (data.error || '未知错误'));
                     }
                 })
                 .catch(err => {
