@@ -125,6 +125,58 @@
         </div>
     </div>
 
+    <!-- 数据备份与灾备 -->
+    <div class="card data-card mb-4" id="backupCard">
+        <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
+            <h5 class="card-title text-white mb-0"><i class="bi bi-shield-check me-2"></i>数据备份与灾备</h5>
+            <div>
+                <button class="btn btn-sm btn-outline-secondary" id="backupRefreshBtn" title="刷新状态"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+                <button class="btn btn-sm btn-primary" id="backupRunBtn"><i class="bi bi-cloud-arrow-up"></i> 立即备份</button>
+            </div>
+        </div>
+        <div class="card-body">
+            <div id="backupAlerts"></div>
+            <div class="row g-3 mb-3" id="backupStatus">
+                <div class="col-12 text-white-50 small">加载中…</div>
+            </div>
+            <div>
+                <button class="btn btn-sm btn-outline-info" type="button" id="backupListToggle"><i class="bi bi-list-ul"></i> 查看备份文件</button>
+                <button class="btn btn-sm btn-outline-info" type="button" id="backupOffsiteCheckBtn"><i class="bi bi-cloud-check"></i> 检查异地 R2</button>
+                <div id="backupOffsiteResult" class="small mt-2"></div>
+                <div id="backupListWrap" class="mt-2" style="display:none;">
+                    <div class="table-responsive">
+                        <table class="table table-dark table-sm table-hover align-middle mb-0">
+                            <thead><tr><th>备份文件</th><th>大小</th><th>时间</th><th class="text-end">操作</th></tr></thead>
+                            <tbody id="backupListBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <hr class="border-secondary border-opacity-25 my-3">
+            <div>
+                <div class="text-white mb-2"><i class="bi bi-bullseye me-1"></i>定点恢复 · 缺失订单检查（只读）</div>
+                <div class="d-flex gap-2 align-items-center flex-wrap">
+                    <select class="form-select form-select-sm bg-dark text-white border-secondary" id="diffSiteSelect" style="width:auto;">
+                        <option value="">选择站点…</option>
+                        {% for site in sites %}
+                        <option value="{{ site.id }}">{{ site.url }}{% if site.manager %} · {{ site.manager }}{% endif %}</option>
+                        {% endfor %}
+                    </select>
+                    <button class="btn btn-sm btn-outline-warning" id="diffCheckBtn"><i class="bi bi-search"></i> 检查缺失订单</button>
+                    <span class="small text-white-50" id="diffSummary"></span>
+                </div>
+                <div id="diffResult" class="mt-2"></div>
+                <div class="small text-white-50 mt-1">缺失 = 镜像有、线上没有 = 疑似该站回滚丢失的订单。此处仅做<strong>只读对比</strong>；把缺失订单回灌到站点的功能将稍后单独加（逐单确认）。</div>
+            </div>
+
+            <div class="small text-white-50 mt-3">
+                <i class="bi bi-info-circle me-1"></i>
+                自动策略：每小时一致性热备 → 本地保留约 2 天 → 上传 Cloudflare R2（30 天自动清理）。
+                还原：下载某份 <code>.db.gz</code>，解压校验后替换数据库即可（步骤见 backup_db.py 顶部注释）。
+            </div>
+        </div>
+    </div>
+
     <!-- Sites List -->
     <div class="card data-card mb-4">
         <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
@@ -3768,6 +3820,136 @@ function deleteWarehouse(id, name) {
         });
     }
 
+</script>
+
+<script>
+// 数据备份与灾备 卡片逻辑（自包含）
+(function () {
+    const fmtSize = b => (b == null ? '-' : (b / 1024 / 1024).toFixed(2) + ' MB');
+
+    function renderAlerts(alerts) {
+        const box = document.getElementById('backupAlerts');
+        if (!box) return;
+        if (!alerts || !alerts.length) { box.innerHTML = ''; return; }
+        box.innerHTML = alerts.map(a => `
+            <div class="alert alert-danger d-flex justify-content-between align-items-start py-2">
+                <div class="small">
+                    <strong><i class="bi bi-exclamation-triangle-fill me-1"></i>疑似站点回滚告警</strong>
+                    — ${a.site_url || ''} <span class="text-white-50">（${a.created_at || ''}）</span><br>
+                    ${(a.detail || '').replace(/</g, '&lt;')}
+                </div>
+                <button class="btn btn-sm btn-outline-light ms-2 backup-ack-btn" data-id="${a.id}">我已知晓</button>
+            </div>`).join('');
+        box.querySelectorAll('.backup-ack-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                fetch('/api/settings/backup/alerts/ack', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: parseInt(btn.dataset.id) })
+                }).then(r => r.json()).then(loadBackupStatus);
+            });
+        });
+    }
+
+    function renderStatus(d) {
+        const wrap = document.getElementById('backupStatus');
+        if (!wrap) return;
+        const off = d.offsite || {};
+        const offTxt = off.mode === 's3'
+            ? `<span class="text-success">已启用 · R2 桶 ${off.bucket || ''}</span>`
+            : `<span class="text-warning">未配置（仅本地）</span>`;
+        const cronTxt = d.cron_hourly
+            ? '<span class="text-success">每小时自动</span>'
+            : '<span class="text-warning">未挂定时</span>';
+        const loc = d.local || {};
+        wrap.innerHTML = `
+            <div class="col-md-3"><div class="text-white-50 small">最近备份</div>
+                <div class="text-white">${loc.latest_time || '<span class="text-danger">无</span>'}</div></div>
+            <div class="col-md-3"><div class="text-white-50 small">本地份数 / 占用</div>
+                <div class="text-white">${loc.count || 0} 份 · ${fmtSize(loc.total_size)}</div></div>
+            <div class="col-md-3"><div class="text-white-50 small">异地备份</div><div>${offTxt}</div></div>
+            <div class="col-md-3"><div class="text-white-50 small">定时 / 归档订单</div>
+                <div>${cronTxt} · 归档 ${d.archived_orders == null ? '-' : d.archived_orders}</div></div>`;
+        renderAlerts(d.alerts);
+    }
+
+    function loadBackupStatus() {
+        fetch('/api/settings/backup/status').then(r => r.json()).then(renderStatus)
+            .catch(e => {
+                const w = document.getElementById('backupStatus');
+                if (w) w.innerHTML = `<div class="col-12 text-danger small">状态加载失败: ${e.message}</div>`;
+            });
+    }
+
+    function loadBackupList() {
+        fetch('/api/settings/backup/list').then(r => r.json()).then(d => {
+            const body = document.getElementById('backupListBody');
+            body.innerHTML = (d.files || []).map(f => `
+                <tr><td class="small">${f.name}</td><td class="small">${fmtSize(f.size)}</td>
+                <td class="small">${f.time}</td>
+                <td class="text-end"><a class="btn btn-sm btn-outline-light" href="/api/settings/backup/download?name=${encodeURIComponent(f.name)}"><i class="bi bi-download"></i></a></td></tr>`).join('')
+                || '<tr><td colspan="4" class="text-white-50 small">暂无备份</td></tr>';
+        });
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+        if (!document.getElementById('backupCard')) return;
+        loadBackupStatus();
+        document.getElementById('backupRefreshBtn').addEventListener('click', loadBackupStatus);
+
+        document.getElementById('backupRunBtn').addEventListener('click', function () {
+            const btn = this, html = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 备份中…';
+            fetch('/api/settings/backup/run', { method: 'POST' }).then(r => r.json()).then(d => {
+                btn.disabled = false; btn.innerHTML = html;
+                alert(d.success ? ('备份完成 ✅\n\n' + (d.output || '')) : ('备份失败 ❌\n\n' + (d.error || d.output || '')));
+                loadBackupStatus();
+            }).catch(e => { btn.disabled = false; btn.innerHTML = html; alert('备份请求失败: ' + e.message); });
+        });
+
+        document.getElementById('backupListToggle').addEventListener('click', function () {
+            const w = document.getElementById('backupListWrap');
+            if (w.style.display === 'none') { w.style.display = 'block'; loadBackupList(); }
+            else { w.style.display = 'none'; }
+        });
+
+        document.getElementById('backupOffsiteCheckBtn').addEventListener('click', function () {
+            const out = document.getElementById('backupOffsiteResult');
+            out.innerHTML = '<span class="text-white-50">检查中…</span>';
+            fetch('/api/settings/backup/offsite-check', { method: 'POST' }).then(r => r.json()).then(d => {
+                out.innerHTML = d.success
+                    ? `<span class="text-success">R2 桶 ${d.bucket}：共 ${d.count} 个对象，最近 ${d.latest_time || '-'}（${fmtSize(d.latest_size)}）</span>`
+                    : `<span class="text-danger">检查失败：${d.error}</span>`;
+            }).catch(e => out.innerHTML = `<span class="text-danger">检查失败：${e.message}</span>`);
+        });
+
+        const diffBtn = document.getElementById('diffCheckBtn');
+        if (diffBtn) diffBtn.addEventListener('click', function () {
+            const sid = document.getElementById('diffSiteSelect').value;
+            if (!sid) { alert('请先选择一个站点'); return; }
+            const btn = this, html = btn.innerHTML;
+            const summary = document.getElementById('diffSummary');
+            const result = document.getElementById('diffResult');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 对比中…（需拉取线上订单，请稍候）';
+            summary.textContent = ''; result.innerHTML = '';
+            fetch('/api/settings/backup/site-diff', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ site_id: parseInt(sid) })
+            }).then(r => r.json()).then(d => {
+                btn.disabled = false; btn.innerHTML = html;
+                if (!d.success) { result.innerHTML = `<div class="text-danger small">对比失败：${d.error}</div>`; return; }
+                summary.innerHTML = `镜像 ${d.mirror_count} 单 / 线上 ${d.live_count} 单 · <span class="${d.missing_count ? 'text-danger' : 'text-success'}">缺失 ${d.missing_count} 单</span>`;
+                if (!d.missing_count) { result.innerHTML = '<div class="text-success small">✅ 该站线上未发现缺失订单（镜像与线上一致）。</div>'; return; }
+                result.innerHTML = `<div class="table-responsive"><table class="table table-dark table-sm table-hover align-middle mb-0">
+                    <thead><tr><th>订单号</th><th>状态</th><th>客户</th><th>金额</th><th>下单时间</th></tr></thead>
+                    <tbody>${d.missing.map(o => `<tr><td>#${o.number || o.id}</td><td class="small">${o.status || ''}</td><td class="small">${(o.customer || '').replace(/</g, '&lt;')}</td><td class="small">${o.total} ${o.currency || ''}</td><td class="small">${o.date_created || ''}</td></tr>`).join('')}</tbody>
+                    </table></div>
+                    <div class="small text-warning mt-1">以上 ${d.missing_count} 单在镜像中存在、但该站线上已查不到——疑似回滚丢失。回灌功能待加（将逐单确认）。</div>`;
+            }).catch(e => { btn.disabled = false; btn.innerHTML = html; result.innerHTML = `<div class="text-danger small">请求失败：${e.message}</div>`; });
+        });
+    });
+})();
 </script>
 
 {% endblock %}

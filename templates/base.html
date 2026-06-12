@@ -823,7 +823,7 @@
                     var allStatuses = ['pending', 'processing', 'on-hold', 'completed', 'cancelled', 'refunded', 'failed', 'checkout-draft'];
                     allStatuses.forEach(function (s) {
                         var activeClass = s === order.status ? ' active' : '';
-                        html += '<li><a class="dropdown-item' + activeClass + '" href="#" onclick="updateOrderStatus(' + order.id + ', \'' + s + '\'); return false;"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + (statusColors[s] || '#6b7280') + ';margin-right:8px;"></span>' + (statusLabels[s] || s) + '</a></li>';
+                        html += '<li><a class="dropdown-item' + activeClass + '" href="#" onclick="updateOrderStatus(\'' + order.id + '\', \'' + s + '\'); return false;"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + (statusColors[s] || '#6b7280') + ';margin-right:8px;"></span>' + (statusLabels[s] || s) + '</a></li>';
                     });
                     html += '</ul></div></p>';
                     {% else %}
@@ -843,10 +843,10 @@
                     html += '</button>';
                     html += '<ul class="dropdown-menu dropdown-menu-dark">';
                     html += '<li><h6 class="dropdown-header">选择发货仓库</h6></li>';
-                    html += '<li><a class="dropdown-item' + (!order.warehouse_id ? ' active' : '') + '" href="#" onclick="setOrderWarehouse(' + order.id + ', null); return false;">未分配</a></li>';
+                    html += '<li><a class="dropdown-item' + (!order.warehouse_id ? ' active' : '') + '" href="#" onclick="setOrderWarehouse(\'' + order.id + '\', null); return false;">未分配</a></li>';
                     (window._warehousesList || []).forEach(function(w) {
                         var activeClass = (order.warehouse_id == w.id) ? ' active' : '';
-                        html += '<li><a class="dropdown-item' + activeClass + '" href="#" onclick="setOrderWarehouse(' + order.id + ', ' + w.id + '); return false;">' + w.name + '</a></li>';
+                        html += '<li><a class="dropdown-item' + activeClass + '" href="#" onclick="setOrderWarehouse(\'' + order.id + '\', ' + w.id + '); return false;">' + w.name + '</a></li>';
                     });
                     html += '</ul></div></p>';
                     {% else %}
@@ -876,14 +876,14 @@
                             html += '<div class="col-12 mt-2"><strong>备注:</strong> <span style="color:#e2e8f0;">' + order.undelivered_note + '</span></div>';
                         }
                         if (canShip) {
-                            html += '<div class="col-12 mt-2"><button class="btn btn-sm btn-outline-light" onclick="unmarkUndelivered(' + order.id + ')"><i class="bi bi-arrow-counterclockwise me-1"></i>撤销标记</button></div>';
+                            html += '<div class="col-12 mt-2"><button class="btn btn-sm btn-outline-light" onclick="unmarkUndelivered(\'' + order.id + '\')"><i class="bi bi-arrow-counterclockwise me-1"></i>撤销标记</button></div>';
                         }
                         html += '</div></div></div></div>';
                     } else if (canShip) {
                         html += '<div class="col-12">';
                         html += '<div class="info-card" style="border-color: rgba(168,85,247,0.25);"><div class="card-body d-flex align-items-center justify-content-between flex-wrap gap-2">';
                         html += '<div><i class="bi bi-arrow-return-left me-2" style="color:#c084fc;"></i><span style="color:#e2e8f0;">如客户拒收 / 包裹被退回，可记录运费损失</span></div>';
-                        html += '<button class="btn btn-sm" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);" onclick="openMarkUndeliveredDialog(' + order.id + ', \'' + (order.currency || '') + '\')"><i class="bi bi-flag me-1"></i>标记为未送达</button>';
+                        html += '<button class="btn btn-sm" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);" onclick="openMarkUndeliveredDialog(\'' + order.id + '\', \'' + (order.currency || '') + '\')"><i class="bi bi-flag me-1"></i>标记为未送达</button>';
                         html += '</div></div></div>';
                     }
 
@@ -917,14 +917,14 @@
                             html += '<div class="col-12 mt-1"><strong>说明:</strong> <span style="color:#e2e8f0;">' + order.problem_return_note + '</span></div>';
                         }
                         if (canShip) {
-                            html += '<div class="col-12 mt-2"><button class="btn btn-sm btn-outline-light" onclick="unmarkProblemReturn(' + order.id + ')"><i class="bi bi-arrow-counterclockwise me-1"></i>撤销标记</button></div>';
+                            html += '<div class="col-12 mt-2"><button class="btn btn-sm btn-outline-light" onclick="unmarkProblemReturn(\'' + order.id + '\')"><i class="bi bi-arrow-counterclockwise me-1"></i>撤销标记</button></div>';
                         }
                         html += '</div></div></div></div>';
                     } else if (canShip) {
                         html += '<div class="col-12">';
                         html += '<div class="info-card" style="border-color: rgba(220,53,69,0.25);"><div class="card-body d-flex align-items-center justify-content-between flex-wrap gap-2">';
                         html += '<div><i class="bi bi-box-seam me-2" style="color:#f87171;"></i><span style="color:#e2e8f0;">退回包裹内货物被调包 / 缺失 / 损坏，可在此记录</span></div>';
-                        html += '<button class="btn btn-sm" style="background:rgba(220,53,69,0.2); color:#f87171; border:1px solid rgba(220,53,69,0.4);" onclick="openProblemReturnModal(' + order.id + ', \'' + order.number + '\', \'' + (order.currency || '') + '\')"><i class="bi bi-flag me-1"></i>标记问题退货</button>';
+                        html += '<button class="btn btn-sm" style="background:rgba(220,53,69,0.2); color:#f87171; border:1px solid rgba(220,53,69,0.4);" onclick="openProblemReturnModal(\'' + order.id + '\', \'' + order.number + '\', \'' + (order.currency || '') + '\')"><i class="bi bi-flag me-1"></i>标记问题退货</button>';
                         html += '</div></div></div>';
                     }
 
@@ -935,7 +935,7 @@
                     html += '<div class="col-12">';
                     html += '<div class="info-card" style="border-color: rgba(96,165,250,0.25);"><div class="card-body d-flex align-items-center justify-content-between flex-wrap gap-2">';
                     html += '<div><i class="bi bi-chat-left-text me-2" style="color:#60a5fa;"></i><span style="color:#e2e8f0;">添加订单备注（可选发邮件通知客户）</span></div>';
-                    html += '<button class="btn btn-sm" style="background:rgba(96,165,250,0.2); color:#60a5fa; border:1px solid rgba(96,165,250,0.4);" onclick="openNoteModal(' + order.id + ', \'' + order.number + '\')"><i class="bi bi-plus-circle me-1"></i>添加备注</button>';
+                    html += '<button class="btn btn-sm" style="background:rgba(96,165,250,0.2); color:#60a5fa; border:1px solid rgba(96,165,250,0.4);" onclick="openNoteModal(\'' + order.id + '\', \'' + order.number + '\')"><i class="bi bi-plus-circle me-1"></i>添加备注</button>';
                     html += '</div></div></div>';
                     {% endif %}
 
@@ -1114,7 +1114,7 @@
                     html += '<div class="col-12">';
                     html += '<div class="info-card"><div class="card-header d-flex align-items-center justify-content-between">';
                     html += '<h6 class="mb-0"><i class="bi bi-envelope-paper me-2"></i>客户邮件记录 <span id="orderEmailLogsPlugin" class="badge bg-secondary bg-opacity-25 text-light ms-2" style="font-size:10px; display:none;"></span></h6>';
-                    html += '<button class="btn btn-sm btn-outline-light" onclick="loadOrderEmails(' + order.id + ', true)" id="orderEmailLogsRefreshBtn" title="刷新"><i class="bi bi-arrow-clockwise"></i></button>';
+                    html += '<button class="btn btn-sm btn-outline-light" onclick="loadOrderEmails(\'' + order.id + '\', true)" id="orderEmailLogsRefreshBtn" title="刷新"><i class="bi bi-arrow-clockwise"></i></button>';
                     html += '</div>';
                     html += '<div class="card-body" style="max-height: 320px; overflow-y: auto;" id="orderEmailLogsBody">';
                     html += '<div class="text-center py-3 text-muted small"><span class="spinner-border spinner-border-sm me-1"></span>正在拉取邮件记录...</div>';
@@ -1251,7 +1251,7 @@
                         html += '<div class="col-12">';
                         html += '<div class="info-card" style="border-color: rgba(16, 185, 129, 0.3);"><div class="card-header" style="background: linear-gradient(90deg, rgba(16, 185, 129, 0.15) 0%, transparent 100%);"><h6 style="color: #34d399;"><i class="bi bi-geo-alt-fill me-2"></i>运单追踪</h6></div>';
                         html += '<div class="card-body">';
-                        html += '<button class="btn btn-sm btn-success mb-2" onclick="queryCarrier(' + order.id + ', \'' + (order.number || '') + '\')"><i class="bi bi-truck me-1"></i>查物流（实时中文轨迹）</button>';
+                        html += '<button class="btn btn-sm btn-success mb-2" onclick="queryCarrier(\'' + order.id + '\', \'' + (order.number || '') + '\')"><i class="bi bi-truck me-1"></i>查物流（实时中文轨迹）</button>';
                         allTracking.forEach(function (t) {
                             html += '<div class="mb-2 p-2 rounded" style="background: rgba(16, 185, 129, 0.1);">';
                             html += '<div><strong>运单号:</strong> <span class="text-info">' + t.tracking_number + '</span></div>';

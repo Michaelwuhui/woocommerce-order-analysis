@@ -90,3 +90,6 @@ secrets.json
 *.backup
 # 带时间戳的备份文件（如 app.py.bak.20260506_094532）
 *.bak.*
+backup_offsite.json
+backup_db.log
+/www/backups/

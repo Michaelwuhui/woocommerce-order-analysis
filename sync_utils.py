@@ -5,6 +5,7 @@ import threading
 import concurrent.futures
 from datetime import datetime
 from woocommerce import API
+from oid_utils import make_oid, site_id_for_source, woo_post_id  # cross-site-safe surrogate order id
 
 # Database configuration
 DB_FILE = 'woocommerce_orders.db'
@@ -124,7 +125,10 @@ def save_orders_to_db(orders_data, connection=None):
             'date_completed', 'date_completed_gmt', 'cart_hash', 'meta_data', 'line_items',
             'tax_lines', 'shipping_lines', 'fee_lines', 'coupon_lines', 'refunds', 'set_paid', 'source'
         ]
-        all_columns = wc_fields + ['updated_at']
+        # woo_id keeps the raw per-site WC post id; id is the cross-site-safe
+        # surrogate "<sites.id>-<woo_id>" so same-numbered orders from different
+        # stores no longer collide under ON CONFLICT(id). See oid_utils.py.
+        all_columns = wc_fields + ['woo_id', 'updated_at']
         placeholders = ', '.join(['?'] * len(all_columns))
         # On UPDATE, set every column EXCEPT id (the conflict key).
         update_set = ', '.join(f'{c} = excluded.{c}' for c in all_columns if c != 'id')
@@ -142,10 +146,20 @@ def save_orders_to_db(orders_data, connection=None):
 
         processed_orders = []
         for order in orders_data:
+            woo_id = order.get('id')
+            site_id = site_id_for_source(connection, order.get('source'))
+            if site_id is None:
+                # Unknown source -> cannot build a safe surrogate; skip rather
+                # than mis-key. (Should not happen: every synced site is in `sites`.)
+                print(f"[save_orders_to_db] skip order {woo_id}: unknown source {order.get('source')!r}")
+                continue
+            oid = make_oid(site_id, woo_id)
             processed_order = []
             for field in wc_fields:
                 value = order.get(field)
-                if field == 'set_paid':
+                if field == 'id':
+                    processed_order.append(oid)
+                elif field == 'set_paid':
                     if isinstance(value, dict) or value is None:
                         processed_order.append(0)
                     else:
@@ -157,7 +171,8 @@ def save_orders_to_db(orders_data, connection=None):
                 else:
                     processed_order.append(value)
 
-            processed_order.append(datetime.now().isoformat())
+            processed_order.append(woo_id)                      # woo_id
+            processed_order.append(datetime.now().isoformat())  # updated_at
             processed_orders.append(tuple(processed_order))
 
         cursor.executemany(insert_query, processed_orders)
@@ -302,34 +317,37 @@ def sync_order_notes(wcapi, site_url, connection=None):
     try:
         cursor = connection.cursor()
 
-        # Use the WC internal post id (orders.id) for the API call. Number can
-        # be a customer-facing sequential number that the API does not accept.
+        # The WC REST API needs the raw post id (woo_id); the local order_id is
+        # the cross-site surrogate. Select both: call the API with woo_id, store
+        # notes under the surrogate id.
         cursor.execute('''
-            SELECT id
+            SELECT id, woo_id
             FROM orders
             WHERE source = ? AND status IN ('processing', 'offline', 'on-hold')
         ''', (site_url,))
 
-        active_order_ids = [row[0] for row in cursor.fetchall()]
+        active_orders = [(row[0], row[1]) for row in cursor.fetchall()]
 
-        if not active_order_ids:
+        if not active_orders:
             return
 
-        def fetch_notes_for_order(order_id):
+        def fetch_notes_for_order(oid, woo_id):
+            wc_pid = woo_id if woo_id is not None else woo_post_id(oid)
             try:
-                response = wcapi.get(f"orders/{order_id}/notes")
+                response = wcapi.get(f"orders/{wc_pid}/notes")
                 if response.status_code == 200:
                     notes_data = response.json()
                     for note in notes_data:
-                        note['_local_order_id'] = order_id
+                        note['_local_order_id'] = oid
                     return notes_data
             except Exception as e:
-                print(f"Error fetching notes for order {order_id}: {e}")
+                print(f"Error fetching notes for order {oid}: {e}")
             return []
 
         all_notes = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_order = {executor.submit(fetch_notes_for_order, oid): oid for oid in active_order_ids}
+            future_to_order = {executor.submit(fetch_notes_for_order, oid, woo_id): oid
+                               for oid, woo_id in active_orders}
 
             for future in concurrent.futures.as_completed(future_to_order):
                 order_id = future_to_order[future]

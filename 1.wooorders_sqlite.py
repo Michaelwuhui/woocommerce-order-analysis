@@ -10,6 +10,7 @@ import argparse
 import httpx
 from httpx import HTTPError, TimeoutException
 from woocommerce import API
+from oid_utils import make_oid, site_id_for_source  # cross-site-safe surrogate order id
 
 # 添加代理配置（如果需要使用代理）
 PROXY_CONFIG = {
@@ -80,6 +81,15 @@ HARDCODED_SITES = [
 # SQLite 数据库配置
 # -----------------------------
 DB_FILE = 'woocommerce_orders.db'
+
+# -----------------------------
+# 孤儿单清理保护阈值（P0-a 数据保护改造）
+# 站点若被回滚到旧库，会突然出现大量"本地有、远程没有"的孤儿单；超过阈值即判定为
+# 疑似数据事故，跳过删除并告警，避免本地备份随站点一起丢数据。
+# -----------------------------
+SUSPICIOUS_ORPHAN_ABS = 20      # 单站单次孤儿单绝对数量阈值
+SUSPICIOUS_ORPHAN_PCT = 0.10    # 或孤儿单占该站本地订单的比例阈值
+SUSPICIOUS_ORPHAN_PCT_MIN = 5   # 百分比规则的最小触发量（小站正常删几单不误报）
 
 # -----------------------------
 # 工具函数
@@ -307,45 +317,151 @@ def fetch_all_remote_order_ids(wcapi, site_url):
     return all_ids
 
 
-def delete_orphaned_orders(site_url, remote_ids):
-    """删除本地数据库中已在WooCommerce中被删除的订单"""
+def ensure_orders_archive(connection):
+    """确保归档表 orders_archive 存在，且列与 orders 对齐（外加 archived_at / archive_reason）。
+
+    用于在物理删除孤儿单之前留底；对 orders 后续新增的列自动补齐，避免 schema 漂移导致归档失败。
+    """
+    cursor = connection.cursor()
+    cursor.execute("CREATE TABLE IF NOT EXISTS orders_archive AS SELECT * FROM orders WHERE 0")
+
+    def _cols(table):
+        return [row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()]
+
+    archive_cols = set(_cols('orders_archive'))
+    for col in _cols('orders'):
+        if col not in archive_cols:
+            cursor.execute(f'ALTER TABLE orders_archive ADD COLUMN "{col}"')
+            archive_cols.add(col)
+    for meta_col in ('archived_at', 'archive_reason'):
+        if meta_col not in archive_cols:
+            cursor.execute(f"ALTER TABLE orders_archive ADD COLUMN {meta_col} TEXT")
+    connection.commit()
+
+
+def record_sync_alert(connection, site_url, alert_type, detail):
+    """写入一条同步告警（如疑似站点回滚），供人工排查 / 后续在应用内展示。"""
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT,
+                site_url TEXT,
+                alert_type TEXT,
+                detail TEXT,
+                acknowledged INTEGER DEFAULT 0
+            )
+            """
+        )
+        cursor.execute(
+            "INSERT INTO sync_alerts (created_at, site_url, alert_type, detail) VALUES (?, ?, ?, ?)",
+            (datetime.now().isoformat(), site_url, alert_type, detail),
+        )
+        connection.commit()
+    except Exception as e:
+        print(f"记录同步告警失败: {e}")
+
+
+def archive_orphaned_orders(site_url, remote_ids):
+    """处理"本地有、远程没有"的孤儿订单（P0-a 数据保护，取代原先的直接物理删除）。
+
+    - 小批量（正常的人工删单/去重）：先归档到 orders_archive，再从 orders 删除，对应用透明。
+    - 大批量（疑似站点回滚/数据事故）：不删除、不归档，保留在 orders 中以免影响发货/对账，
+      并写入 sync_alerts 告警等待人工确认——这是"站点崩了也不丢最新订单"的核心保护。
+
+    返回从 orders 实际移除（已归档）的订单数。
+    """
     local_ids = get_order_ids_from_db(site_url)
-    
+
     if not local_ids:
         print(f"站点 {site_url} 本地无订单，跳过删除检查")
         return 0
-    
+
     if not remote_ids:
         print(f"未获取到远程订单ID，跳过删除以避免误删")
         return 0
-    
-    # 找出本地存在但远程不存在的订单
+
+    # remote_ids 是裸 WC post id；本地 id 是跨站代理 id（"<sites.id>-<woo_id>"）。
+    # 差集前必须把远程归一到同一代理空间，否则每个本地订单都会被判为孤儿。
+    _conn_sid = create_database_connection()
+    site_id = site_id_for_source(_conn_sid, site_url) if _conn_sid else None
+    if _conn_sid:
+        _conn_sid.close()
+    if site_id is None:
+        print(f"站点 {site_url} 不在 sites 表，跳过孤儿清理以免误删")
+        return 0
+    remote_ids = {make_oid(site_id, rid) for rid in remote_ids}
+
     local_set = set(local_ids)
     orphaned_ids = local_set - remote_ids
-    
+
     if not orphaned_ids:
-        print(f"站点 {site_url} 没有需要删除的孤立订单")
+        print(f"站点 {site_url} 没有需要处理的孤立订单")
         return 0
-    
-    print(f"发现 {len(orphaned_ids)} 个孤立订单需要删除")
-    
+
     connection = create_database_connection()
     if not connection:
         return 0
-    
+
     try:
+        n_orphan = len(orphaned_ids)
+        n_local = len(local_set)
+        orphan_params = list(orphaned_ids)
+
+        # —— 保护阈值：疑似站点回滚 / 数据事故 ——
+        is_suspicious = (n_orphan >= SUSPICIOUS_ORPHAN_ABS) or (
+            n_orphan >= SUSPICIOUS_ORPHAN_PCT_MIN and n_orphan >= SUSPICIOUS_ORPHAN_PCT * n_local
+        )
+        if is_suspicious:
+            detail = (
+                f"检测到 {n_orphan} 个孤儿订单（占本地 {n_local} 单的 {n_orphan / n_local:.0%}），"
+                f"超过保护阈值，疑似站点回滚/数据事故；已跳过删除并保留这些订单。"
+                f"示例ID: {sorted(orphaned_ids)[:10]}"
+            )
+            print("\n" + "!" * 72)
+            print(f"⚠️  [数据保护] 站点 {site_url}: {detail}")
+            print("!" * 72 + "\n")
+            record_sync_alert(connection, site_url, 'suspected_rollback', detail)
+            return 0
+
+        # —— 正常小批量清理：先归档，再删除 ——
+        ensure_orders_archive(connection)
         cursor = connection.cursor()
-        # 批量删除孤立订单
-        placeholders = ','.join(['?' for _ in orphaned_ids])
-        delete_query = f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})"
-        params = [site_url] + list(orphaned_ids)
-        cursor.execute(delete_query, params)
-        connection.commit()
+        order_cols = [row[1] for row in cursor.execute("PRAGMA table_info(orders)").fetchall()]
+        col_list = ', '.join(f'"{c}"' for c in order_cols)
+        placeholders = ','.join(['?'] * n_orphan)
+        now_iso = datetime.now().isoformat()
+
+        # 去重：同一订单若此前归档过，先删旧归档行，只保留最新一次
+        cursor.execute(
+            f"DELETE FROM orders_archive WHERE source = ? AND id IN ({placeholders})",
+            [site_url] + orphan_params,
+        )
+        cursor.execute(
+            f"INSERT INTO orders_archive ({col_list}, archived_at, archive_reason) "
+            f"SELECT {col_list}, ?, ? FROM orders WHERE source = ? AND id IN ({placeholders})",
+            [now_iso, 'orphaned_remote_deleted', site_url] + orphan_params,
+        )
+        archived = cursor.rowcount
+        cursor.execute(
+            f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})",
+            [site_url] + orphan_params,
+        )
         deleted_count = cursor.rowcount
-        print(f"已删除 {deleted_count} 个孤立订单: {list(orphaned_ids)[:10]}{'...' if len(orphaned_ids) > 10 else ''}")
+        connection.commit()
+        print(
+            f"已归档并移除 {deleted_count} 个孤立订单（归档 {archived} 条）: "
+            f"{sorted(orphaned_ids)[:10]}{'...' if n_orphan > 10 else ''}"
+        )
         return deleted_count
     except Exception as e:
-        print(f"删除孤立订单时出错: {e}")
+        print(f"处理孤立订单时出错: {e}")
+        try:
+            connection.rollback()
+        except Exception:
+            pass
         return 0
     finally:
         if connection:
@@ -379,7 +495,10 @@ def save_orders_to_db(orders_data):
             'date_completed', 'date_completed_gmt', 'cart_hash', 'meta_data', 'line_items',
             'tax_lines', 'shipping_lines', 'fee_lines', 'coupon_lines', 'refunds', 'set_paid', 'source'
         ]
-        all_columns = wc_fields + ['updated_at']
+        # woo_id keeps the raw per-site WC post id; id is the cross-site-safe
+        # surrogate "<sites.id>-<woo_id>" (see oid_utils.py) so same-numbered
+        # orders from different stores no longer collide under ON CONFLICT(id).
+        all_columns = wc_fields + ['woo_id', 'updated_at']
         placeholders = ', '.join(['?'] * len(all_columns))
         update_set = ', '.join(f'{c} = excluded.{c}' for c in all_columns if c != 'id')
         insert_query = f"""
@@ -391,6 +510,13 @@ def save_orders_to_db(orders_data):
         # 处理订单数据
         processed_orders = []
         for order in orders_data:
+            woo_id = order.get('id')
+            site_id = site_id_for_source(connection, order.get('source'))
+            if site_id is None:
+                # 未知站点来源 -> 无法构造安全的代理 id,跳过而非错误归并
+                print(f"[save_orders_to_db] 跳过订单 {woo_id}: 未知来源 {order.get('source')!r}")
+                continue
+            oid = make_oid(site_id, woo_id)
             processed_order = []
 
             # 按照字段顺序处理数据
@@ -398,9 +524,11 @@ def save_orders_to_db(orders_data):
 
             for field in fields:
                 value = order.get(field)
-                
+
                 # 特殊处理
-                if field == 'set_paid':
+                if field == 'id':
+                    processed_order.append(oid)
+                elif field == 'set_paid':
                     if isinstance(value, dict):
                         processed_order.append(0)
                     elif value is None:
@@ -413,10 +541,11 @@ def save_orders_to_db(orders_data):
                     processed_order.append(json.dumps(value, ensure_ascii=False))
                 else:
                     processed_order.append(value)
-            
-            # 添加 updated_at 字段
+
+            # 添加 woo_id 与 updated_at 字段
+            processed_order.append(woo_id)
             processed_order.append(datetime.now().isoformat())
-            
+
             processed_orders.append(tuple(processed_order))
         
         # 批量插入数据
@@ -571,7 +700,7 @@ def main(incremental=True, sync_status=True, start_date=None, clean_deleted=Fals
     print("开始 WooCommerce 订单同步程序（SQLite版本）...")
     
     if clean_deleted:
-        print("注意: 已启用删除同步，将清理本地数据库中已被远程删除的订单")
+        print("注意: 已启用清理同步——孤儿单先归档到 orders_archive 再删除；疑似回滚的大批量将跳过并告警")
     
     # 创建订单表
     create_orders_table()
@@ -615,7 +744,7 @@ def main(incremental=True, sync_status=True, start_date=None, clean_deleted=Fals
         if clean_deleted:
             print(f"\n开始检查站点 {site['url']} 的已删除订单...")
             remote_ids = fetch_all_remote_order_ids(wcapi, site['url'])
-            deleted_count = delete_orphaned_orders(site['url'], remote_ids)
+            deleted_count = archive_orphaned_orders(site['url'], remote_ids)
             total_deleted += deleted_count
         
         print(f"站点 {site['url']} 处理完成，等待处理下一个站点...")
@@ -623,7 +752,7 @@ def main(incremental=True, sync_status=True, start_date=None, clean_deleted=Fals
     
     print("\n所有站点处理完成！")
     if clean_deleted:
-        print(f"共清理 {total_deleted} 个已删除的订单")
+        print(f"共归档并清理 {total_deleted} 个孤立订单（疑似回滚的站点已跳过并告警）")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WooCommerce订单同步工具")

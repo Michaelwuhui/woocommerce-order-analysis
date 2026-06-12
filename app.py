@@ -10,6 +10,7 @@ from functools import wraps
 
 from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session, send_file, make_response
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from oid_utils import woo_post_id  # cross-site-safe WC post id for REST calls
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 
@@ -338,6 +339,30 @@ def _addr_for_order(billing, shipping):
     if isinstance(shipping, dict) and shipping.get('address_1'):
         return shipping
     return billing if isinstance(billing, dict) else {}
+
+
+def _compose_address(addr, sep=', '):
+    """Compose a human-readable shipping address from a billing/shipping dict.
+
+    The locality line is "City State Postcode" (e.g. "Brassall QLD 4305") so the
+    destination state is always shown. It used to be dropped from every shipping
+    view, which made AU/US parcels ambiguous — the same suburb name recurs across
+    states, and packers/carriers need the state to route correctly. Polish (DPD/
+    InPost) addresses simply have no state, so it falls away cleanly there."""
+    if not isinstance(addr, dict):
+        return ''
+    locality = ' '.join(p for p in (
+        (addr.get('city') or '').strip(),
+        (addr.get('state') or '').strip(),
+        (addr.get('postcode') or '').strip(),
+    ) if p)
+    parts = [
+        (addr.get('address_1') or '').strip(),
+        (addr.get('address_2') or '').strip(),
+        locality,
+        (addr.get('country') or '').strip(),
+    ]
+    return sep.join(p for p in parts if p)
 
 
 def _build_risk_index(conn):
@@ -2025,8 +2050,17 @@ def orders():
     
     # Get current month from page parameter
     current_month = request.args.get('month', '')
-    if not current_month and available_months:
-        current_month = available_months[0]  # Default to most recent month
+    if not current_month:
+        # A search targets a specific order/tracking number whose match may live in
+        # any month. Defaulting to the latest month would hide a hit in an older one
+        # (e.g. searching "105" returns #105 from 2026-05, but only the newest
+        # month's orders render, so it silently disappears). When a search is active,
+        # show all matches; the month tabs still let the user narrow down afterwards.
+        # No search → keep the latest-month default for normal browsing.
+        if search:
+            current_month = 'all'
+        elif available_months:
+            current_month = available_months[0]  # Default to most recent month
     
     # Get orders for the selected month (or all if month='all')
     if current_month == 'all':
@@ -4560,8 +4594,7 @@ def loss_customers_list():
         key = email or phone or addr_key or f"o{r['id']}"
         name = (f"{addr_d.get('first_name', '')} {addr_d.get('last_name', '')}".strip()
                 or f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip())
-        disp_addr = ', '.join(filter(None, [addr_d.get('address_1', ''), addr_d.get('address_2', ''),
-                                            addr_d.get('postcode', ''), addr_d.get('city', ''), addr_d.get('country', '')]))
+        disp_addr = _compose_address(addr_d)
         c = customers.get(key)
         if not c:
             c = {'name': name, 'email': billing.get('email') or '',
@@ -4712,7 +4745,7 @@ def get_order_details(order_id):
     if site_row and site_row['consumer_key'] and site_row['consumer_secret']:
         try:
             import requests as req
-            api_url = f"{site_row['url']}/wp-json/wc/v3/orders/{order['id']}/notes"
+            api_url = f"{site_row['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes"
             response = req.get(
                 api_url,
                 auth=(site_row['consumer_key'], site_row['consumer_secret']),
@@ -8675,27 +8708,22 @@ def clean_sync_site(site_id):
                     SYNC_STATUS[status_id]['message'] = '没有需要清理的订单'
                     return
                 
-                # Delete orphaned orders
-                SYNC_STATUS[status_id]['message'] = f'正在清理 {len(orphaned_ids)} 个已删除订单...'
-                
+                # 通过受保护的归档逻辑处理孤儿单（P0-a：先归档留底 + 大批量回滚保护，取代直接物理删除）
+                SYNC_STATUS[status_id]['message'] = f'正在处理 {len(orphaned_ids)} 个疑似已删除订单...'
                 try:
-                    conn = get_db_connection()
-                    placeholders = ','.join(['?' for _ in orphaned_ids])
-                    # Execute delete
-                    conn.execute(f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})", 
-                                 [site_url] + list(orphaned_ids))
-                    conn.commit()
-                    deleted_count = conn.total_changes
-                    conn.close()
-                    
-                    SYNC_STATUS[status_id]['status'] = 'success'
-                    SYNC_STATUS[status_id]['message'] = f'清理完成，删除了 {deleted_count} 个订单'
-                    SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Successfully deleted {deleted_count} orphaned orders")
-                    
+                    removed = _get_woosync().archive_orphaned_orders(site_url, remote_ids)
+                    if removed == 0 and len(orphaned_ids) > 0:
+                        SYNC_STATUS[status_id]['status'] = 'success'
+                        SYNC_STATUS[status_id]['message'] = f'检测到 {len(orphaned_ids)} 个孤儿单、疑似站点回滚，已跳过删除并记录告警（数据已保留，未丢失）'
+                        SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Suspected rollback: skipped delete, kept {len(orphaned_ids)} orders, alert logged")
+                    else:
+                        SYNC_STATUS[status_id]['status'] = 'success'
+                        SYNC_STATUS[status_id]['message'] = f'清理完成，已归档并移除 {removed} 个订单'
+                        SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Archived & removed {removed} orphaned orders")
                 except Exception as e:
                     SYNC_STATUS[status_id]['status'] = 'error'
-                    SYNC_STATUS[status_id]['message'] = f'删除失败: {str(e)}'
-                    SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] DB Error: {str(e)}")
+                    SYNC_STATUS[status_id]['message'] = f'清理失败: {str(e)}'
+                    SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
                 
             except Exception as e:
                 SYNC_STATUS[status_id]['status'] = 'error'
@@ -8807,6 +8835,276 @@ def sync_all_data():
     thread.start()
     
     return jsonify({'success': True, 'message': 'Global synchronization started', 'sync_id': ALL_SITES_ID})
+
+
+# =====================================================================
+# 数据备份与灾备后台管理 API（P0-a 归档/回滚告警 + P0-b 一致性热备到 R2）
+# 对应脚本 backup_db.py / 1.wooorders_sqlite.py；管理员专属
+# =====================================================================
+_BK_DIR = '/www/backups/woo-orders'
+_BK_OFFSITE_CFG = '/www/wwwroot/woo-analysis/backup_offsite.json'
+_BK_SCRIPT = '/www/wwwroot/woo-analysis/backup_db.py'
+_BK_VENV_PY = '/www/wwwroot/woo-analysis/venv/bin/python'
+_BK_NAME_RE = re.compile(r'^woocommerce_orders_\d{8}_\d{6}\.db\.gz$')
+
+
+def _bk_local_list():
+    import os, glob
+    files = []
+    if os.path.isdir(_BK_DIR):
+        for p in glob.glob(os.path.join(_BK_DIR, 'woocommerce_orders_*.db.gz')):
+            try:
+                st = os.stat(p)
+                files.append({'name': os.path.basename(p), 'size': st.st_size, 'mtime': st.st_mtime})
+            except OSError:
+                pass
+    files.sort(key=lambda f: f['mtime'], reverse=True)
+    return files
+
+
+def _bk_offsite_cfg():
+    try:
+        with open(_BK_OFFSITE_CFG, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+@app.route('/api/settings/backup/status', methods=['GET'])
+@login_required
+@admin_required
+def backup_status():
+    """备份状态总览：本地份数/最近一次、异地配置、定时任务、归档订单数、未确认回滚告警"""
+    import time
+    files = _bk_local_list()
+    latest = files[0] if files else None
+    cfg = _bk_offsite_cfg()
+    mode = cfg.get('mode', 'none')
+    bucket = cfg.get('s3', {}).get('bucket') if mode == 's3' else None
+
+    cron_on = False
+    try:
+        import subprocess
+        r = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
+        cron_on = 'backup_db.py' in (r.stdout or '')
+    except Exception:
+        pass
+
+    conn = get_db_connection()
+    try:
+        archived = conn.execute('SELECT COUNT(*) FROM orders_archive').fetchone()[0]
+    except Exception:
+        archived = None
+    alerts = []
+    try:
+        rows = conn.execute(
+            "SELECT id, created_at, site_url, alert_type, detail FROM sync_alerts "
+            "WHERE COALESCE(acknowledged,0)=0 ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+        alerts = [dict(r) for r in rows]
+    except Exception:
+        pass
+    conn.close()
+
+    def _fmt(ts):
+        try:
+            return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
+        except Exception:
+            return None
+
+    return jsonify({
+        'local': {
+            'count': len(files),
+            'total_size': sum(f['size'] for f in files),
+            'latest_name': latest['name'] if latest else None,
+            'latest_time': _fmt(latest['mtime']) if latest else None,
+            'latest_size': latest['size'] if latest else None,
+            'dir': _BK_DIR,
+        },
+        'offsite': {'mode': mode, 'bucket': bucket},
+        'cron_hourly': cron_on,
+        'archived_orders': archived,
+        'alerts': alerts,
+    })
+
+
+@app.route('/api/settings/backup/run', methods=['POST'])
+@login_required
+@admin_required
+def backup_run():
+    """立即执行一次热备（含异地上传），返回日志尾部"""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            [_BK_VENV_PY, _BK_SCRIPT],
+            cwd='/www/wwwroot/woo-analysis',
+            capture_output=True, text=True, timeout=180
+        )
+        out = ((proc.stdout or '') + (proc.stderr or '')).strip()
+        tail = '\n'.join(out.splitlines()[-12:])
+        return jsonify({'success': proc.returncode == 0, 'output': tail})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': '备份超时（>180s）'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/settings/backup/list', methods=['GET'])
+@login_required
+@admin_required
+def backup_list():
+    """本地备份文件列表（最多 50 份，最新在前）"""
+    import time
+    files = _bk_local_list()[:50]
+    for f in files:
+        f['time'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(f['mtime']))
+    return jsonify({'files': files})
+
+
+@app.route('/api/settings/backup/download', methods=['GET'])
+@login_required
+@admin_required
+def backup_download():
+    """下载一份本地备份（严格校验文件名，防路径穿越）"""
+    import os
+    name = request.args.get('name', '')
+    if not _BK_NAME_RE.match(name):
+        return jsonify({'error': '非法文件名'}), 400
+    path = os.path.join(_BK_DIR, name)
+    if not os.path.isfile(path):
+        return jsonify({'error': '文件不存在'}), 404
+    return send_file(path, as_attachment=True)
+
+
+@app.route('/api/settings/backup/offsite-check', methods=['POST'])
+@login_required
+@admin_required
+def backup_offsite_check():
+    """按需列举异地 R2 桶内对象，确认异地链路正常"""
+    cfg = _bk_offsite_cfg()
+    if cfg.get('mode') != 's3':
+        return jsonify({'success': False, 'error': '异地未配置为 S3/R2'}), 400
+    s3 = cfg.get('s3', {})
+    try:
+        import boto3
+        from botocore.config import Config as _Cfg
+        client = boto3.client(
+            's3', endpoint_url=s3.get('endpoint_url'),
+            aws_access_key_id=s3['access_key_id'],
+            aws_secret_access_key=s3['secret_access_key'],
+            region_name=s3.get('region', 'auto'),
+            config=_Cfg(signature_version='s3v4'),
+        )
+        resp = client.list_objects_v2(Bucket=s3['bucket'], Prefix=s3.get('prefix', ''))
+        objs = sorted(resp.get('Contents', []), key=lambda o: o['LastModified'])
+        latest = objs[-1] if objs else None
+        return jsonify({
+            'success': True,
+            'bucket': s3['bucket'],
+            'count': len(objs),
+            'latest_size': latest['Size'] if latest else None,
+            'latest_time': latest['LastModified'].astimezone().strftime('%Y-%m-%d %H:%M:%S') if latest else None,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/settings/backup/alerts/ack', methods=['POST'])
+@login_required
+@admin_required
+def backup_alert_ack():
+    """确认（忽略）回滚告警：传 {id:N} 或 {all:true}"""
+    data = request.json or {}
+    conn = get_db_connection()
+    try:
+        if data.get('all'):
+            conn.execute('UPDATE sync_alerts SET acknowledged=1 WHERE COALESCE(acknowledged,0)=0')
+        elif data.get('id') is not None:
+            conn.execute('UPDATE sync_alerts SET acknowledged=1 WHERE id=?', (int(data['id']),))
+        else:
+            conn.close()
+            return jsonify({'success': False, 'error': '缺少 id'}), 400
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    conn.close()
+    return jsonify({'success': True})
+
+
+# 惰性加载并缓存 cron 同步模块（文件名带数字，无法普通 import）；
+# 复用其 archive_orphaned_orders / fetch_all_remote_order_ids，让 UI 与 cron 对孤儿单的处理保持一致。
+_WOOSYNC = None
+
+
+def _get_woosync():
+    global _WOOSYNC
+    if _WOOSYNC is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("woosync", "/www/wwwroot/woo-analysis/1.wooorders_sqlite.py")
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        _WOOSYNC = m
+    return _WOOSYNC
+
+
+@app.route('/api/settings/backup/site-diff', methods=['POST'])
+@login_required
+@admin_required
+def backup_site_diff():
+    """只读：对比某站点'镜像有、线上没有'的订单（疑似该站回滚丢失的订单）。不修改任何数据。"""
+    data = request.json or {}
+    site_id = data.get('site_id')
+    conn = get_db_connection()
+    site = conn.execute('SELECT id, url, consumer_key, consumer_secret FROM sites WHERE id = ?', (site_id,)).fetchone()
+    if not site:
+        conn.close()
+        return jsonify({'success': False, 'error': '站点不存在'}), 404
+    site_url = (site['url'] or '').strip()
+
+    # 拉取该站线上现有订单ID（与 clean 同步同一套判定）
+    try:
+        from woocommerce import API
+        wcapi = API(url=site_url, consumer_key=site['consumer_key'], consumer_secret=site['consumer_secret'],
+                    version="wc/v3", timeout=30, user_agent="WooCommerce API Client-Python/3.0.0")
+        remote_ids = _get_woosync().fetch_all_remote_order_ids(wcapi, site_url)
+    except Exception as e:
+        conn.close()
+        return jsonify({'success': False, 'error': f'获取线上订单失败：{e}'}), 502
+
+    if not remote_ids:
+        conn.close()
+        return jsonify({'success': False, 'error': '未能获取该站线上订单（API 异常或确实无单），为避免误判已中止对比'}), 502
+
+    rows = conn.execute(
+        "SELECT id, number, status, date_created, total, currency, billing FROM orders "
+        "WHERE source = ? ORDER BY date_created DESC", (site_url,)
+    ).fetchall()
+    conn.close()
+
+    missing = []
+    for r in rows:
+        if str(r['id']) not in remote_ids:
+            cust = ''
+            try:
+                b = json.loads(r['billing']) if r['billing'] else {}
+                cust = ((b.get('first_name') or '') + ' ' + (b.get('last_name') or '')).strip()
+            except Exception:
+                pass
+            missing.append({
+                'id': r['id'], 'number': r['number'], 'status': r['status'],
+                'date_created': r['date_created'], 'total': r['total'],
+                'currency': r['currency'], 'customer': cust,
+            })
+
+    return jsonify({
+        'success': True,
+        'site_url': site_url,
+        'mirror_count': len(rows),
+        'live_count': len(remote_ids),
+        'missing_count': len(missing),
+        'missing': missing[:500],
+    })
 
 
 @app.route('/api/settings/autosync', methods=['GET'])
@@ -9258,15 +9556,13 @@ def clean_all_sites():
                         orphaned_ids = local_ids - remote_ids
                         
                         if orphaned_ids:
-                            conn = get_db_connection()
-                            placeholders = ','.join(['?' for _ in orphaned_ids])
-                            conn.execute(f"DELETE FROM orders WHERE source = ? AND id IN ({placeholders})", 
-                                         [site_url] + list(orphaned_ids))
-                            conn.commit()
-                            conn.close()
-                            
-                            total_deleted += len(orphaned_ids)
-                            SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Deleted {len(orphaned_ids)} orphaned orders from {site_url}")
+                            # 受保护的归档逻辑（P0-a）：大批量孤儿单（疑似回滚）会被跳过并告警，而非删除
+                            removed = _get_woosync().archive_orphaned_orders(site_url, remote_ids)
+                            if removed == 0:
+                                SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] {site_url}: {len(orphaned_ids)} orphans, suspected rollback -> skipped & alerted (orders kept)")
+                            else:
+                                total_deleted += removed
+                                SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Archived & removed {removed} orphaned orders from {site_url}")
                         else:
                             SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] No orphaned orders in {site_url}")
                             
@@ -14664,8 +14960,6 @@ def au_orders_sheet():
                 seen.add(tn.lower())
                 trackings.append({'number': tn, 'carrier': carrier_label(prov, '')})
         addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
-        std_parts = [addr.get('address_1', ''), addr.get('address_2', ''),
-                     addr.get('postcode', ''), addr.get('city', ''), addr.get('country', '')]
         tracking = trackings[0]['number'] if trackings else ''
         is_shipped = bool(trackings) or (o['status'] in SHIPPED)
         # Hide orders cancelled before ever shipping — typically the customer
@@ -14706,7 +15000,7 @@ def au_orders_sheet():
                                 else carrier_label('', shipping_lines[0].get('method_title', '') if shipping_lines else '')),
             'customer': name,
             'phone': addr.get('phone') or billing.get('phone', ''),
-            'address': ', '.join(filter(None, std_parts)),
+            'address': _compose_address(addr),
             'customer_note': o['customer_note'] or '',
             'internal_note': o['internal_note'] or '',
         })
@@ -14924,14 +15218,7 @@ def get_pending_orders():
         custom_fields = extract_custom_billing_fields(meta_data)
 
         # Calculate customer address (Standard)
-        std_parts = [
-            addr.get('address_1', ''),
-            addr.get('address_2', ''),
-            addr.get('postcode', ''),
-            addr.get('city', ''),
-            addr.get('country', '')
-        ]
-        customer_address = ', '.join(filter(None, std_parts))
+        customer_address = _compose_address(addr)
 
         # DPD Fallback: If standard address is empty but DPD fields exist
         if not addr.get('address_1') and (custom_fields.get('dpd_street') or custom_fields.get('dpd_city')):
@@ -15080,9 +15367,7 @@ def get_pending_outcome_orders():
         meta_data = parse_json_field(order['meta_data'])
         custom_fields = extract_custom_billing_fields(meta_data)
 
-        std_parts = [addr.get('address_1', ''), addr.get('address_2', ''),
-                     addr.get('postcode', ''), addr.get('city', ''), addr.get('country', '')]
-        customer_address = ', '.join(filter(None, std_parts))
+        customer_address = _compose_address(addr)
         if not addr.get('address_1') and (custom_fields.get('dpd_street') or custom_fields.get('dpd_city')):
             dpd_parts = [f"{custom_fields.get('dpd_street', '')} {custom_fields.get('dpd_house', '')}".strip(),
                          custom_fields.get('dpd_zip', ''), custom_fields.get('dpd_city', '')]
@@ -15630,7 +15915,7 @@ def _post_fallback_customer_note(req, site, order, carrier_name, tracking_number
     WooCommerce sends its built-in 'Customer Note' email — uglier than the
     plugin-native one but better than no notification at all."""
     try:
-        note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes"
+        note_url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes"
         if tracking_url:
             note_content = (
                 f"Order has been shipped via {carrier_name}. "
@@ -15826,7 +16111,7 @@ def ship_order():
              'value': build_ast_tracking_items(parcels, line_items)},
         ]
 
-    status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}"
+    status_url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}"
     warnings = []
     remote_success = False
 
@@ -15927,7 +16212,7 @@ def ship_order():
     customer_notified = False
     if send_email:
         try:
-            trig_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['id']}/trigger-shipment-email"
+            trig_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/trigger-shipment-email"
             trig_resp = req.post(
                 trig_url,
                 json={'tracking_number': tracking_number, 'carrier_slug': carrier_slug},
@@ -15971,7 +16256,7 @@ def ship_order():
     if is_reship and reship_log_line:
         try:
             req.post(
-                f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes",
+                f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes",
                 json={'note': reship_log_line, 'customer_note': False},
                 auth=(site['consumer_key'], site['consumer_secret']),
                 timeout=10,
@@ -16066,7 +16351,7 @@ def ship_order():
     return jsonify({'success': True, 'message': msg, **resp_extra})
 
 
-@app.route('/api/shipping/debug/<int:order_id>', methods=['POST'])
+@app.route('/api/shipping/debug/<order_id>', methods=['POST'])
 @login_required
 @shipper_required
 def debug_tracking_sync(order_id):
@@ -16162,7 +16447,7 @@ def debug_tracking_sync(order_id):
         }), 500
 
 
-@app.route('/api/shipping/complete/<int:order_id>', methods=['POST'])
+@app.route('/api/shipping/complete/<order_id>', methods=['POST'])
 @login_required
 @shipper_required
 def complete_order(order_id):
@@ -16183,7 +16468,7 @@ def complete_order(order_id):
     
     try:
         # Update order status via WooCommerce API
-        url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}"
+        url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}"
         resp = req.put(
             url,
             json={'status': 'completed'},
@@ -16428,7 +16713,7 @@ def get_carriers_for_site():
     return jsonify(carriers)
 
 
-@app.route('/api/order/<int:order_id>/emails', methods=['GET'])
+@app.route('/api/order/<order_id>/emails', methods=['GET'])
 @login_required
 def get_order_emails(order_id):
     """Fetch emails sent to this order's customer, by calling the source
@@ -16448,7 +16733,7 @@ def get_order_emails(order_id):
     if not site:
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
 
-    url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['id']}/email-logs"
+    url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/email-logs"
     # Pass-through ?debug=1 surfaces the WP-side candidate-table list, so when
     # nothing matches the user can see which logger plugin (and table name)
     # the site actually has.
@@ -16590,7 +16875,7 @@ def get_site_email_detail(site_id, log_id):
         return jsonify({'success': False, 'error': f'请求失败: {e}'}), 502
 
 
-@app.route('/api/order/<int:order_id>/emails/<int:log_id>', methods=['GET'])
+@app.route('/api/order/<order_id>/emails/<int:log_id>', methods=['GET'])
 @login_required
 def get_order_email_detail(order_id, log_id):
     """Fetch full body / headers for one email log entry. Backed by the WP
@@ -16608,7 +16893,7 @@ def get_order_email_detail(order_id, log_id):
     if not site:
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
 
-    url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{order['id']}/email-logs/{log_id}"
+    url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/email-logs/{log_id}"
     try:
         r = req.get(
             url,
@@ -16625,7 +16910,7 @@ def get_order_email_detail(order_id, log_id):
         return jsonify({'success': False, 'error': f'请求失败: {e}'}), 502
 
 
-@app.route('/api/order/<int:order_id>/notes', methods=['GET'])
+@app.route('/api/order/<order_id>/notes', methods=['GET'])
 @login_required
 def get_order_notes(order_id):
     """Get all notes for an order from local database"""
@@ -16641,7 +16926,7 @@ def get_order_notes(order_id):
     return jsonify([dict(n) for n in notes])
 
 
-@app.route('/api/order/<int:order_id>/note', methods=['POST'])
+@app.route('/api/order/<order_id>/note', methods=['POST'])
 @login_required
 @shipper_required
 def add_order_note(order_id):
@@ -16676,7 +16961,7 @@ def add_order_note(order_id):
     if not site:
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
 
-    url = f"{site['url']}/wp-json/wc/v3/orders/{order_id}/notes"
+    url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order_id)}/notes"
     headers = {
         "User-Agent": "WooCommerce API Client-Python/3.0.0",
         "Content-Type": "application/json",
@@ -16749,7 +17034,7 @@ def add_order_note(order_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/order/<int:order_id>/status', methods=['POST'])
+@app.route('/api/order/<order_id>/status', methods=['POST'])
 @login_required
 @editor_required
 def update_order_status(order_id):
@@ -16819,7 +17104,7 @@ def update_order_status(order_id):
         # Use orders.id (WC internal post ID), not order['number'], because sites
         # using Sequential Order Numbers have number != id and the REST API only
         # accepts the post ID.
-        status_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}"
+        status_url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}"
 
         print(f"[DEBUG] Update Status - URL: {status_url}")
         print(f"[DEBUG] Update Status - Order ID: {order['id']}, Number: {order['number']}, New Status: {new_status}")
@@ -16844,7 +17129,7 @@ def update_order_status(order_id):
             raise Exception(f"远程API错误: {status_resp.status_code} - {response_text[:200]}")
 
         # 2. Add order note documenting the change
-        note_url = f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes"
+        note_url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes"
         note_content = f"订单状态由 {current_user.name} 从 {status_labels.get(old_status, old_status)} 手动修改为 {status_labels.get(new_status, new_status)}"
         
         try:
@@ -16878,7 +17163,7 @@ def update_order_status(order_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/order/<int:order_id>/mark-undelivered', methods=['POST'])
+@app.route('/api/order/<order_id>/mark-undelivered', methods=['POST'])
 @login_required
 @shipper_required
 def mark_order_undelivered(order_id):
@@ -16944,7 +17229,7 @@ def mark_order_undelivered(order_id):
             # Use orders.id (WC post ID) — sites with Sequential Order Numbers
             # have number != id and the REST API only accepts the post ID.
             req.post(
-                f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes",
+                f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes",
                 json={'note': log_line, 'customer_note': False},
                 auth=(site['consumer_key'], site['consumer_secret']),
                 timeout=10,
@@ -16963,7 +17248,7 @@ def mark_order_undelivered(order_id):
     })
 
 
-@app.route('/api/order/<int:order_id>/confirm-delivery', methods=['POST'])
+@app.route('/api/order/<order_id>/confirm-delivery', methods=['POST'])
 @login_required
 @shipper_required
 def confirm_order_delivery(order_id):
@@ -17013,7 +17298,7 @@ def confirm_order_delivery(order_id):
     elif site and site['consumer_key'] and site['consumer_secret'] and (
             'api_write_status' not in site.keys() or site['api_write_status'] != 'error'):
         try:
-            r = req.put(f"{site['url']}/wp-json/wc/v3/orders/{order['id']}",
+            r = req.put(f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}",
                         json={'status': 'completed'},
                         auth=(site['consumer_key'], site['consumer_secret']), timeout=60,
                         headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0', 'Content-Type': 'application/json'})
@@ -17052,7 +17337,7 @@ def _persist_carrier_status(order_id, outcome):
         app.logger.warning(f"persist carrier_status for {order_id} failed: {e}")
 
 
-@app.route('/api/order/<int:order_id>/carrier-status')
+@app.route('/api/order/<order_id>/carrier-status')
 @login_required
 @shipping_view_required
 def order_carrier_status(order_id):
@@ -17167,7 +17452,7 @@ def order_carrier_status(order_id):
                     'note': '物流商正在抓取轨迹或暂无记录（新登记的单需等几分钟），请稍后再查'})
 
 
-@app.route('/api/order/<int:order_id>/unmark-undelivered', methods=['POST'])
+@app.route('/api/order/<order_id>/unmark-undelivered', methods=['POST'])
 @login_required
 @shipper_required
 def unmark_order_undelivered(order_id):
@@ -17214,7 +17499,7 @@ PROBLEM_RETURN_TYPES = {
 }
 
 
-@app.route('/api/order/<int:order_id>/mark-problem-return', methods=['POST'])
+@app.route('/api/order/<order_id>/mark-problem-return', methods=['POST'])
 @login_required
 @shipper_required
 def mark_order_problem_return(order_id):
@@ -17296,7 +17581,7 @@ def mark_order_problem_return(order_id):
     if site and site['consumer_key'] and site['consumer_secret']:
         try:
             req.post(
-                f"{site['url']}/wp-json/wc/v3/orders/{order['id']}/notes",
+                f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes",
                 json={'note': log_line, 'customer_note': False},
                 auth=(site['consumer_key'], site['consumer_secret']),
                 timeout=10,
@@ -17316,7 +17601,7 @@ def mark_order_problem_return(order_id):
     })
 
 
-@app.route('/api/order/<int:order_id>/unmark-problem-return', methods=['POST'])
+@app.route('/api/order/<order_id>/unmark-problem-return', methods=['POST'])
 @login_required
 @shipper_required
 def unmark_order_problem_return(order_id):
@@ -17374,7 +17659,7 @@ def unmark_order_problem_return(order_id):
     return jsonify({'success': True, 'message': '已撤销问题退货标记'})
 
 
-@app.route('/api/shipping/print/label/<int:order_id>')
+@app.route('/api/shipping/print/label/<order_id>')
 @login_required
 @shipping_view_required
 def print_shipping_label(order_id):
@@ -17415,12 +17700,7 @@ def print_shipping_label(order_id):
         'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
         'customer_phone': addr.get('phone') or billing.get('phone', ''),
         'customer_email': billing.get('email', ''),
-        'customer_address': '\n'.join(filter(None, [
-            addr.get('address_1', ''),
-            addr.get('address_2', ''),
-            f"{addr.get('postcode', '')} {addr.get('city', '')}".strip(),
-            addr.get('country', '')
-        ])),
+        'customer_address': _compose_address(addr, sep='\n'),
         'customer_inpost_id': extract_custom_billing_fields(parse_json_field(order['meta_data'])).get('customer_inpost_id', ''),
         'customer_social': extract_custom_billing_fields(parse_json_field(order['meta_data'])).get('customer_social', ''),
         'customer_note': order['customer_note'] or '',
@@ -17667,14 +17947,7 @@ def process_shipped_order(order, conn, carriers, ast_provider_mapping):
     custom_fields = extract_custom_billing_fields(meta_data)
     
     # Calculate customer address (Standard)
-    std_parts = [
-        addr.get('address_1', ''),
-        addr.get('address_2', ''),
-        addr.get('city', ''),
-        addr.get('postcode', ''),
-        addr.get('country', '')
-    ]
-    customer_address = ', '.join(filter(None, std_parts))
+    customer_address = _compose_address(addr)
 
     # DPD Fallback: If standard address is empty but DPD fields exist
     if not addr.get('address_1') and (custom_fields.get('dpd_street') or custom_fields.get('dpd_city')):
@@ -21098,7 +21371,7 @@ def get_sales_board_unmapped():
         conn.close()
 
 
-@app.route('/api/order/<int:order_id>/warehouse', methods=['PUT'])
+@app.route('/api/order/<order_id>/warehouse', methods=['PUT'])
 @login_required
 @admin_required
 def set_order_warehouse(order_id):
