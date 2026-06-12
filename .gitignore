@@ -69,6 +69,8 @@ Thumbs.db
 *.db-shm
 *.db-wal
 *.db.backup*
+# 迁移/切换前的数据库快照备份
+*.db.pre*
 
 # Configuration files with sensitive data
 config.ini
