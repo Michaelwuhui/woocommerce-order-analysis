@@ -818,22 +818,22 @@
                                             <span class="text-white small font-monospace">${o.customer_inpost_id || ''}</span>
                                         </div>
                                         ${o.customer_address_2 ? `<div class="text-warning small mt-1 font-monospace"><i class="bi bi-geo-alt me-1"></i>${o.customer_address_2}</div>` : ''}
-                                        ${!o.customer_inpost_id ? `<div class="text-muted small text-break mt-1">${o.customer_address || ''}</div>` : ''}
+                                        ${!o.customer_inpost_id ? `<div class="text-muted small text-break mt-1">${fmtAuAddr(o.customer_address)}</div>` : ''}
                                     </div>`;
                             } else if (isDPD) {
                                 return `<div>
                                         <div class="mb-1"><span class="badge bg-primary text-white small">${o.shipping_method}</span></div>
-                                        <div class="text-muted small text-break">${o.customer_address || '-'}</div>
+                                        <div class="text-muted small text-break">${fmtAuAddr(o.customer_address) || '-'}</div>
                                     </div>`;
                             } else {
                                 return `<div>
                                         <div class="mb-1"><span class="badge bg-secondary bg-opacity-50 text-light small">${o.shipping_method || 'Delivery'}</span></div>
-                                        <div class="text-muted small text-break">${o.customer_address || '-'}</div>
+                                        <div class="text-muted small text-break">${fmtAuAddr(o.customer_address) || '-'}</div>
                                     </div>`;
                             }
                         })()}
                         </div>
-                        ${o.state_mismatch ? `<div class="small mt-1" style="color:#fbbf24;" title="客户结账时选的州装不下这个邮编,按邮编应为 ${o.state_mismatch}。澳邮按邮编路由,一般可正常投递,但打单时请以邮编为准。"><i class="bi bi-exclamation-triangle-fill me-1"></i>州与邮编不符 · 应为 ${o.state_mismatch}</div>` : ''}
+                        ${o.state_mismatch ? `<div class="small mt-1" style="color:#fbbf24;" title="客户结账时选的州装不下这个邮编,按邮编应为 ${auStateFull(o.state_mismatch)}。澳邮按邮编路由,一般可正常投递,但打单时请以邮编为准。"><i class="bi bi-exclamation-triangle-fill me-1"></i>州与邮编不符 · 应为 ${auStateFull(o.state_mismatch)}</div>` : ''}
                     <td>
                         ${o.products.map(p => `
                         <div class="product-item" style="font-size: 0.9em;">
@@ -905,8 +905,8 @@
                     <td>
                         <div class="text-white"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name}</a></div>
                         ${shippedRiskBadge ? `<div class="mt-1">${shippedRiskBadge}</div>` : ''}
-                        <small class="text-muted d-block" title="${o.customer_address || ''}">${o.customer_address || ''}</small>
-                        ${o.state_mismatch ? `<div class="small" style="color:#fbbf24;" title="客户结账时选的州装不下这个邮编,按邮编应为 ${o.state_mismatch}"><i class="bi bi-exclamation-triangle-fill me-1"></i>州与邮编不符 · 应为 ${o.state_mismatch}</div>` : ''}
+                        <small class="text-muted d-block" title="${fmtAuAddr(o.customer_address)}">${fmtAuAddr(o.customer_address)}</small>
+                        ${o.state_mismatch ? `<div class="small" style="color:#fbbf24;" title="客户结账时选的州装不下这个邮编,按邮编应为 ${auStateFull(o.state_mismatch)}"><i class="bi bi-exclamation-triangle-fill me-1"></i>州与邮编不符 · 应为 ${auStateFull(o.state_mismatch)}</div>` : ''}
                     </td>
                     <td>
                         ${o.products.map(p => `
@@ -1053,7 +1053,7 @@
                         <div class="text-white"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name || '-'}</a></div>
                         ${riskBadge ? `<div class="mt-1">${riskBadge}</div>` : ''}
                         ${o.customer_phone ? `<small class="text-muted d-block"><i class="bi bi-telephone me-1"></i>${o.customer_phone}</small>` : ''}
-                        <small class="text-muted d-block text-truncate" style="max-width:16vw" title="${(o.customer_address || '').replace(/"/g, '&quot;')}">${o.customer_address || ''}</small>
+                        <small class="text-muted d-block text-truncate" style="max-width:16vw" title="${(o.customer_address || '').replace(/"/g, '&quot;')}">${fmtAuAddr(o.customer_address)}</small>
                     </td>
                     <td>
                         ${(o.products || []).map(p => `<div class="small"><span class="text-white">${p.name}</span> <span class="text-muted">×${p.quantity}</span></div>`).join('')}
@@ -1092,6 +1092,30 @@
             });
             const badge = document.getElementById('outcomeUnknownCount');
             if (badge) badge.textContent = unknown + ' 单';
+        }
+
+        // AU 州缩写注解(发货同事在澳洲本地发货):
+        //  - 地址行:纯英文全名 + 城/州/邮编用逗号分隔,方便整段复制粘贴到澳邮等表单
+        //  - 不符徽章:英文全名·中文,中英对照
+        // 打印面单走 /api/shipping/print 的服务端原始地址,不受影响。
+        const AU_STATE_EN = {
+            NSW: 'New South Wales', VIC: 'Victoria', QLD: 'Queensland', SA: 'South Australia',
+            WA: 'Western Australia', TAS: 'Tasmania', NT: 'Northern Territory', ACT: 'Australian Capital Territory'
+        };
+        const AU_STATE_CN = {
+            NSW: '新南威尔士', VIC: '维多利亚', QLD: '昆士兰', SA: '南澳',
+            WA: '西澳', TAS: '塔斯马尼亚', NT: '北领地', ACT: '堪培拉'
+        };
+        // 徽章用:"WA" -> "WA(Western Australia·西澳)";灰区 "ACT/NSW" 两段都注解
+        function auStateFull(s) {
+            return String(s || '').split('/')
+                .map(c => AU_STATE_EN[c] ? `${c}(${AU_STATE_EN[c]}·${AU_STATE_CN[c]})` : c)
+                .join('/');
+        }
+        // 地址行用:"Perth ACT 6000" -> "Perth, ACT(Australian Capital Territory), 6000"
+        function fmtAuAddr(addr) {
+            return String(addr || '').replace(/\s+(NSW|VIC|QLD|SA|WA|TAS|NT|ACT)\s+(\d{4})\b/g,
+                (m, st, pc) => `, ${st}(${AU_STATE_EN[st]}), ${pc}`);
         }
 
         function renderCarrierBadge(cs) {
@@ -1715,7 +1739,7 @@
                     </td>
                     <td>
                         <div class="text-white small">${o.customer_name || '-'}</div>
-                        <small class="text-muted text-break">${o.customer_address || ''}</small>
+                        <small class="text-muted text-break">${fmtAuAddr(o.customer_address)}</small>
                     </td>
                     <td>
                         ${(o.products || []).slice(0, 4).map(p => `<div class="small text-light">${p.name} <span class="text-muted">×${p.quantity}</span></div>`).join('')}

@@ -973,9 +973,17 @@
 
                     // 城市/州/邮编一行:有州(AU/US/AE 等)按 "City STATE Postcode",
                     // 无州(PL 等)保持欧式 "Postcode City" 不变。与后端 _compose_address 一致,州不再丢失。
+                    // AU 州缩写加英文全名注解(发货同事在澳洲本地,对接澳邮用英文),如 WA(Western Australia)。
+                    var AU_STATE_NAMES = {
+                        NSW: 'New South Wales', VIC: 'Victoria', QLD: 'Queensland', SA: 'South Australia',
+                        WA: 'Western Australia', TAS: 'Tasmania', NT: 'Northern Territory', ACT: 'Australian Capital Territory'
+                    };
                     var addrLocality = function (a) {
                         var st = (a.state || '').trim();
-                        return st ? [(a.city || ''), st, (a.postcode || '')].filter(Boolean).join(' ')
+                        // 仅澳洲地址注解中文——美国 WA(华盛顿州)等同码州不能误标
+                        var cn = ((a.country || '').toUpperCase() === 'AU') ? AU_STATE_NAMES[st.toUpperCase()] : null;
+                        var stDisp = cn ? st + '(' + cn + ')' : st;
+                        return st ? [(a.city || ''), stDisp, (a.postcode || '')].filter(Boolean).join(' ')
                                   : ((a.postcode || '') + ' ' + (a.city || ''));
                     };
 
