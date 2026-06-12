@@ -365,6 +365,39 @@ def _compose_address(addr, sep=', '):
     return sep.join(p for p in parts if p)
 
 
+# AU postcode -> expected state (Australia Post ranges). Checkout's state
+# dropdown is customer-chosen and never validated by WC, so e.g. Perth+6000
+# can arrive with state=ACT. Gray-zone ranges list every state they can
+# legitimately belong to, so only impossible combinations get flagged.
+_AU_POSTCODE_STATES = (
+    ((200, 299), {'ACT'}), ((800, 999), {'NT'}),
+    ((1000, 2599), {'NSW'}), ((2600, 2620), {'ACT', 'NSW'}),
+    ((2621, 2899), {'NSW'}), ((2900, 2920), {'ACT', 'NSW'}),
+    ((2921, 2999), {'NSW'}), ((3000, 3999), {'VIC'}),
+    ((4000, 4999), {'QLD'}), ((5000, 5999), {'SA'}),
+    ((6000, 6999), {'WA'}), ((7000, 7999), {'TAS'}),
+    ((8000, 8999), {'VIC'}), ((9000, 9999), {'QLD'}),
+)
+
+
+def _au_state_mismatch(addr):
+    """Return the expected AU state code(s) ('WA' / 'ACT/NSW') when the chosen
+    state cannot contain the postcode; None when consistent or not checkable."""
+    if not isinstance(addr, dict) or (addr.get('country') or '').upper() != 'AU':
+        return None
+    state = (addr.get('state') or '').strip().upper()
+    pc_raw = (addr.get('postcode') or '').strip()
+    if not state or not pc_raw.isdigit():
+        return None
+    pc = int(pc_raw)
+    if pc == 872:  # tri-state remote zone (NT/SA/WA), never flag
+        return None
+    for (lo, hi), states in _AU_POSTCODE_STATES:
+        if lo <= pc <= hi:
+            return None if state in states else '/'.join(sorted(states))
+    return None
+
+
 def _build_risk_index(conn):
     """Scan every order that's been flagged as a problem-return or undelivered
     and group them by normalized email / phone / address. Each bucket lists
@@ -15247,6 +15280,7 @@ def get_pending_orders():
             'customer_email': billing.get('email', ''),
             'customer_phone': addr.get('phone') or billing.get('phone', ''),
             'customer_address': customer_address,
+            'state_mismatch': _au_state_mismatch(addr),
             'customer_inpost_id': custom_fields['customer_inpost_id'],
             'customer_social': custom_fields['customer_social'],
             'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (line_items or [])],
@@ -15396,6 +15430,7 @@ def get_pending_outcome_orders():
             'customer_email': billing.get('email', ''),
             'customer_phone': addr.get('phone') or billing.get('phone', ''),
             'customer_address': customer_address,
+            'state_mismatch': _au_state_mismatch(addr),
             'shipping_total': float(order['shipping_total'] or 0),
             'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1)} for item in (line_items or [])],
             'tracking_number': order['tracking_number'] or '',

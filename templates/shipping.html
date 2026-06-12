@@ -833,6 +833,7 @@
                             }
                         })()}
                         </div>
+                        ${o.state_mismatch ? `<div class="small mt-1" style="color:#fbbf24;" title="客户结账时选的州装不下这个邮编,按邮编应为 ${o.state_mismatch}。澳邮按邮编路由,一般可正常投递,但打单时请以邮编为准。"><i class="bi bi-exclamation-triangle-fill me-1"></i>州与邮编不符 · 应为 ${o.state_mismatch}</div>` : ''}
                     <td>
                         ${o.products.map(p => `
                         <div class="product-item" style="font-size: 0.9em;">
@@ -905,6 +906,7 @@
                         <div class="text-white"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name}</a></div>
                         ${shippedRiskBadge ? `<div class="mt-1">${shippedRiskBadge}</div>` : ''}
                         <small class="text-muted d-block" title="${o.customer_address || ''}">${o.customer_address || ''}</small>
+                        ${o.state_mismatch ? `<div class="small" style="color:#fbbf24;" title="客户结账时选的州装不下这个邮编,按邮编应为 ${o.state_mismatch}"><i class="bi bi-exclamation-triangle-fill me-1"></i>州与邮编不符 · 应为 ${o.state_mismatch}</div>` : ''}
                     </td>
                     <td>
                         ${o.products.map(p => `

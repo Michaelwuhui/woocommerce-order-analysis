@@ -971,6 +971,14 @@
                     if (billing.company) html += '<p><strong>公司:</strong> ' + billing.company + '</p>';
                     html += '</div></div></div>';
 
+                    // 城市/州/邮编一行:有州(AU/US/AE 等)按 "City STATE Postcode",
+                    // 无州(PL 等)保持欧式 "Postcode City" 不变。与后端 _compose_address 一致,州不再丢失。
+                    var addrLocality = function (a) {
+                        var st = (a.state || '').trim();
+                        return st ? [(a.city || ''), st, (a.postcode || '')].filter(Boolean).join(' ')
+                                  : ((a.postcode || '') + ' ' + (a.city || ''));
+                    };
+
                     // Billing Address
                     html += '<div class="col-md-6">';
                     html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-geo-alt me-2"></i>账单地址</h6></div>';
@@ -983,7 +991,7 @@
                     // Address
                     html += '<p>' + (billing.address_1 || '-') + '</p>';
                     if (billing.address_2) html += '<p>' + billing.address_2 + '</p>';
-                    html += '<p>' + (billing.postcode || '') + ' ' + (billing.city || '') + '</p>';
+                    html += '<p>' + addrLocality(billing) + '</p>';
                     html += '<p>' + (billing.country || '') + '</p>';
 
                     // Check for custom billing fields
@@ -1029,7 +1037,7 @@
                         html += '<p><strong>收件人:</strong> ' + (shipping.first_name || '') + ' ' + (shipping.last_name || '') + '</p>';
                         html += '<p>' + shipping.address_1 + '</p>';
                         if (shipping.address_2) html += '<p>' + shipping.address_2 + '</p>';
-                        html += '<p>' + (shipping.postcode || '') + ' ' + (shipping.city || '') + '</p>';
+                        html += '<p>' + addrLocality(shipping) + '</p>';
                         html += '<p>' + (shipping.country || '') + '</p>';
                     } else {
                         html += '<p class="text-muted mb-0">没有设置配送地址</p>';
