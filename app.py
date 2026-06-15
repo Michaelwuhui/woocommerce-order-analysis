@@ -11,6 +11,7 @@ from functools import wraps
 from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session, send_file, make_response
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from oid_utils import woo_post_id  # cross-site-safe WC post id for REST calls
+import blocklist  # customer blocklist: auto-cancel COD orders from blacklisted phones
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 
@@ -212,6 +213,21 @@ class User(UserMixin):
             conn.close()
             return bool(user and user['can_edit_costs'] == 1)
         except:
+            return False
+
+    def can_manage_blocklist(self):
+        """Add/remove customer-blocklist entries (which triggers auto-cancel of
+        their COD orders) — a privileged action. Admin role always passes;
+        other users need the can_manage_blocklist flag, granted per-user in
+        用户管理 by the super admin."""
+        if self.role == 'admin':
+            return True
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_manage_blocklist FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return bool(user and user['can_manage_blocklist'] == 1)
+        except Exception:
             return False
 
     def get_accessible_partner_ids(self):
@@ -1041,6 +1057,18 @@ def editor_required(f):
             return jsonify({'error': '只读用户无法修改数据', 'readonly': True}), 403
         return f(*args, **kwargs)
     return decorated_function
+
+
+@app.context_processor
+def inject_blocklist_perm():
+    """Expose can_manage_blocklist to all templates (controls the block button in
+    the customer modal). Per-user permission — see User.can_manage_blocklist."""
+    try:
+        ok = bool(getattr(current_user, 'is_authenticated', False)
+                  and current_user.can_manage_blocklist())
+    except Exception:
+        ok = False
+    return {'can_manage_blocklist': ok}
 
 
 def super_admin_required(f):
@@ -5081,7 +5109,29 @@ def get_customer_details(email):
         rate, _ = get_cny_rate(currency, current_month)
         if rate:
             spending_cny += amount * rate
-    
+
+    # Blocklist status (auto-cancel COD), matched by normalized phone.
+    norm_ph = _normalize_phone(customer_phone)
+    is_blocked = False
+    block_info = None
+    if norm_ph:
+        conn_b = get_db_connection()
+        brow = conn_b.execute(
+            "SELECT * FROM blocked_customers WHERE phone = ?", (norm_ph,)
+        ).fetchone()
+        conn_b.close()
+        if brow:
+            is_blocked = True
+            block_info = {
+                'phone': brow['phone'],
+                'reason': brow['reason'],
+                'auto_cancel': bool(brow['auto_cancel']),
+                'cancelled_count': brow['cancelled_count'] or 0,
+                'created_by': brow['created_by'],
+                'created_at': brow['created_at'],
+                'last_cancelled_at': brow['last_cancelled_at'],
+            }
+
     result = {
         'email': email,
         'name': customer_name,
@@ -5106,6 +5156,9 @@ def get_customer_details(email):
         'avg_days_between_orders': round(avg_days_between, 1),
         'quality_score': round(quality_score),
         'customer_tier': customer_tier,
+        'is_blocked': is_blocked,
+        'block_info': block_info,
+        'phone_normalized': norm_ph,
         'site_spending': [{'site': k.replace('https://www.', ''), 'orders': v['orders'], 'amount': v['amount']} for k, v in site_spending.items()],
         'top_products': [{'name': k, 'quantity': v['quantity'], 'total': v['total']} for k, v in sorted_products[:10]],
         'orders': order_list[:20]  # Limit to 20 most recent
@@ -5137,6 +5190,86 @@ def update_customer_quality():
         ''', (email, quality))
         conn.commit()
         return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/customer/block', methods=['POST'])
+@login_required
+def block_customer():
+    """Add a customer to the auto-cancel blocklist, keyed by normalized phone.
+    Their PRE-SHIPMENT COD orders get auto-cancelled by the hourly enforcer;
+    prepaid orders are never touched. Who may do this is configurable in
+    用户管理 (per-user can_manage_blocklist permission)."""
+    if not current_user.can_manage_blocklist():
+        return jsonify({'success': False, 'error': '你没有管理拦截名单的权限'}), 403
+    data = request.json or {}
+    phone_raw = (data.get('phone') or '').strip()
+    email = (data.get('email') or '').strip()
+    name = (data.get('name') or '').strip()
+    reason = (data.get('reason') or '').strip() or '惯性COD拒收'
+    auto_cancel = 0 if data.get('auto_cancel') is False else 1
+
+    norm = _normalize_phone(phone_raw)
+    if not norm:
+        return jsonify({'success': False, 'error': '该客户没有有效手机号，无法按手机号拦截'}), 400
+
+    conn = get_db_connection()
+    try:
+        conn.execute('''
+            INSERT INTO blocked_customers
+                (phone, raw_phone, name, email, reason, auto_cancel, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(phone) DO UPDATE SET
+                raw_phone = excluded.raw_phone,
+                name = excluded.name,
+                email = excluded.email,
+                reason = excluded.reason,
+                auto_cancel = excluded.auto_cancel
+        ''', (norm, phone_raw, name, email, reason, auto_cancel, current_user.name))
+        conn.commit()
+        return jsonify({'success': True, 'phone': norm})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/customer/unblock', methods=['POST'])
+@login_required
+def unblock_customer():
+    """Remove a customer from the auto-cancel blocklist."""
+    if not current_user.can_manage_blocklist():
+        return jsonify({'success': False, 'error': '你没有管理拦截名单的权限'}), 403
+    data = request.json or {}
+    phone_raw = (data.get('phone') or '').strip()
+    norm = _normalize_phone(phone_raw) or phone_raw  # accept raw or already-normalized
+    if not norm:
+        return jsonify({'success': False, 'error': '缺少手机号'}), 400
+    conn = get_db_connection()
+    try:
+        conn.execute("DELETE FROM blocked_customers WHERE phone = ?", (norm,))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/blocklist/enforce', methods=['POST'])
+@login_required
+@admin_required
+def blocklist_enforce_now():
+    """Run blocklist enforcement on demand. Body {dry_run: true} previews only."""
+    data = request.get_json(silent=True) or {}
+    dry = bool(data.get('dry_run', False))
+    conn = get_db_connection()
+    try:
+        summary = blocklist.enforce(conn, dry_run=dry, actor=f'manual:{current_user.name}')
+        return jsonify({'success': True, 'summary': summary})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
@@ -6279,6 +6412,15 @@ def init_partner_reconciliation_tables():
     except sqlite3.OperationalError:
         pass  # column already exists
 
+    # Add can_manage_blocklist column — gates who may add/remove customer
+    # blocklist entries (auto-cancel COD). Admin role passes implicitly; granted
+    # per-user to others in 用户管理 (super admin only). Default 0.
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_manage_blocklist INTEGER DEFAULT 0')
+        conn.execute('UPDATE users SET can_manage_blocklist = 1 WHERE role = ?', ('admin',))
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     # ---------- P2: AUDIT LOG ----------
     # Every state change / edit / dispute / confirm / receipt-attach lands here.
     # Append-only; never delete rows. Powers the timeline shown in the
@@ -6499,6 +6641,51 @@ def init_warehouses():
     conn.close()
 
 
+def init_blocklist_tables():
+    """Customer blocklist — auto-cancel COD orders from blacklisted phones.
+    Keyed by normalized phone (last 9 digits): emails rotate, the phone is the
+    stable identity. Enforcement lives in blocklist.py (run by the hourly cron).
+    """
+    conn = get_db_connection()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS blocked_customers (
+            phone TEXT PRIMARY KEY,
+            raw_phone TEXT,
+            name TEXT,
+            email TEXT,
+            reason TEXT,
+            auto_cancel INTEGER DEFAULT 1,
+            created_by TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            cancelled_count INTEGER DEFAULT 0,
+            last_cancelled_at TEXT
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS blocked_cancel_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT,
+            order_number TEXT,
+            phone TEXT,
+            source TEXT,
+            total REAL,
+            currency TEXT,
+            old_status TEXT,
+            result TEXT,
+            detail TEXT,
+            actor TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # Global kill-switch. Default ON is safe: enforcement is a no-op until a phone
+    # is actually added to blocked_customers.
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('blocklist_auto_cancel_enabled', '1')")
+    # NOTE: who may *manage* the blocklist is a per-user permission
+    # (users.can_manage_blocklist, granted in 用户管理), not a global setting.
+    conn.commit()
+    conn.close()
+
+
 # Initialize tables on startup
 with app.app_context():
     init_sites_table()
@@ -6516,6 +6703,7 @@ with app.app_context():
     init_partner_reconciliation_tables()
     init_product_costs_tables()
     init_warehouses()
+    init_blocklist_tables()
 
 @app.route('/settings')
 @login_required
@@ -9848,8 +10036,8 @@ def get_users():
     # back if columns are missing. The init_*_tables() functions always add
     # them on startup, so in practice the first SELECT succeeds.
     SCHEMAS = [
-        # 0: latest — both can_view_costs and can_edit_costs (+ can_view_own_sales_board)
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, created_at FROM users',
+        # 0: latest — both can_view_costs and can_edit_costs (+ can_view_own_sales_board, can_manage_blocklist)
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, created_at FROM users',
         # 1: missing can_edit_costs
         'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, 0 as can_edit_costs, created_at FROM users',
         # 2: missing can_view_costs
@@ -9886,6 +10074,7 @@ def get_users():
         u = dict(row)
         u.setdefault('can_view_own_sales_board', 0)
         u.setdefault('can_view_shipping', 0)
+        u.setdefault('can_manage_blocklist', 0)
         u['site_count'] = site_counts.get(u.get('name') or '', 0)
         # Mark users that the current operator cannot modify
         u['is_super_admin'] = (u['username'] == 'admin')
@@ -9995,12 +10184,13 @@ def update_user(user_id):
             if can_view_own_sales_board_val and not conn.execute(
                     'SELECT 1 FROM sites WHERE manager = ? LIMIT 1', (name,)).fetchone():
                 can_view_own_sales_board_val = 0
+            can_manage_blocklist_val = 1 if data.get('can_manage_blocklist') else 0
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, user_id))
         else:
             # Non-superadmin: cannot change can_manage_users, can_view_sales_board, or set role to admin
             # but CAN grant can_manage_products (a regular operator-level permission)
@@ -14683,6 +14873,13 @@ def settings_api():
                     # AU scheduled carrier-tracking toggle ('1'/'0'), read by the
                     # nightly resolve_outcomes.py cron job.
                     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+                elif key == 'blocklist_auto_cancel_enabled':
+                    # Blocklist master switch. Admin-only (governs an automated
+                    # order-cancelling action).
+                    if not current_user.is_admin():
+                        continue
+                    v = '1' if str(value).strip().lower() in ('1', 'true', 'yes', 'on') else '0'
+                    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, v))
             conn.commit()
             
             # 如果自动同步设置发生变更，同步更新 Crontab 定时任务

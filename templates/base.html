@@ -1847,6 +1847,8 @@
                     }
 
                     document.getElementById('modalCustomerName').textContent = '- ' + customer.name;
+                    // Stash for the block/unblock buttons (avoids unsafe string interpolation of name).
+                    window.__customerDetail = customer;
 
                     var html = '<div class="row g-3">';
 
@@ -1933,6 +1935,26 @@
                         html += '</div>';
                     }
                     html += '<p><strong>电话:</strong> ' + (customer.phone || '-') + '</p>';
+
+                    // ── 拦截名单（自动取消其 COD 新单；预付单不受影响）──
+                    {% if can_manage_blocklist %}
+                    html += '<div class="mt-2 pt-2" style="border-top:1px solid rgba(255,255,255,0.1);">';
+                    if (customer.is_blocked) {
+                        var bi = customer.block_info || {};
+                        html += '<div class="d-flex align-items-center justify-content-between gap-2">';
+                        html += '<span class="badge bg-danger"><i class="bi bi-shield-fill-x me-1"></i>已拦截 · 自动取消</span>';
+                        html += '<button class="btn btn-sm btn-outline-light py-0 px-2" onclick="unblockCustomer(); return false;">解除拦截</button>';
+                        html += '</div>';
+                        html += '<div class="small text-white-50 mt-1">原因：' + (bi.reason || '-') + '；已自动取消 ' + (bi.cancelled_count || 0) + ' 单</div>';
+                    } else {
+                        if (customer.customer_tier && customer.customer_tier.level === '劣质') {
+                            html += '<div class="small text-danger mb-1"><i class="bi bi-exclamation-triangle-fill me-1"></i>拒收率高，建议加入拦截</div>';
+                        }
+                        html += '<button class="btn btn-sm btn-outline-danger w-100" onclick="blockCustomer(); return false;"><i class="bi bi-shield-x me-1"></i>加入拦截名单（自动取消其 COD 新单）</button>';
+                    }
+                    html += '</div>';
+                    {% endif %}
+
                     html += '<p><strong>首次购买:</strong> ' + (customer.first_order_date || '-') + '</p>';
                     html += '<p><strong>最近购买:</strong> ' + (customer.last_order_date || '-') + '</p>';
                     html += '<p><strong>购买频率:</strong> ' + (customer.avg_days_between_orders > 0 ? '平均 ' + customer.avg_days_between_orders + ' 天/单' : '仅一单') + '</p>';
@@ -2153,6 +2175,50 @@
                 .catch(function (err) {
                     alert('请求失败: ' + err.message);
                 });
+        }
+
+        function blockCustomer() {
+            var c = window.__customerDetail;
+            if (!c) return;
+            var reason = prompt('拦截原因（会写入被取消订单的备注）：', '惯性COD拒收');
+            if (reason === null) return; // 用户取消
+            fetch('/api/customer/block', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: c.email, phone: c.phone, name: c.name, reason: reason })
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.success) {
+                        customerQualityChanged = true;
+                        showCustomerDetail(c.email);
+                    } else {
+                        alert('加入拦截失败: ' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(function (err) { alert('请求失败: ' + err.message); });
+        }
+
+        function unblockCustomer() {
+            var c = window.__customerDetail;
+            if (!c) return;
+            if (!confirm('确认解除对该客户的拦截？\n解除后其新 COD 订单将不再自动取消。')) return;
+            var ph = (c.block_info && c.block_info.phone) || c.phone;
+            fetch('/api/customer/unblock', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone: ph, email: c.email })
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.success) {
+                        customerQualityChanged = true;
+                        showCustomerDetail(c.email);
+                    } else {
+                        alert('解除失败: ' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(function (err) { alert('请求失败: ' + err.message); });
         }
 
         // Refresh page when customer modal is closed if quality was changed

@@ -373,6 +373,31 @@
     </div>
 </div>
 
+<!-- Customer Blocklist (auto-cancel COD) -->
+<div class="card data-card mb-4">
+    <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
+        <h5 class="card-title text-white mb-0">
+            <i class="bi bi-shield-x me-2" style="color:#ef4444;"></i>客户拦截名单（自动取消货到付款）
+        </h5>
+    </div>
+    <div class="card-body">
+        <div class="alert alert-info bg-info bg-opacity-10 border-0 small mb-3 px-3 py-2">
+            <i class="bi bi-info-circle me-1"></i>
+            被加入拦截名单的客户（按<strong>手机号</strong>识别），其<strong>货到付款(COD)且尚未发货</strong>的订单会在每小时同步后自动取消并写订单备注；<strong>预付/转账订单不受影响，照常发货</strong>。在「客户分析」弹窗里点「加入拦截名单」即可加入。
+        </div>
+
+        <!-- 总开关 -->
+        <div class="form-check form-switch mb-2">
+            <input class="form-check-input" type="checkbox" id="blocklistEnableToggle">
+            <label class="form-check-label text-white-50" for="blocklistEnableToggle">启用自动取消（总开关）</label>
+            <span id="blocklistEnableHint" class="ms-2 small"></span>
+        </div>
+        <div class="text-muted small">
+            <i class="bi bi-person-gear me-1"></i>「谁可以加入/解除拦截名单」是<strong>按用户授权</strong>的，在 <a href="/users" class="text-info">用户管理</a> 里勾选某用户的「拦截名单管理权限」。管理员默认即可管理；只读用户始终不可。无权限者在客户弹窗里看不到「加入拦截名单」按钮，直接调接口也会被拒绝。注意：拦截名单<strong>全站全局生效</strong>。
+        </div>
+    </div>
+</div>
+
 <!-- Product Masters Management Card -->
 <div class="card data-card mb-4">
     <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
@@ -1719,6 +1744,38 @@
             });
             bigOrderAmount.addEventListener('change', function () {
                 saveBigOrderThreshold('big_order_amount_threshold', Math.max(0, parseFloat(this.value) || 0));
+            });
+        }
+
+        // 客户拦截名单：自动取消总开关
+        const blocklistEnableToggle = document.getElementById('blocklistEnableToggle');
+        if (blocklistEnableToggle) {
+            fetch('/api/settings')
+                .then(res => res.json())
+                .then(data => {
+                    const v = (data.blocklist_auto_cancel_enabled || '').toString().toLowerCase();
+                    blocklistEnableToggle.checked = (v === '1' || v === 'true' || v === 'on' || v === 'yes');
+                });
+            blocklistEnableToggle.addEventListener('change', function () {
+                const hint = document.getElementById('blocklistEnableHint');
+                const on = this.checked;
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ blocklist_auto_cancel_enabled: on ? '1' : '0' })
+                })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            hint.textContent = on ? '✓ 已开启' : '✓ 已关闭';
+                            hint.className = 'ms-2 small text-success';
+                            setTimeout(() => { hint.textContent = ''; }, 2500);
+                        } else {
+                            hint.textContent = (data.error || '保存失败');
+                            hint.className = 'ms-2 small text-danger';
+                        }
+                    })
+                    .catch(() => { hint.textContent = '保存错误'; hint.className = 'ms-2 small text-danger'; });
             });
         }
 

@@ -129,5 +129,23 @@ def main():
                f"{success_count} success, {error_count} errors, "
                f"longest site took {total_max_duration}s")
 
+    # Enforce the customer blocklist (auto-cancel blacklisted COD orders).
+    # Isolated in its own try so a failure here never affects sync.
+    try:
+        import blocklist
+        conn = get_db_connection()
+        try:
+            if blocklist.is_globally_enabled(conn):
+                bl = blocklist.enforce(conn, progress=safe_print, actor='auto-sync')
+                safe_print(f"[blocklist] checked={bl['checked']} cancelled={bl['cancelled']} "
+                           f"errors={bl['errors']} skipped={bl['skipped']}"
+                           + ("  [ABORTED-safety-cap]" if bl.get('aborted') else ""))
+            else:
+                safe_print("[blocklist] globally disabled — skipped")
+        finally:
+            conn.close()
+    except Exception as e:
+        safe_print(f"[blocklist] enforcement failed: {e}")
+
 if __name__ == '__main__':
     main()
