@@ -1,0 +1,316 @@
+{% extends "base.html" %}
+
+{% block title %}仓库管理 - 苍赋管理系统{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h5 class="text-light mb-0">
+            <i class="bi bi-buildings me-2"></i>仓库管理
+            <span class="text-white-50 small ms-2">库存真账本 · 自营 / 合伙人 · 市场分仓路由</span>
+        </h5>
+        {% if is_inv_admin %}
+        <button class="btn btn-sm btn-primary" onclick="openWhModal()">
+            <i class="bi bi-plus-lg me-1"></i>新建仓库
+        </button>
+        {% else %}
+        <span class="badge" style="background:rgba(148,163,184,0.25);color:#cbd5e1;padding:6px 12px;">
+            <i class="bi bi-eye me-1"></i>只读模式
+        </span>
+        {% endif %}
+    </div>
+
+    <!-- 仓库列表 -->
+    <div class="card data-card mb-4">
+        <div class="card-header bg-transparent border-secondary border-opacity-25">
+            <i class="bi bi-house-gear me-1"></i>仓库清单
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-dark table-hover align-middle mb-0">
+                    <thead>
+                        <tr class="text-white-50 small">
+                            <th>仓库</th><th>编码</th><th>国家</th><th>币种</th>
+                            <th>归属</th><th>参与分仓</th><th>市场路由数</th><th>状态</th>
+                            {% if is_inv_admin %}<th class="text-end">操作</th>{% endif %}
+                        </tr>
+                    </thead>
+                    <tbody id="whTbody">
+                        <tr><td colspan="9" class="text-center text-white-50 py-4">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- 市场 → 仓库路由 -->
+    <div class="card data-card">
+        <div class="card-header bg-transparent border-secondary border-opacity-25 d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-diagram-3 me-1"></i>市场分仓路由
+                <span class="text-white-50 small ms-1">订单按目的市场,依优先级(越小越先)选仓,缺货才拆单</span>
+            </span>
+            {% if is_inv_admin %}
+            <button class="btn btn-sm btn-outline-primary" onclick="openRouteModal()">
+                <i class="bi bi-plus-lg me-1"></i>添加路由
+            </button>
+            {% endif %}
+        </div>
+        <div class="card-body" id="routesContainer">
+            <div class="text-center text-white-50 py-4">加载中...</div>
+        </div>
+    </div>
+</div>
+
+<!-- 仓库 新建/编辑 Modal -->
+<div class="modal fade" id="whModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content bg-dark border border-secondary border-opacity-25">
+      <div class="modal-header border-bottom border-secondary border-opacity-25">
+        <h5 class="modal-title text-white"><i class="bi bi-house-add me-2"></i><span id="whModalTitle">新建仓库</span></h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="whId">
+        <div class="row g-3">
+          <div class="col-md-7"><label class="form-label text-white-50 small">仓库名称 *</label>
+            <input id="whName" class="form-control bg-dark text-white border-secondary" placeholder="如 匈牙利仓库"></div>
+          <div class="col-md-5"><label class="form-label text-white-50 small">编码 *</label>
+            <input id="whCode" class="form-control bg-dark text-white border-secondary" placeholder="如 HU"></div>
+          <div class="col-md-4"><label class="form-label text-white-50 small">国家 *</label>
+            <input id="whCountry" class="form-control bg-dark text-white border-secondary" placeholder="如 HU"></div>
+          <div class="col-md-4"><label class="form-label text-white-50 small">币种</label>
+            <input id="whCurrency" class="form-control bg-dark text-white border-secondary" value="PLN"></div>
+          <div class="col-md-4"><label class="form-label text-white-50 small">状态</label>
+            <select id="whActive" class="form-select bg-dark text-white border-secondary">
+              <option value="1">启用</option><option value="0">停用</option></select></div>
+          <div class="col-md-6"><label class="form-label text-white-50 small">归属类型</label>
+            <select id="whOwnership" class="form-select bg-dark text-white border-secondary" onchange="togglePartner()">
+              <option value="self">自营仓</option><option value="partner">合伙人仓</option></select></div>
+          <div class="col-md-6" id="partnerWrap" style="display:none;"><label class="form-label text-white-50 small">合伙人名称 *</label>
+            <input id="whPartner" class="form-control bg-dark text-white border-secondary" placeholder="如 金毅金谷"></div>
+          <div class="col-12">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="whFulfillment" checked>
+              <label class="form-check-label text-white-50 small" for="whFulfillment">参与自动分仓发货(关闭则只记账,不进路由)</label>
+            </div></div>
+          <div class="col-12"><label class="form-label text-white-50 small">备注</label>
+            <input id="whNotes" class="form-control bg-dark text-white border-secondary"></div>
+        </div>
+      </div>
+      <div class="modal-footer border-top border-secondary border-opacity-25">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" onclick="saveWh()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 路由 新建/编辑 Modal -->
+<div class="modal fade" id="routeModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content bg-dark border border-secondary border-opacity-25">
+      <div class="modal-header border-bottom border-secondary border-opacity-25">
+        <h5 class="modal-title text-white"><i class="bi bi-diagram-3 me-2"></i><span id="routeModalTitle">添加市场路由</span></h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="routeId">
+        <div class="row g-3">
+          <div class="col-md-6"><label class="form-label text-white-50 small">市场代码 *</label>
+            <input id="routeMarket" class="form-control bg-dark text-white border-secondary" placeholder="目的市场国家码,如 CZ">
+            <div class="form-text text-white-50">未来新市场只需在此新增,无需改代码</div></div>
+          <div class="col-md-6"><label class="form-label text-white-50 small">仓库 *</label>
+            <select id="routeWh" class="form-select bg-dark text-white border-secondary"></select></div>
+          <div class="col-md-6"><label class="form-label text-white-50 small">优先级(越小越先) *</label>
+            <input id="routePriority" type="number" class="form-control bg-dark text-white border-secondary" value="100"></div>
+          <div class="col-md-6"><label class="form-label text-white-50 small">状态</label>
+            <select id="routeActive" class="form-select bg-dark text-white border-secondary">
+              <option value="1">启用</option><option value="0">停用</option></select></div>
+          <div class="col-12"><label class="form-label text-white-50 small">备注</label>
+            <input id="routeNotes" class="form-control bg-dark text-white border-secondary"></div>
+        </div>
+      </div>
+      <div class="modal-footer border-top border-secondary border-opacity-25">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" onclick="saveRoute()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const IS_ADMIN = {{ 'true' if is_inv_admin else 'false' }};
+let whCache = [];
+
+function ownBadge(o, partner){
+  if(o === 'partner') return `<span class="badge bg-warning text-dark">合伙人${partner?(' · '+partner):''}</span>`;
+  return `<span class="badge bg-info">自营</span>`;
+}
+
+async function loadWarehouses(){
+  const r = await fetch('/api/inv/warehouses');
+  whCache = await r.json();
+  const tb = document.getElementById('whTbody');
+  if(!whCache.length){ tb.innerHTML = '<tr><td colspan="9" class="text-center text-white-50 py-4">暂无仓库</td></tr>'; return; }
+  tb.innerHTML = whCache.map(w => `
+    <tr class="${w.is_active? '' : 'opacity-50'}">
+      <td>${esc(w.name)}</td>
+      <td><code class="text-info">${esc(w.code)}</code></td>
+      <td>${esc(w.country)}</td>
+      <td>${esc(w.default_currency)}</td>
+      <td>${ownBadge(w.ownership_type, w.partner_name)}</td>
+      <td>${w.is_fulfillment? '<span class="text-success">是</span>':'<span class="text-white-50">否</span>'}</td>
+      <td>${w.route_count}</td>
+      <td>${w.is_active? '<span class="text-success">启用</span>':'<span class="text-danger">停用</span>'}</td>
+      ${IS_ADMIN? `<td class="text-end">
+        <button class="btn btn-sm btn-outline-light me-1" onclick='editWh(${w.id})'><i class="bi bi-pencil"></i></button>
+        <button class="btn btn-sm btn-outline-danger" onclick='delWh(${w.id}, ${JSON.stringify(w.name)})'><i class="bi bi-trash"></i></button>
+      </td>`:''}
+    </tr>`).join('');
+}
+
+function openWhModal(){
+  document.getElementById('whModalTitle').textContent='新建仓库';
+  document.getElementById('whId').value='';
+  ['whName','whCode','whCountry','whPartner','whNotes'].forEach(id=>document.getElementById(id).value='');
+  document.getElementById('whCurrency').value='PLN';
+  document.getElementById('whActive').value='1';
+  document.getElementById('whOwnership').value='self';
+  document.getElementById('whFulfillment').checked=true;
+  togglePartner();
+  new bootstrap.Modal('#whModal').show();
+}
+function editWh(id){
+  const w = whCache.find(x=>x.id===id); if(!w) return;
+  document.getElementById('whModalTitle').textContent='编辑仓库';
+  document.getElementById('whId').value=w.id;
+  document.getElementById('whName').value=w.name||'';
+  document.getElementById('whCode').value=w.code||'';
+  document.getElementById('whCountry').value=w.country||'';
+  document.getElementById('whCurrency').value=w.default_currency||'PLN';
+  document.getElementById('whActive').value=w.is_active?'1':'0';
+  document.getElementById('whOwnership').value=w.ownership_type||'self';
+  document.getElementById('whPartner').value=w.partner_name||'';
+  document.getElementById('whFulfillment').checked=!!w.is_fulfillment;
+  togglePartner();
+  new bootstrap.Modal('#whModal').show();
+}
+function togglePartner(){
+  document.getElementById('partnerWrap').style.display =
+    document.getElementById('whOwnership').value==='partner'?'block':'none';
+}
+async function saveWh(){
+  const id = document.getElementById('whId').value;
+  const body = {
+    name:document.getElementById('whName').value.trim(),
+    code:document.getElementById('whCode').value.trim(),
+    country:document.getElementById('whCountry').value.trim(),
+    default_currency:document.getElementById('whCurrency').value.trim(),
+    is_active:document.getElementById('whActive').value==='1',
+    ownership_type:document.getElementById('whOwnership').value,
+    partner_name:document.getElementById('whPartner').value.trim(),
+    is_fulfillment:document.getElementById('whFulfillment').checked,
+    notes:document.getElementById('whNotes').value.trim()
+  };
+  const url = id? `/api/inv/warehouses/${id}`:'/api/inv/warehouses';
+  const r = await fetch(url,{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j = await r.json();
+  if(!r.ok){ alert(j.error||'保存失败'); return; }
+  bootstrap.Modal.getInstance('#whModal').hide();
+  await loadWarehouses(); await loadRoutes();
+}
+async function delWh(id, name){
+  if(!confirm(`删除仓库「${name}」?\n有引用时将自动改为停用(软删),保护历史数据。`)) return;
+  const r = await fetch(`/api/inv/warehouses/${id}`,{method:'DELETE'});
+  const j = await r.json();
+  if(!r.ok){ alert(j.error||'删除失败'); return; }
+  if(j.mode==='soft') alert('该仓库有数据引用,已改为「停用」而非删除。');
+  await loadWarehouses(); await loadRoutes();
+}
+
+async function loadRoutes(){
+  const r = await fetch('/api/inv/market-routes');
+  const rows = await r.json();
+  const c = document.getElementById('routesContainer');
+  if(!rows.length){ c.innerHTML='<div class="text-center text-white-50 py-3">暂无市场路由</div>'; return; }
+  const byMarket = {};
+  rows.forEach(x=>{ (byMarket[x.market_code]=byMarket[x.market_code]||[]).push(x); });
+  c.innerHTML = Object.keys(byMarket).sort().map(mk=>{
+    const items = byMarket[mk].sort((a,b)=>a.priority-b.priority);
+    return `<div class="mb-3">
+      <div class="fw-bold text-info mb-2"><i class="bi bi-geo-alt me-1"></i>市场 ${esc(mk)}</div>
+      <div class="d-flex flex-wrap gap-2">
+        ${items.map(it=>`<div class="border border-secondary border-opacity-25 rounded px-3 py-2 ${it.is_active?'':'opacity-50'}" style="background:rgba(255,255,255,0.03);">
+          <span class="badge bg-secondary me-1">P${it.priority}</span>
+          ${esc(it.warehouse_name)} ${ownBadge(it.ownership_type, it.partner_name)}
+          ${it.notes?`<div class="text-white-50 small mt-1">${esc(it.notes)}</div>`:''}
+          ${IS_ADMIN?`<div class="mt-1">
+            <button class="btn btn-sm btn-link text-light p-0 me-2" onclick='editRoute(${it.id})'><i class="bi bi-pencil"></i></button>
+            <button class="btn btn-sm btn-link text-danger p-0" onclick='delRoute(${it.id})'><i class="bi bi-trash"></i></button>
+          </div>`:''}
+        </div>`).join('')}
+      </div></div>`;
+  }).join('');
+}
+
+let routeCache = [];
+function fillWhSelect(){
+  const sel = document.getElementById('routeWh');
+  sel.innerHTML = whCache.filter(w=>w.is_active).map(w=>`<option value="${w.id}">${esc(w.name)} (${esc(w.code)})</option>`).join('');
+}
+function openRouteModal(){
+  document.getElementById('routeModalTitle').textContent='添加市场路由';
+  document.getElementById('routeId').value='';
+  document.getElementById('routeMarket').value='';
+  document.getElementById('routePriority').value='100';
+  document.getElementById('routeActive').value='1';
+  document.getElementById('routeNotes').value='';
+  fillWhSelect();
+  document.getElementById('routeMarket').disabled=false;
+  document.getElementById('routeWh').disabled=false;
+  new bootstrap.Modal('#routeModal').show();
+}
+async function editRoute(id){
+  const r = await fetch('/api/inv/market-routes'); routeCache = await r.json();
+  const it = routeCache.find(x=>x.id===id); if(!it) return;
+  document.getElementById('routeModalTitle').textContent='编辑市场路由';
+  document.getElementById('routeId').value=it.id;
+  document.getElementById('routeMarket').value=it.market_code;
+  document.getElementById('routePriority').value=it.priority;
+  document.getElementById('routeActive').value=it.is_active?'1':'0';
+  document.getElementById('routeNotes').value=it.notes||'';
+  fillWhSelect();
+  document.getElementById('routeWh').value=it.warehouse_id;
+  // 编辑时市场与仓库构成唯一键,不允许改(改请删后新增)
+  document.getElementById('routeMarket').disabled=true;
+  document.getElementById('routeWh').disabled=true;
+  new bootstrap.Modal('#routeModal').show();
+}
+async function saveRoute(){
+  const id = document.getElementById('routeId').value;
+  const body = {
+    market_code:document.getElementById('routeMarket').value.trim(),
+    warehouse_id:parseInt(document.getElementById('routeWh').value),
+    priority:parseInt(document.getElementById('routePriority').value),
+    is_active:document.getElementById('routeActive').value==='1',
+    notes:document.getElementById('routeNotes').value.trim()
+  };
+  const url = id?`/api/inv/market-routes/${id}`:'/api/inv/market-routes';
+  const r = await fetch(url,{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j = await r.json();
+  if(!r.ok){ alert(j.error||'保存失败'); return; }
+  bootstrap.Modal.getInstance('#routeModal').hide();
+  await loadWarehouses(); await loadRoutes();
+}
+async function delRoute(id){
+  if(!confirm('删除该市场路由?')) return;
+  const r = await fetch(`/api/inv/market-routes/${id}`,{method:'DELETE'});
+  if(!r.ok){ const j=await r.json(); alert(j.error||'删除失败'); return; }
+  await loadWarehouses(); await loadRoutes();
+}
+
+function esc(s){ return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+(async()=>{ await loadWarehouses(); await loadRoutes(); })();
+</script>
+{% endblock %}

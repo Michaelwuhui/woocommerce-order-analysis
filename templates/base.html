@@ -201,6 +201,14 @@
                         </a>
                     </li>
                     {% endif %}
+                    {% if inv_can_view %}
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('inv_') else '' }}"
+                            href="{{ url_for('inv_wh.warehouses_page') }}">
+                            <i class="bi bi-boxes me-1"></i>库存管理
+                        </a>
+                    </li>
+                    {% endif %}
                     {% if current_user.can_manage_users() %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint in ['settings','users_page'] else '' }}"

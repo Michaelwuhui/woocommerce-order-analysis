@@ -22035,5 +22035,36 @@ def set_order_warehouse(order_id):
         conn.close()
 
 
+# ─────────────────────── 进销存(库存)模块 ───────────────────────
+# 库存功能拆到独立的 inv_*.py 模块(Blueprint),避免继续膨胀 app.py。
+# 只读关联现有表,全部走 inv_migrations.py 的可回滚迁移建表。
+try:
+    from inv_warehouses import inv_wh_bp
+    app.register_blueprint(inv_wh_bp)
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger(__name__).warning('库存模块未加载: %s', _e)
+
+
+@app.context_processor
+def inject_inventory_perms():
+    """把库存权限标志暴露给所有模板(导航栏与库存页都用)。
+
+    inv_can_view: 能否看到库存菜单/页面;
+    is_inv_admin: 是否可管理仓库主数据(超管)。
+    """
+    try:
+        from inv_common import can_view_inventory, can_manage_inventory
+        is_admin = (getattr(current_user, 'username', None) == 'admin'
+                    or (getattr(current_user, 'is_authenticated', False)
+                        and current_user.is_admin()))
+        return {
+            'inv_can_view': bool(is_admin or can_view_inventory() or can_manage_inventory()),
+            'is_inv_admin': bool(is_admin),
+        }
+    except Exception:
+        return {'inv_can_view': False, 'is_inv_admin': False}
+
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
