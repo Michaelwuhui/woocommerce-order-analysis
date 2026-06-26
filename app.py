@@ -22049,6 +22049,8 @@ try:
     app.register_blueprint(inv_batch_bp)
     from inv_orders import inv_ord_bp
     app.register_blueprint(inv_ord_bp)
+    from inv_push import inv_push_bp
+    app.register_blueprint(inv_push_bp)
 except Exception as _e:
     import logging as _logging
     _logging.getLogger(__name__).warning('库存模块未加载: %s', _e)

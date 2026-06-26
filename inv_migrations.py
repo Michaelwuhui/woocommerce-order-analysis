@@ -404,10 +404,41 @@ def down_003(conn):
     conn.commit()
 
 
+# ───────────────── 004: 库存下推 WP 日志 ─────────────────
+
+def up_004(conn):
+    """inv_push_logs:记录每次把可用库存下推到各站 WC 商品的结果(审计 + 对账)。"""
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS inv_push_logs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              TEXT DEFAULT CURRENT_TIMESTAMP,
+            site_id         INTEGER,
+            source          TEXT,
+            wc_product_id   INTEGER,
+            wc_variation_id INTEGER DEFAULT 0,
+            sku_id          INTEGER,
+            prev_qty        INTEGER,   -- 推送前 WC 库存(对账时填,纯推送可空)
+            pushed_qty      INTEGER,   -- 本次下推的可用数量
+            status          TEXT,      -- ok / error / skipped / dry
+            error           TEXT,
+            operator_id     INTEGER,
+            operator_name   TEXT
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_inv_push_site ON inv_push_logs(site_id, ts)')
+    conn.commit()
+
+
+def down_004(conn):
+    conn.execute('DROP TABLE IF EXISTS inv_push_logs')
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
     ('003', 'order_inventory_state', up_003, down_003),
+    ('004', 'inv_push_logs', up_004, down_004),
 ]
 
 
