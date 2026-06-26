@@ -218,6 +218,18 @@
                                 <i class="bi bi-pencil-square me-1"></i>成本管理 · 编辑 <small class="text-muted">（可新增/修改/删除产品成本及历史价格版本）</small>
                             </label>
                         </div>
+                        <div class="form-check mt-2">
+                            <input class="form-check-input" type="checkbox" id="editCanViewInventory">
+                            <label class="form-check-label text-white-50" for="editCanViewInventory">
+                                <i class="bi bi-boxes me-1"></i>库存管理 · 查看 <small class="text-muted">（可访问库存台账/批次/订单联动/报表等，只读）</small>
+                            </label>
+                        </div>
+                        <div class="form-check mt-1 ms-4">
+                            <input class="form-check-input" type="checkbox" id="editCanManageInventory">
+                            <label class="form-check-label text-white-50" for="editCanManageInventory">
+                                <i class="bi bi-pencil-square me-1"></i>库存管理 · 操作 <small class="text-muted">（可采购入库、手工调整、处理订单库存联动、下推等。勾选后自动含查看）</small>
+                            </label>
+                        </div>
                         <div class="form-check mt-2" id="wrapCanManageUsers">
                             <input class="form-check-input" type="checkbox" id="editCanManageUsers">
                             <label class="form-check-label text-warning" for="editCanManageUsers">
@@ -305,7 +317,7 @@
             } else if (btn.classList.contains('btn-edit')) {
                 const user = window._usersData && window._usersData[userId];
                 if (user) {
-                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0, user.can_view_own_sales_board || 0, user.site_count || 0, user.can_view_shipping || 0, user.can_manage_blocklist || 0);
+                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0, user.can_view_own_sales_board || 0, user.site_count || 0, user.can_view_shipping || 0, user.can_manage_blocklist || 0, user.can_view_inventory || 0, user.can_manage_inventory || 0);
                 }
             } else if (btn.classList.contains('btn-delete')) {
                 deleteUser(userId);
@@ -402,7 +414,7 @@
         });
 
         // Edit User
-        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, site_count, can_view_shipping, can_manage_blocklist) {
+        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, site_count, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory) {
             document.getElementById('editUserId').value = id;
             document.getElementById('editUsername').value = username;
             document.getElementById('editName').value = name;
@@ -442,10 +454,15 @@
             if (cmEl) cmEl.checked = can_manage_users == 1;
             var mbEl = document.getElementById('editCanManageBlocklist');
             if (mbEl) mbEl.checked = can_manage_blocklist == 1;
+            var ivEl = document.getElementById('editCanViewInventory');
+            if (ivEl) ivEl.checked = can_view_inventory == 1;
+            var imEl = document.getElementById('editCanManageInventory');
+            if (imEl) imEl.checked = can_manage_inventory == 1;
             document.getElementById('editPassword').value = '';
             // Enforce: edit implies view. If view is unchecked, disable edit.
             updateReconEditState();
             updateCostsEditState();
+            updateInventoryEditState();
             bootstrap.Modal.getOrCreateInstance(document.getElementById('editUserModal')).show();
         };
 
@@ -484,6 +501,18 @@
                 eEl.disabled = false;
             }
         }
+        // 库存管理:操作 implies 查看(不能操作看不到的东西)。view 取消则禁用 manage。
+        function updateInventoryEditState() {
+            var vEl = document.getElementById('editCanViewInventory');
+            var eEl = document.getElementById('editCanManageInventory');
+            if (!vEl || !eEl) return;
+            if (!vEl.checked) {
+                eEl.checked = false;
+                eEl.disabled = true;
+            } else {
+                eEl.disabled = false;
+            }
+        }
         // 发货权限(操作) implies 发货·仅查看: checking 发货权限 auto-checks + disables
         // the view box (you can't operate without seeing).
         function updateShipViewState() {
@@ -512,6 +541,13 @@
             if (ceEl) ceEl.addEventListener('change', function () {
                 if (ceEl.checked && cvEl && !cvEl.checked) cvEl.checked = true;
             });
+            // 库存:同样的 view/manage 联动
+            var ivEl = document.getElementById('editCanViewInventory');
+            var imEl = document.getElementById('editCanManageInventory');
+            if (ivEl) ivEl.addEventListener('change', updateInventoryEditState);
+            if (imEl) imEl.addEventListener('change', function () {
+                if (imEl.checked && ivEl && !ivEl.checked) ivEl.checked = true;
+            });
         })();
 
         document.getElementById('editUserForm').addEventListener('submit', function (e) {
@@ -535,7 +571,9 @@
                     can_view_costs: (document.getElementById('editCanViewCosts') || {}).checked ? 1 : 0,
                     can_edit_costs: (document.getElementById('editCanEditCosts') || {}).checked ? 1 : 0,
                     can_manage_users: (document.getElementById('editCanManageUsers') || {}).checked ? 1 : 0,
-                    can_manage_blocklist: (document.getElementById('editCanManageBlocklist') || {}).checked ? 1 : 0
+                    can_manage_blocklist: (document.getElementById('editCanManageBlocklist') || {}).checked ? 1 : 0,
+                    can_view_inventory: (document.getElementById('editCanViewInventory') || {}).checked ? 1 : 0,
+                    can_manage_inventory: (document.getElementById('editCanManageInventory') || {}).checked ? 1 : 0
                 })
             })
                 .then(res => res.json())

@@ -10332,8 +10332,10 @@ def get_users():
     # back if columns are missing. The init_*_tables() functions always add
     # them on startup, so in practice the first SELECT succeeds.
     SCHEMAS = [
-        # 0: latest — both can_view_costs and can_edit_costs (+ can_view_own_sales_board, can_manage_blocklist)
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, created_at FROM users',
+        # 0: latest — incl. 库存权限 can_view_inventory / can_manage_inventory
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, created_at FROM users',
+        # 0b: 库存列尚未迁移时回退(其余同上)
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, 0 as can_view_inventory, 0 as can_manage_inventory, created_at FROM users',
         # 1: missing can_edit_costs
         'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, 0 as can_edit_costs, created_at FROM users',
         # 2: missing can_view_costs
@@ -10371,6 +10373,8 @@ def get_users():
         u.setdefault('can_view_own_sales_board', 0)
         u.setdefault('can_view_shipping', 0)
         u.setdefault('can_manage_blocklist', 0)
+        u.setdefault('can_view_inventory', 0)
+        u.setdefault('can_manage_inventory', 0)
         u['site_count'] = site_counts.get(u.get('name') or '', 0)
         # Mark users that the current operator cannot modify
         u['is_super_admin'] = (u['username'] == 'admin')
@@ -10481,12 +10485,17 @@ def update_user(user_id):
                     'SELECT 1 FROM sites WHERE manager = ? LIMIT 1', (name,)).fetchone():
                 can_view_own_sales_board_val = 0
             can_manage_blocklist_val = 1 if data.get('can_manage_blocklist') else 0
+            # 库存权限:操作含查看(不能操作看不到的东西)
+            can_view_inventory_val = 1 if data.get('can_view_inventory') else 0
+            can_manage_inventory_val = 1 if data.get('can_manage_inventory') else 0
+            if can_manage_inventory_val and not can_view_inventory_val:
+                can_view_inventory_val = 1
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, user_id))
         else:
             # Non-superadmin: cannot change can_manage_users, can_view_sales_board, or set role to admin
             # but CAN grant can_manage_products (a regular operator-level permission)
