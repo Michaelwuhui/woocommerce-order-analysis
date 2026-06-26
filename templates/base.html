@@ -202,11 +202,15 @@
                     </li>
                     {% endif %}
                     {% if inv_can_view %}
-                    <li class="nav-item">
-                        <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('inv_') else '' }}"
-                            href="{{ url_for('inv_wh.warehouses_page') }}">
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle {{ 'active' if request.endpoint and request.endpoint.startswith('inv_') else '' }}"
+                            href="#" data-bs-toggle="dropdown">
                             <i class="bi bi-boxes me-1"></i>库存管理
                         </a>
+                        <ul class="dropdown-menu dropdown-menu-dark">
+                            <li><a class="dropdown-item" href="{{ url_for('inv_wh.warehouses_page') }}"><i class="bi bi-buildings me-2"></i>仓库管理</a></li>
+                            <li><a class="dropdown-item" href="{{ url_for('inv_sku.skus_page') }}"><i class="bi bi-upc-scan me-2"></i>SKU 主档</a></li>
+                        </ul>
                     </li>
                     {% endif %}
                     {% if current_user.can_manage_users() %}

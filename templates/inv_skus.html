@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+{% block title %}SKU 主档 - 苍赋管理系统{% endblock %}
+{% block content %}
+<div class="container-fluid py-4">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h5 class="text-light mb-0"><i class="bi bi-upc-scan me-2"></i>SKU 主档与站点映射
+      <span class="text-white-50 small ms-2">库存最小单位 · WC商品↔SKU · 订单解析</span></h5>
+  </div>
+
+  <ul class="nav nav-tabs mb-3" role="tablist">
+    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tabSku">SKU 主档</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabMap">站点映射</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabUnmapped" onclick="scanUnmapped()">未映射发现</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabResolve">订单解析预览</button></li>
+  </ul>
+
+  <div class="tab-content">
+    <!-- SKU 主档 -->
+    <div class="tab-pane fade show active" id="tabSku">
+      <div class="d-flex gap-2 mb-2">
+        <input id="skuSearch" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:280px" placeholder="搜索 编码/名称/条码" oninput="loadSkus()">
+        {% if can_manage_inv %}<button class="btn btn-sm btn-primary" onclick="openSkuModal()"><i class="bi bi-plus-lg"></i> 新建 SKU</button>{% endif %}
+      </div>
+      <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead><tr class="text-white-50 small"><th>编码</th><th>名称</th><th>品牌</th><th>口数</th><th>口味</th><th>条码</th><th>映射数</th><th>状态</th>{% if can_manage_inv %}<th class="text-end">操作</th>{% endif %}</tr></thead>
+          <tbody id="skuTbody"><tr><td colspan="9" class="text-center text-white-50 py-4">加载中...</td></tr></tbody>
+        </table></div></div></div>
+    </div>
+
+    <!-- 站点映射 -->
+    <div class="tab-pane fade" id="tabMap">
+      <div class="d-flex gap-2 mb-2">
+        <select id="mapSiteFilter" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:260px" onchange="loadMaps()">
+          <option value="">全部站点</option>
+          {% for s in sites %}<option value="{{ s.id }}">{{ s.url }} ({{ s.country }})</option>{% endfor %}
+        </select>
+        {% if can_manage_inv %}<button class="btn btn-sm btn-primary" onclick="openMapModal()"><i class="bi bi-plus-lg"></i> 新建映射</button>{% endif %}
+      </div>
+      <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead><tr class="text-white-50 small"><th>站点</th><th>WC商品ID</th><th>变体ID</th><th>WC SKU</th><th>→ SKU</th><th>每件折合</th><th>状态</th>{% if can_manage_inv %}<th class="text-end">操作</th>{% endif %}</tr></thead>
+          <tbody id="mapTbody"><tr><td colspan="8" class="text-center text-white-50 py-4">选择站点或查看全部</td></tr></tbody>
+        </table></div></div></div>
+    </div>
+
+    <!-- 未映射发现 -->
+    <div class="tab-pane fade" id="tabUnmapped">
+      <div class="d-flex gap-2 mb-2 align-items-center">
+        <select id="unmapSite" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:260px">
+          <option value="">全部站点</option>
+          {% for s in sites %}<option value="{{ s.id }}">{{ s.url }} ({{ s.country }})</option>{% endfor %}
+        </select>
+        <input id="unmapLimit" type="number" value="800" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:120px" title="扫描订单数">
+        <button class="btn btn-sm btn-outline-warning" onclick="scanUnmapped()"><i class="bi bi-search"></i> 扫描</button>
+        <span id="unmapStat" class="text-white-50 small"></span>
+      </div>
+      <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead><tr class="text-white-50 small"><th>站点</th><th>商品名</th><th>WC商品ID</th><th>WC SKU</th><th>出现次数</th><th>总数量</th>{% if can_manage_inv %}<th class="text-end">操作</th>{% endif %}</tr></thead>
+          <tbody id="unmapTbody"><tr><td colspan="7" class="text-center text-white-50 py-4">点击「扫描」发现未映射商品</td></tr></tbody>
+        </table></div></div></div>
+    </div>
+
+    <!-- 订单解析 -->
+    <div class="tab-pane fade" id="tabResolve">
+      <div class="d-flex gap-2 mb-2">
+        <input id="resolveOid" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:240px" placeholder="订单ID 如 1-50354">
+        <button class="btn btn-sm btn-info" onclick="resolveOrder()"><i class="bi bi-diagram-2"></i> 解析</button>
+        <span id="resolveStat" class="text-white-50 small align-self-center"></span>
+      </div>
+      <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead><tr class="text-white-50 small"><th>商品名</th><th>数量</th><th>命中SKU</th><th>每件折合</th><th>SKU总数</th><th>匹配路径</th></tr></thead>
+          <tbody id="resolveTbody"><tr><td colspan="6" class="text-center text-white-50 py-4">输入订单ID解析</td></tr></tbody>
+        </table></div></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- SKU Modal -->
+<div class="modal fade" id="skuModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content bg-dark border border-secondary border-opacity-25">
+  <div class="modal-header border-bottom border-secondary border-opacity-25"><h5 class="modal-title text-white"><span id="skuModalTitle">新建 SKU</span></h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+  <div class="modal-body"><input type="hidden" id="skuId">
+    <div class="row g-2">
+      <div class="col-md-7"><label class="form-label text-white-50 small">名称 *</label>
+        <div class="input-group input-group-sm">
+          <input id="skuName" class="form-control bg-dark text-white border-secondary">
+          <button class="btn btn-outline-info" onclick="suggestFromName()" title="按名称解析品牌/口数/口味">解析</button>
+        </div></div>
+      <div class="col-md-5"><label class="form-label text-white-50 small">编码 *</label><input id="skuCode" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-md-6"><label class="form-label text-white-50 small">品牌</label>
+        <select id="skuBrand" class="form-select form-select-sm bg-dark text-white border-secondary">
+          <option value="">(无)</option>{% for b in brands %}<option value="{{ b.id }}">{{ b.name }}</option>{% endfor %}
+        </select></div>
+      <div class="col-md-3"><label class="form-label text-white-50 small">口数</label><input id="skuPuff" type="number" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-md-3"><label class="form-label text-white-50 small">单位</label><input id="skuUnit" value="pcs" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-md-6"><label class="form-label text-white-50 small">口味</label><input id="skuFlavor" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-md-6"><label class="form-label text-white-50 small">条码</label><input id="skuBarcode" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-md-6"><label class="form-label text-white-50 small">保质期(天)</label><input id="skuShelf" type="number" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-md-6"><label class="form-label text-white-50 small">状态</label><select id="skuActive" class="form-select form-select-sm bg-dark text-white border-secondary"><option value="1">启用</option><option value="0">停用</option></select></div>
+      <input type="hidden" id="skuSeries">
+      <div class="col-12"><label class="form-label text-white-50 small">备注</label><input id="skuNotes" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-12"><div id="suggestBox" class="small text-info"></div></div>
+    </div></div>
+  <div class="modal-footer border-top border-secondary border-opacity-25"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" onclick="saveSku()">保存</button></div>
+</div></div></div>
+
+<!-- Map Modal -->
+<div class="modal fade" id="mapModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content bg-dark border border-secondary border-opacity-25">
+  <div class="modal-header border-bottom border-secondary border-opacity-25"><h5 class="modal-title text-white"><span id="mapModalTitle">新建映射</span></h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+  <div class="modal-body"><input type="hidden" id="mapId">
+    <div class="row g-2">
+      <div class="col-md-12"><label class="form-label text-white-50 small">站点 *</label>
+        <select id="mapSite" class="form-select form-select-sm bg-dark text-white border-secondary"><option value="">选择站点</option>{% for s in sites %}<option value="{{ s.id }}">{{ s.url }} ({{ s.country }})</option>{% endfor %}</select></div>
+      <div class="col-md-6"><label class="form-label text-white-50 small">WC 商品ID</label><input id="mapPid" type="number" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-md-6"><label class="form-label text-white-50 small">WC 变体ID(无填0)</label><input id="mapVid" type="number" value="0" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-md-6"><label class="form-label text-white-50 small">WC SKU 字符串(可选)</label><input id="mapWcSku" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-md-6"><label class="form-label text-white-50 small">每件折合 SKU 数 *</label><input id="mapQty" type="number" value="1" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-12"><label class="form-label text-white-50 small">目标 SKU *</label>
+        <div class="input-group input-group-sm">
+          <input id="mapSkuSearch" class="form-control bg-dark text-white border-secondary" placeholder="搜索 SKU 编码/名称" oninput="searchMapSku()">
+          <span class="input-group-text bg-dark text-info border-secondary" id="mapSkuChosen">未选</span>
+        </div>
+        <div id="mapSkuResults" class="list-group mt-1" style="max-height:160px;overflow:auto"></div>
+        <input type="hidden" id="mapSkuId"></div>
+      <div class="col-12"><label class="form-label text-white-50 small">原始名称(备注)</label><input id="mapRawName" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+    </div></div>
+  <div class="modal-footer border-top border-secondary border-opacity-25"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" onclick="saveMap()">保存</button></div>
+</div></div></div>
+
+<script>
+const CAN_MANAGE = {{ 'true' if can_manage_inv else 'false' }};
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const VIA = {exact:'精确(商品+变体)',product:'产品级',wc_sku:'WC SKU',taxonomy:'品牌解析',unmatched:'未映射'};
+
+// ---- SKU 主档 ----
+async function loadSkus(){
+  const q = document.getElementById('skuSearch').value.trim();
+  const r = await fetch('/api/inv/skus?q='+encodeURIComponent(q));
+  const rows = await r.json();
+  const tb = document.getElementById('skuTbody');
+  if(!rows.length){tb.innerHTML='<tr><td colspan="9" class="text-center text-white-50 py-4">暂无 SKU</td></tr>';return;}
+  tb.innerHTML = rows.map(s=>`<tr class="${s.is_active?'':'opacity-50'}">
+    <td><code class="text-info">${esc(s.sku_code)}</code></td><td>${esc(s.name)}</td>
+    <td>${esc(s.brand_name||'')}</td><td>${s.puff_count||''}</td><td>${esc(s.flavor||'')}</td>
+    <td>${esc(s.barcode||'')}</td><td>${s.map_count}</td>
+    <td>${s.is_active?'<span class="text-success">启用</span>':'<span class="text-danger">停用</span>'}</td>
+    ${CAN_MANAGE?`<td class="text-end"><button class="btn btn-sm btn-outline-light me-1" onclick='editSku(${s.id})'><i class="bi bi-pencil"></i></button>
+      <button class="btn btn-sm btn-outline-danger" onclick='delSku(${s.id},${JSON.stringify(s.sku_code)})'><i class="bi bi-trash"></i></button></td>`:''}
+  </tr>`).join('');
+  window._skus = rows;
+}
+function openSkuModal(){document.getElementById('skuModalTitle').textContent='新建 SKU';
+  ['skuId','skuName','skuCode','skuPuff','skuFlavor','skuBarcode','skuShelf','skuNotes','skuSeries'].forEach(i=>document.getElementById(i).value='');
+  document.getElementById('skuBrand').value='';document.getElementById('skuUnit').value='pcs';document.getElementById('skuActive').value='1';
+  document.getElementById('suggestBox').innerHTML='';new bootstrap.Modal('#skuModal').show();}
+function editSku(id){const s=(window._skus||[]).find(x=>x.id===id);if(!s)return;
+  document.getElementById('skuModalTitle').textContent='编辑 SKU';
+  document.getElementById('skuId').value=s.id;document.getElementById('skuName').value=s.name||'';
+  document.getElementById('skuCode').value=s.sku_code||'';document.getElementById('skuBrand').value=s.brand_id||'';
+  document.getElementById('skuSeries').value=s.series_id||'';
+  document.getElementById('skuPuff').value=s.puff_count||'';document.getElementById('skuFlavor').value=s.flavor||'';
+  document.getElementById('skuBarcode').value=s.barcode||'';document.getElementById('skuUnit').value=s.unit||'pcs';
+  document.getElementById('skuShelf').value=s.shelf_life_days||'';document.getElementById('skuActive').value=s.is_active?'1':'0';
+  document.getElementById('skuNotes').value=s.notes||'';document.getElementById('suggestBox').innerHTML='';
+  new bootstrap.Modal('#skuModal').show();}
+async function suggestFromName(){
+  const name=document.getElementById('skuName').value.trim();if(!name){return;}
+  const r=await fetch('/api/inv/parse-suggest?name='+encodeURIComponent(name));const j=await r.json();
+  if(j.error){document.getElementById('suggestBox').textContent=j.error;return;}
+  const t=j.taxonomy;
+  if(t.brand_id)document.getElementById('skuBrand').value=t.brand_id;
+  if(t.series_id)document.getElementById('skuSeries').value=t.series_id;
+  if(t.puff_count)document.getElementById('skuPuff').value=t.puff_count;
+  if(t.flavor)document.getElementById('skuFlavor').value=t.flavor;
+  let msg=`解析: 品牌=${esc(t.brand_name||'?')} 口数=${t.puff_count||'?'} 口味=${esc(t.flavor||'?')}`;
+  if(j.candidates.length)msg+=` · 已有同类SKU: ${j.candidates.map(c=>esc(c.sku_code)).join(', ')}`;
+  document.getElementById('suggestBox').innerHTML=msg;
+}
+async function saveSku(){
+  const id=document.getElementById('skuId').value;
+  const body={sku_code:document.getElementById('skuCode').value.trim(),name:document.getElementById('skuName').value.trim(),
+    brand_id:document.getElementById('skuBrand').value||null,series_id:document.getElementById('skuSeries').value||null,
+    puff_count:document.getElementById('skuPuff').value||null,flavor:document.getElementById('skuFlavor').value.trim(),
+    barcode:document.getElementById('skuBarcode').value.trim(),unit:document.getElementById('skuUnit').value.trim(),
+    shelf_life_days:document.getElementById('skuShelf').value||null,notes:document.getElementById('skuNotes').value.trim(),
+    is_active:document.getElementById('skuActive').value==='1'};
+  const r=await fetch(id?`/api/inv/skus/${id}`:'/api/inv/skus',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();if(!r.ok){alert(j.error||'保存失败');return;}
+  bootstrap.Modal.getInstance('#skuModal').hide();loadSkus();
+}
+async function delSku(id,code){if(!confirm(`删除 SKU「${code}」?有引用时改为停用。`))return;
+  const r=await fetch(`/api/inv/skus/${id}`,{method:'DELETE'});const j=await r.json();
+  if(!r.ok){alert(j.error||'删除失败');return;}if(j.mode==='soft')alert('该 SKU 有引用,已改为停用。');loadSkus();}
+
+// ---- 站点映射 ----
+async function loadMaps(){
+  const site=document.getElementById('mapSiteFilter').value;
+  const r=await fetch('/api/inv/sku-maps'+(site?('?site_id='+site):''));const rows=await r.json();
+  const tb=document.getElementById('mapTbody');
+  if(!rows.length){tb.innerHTML='<tr><td colspan="8" class="text-center text-white-50 py-4">暂无映射</td></tr>';return;}
+  tb.innerHTML=rows.map(m=>`<tr class="${m.is_active?'':'opacity-50'}">
+    <td class="small">${esc(m.site_url)}</td><td>${m.wc_product_id||''}</td><td>${m.wc_variation_id||0}</td>
+    <td>${esc(m.wc_sku||'')}</td><td><code class="text-info">${esc(m.sku_code)}</code> ${esc(m.sku_name)}</td>
+    <td>${m.qty_per_item}</td><td>${m.is_active?'<span class="text-success">启用</span>':'<span class="text-danger">停用</span>'}</td>
+    ${CAN_MANAGE?`<td class="text-end"><button class="btn btn-sm btn-outline-danger" onclick='delMap(${m.id})'><i class="bi bi-trash"></i></button></td>`:''}
+  </tr>`).join('');
+}
+function openMapModal(prefill){document.getElementById('mapModalTitle').textContent='新建映射';
+  ['mapId','mapPid','mapWcSku','mapRawName','mapSkuId','mapSkuSearch'].forEach(i=>document.getElementById(i).value='');
+  document.getElementById('mapVid').value='0';document.getElementById('mapQty').value='1';
+  document.getElementById('mapSite').value='';document.getElementById('mapSkuChosen').textContent='未选';
+  document.getElementById('mapSkuResults').innerHTML='';
+  if(prefill){document.getElementById('mapSite').value=prefill.site_id||'';document.getElementById('mapPid').value=prefill.wc_product_id||'';
+    document.getElementById('mapWcSku').value=prefill.wc_sku||'';document.getElementById('mapRawName').value=prefill.name||'';}
+  new bootstrap.Modal('#mapModal').show();}
+let mapSkuTimer;
+async function searchMapSku(){clearTimeout(mapSkuTimer);mapSkuTimer=setTimeout(async()=>{
+  const q=document.getElementById('mapSkuSearch').value.trim();if(!q){document.getElementById('mapSkuResults').innerHTML='';return;}
+  const r=await fetch('/api/inv/skus?active=1&q='+encodeURIComponent(q));const rows=await r.json();
+  document.getElementById('mapSkuResults').innerHTML=rows.slice(0,15).map(s=>
+    `<button type="button" class="list-group-item list-group-item-action bg-dark text-white border-secondary" onclick='pickMapSku(${s.id},${JSON.stringify(s.sku_code)})'>
+      <code class="text-info">${esc(s.sku_code)}</code> ${esc(s.name)}</button>`).join('');
+},250);}
+function pickMapSku(id,code){document.getElementById('mapSkuId').value=id;document.getElementById('mapSkuChosen').textContent=code;document.getElementById('mapSkuResults').innerHTML='';}
+async function saveMap(){
+  const body={site_id:document.getElementById('mapSite').value,sku_id:document.getElementById('mapSkuId').value,
+    wc_product_id:document.getElementById('mapPid').value||null,wc_variation_id:document.getElementById('mapVid').value||0,
+    wc_sku:document.getElementById('mapWcSku').value.trim(),qty_per_item:document.getElementById('mapQty').value||1,
+    raw_name:document.getElementById('mapRawName').value.trim()};
+  if(!body.sku_id){alert('请选择目标 SKU');return;}
+  const r=await fetch('/api/inv/sku-maps',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();if(!r.ok){alert(j.error||'保存失败');return;}
+  bootstrap.Modal.getInstance('#mapModal').hide();loadMaps();
+}
+async function delMap(id){if(!confirm('删除该映射?'))return;await fetch(`/api/inv/sku-maps/${id}`,{method:'DELETE'});loadMaps();}
+
+// ---- 未映射发现 ----
+async function scanUnmapped(){
+  const site=document.getElementById('unmapSite').value;const limit=document.getElementById('unmapLimit').value||800;
+  document.getElementById('unmapStat').textContent='扫描中...';
+  const r=await fetch(`/api/inv/unmapped-products?limit=${limit}`+(site?('&site_id='+site):''));const j=await r.json();
+  document.getElementById('unmapStat').textContent=`扫描 ${j.scanned_orders} 单 · 未映射 ${j.unmapped_count} 种`;
+  const tb=document.getElementById('unmapTbody');
+  if(!j.items.length){tb.innerHTML='<tr><td colspan="7" class="text-center text-white-50 py-4">全部已可解析 🎉</td></tr>';return;}
+  tb.innerHTML=j.items.map(x=>`<tr><td class="small">${esc(x.source)}</td><td>${esc(x.name)}</td><td>${x.wc_product_id||''}</td>
+    <td>${esc(x.wc_sku||'')}</td><td>${x.count}</td><td>${x.qty}</td>
+    ${CAN_MANAGE?`<td class="text-end"><button class="btn btn-sm btn-outline-primary" onclick='openMapModal(${JSON.stringify(x)})'>建映射</button></td>`:''}
+  </tr>`).join('');
+}
+
+// ---- 订单解析 ----
+async function resolveOrder(){
+  const oid=document.getElementById('resolveOid').value.trim();if(!oid)return;
+  const r=await fetch('/api/inv/resolve-order/'+encodeURIComponent(oid));const j=await r.json();
+  if(!r.ok){document.getElementById('resolveStat').textContent=j.error||'失败';document.getElementById('resolveTbody').innerHTML='';return;}
+  document.getElementById('resolveStat').textContent=`命中 ${j.matched} / 未映射 ${j.unmatched} · ${j.all_matched?'整单可解析':'存在未映射'}`;
+  const tb=document.getElementById('resolveTbody');
+  tb.innerHTML=j.lines.map(l=>`<tr class="${l.sku_id?'':'table-warning text-dark'}">
+    <td>${esc(l.name)}</td><td>${l.qty}</td><td>${l.sku_code?('<code>'+esc(l.sku_code)+'</code>'):'<span class="text-danger">未映射</span>'}</td>
+    <td>${l.qty_per_item}</td><td>${l.sku_qty}</td><td>${VIA[l.match_via]||l.match_via}</td></tr>`).join('');
+}
+
+loadSkus();loadMaps();
+</script>
+{% endblock %}

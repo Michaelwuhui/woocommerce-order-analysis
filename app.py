@@ -22041,6 +22041,8 @@ def set_order_warehouse(order_id):
 try:
     from inv_warehouses import inv_wh_bp
     app.register_blueprint(inv_wh_bp)
+    from inv_skus import inv_sku_bp
+    app.register_blueprint(inv_sku_bp)
 except Exception as _e:
     import logging as _logging
     _logging.getLogger(__name__).warning('库存模块未加载: %s', _e)
@@ -22060,10 +22062,11 @@ def inject_inventory_perms():
                         and current_user.is_admin()))
         return {
             'inv_can_view': bool(is_admin or can_view_inventory() or can_manage_inventory()),
+            'can_manage_inv': bool(is_admin or can_manage_inventory()),
             'is_inv_admin': bool(is_admin),
         }
     except Exception:
-        return {'inv_can_view': False, 'is_inv_admin': False}
+        return {'inv_can_view': False, 'can_manage_inv': False, 'is_inv_admin': False}
 
 
 if __name__ == '__main__':
