@@ -1,0 +1,256 @@
+{% extends "base.html" %}
+{% block title %}库存台账 - 苍赋管理系统{% endblock %}
+{% block content %}
+<div class="container-fluid py-4">
+  <h5 class="text-light mb-3"><i class="bi bi-clipboard-data me-2"></i>库存台账与出入库
+    <span class="text-white-50 small ms-2">现存/预留/可用 · 采购入库 · 流水审计</span></h5>
+
+  <ul class="nav nav-tabs mb-3" role="tablist">
+    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tabStock" onclick="loadStock()">库存台账</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabMov" onclick="loadMovements()">出入库流水</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabPo" onclick="loadPos()">采购单</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabSup" onclick="loadSuppliers()">供应商</button></li>
+  </ul>
+
+  <div class="tab-content">
+    <!-- 库存台账 -->
+    <div class="tab-pane fade show active" id="tabStock">
+      <div class="d-flex gap-2 mb-2">
+        <select id="stockWh" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:220px" onchange="loadStock()">
+          <option value="">全部仓库</option>{% for w in warehouses %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}
+        </select>
+        <input id="stockQ" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:240px" placeholder="搜索 SKU" oninput="loadStock()">
+        <div class="form-check form-switch align-self-center ms-2"><input class="form-check-input" type="checkbox" id="stockNonzero" checked onchange="loadStock()"><label class="form-check-label text-white-50 small" for="stockNonzero">仅非零</label></div>
+        {% if can_manage_inv %}<button class="btn btn-sm btn-outline-warning ms-auto" onclick="openAdjustModal()"><i class="bi bi-sliders"></i> 手工调整</button>{% endif %}
+      </div>
+      <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead><tr class="text-white-50 small"><th>仓库</th><th>SKU</th><th>名称</th><th class="text-end">现存</th><th class="text-end">预留</th><th class="text-end">可用</th><th>更新时间</th></tr></thead>
+          <tbody id="stockTbody"><tr><td colspan="7" class="text-center text-white-50 py-4">加载中...</td></tr></tbody>
+        </table></div></div></div>
+    </div>
+
+    <!-- 流水 -->
+    <div class="tab-pane fade" id="tabMov">
+      <div class="d-flex gap-2 mb-2 flex-wrap">
+        <select id="movWh" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:200px" onchange="loadMovements()">
+          <option value="">全部仓库</option>{% for w in warehouses %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select>
+        <select id="movType" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:160px" onchange="loadMovements()">
+          <option value="">全部类型</option><option value="purchase_in">采购入库</option><option value="sale_out">销售出库</option>
+          <option value="adjust">手工调整</option><option value="reserve">预留</option><option value="release">释放预留</option>
+          <option value="return_in">退货入库</option><option value="transfer_in">调拨入</option><option value="transfer_out">调拨出</option></select>
+        <input id="movFrom" type="date" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:150px" onchange="loadMovements()">
+        <input id="movTo" type="date" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:150px" onchange="loadMovements()">
+      </div>
+      <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead><tr class="text-white-50 small"><th>时间</th><th>仓库</th><th>SKU</th><th>类型</th><th class="text-end">现存Δ</th><th class="text-end">前→后</th><th class="text-end">预留Δ</th><th>关联</th><th>操作人</th><th>备注</th></tr></thead>
+          <tbody id="movTbody"><tr><td colspan="10" class="text-center text-white-50 py-4">加载中...</td></tr></tbody>
+        </table></div></div></div>
+    </div>
+
+    <!-- 采购单 -->
+    <div class="tab-pane fade" id="tabPo">
+      <div class="d-flex gap-2 mb-2">
+        <select id="poStatus" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:160px" onchange="loadPos()">
+          <option value="">全部状态</option><option value="draft">草稿</option><option value="received">已收货</option><option value="cancelled">已取消</option></select>
+        {% if can_manage_inv %}<button class="btn btn-sm btn-primary ms-auto" onclick="openPoModal()"><i class="bi bi-plus-lg"></i> 新建采购单</button>{% endif %}
+      </div>
+      <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead><tr class="text-white-50 small"><th>单号</th><th>仓库</th><th>供应商</th><th>明细</th><th class="text-end">总数量</th><th class="text-end">金额</th><th>状态</th><th>下单日</th>{% if can_manage_inv %}<th class="text-end">操作</th>{% endif %}</tr></thead>
+          <tbody id="poTbody"><tr><td colspan="9" class="text-center text-white-50 py-4">加载中...</td></tr></tbody>
+        </table></div></div></div>
+    </div>
+
+    <!-- 供应商 -->
+    <div class="tab-pane fade" id="tabSup">
+      <div class="d-flex gap-2 mb-2">{% if can_manage_inv %}<button class="btn btn-sm btn-primary ms-auto" onclick="openSupModal()"><i class="bi bi-plus-lg"></i> 新建供应商</button>{% endif %}</div>
+      <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead><tr class="text-white-50 small"><th>名称</th><th>联系人</th><th>电话</th><th>币种</th><th>状态</th>{% if can_manage_inv %}<th class="text-end">操作</th>{% endif %}</tr></thead>
+          <tbody id="supTbody"><tr><td colspan="6" class="text-center text-white-50 py-4">加载中...</td></tr></tbody>
+        </table></div></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- 手工调整 Modal -->
+<div class="modal fade" id="adjustModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content bg-dark border border-secondary border-opacity-25">
+  <div class="modal-header border-bottom border-secondary border-opacity-25"><h5 class="modal-title text-white">手工库存调整</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+  <div class="modal-body"><div class="row g-2">
+    <div class="col-md-6"><label class="form-label text-white-50 small">仓库 *</label><select id="adjWh" class="form-select form-select-sm bg-dark text-white border-secondary"><option value="">选择</option>{% for w in warehouses %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select></div>
+    <div class="col-md-6"><label class="form-label text-white-50 small">SKU *</label>
+      <input id="adjSkuSearch" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="搜索 SKU" oninput="searchAdjSku()">
+      <input type="hidden" id="adjSkuId"><div id="adjSkuChosen" class="small text-info mt-1">未选</div>
+      <div id="adjSkuResults" class="list-group mt-1" style="max-height:140px;overflow:auto"></div></div>
+    <div class="col-md-6"><label class="form-label text-white-50 small">调整量(盘盈+ / 盘亏−) *</label><input id="adjDelta" type="number" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+    <div class="col-12"><label class="form-label text-white-50 small">原因 *</label><input id="adjReason" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="如 盘点差异 / 报损"></div>
+  </div></div>
+  <div class="modal-footer border-top border-secondary border-opacity-25"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-warning" onclick="saveAdjust()">提交调整</button></div>
+</div></div></div>
+
+<!-- 采购单 Modal -->
+<div class="modal fade" id="poModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content bg-dark border border-secondary border-opacity-25">
+  <div class="modal-header border-bottom border-secondary border-opacity-25"><h5 class="modal-title text-white">新建采购单</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+  <div class="modal-body">
+    <div class="row g-2 mb-3">
+      <div class="col-md-4"><label class="form-label text-white-50 small">入库仓库 *</label><select id="poWh" class="form-select form-select-sm bg-dark text-white border-secondary"><option value="">选择</option>{% for w in warehouses %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select></div>
+      <div class="col-md-4"><label class="form-label text-white-50 small">供应商</label><select id="poSup" class="form-select form-select-sm bg-dark text-white border-secondary"><option value="">(无)</option></select></div>
+      <div class="col-md-2"><label class="form-label text-white-50 small">币种</label><input id="poCur" value="CNY" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+      <div class="col-md-2"><label class="form-label text-white-50 small">下单日</label><input id="poDate" type="date" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+    </div>
+    <div class="d-flex justify-content-between align-items-center mb-2"><span class="text-white-50 small">采购明细</span>
+      <button class="btn btn-sm btn-outline-light" onclick="addPoRow()"><i class="bi bi-plus"></i> 加行</button></div>
+    <div class="table-responsive"><table class="table table-dark table-sm align-middle"><thead><tr class="text-white-50 small">
+      <th style="width:34%">SKU *</th><th>数量 *</th><th>单价</th><th>批次号</th><th>到期日</th><th></th></tr></thead>
+      <tbody id="poItemsBody"></tbody></table></div>
+    <input id="poNote" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="备注">
+  </div>
+  <div class="modal-footer border-top border-secondary border-opacity-25"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" onclick="savePo()">保存采购单(草稿)</button></div>
+</div></div></div>
+
+<!-- 供应商 Modal -->
+<div class="modal fade" id="supModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content bg-dark border border-secondary border-opacity-25">
+  <div class="modal-header border-bottom border-secondary border-opacity-25"><h5 class="modal-title text-white"><span id="supModalTitle">新建供应商</span></h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+  <div class="modal-body"><input type="hidden" id="supId"><div class="row g-2">
+    <div class="col-md-8"><label class="form-label text-white-50 small">名称 *</label><input id="supName" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+    <div class="col-md-4"><label class="form-label text-white-50 small">币种</label><input id="supCur" value="CNY" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+    <div class="col-md-6"><label class="form-label text-white-50 small">联系人</label><input id="supContact" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+    <div class="col-md-6"><label class="form-label text-white-50 small">电话</label><input id="supPhone" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+    <div class="col-12"><label class="form-label text-white-50 small">备注</label><input id="supNotes" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+  </div></div>
+  <div class="modal-footer border-top border-secondary border-opacity-25"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" onclick="saveSup()">保存</button></div>
+</div></div></div>
+
+<script>
+const CAN_MANAGE = {{ 'true' if can_manage_inv else 'false' }};
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const TYPE_CN={purchase_in:'采购入库',sale_out:'销售出库',adjust:'手工调整',reserve:'预留',release:'释放预留',return_in:'退货入库',transfer_in:'调拨入',transfer_out:'调拨出',init:'期初'};
+const qs=id=>document.getElementById(id);
+
+// ---- 台账 ----
+async function loadStock(){
+  const p=new URLSearchParams();const wh=qs('stockWh').value;const q=qs('stockQ').value.trim();
+  if(wh)p.set('warehouse_id',wh);if(q)p.set('q',q);if(qs('stockNonzero').checked)p.set('nonzero','1');
+  const rows=await (await fetch('/api/inv/stock?'+p)).json();
+  qs('stockTbody').innerHTML = rows.length? rows.map(s=>`<tr>
+    <td>${esc(s.warehouse_name)}</td><td><code class="text-info">${esc(s.sku_code)}</code></td><td>${esc(s.sku_name)}</td>
+    <td class="text-end">${s.on_hand}</td><td class="text-end text-warning">${s.reserved}</td>
+    <td class="text-end fw-bold ${s.available>0?'text-success':'text-danger'}">${s.available}</td>
+    <td class="small text-white-50">${esc(s.updated_at||'')}</td></tr>`).join('')
+    : '<tr><td colspan="7" class="text-center text-white-50 py-4">暂无库存</td></tr>';
+}
+// ---- 流水 ----
+async function loadMovements(){
+  const p=new URLSearchParams();
+  if(qs('movWh').value)p.set('warehouse_id',qs('movWh').value);
+  if(qs('movType').value)p.set('type',qs('movType').value);
+  if(qs('movFrom').value)p.set('date_from',qs('movFrom').value);
+  if(qs('movTo').value)p.set('date_to',qs('movTo').value);
+  const rows=await (await fetch('/api/inv/movements?'+p)).json();
+  qs('movTbody').innerHTML = rows.length? rows.map(m=>`<tr>
+    <td class="small">${esc(m.ts)}</td><td>${esc(m.warehouse_name||'')}</td><td><code class="text-info">${esc(m.sku_code||'')}</code></td>
+    <td>${TYPE_CN[m.movement_type]||m.movement_type}</td>
+    <td class="text-end ${m.qty_delta>0?'text-success':(m.qty_delta<0?'text-danger':'')}">${m.qty_delta>0?'+':''}${m.qty_delta}</td>
+    <td class="text-end small text-white-50">${m.qty_before}→${m.qty_after}</td>
+    <td class="text-end">${m.reserved_delta?((m.reserved_delta>0?'+':'')+m.reserved_delta):''}</td>
+    <td class="small">${esc((m.ref_type||'')+(m.ref_id?(' #'+m.ref_id):''))}</td>
+    <td class="small">${esc(m.operator_name||'')}</td><td class="small text-white-50">${esc(m.note||'')}</td></tr>`).join('')
+    : '<tr><td colspan="10" class="text-center text-white-50 py-4">暂无流水</td></tr>';
+}
+// ---- 采购单 ----
+async function loadPos(){
+  const st=qs('poStatus').value;
+  const rows=await (await fetch('/api/inv/purchase-orders'+(st?('?status='+st):''))).json();
+  const ST={draft:'<span class="badge bg-secondary">草稿</span>',received:'<span class="badge bg-success">已收货</span>',cancelled:'<span class="badge bg-danger">已取消</span>'};
+  qs('poTbody').innerHTML = rows.length? rows.map(p=>`<tr>
+    <td><code>${esc(p.po_no)}</code></td><td>${esc(p.warehouse_name||'')}</td><td>${esc(p.supplier_name||'')}</td>
+    <td>${p.item_count}</td><td class="text-end">${p.total_qty}</td><td class="text-end">${(p.total_amount||0).toFixed(2)} ${esc(p.currency)}</td>
+    <td>${ST[p.status]||p.status}</td><td class="small">${esc(p.order_date||'')}</td>
+    ${CAN_MANAGE?`<td class="text-end">
+      ${p.status==='draft'?`<button class="btn btn-sm btn-success me-1" onclick="receivePo(${p.id},'${esc(p.po_no)}')"><i class="bi bi-box-arrow-in-down"></i> 收货</button>
+        <button class="btn btn-sm btn-outline-danger" onclick="cancelPo(${p.id})"><i class="bi bi-x"></i></button>`:''}
+    </td>`:''}</tr>`).join('')
+    : '<tr><td colspan="9" class="text-center text-white-50 py-4">暂无采购单</td></tr>';
+}
+async function receivePo(id,no){if(!confirm(`确认对 ${no} 收货入库?将生成批次并增加库存,不可撤销。`))return;
+  const r=await fetch(`/api/inv/purchase-orders/${id}/receive`,{method:'POST'});const j=await r.json();
+  if(!r.ok){alert(j.error||'收货失败');return;}alert('收货成功,已入库 '+j.received.length+' 个 SKU 批次。');loadPos();loadStock();}
+async function cancelPo(id){if(!confirm('取消该采购单?'))return;
+  const r=await fetch(`/api/inv/purchase-orders/${id}/cancel`,{method:'POST'});const j=await r.json();if(!r.ok){alert(j.error||'失败');return;}loadPos();}
+
+let poRowSeq=0;
+function addPoRow(prefill){poRowSeq++;const id=poRowSeq;
+  const tr=document.createElement('tr');tr.id='poRow'+id;
+  tr.innerHTML=`<td><input class="form-control form-control-sm bg-dark text-white border-secondary poSkuSearch" placeholder="搜SKU" oninput="searchPoSku(${id})"><input type="hidden" class="poSkuId"><div class="small text-info poSkuChosen"></div><div class="list-group poSkuResults" style="max-height:120px;overflow:auto;position:absolute;z-index:10;"></div></td>
+    <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary poQty" style="width:70px"></td>
+    <td><input type="number" step="0.01" class="form-control form-control-sm bg-dark text-white border-secondary poCost" style="width:80px"></td>
+    <td><input class="form-control form-control-sm bg-dark text-white border-secondary poBatch" style="width:90px"></td>
+    <td><input type="date" class="form-control form-control-sm bg-dark text-white border-secondary poExp" style="width:140px"></td>
+    <td><button class="btn btn-sm btn-outline-danger" onclick="this.closest('tr').remove()"><i class="bi bi-x"></i></button></td>`;
+  qs('poItemsBody').appendChild(tr);
+}
+let poSkuTimer;
+async function searchPoSku(rowId){clearTimeout(poSkuTimer);poSkuTimer=setTimeout(async()=>{
+  const tr=qs('poRow'+rowId);const q=tr.querySelector('.poSkuSearch').value.trim();const box=tr.querySelector('.poSkuResults');
+  if(!q){box.innerHTML='';return;}
+  const rows=await (await fetch('/api/inv/skus?active=1&q='+encodeURIComponent(q))).json();
+  box.innerHTML=rows.slice(0,10).map(s=>`<button type="button" class="list-group-item list-group-item-action bg-dark text-white border-secondary py-1" onclick='pickPoSku(${rowId},${s.id},${JSON.stringify(s.sku_code)})'><code class="text-info">${esc(s.sku_code)}</code> ${esc(s.name)}</button>`).join('');
+},250);}
+function pickPoSku(rowId,id,code){const tr=qs('poRow'+rowId);tr.querySelector('.poSkuId').value=id;tr.querySelector('.poSkuChosen').textContent=code;tr.querySelector('.poSkuResults').innerHTML='';tr.querySelector('.poSkuSearch').value=code;}
+function openPoModal(){qs('poWh').value='';qs('poCur').value='CNY';qs('poNote').value='';qs('poDate').value=new Date().toISOString().slice(0,10);
+  qs('poItemsBody').innerHTML='';addPoRow();
+  fetch('/api/inv/suppliers').then(r=>r.json()).then(rows=>{qs('poSup').innerHTML='<option value="">(无)</option>'+rows.filter(s=>s.is_active).map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join('');});
+  new bootstrap.Modal('#poModal').show();}
+async function savePo(){
+  const items=[];let bad=false;
+  qs('poItemsBody').querySelectorAll('tr').forEach(tr=>{
+    const sku=tr.querySelector('.poSkuId').value;const qty=tr.querySelector('.poQty').value;
+    if(!sku||!qty){return;}
+    items.push({sku_id:parseInt(sku),qty:parseInt(qty),unit_cost:parseFloat(tr.querySelector('.poCost').value||0),
+      batch_no:tr.querySelector('.poBatch').value.trim()||null,expiry_date:tr.querySelector('.poExp').value||null});
+  });
+  if(!qs('poWh').value){alert('请选择入库仓库');return;}
+  if(!items.length){alert('请至少填写一条有效明细(SKU+数量)');return;}
+  const body={warehouse_id:qs('poWh').value,supplier_id:qs('poSup').value||null,currency:qs('poCur').value.trim(),order_date:qs('poDate').value,note:qs('poNote').value.trim(),items};
+  const r=await fetch('/api/inv/purchase-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();if(!r.ok){alert(j.error||'保存失败');return;}
+  bootstrap.Modal.getInstance('#poModal').hide();loadPos();
+}
+// ---- 供应商 ----
+async function loadSuppliers(){
+  const rows=await (await fetch('/api/inv/suppliers')).json();window._sups=rows;
+  qs('supTbody').innerHTML = rows.length? rows.map(s=>`<tr class="${s.is_active?'':'opacity-50'}">
+    <td>${esc(s.name)}</td><td>${esc(s.contact||'')}</td><td>${esc(s.phone||'')}</td><td>${esc(s.currency)}</td>
+    <td>${s.is_active?'<span class="text-success">启用</span>':'<span class="text-danger">停用</span>'}</td>
+    ${CAN_MANAGE?`<td class="text-end"><button class="btn btn-sm btn-outline-light" onclick='editSup(${s.id})'><i class="bi bi-pencil"></i></button></td>`:''}</tr>`).join('')
+    : '<tr><td colspan="6" class="text-center text-white-50 py-4">暂无供应商</td></tr>';
+}
+function openSupModal(){qs('supModalTitle').textContent='新建供应商';['supId','supName','supContact','supPhone','supNotes'].forEach(i=>qs(i).value='');qs('supCur').value='CNY';new bootstrap.Modal('#supModal').show();}
+function editSup(id){const s=(window._sups||[]).find(x=>x.id===id);if(!s)return;qs('supModalTitle').textContent='编辑供应商';
+  qs('supId').value=s.id;qs('supName').value=s.name||'';qs('supContact').value=s.contact||'';qs('supPhone').value=s.phone||'';qs('supCur').value=s.currency||'CNY';qs('supNotes').value=s.notes||'';new bootstrap.Modal('#supModal').show();}
+async function saveSup(){const id=qs('supId').value;
+  const body={name:qs('supName').value.trim(),contact:qs('supContact').value.trim(),phone:qs('supPhone').value.trim(),currency:qs('supCur').value.trim(),notes:qs('supNotes').value.trim(),is_active:true};
+  if(!body.name){alert('名称必填');return;}
+  const r=await fetch(id?`/api/inv/suppliers/${id}`:'/api/inv/suppliers',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();if(!r.ok){alert(j.error||'失败');return;}bootstrap.Modal.getInstance('#supModal').hide();loadSuppliers();}
+// ---- 调整 ----
+let adjTimer;
+function openAdjustModal(){['adjWh','adjSkuSearch','adjSkuId','adjDelta','adjReason'].forEach(i=>qs(i).value='');qs('adjSkuChosen').textContent='未选';qs('adjSkuResults').innerHTML='';new bootstrap.Modal('#adjustModal').show();}
+async function searchAdjSku(){clearTimeout(adjTimer);adjTimer=setTimeout(async()=>{
+  const q=qs('adjSkuSearch').value.trim();if(!q){qs('adjSkuResults').innerHTML='';return;}
+  const rows=await (await fetch('/api/inv/skus?active=1&q='+encodeURIComponent(q))).json();
+  qs('adjSkuResults').innerHTML=rows.slice(0,12).map(s=>`<button type="button" class="list-group-item list-group-item-action bg-dark text-white border-secondary py-1" onclick='pickAdjSku(${s.id},${JSON.stringify(s.sku_code)})'><code class="text-info">${esc(s.sku_code)}</code> ${esc(s.name)}</button>`).join('');
+},250);}
+function pickAdjSku(id,code){qs('adjSkuId').value=id;qs('adjSkuChosen').textContent=code;qs('adjSkuResults').innerHTML='';}
+async function saveAdjust(){
+  const body={warehouse_id:qs('adjWh').value,sku_id:qs('adjSkuId').value,qty_delta:parseInt(qs('adjDelta').value),reason:qs('adjReason').value.trim()};
+  if(!body.warehouse_id||!body.sku_id){alert('请选择仓库与 SKU');return;}
+  const r=await fetch('/api/inv/adjust',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();if(!r.ok){alert(j.error||'调整失败');return;}
+  bootstrap.Modal.getInstance('#adjustModal').hide();loadStock();
+}
+loadStock();
+</script>
+{% endblock %}
