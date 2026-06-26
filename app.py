@@ -808,23 +808,116 @@ def get_user_allowed_sources(user_id, is_admin=False, is_viewer=False):
     """
     if is_admin or is_viewer:
         return None  # No restrictions for admin or viewer
-    
+    return _resolve_user_sites(user_id)
+
+
+def _resolve_user_sites(user_id):
+    """Site URLs a user is scoped to, resolved live from the 3 permission tables
+    (country grants ∪ explicit single-site grants − exclusions). Role-INDEPENDENT —
+    callers decide whether a role overrides it (view: admin/viewer see all; edit:
+    see get_user_editable_sources). New sites in a granted country auto-inherit."""
     conn = get_db_connection()
-    
-    # Get site_ids from user_site_permissions
-    perms = conn.execute('''
-        SELECT s.url FROM user_site_permissions p
-        JOIN sites s ON p.site_id = s.id
-        WHERE p.user_id = ?
-    ''', (user_id,)).fetchall()
-    
-    conn.close()
-    
-    if not perms:
-        # No permissions set - return empty list (no access)
-        return []
-    
-    return [p['url'] for p in perms]
+    try:
+        granted_countries = {r['country'] for r in conn.execute(
+            'SELECT country FROM user_country_permissions WHERE user_id = ?', (user_id,)).fetchall()}
+        excluded_ids = {r['site_id'] for r in conn.execute(
+            'SELECT site_id FROM user_site_exclusions WHERE user_id = ?', (user_id,)).fetchall()}
+        explicit_ids = {r['site_id'] for r in conn.execute(
+            'SELECT site_id FROM user_site_permissions WHERE user_id = ?', (user_id,)).fetchall()}
+        urls = []
+        for s in conn.execute('SELECT id, url, country FROM sites').fetchall():
+            if s['country'] in granted_countries:
+                if s['id'] not in excluded_ids:
+                    urls.append(s['url'])      # covered by country grant (future sites included)
+            elif s['id'] in explicit_ids:
+                urls.append(s['url'])          # explicitly granted single site
+        return urls
+    finally:
+        conn.close()
+
+
+def get_user_editable_sources(user):
+    """Source URLs a user may EDIT (mutate orders) for. None = unrestricted.
+      - super admin (username 'admin')            → None (edits everything)
+      - sites the user MANAGES (sites.manager == their name) are auto-granted —
+        being the 负责人 doubles as an edit grant, no per-site config needed
+      - plus any explicitly-granted / country-granted sites (3-table scope)
+      - admin with NO scope at all (manages nothing, no grants) → None (finance/
+        global admins keep full edit — chosen backward-compat rule)
+      - anyone else with no scope                  → empty set (cannot edit)"""
+    if getattr(user, 'username', None) == 'admin':
+        return None
+    sites = set(_resolve_user_sites(user.id))
+    # Auto-match: also editable for the sites this user is the 负责人 of. An explicit
+    # exclusion still wins (admin can carve a managed site back out if they must).
+    uname = (getattr(user, 'name', None) or '').strip()
+    if uname:
+        conn = get_db_connection()
+        try:
+            excluded = {r['site_id'] for r in conn.execute(
+                'SELECT site_id FROM user_site_exclusions WHERE user_id = ?', (user.id,)).fetchall()}
+            sites |= {r['url'] for r in conn.execute(
+                'SELECT id, url FROM sites WHERE manager = ?', (uname,)).fetchall()
+                if r['id'] not in excluded}
+        finally:
+            conn.close()
+    if not sites and user.is_admin():
+        return None
+    return sites
+
+
+def _site_edit_block(sources):
+    """Return a 403 JSON response if current_user may NOT edit EVERY url in `sources`,
+    else None. Call inside order-mutation endpoints once the order source(s) are known:
+        block = _site_edit_block([order['source']])
+        if block: return block
+    """
+    scope = get_user_editable_sources(current_user)
+    if scope is None:
+        return None
+    for src in sources:
+        if src not in scope:
+            return jsonify({'error': '无权编辑该站点的订单（只能操作已授权的站点）', 'site_forbidden': True}), 403
+    return None
+
+
+def _order_site_edit_block(order_id):
+    """403 response if current_user may not edit the given order's site, else None.
+    Self-contained (own connection). Returns None for a missing order so the endpoint
+    can still emit its own 404."""
+    scope = get_user_editable_sources(current_user)
+    if scope is None:
+        return None
+    conn = get_db_connection()
+    try:
+        row = conn.execute('SELECT source FROM orders WHERE id = ?', (order_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is not None and row['source'] not in scope:
+        return jsonify({'error': '无权编辑该站点的订单（只能操作已授权的站点）', 'site_forbidden': True}), 403
+    return None
+
+
+def order_site_editable(f):
+    """Decorator: after the role gate, block the request when current_user is not
+    allowed to edit the target order's SITE. Resolves order_id from the URL kwarg,
+    else from the JSON body's 'order_id'. Place it just above the view function
+    (below @editor_required / @shipper_required) so the role check runs first."""
+    from functools import wraps
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        oid = kwargs.get('order_id')
+        if oid is None:
+            try:
+                oid = (request.json or {}).get('order_id')
+            except Exception:
+                oid = None
+        if oid is not None:
+            blk = _order_site_edit_block(oid)
+            if blk:
+                return blk
+        return f(*args, **kwargs)
+    return wrapper
 
 
 def build_source_filter_clause(allowed_sources, table_alias=''):
@@ -1069,6 +1162,22 @@ def inject_blocklist_perm():
     except Exception:
         ok = False
     return {'can_manage_blocklist': ok}
+
+
+@app.context_processor
+def inject_editable_sources():
+    """Expose the current user's EDIT scope to every template so the UI can hide
+    order-edit buttons on sites the user can't edit. Emitted as JSON: `null` means
+    unrestricted (edit all); otherwise a list of editable source URLs. The backend
+    @order_site_editable guard is still the real enforcement — this is just UX."""
+    try:
+        if getattr(current_user, 'is_authenticated', False):
+            scope = get_user_editable_sources(current_user)
+        else:
+            scope = set()
+    except Exception:
+        scope = None  # fail open in the UI; backend still guards
+    return {'editable_sources_json': json.dumps(None if scope is None else sorted(scope))}
 
 
 def super_admin_required(f):
@@ -2156,7 +2265,9 @@ def orders():
         if isinstance(items, list):
             od['product_count'] = sum(i.get('quantity', 0) for i in items)
             od['products'] = [{
-                'name': i.get('name', ''),
+                # WooCommerce stores line-item names HTML-encoded (e.g. "&amp;");
+                # decode so Jinja's autoescape doesn't double-encode them.
+                'name': html.unescape(i.get('name', '') or ''),
                 'quantity': i.get('quantity', 0),
                 'total': float(i.get('total', 0))
             } for i in items]
@@ -5419,13 +5530,14 @@ def _success_status_cond(prefix=''):
 
 def _revenue_status_cond(prefix=''):
     """SQL boolean condition: true if order should count toward revenue.
-    Excludes: failed/cancelled/draft/trash/cheat, online-pending, bacs-on-hold,
+    Excludes: failed/cancelled/draft/trash/cheat, refunded (fully refunded —
+    money was returned, so no net revenue), online-pending, bacs-on-hold,
     on-hold orders from sites that don't treat on-hold as shipped (AU/AE),
     undelivered (package returned, no money collected), and 问题退货 (contents
     were wrong/missing/damaged, customer never paid or money was refunded)."""
     p = f'{prefix}.' if prefix else ''
     on_hold_clause = _on_hold_is_shipped_clause(prefix)
-    return f"""({p}status NOT IN ('failed','cancelled','checkout-draft','trash','cheat')
+    return f"""({p}status NOT IN ('failed','cancelled','checkout-draft','trash','cheat','refunded')
         AND NOT ({p}status = 'pending' AND COALESCE({p}payment_method,'cod') != 'cod')
         AND NOT ({p}status = 'on-hold' AND {p}payment_method = 'bacs')
         AND NOT ({p}status = 'on-hold' AND NOT {on_hold_clause})
@@ -5435,13 +5547,13 @@ def _revenue_status_cond(prefix=''):
 
 def _active_status_cond(prefix=''):
     """SQL boolean condition: like _revenue_status_cond but a narrower exclusion list
-    (only filters failed/cancelled, not draft/trash/cheat). Used in legacy trend / chart
-    queries where draft/trash never carried real data anyway. Kept distinct so behavior
-    matches the previous inline strings exactly — do NOT consolidate without checking
-    each callsite's data semantics."""
+    (only filters failed/cancelled/refunded, not draft/trash/cheat). Used in legacy
+    trend / chart queries where draft/trash never carried real data anyway. Kept
+    distinct so behavior matches the previous inline strings exactly — do NOT
+    consolidate without checking each callsite's data semantics."""
     p = f'{prefix}.' if prefix else ''
     on_hold_clause = _on_hold_is_shipped_clause(prefix)
-    return f"""({p}status NOT IN ('failed','cancelled')
+    return f"""({p}status NOT IN ('failed','cancelled','refunded')
         AND NOT ({p}status = 'pending' AND COALESCE({p}payment_method,'cod') != 'cod')
         AND NOT ({p}status = 'on-hold' AND {p}payment_method = 'bacs')
         AND NOT ({p}status = 'on-hold' AND NOT {on_hold_clause})
@@ -5734,6 +5846,28 @@ def init_users_table():
     ''')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS user_site_permissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            site_id INTEGER,
+            UNIQUE(user_id, site_id)
+        )
+    ''')
+    # Country-level grant: user can see ALL sites in this country, including any
+    # added later (auto-inherit). Resolved live against sites.country, so new
+    # sites need no per-user click. See get_user_allowed_sources.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS user_country_permissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            country TEXT,
+            UNIQUE(user_id, country)
+        )
+    ''')
+    # Exclusions carved out of a country grant — a site in a granted country the
+    # user should NOT see. (user_site_permissions stays the explicit GRANT list
+    # for sites in non-granted countries.)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS user_site_exclusions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             site_id INTEGER,
@@ -7756,6 +7890,158 @@ def _clone_variations(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
     return {'success': success, 'failed': failed, 'total_source': len(all_variations)}
 
 
+def _extract_source_image_urls(html, src_host):
+    """Find every image URL in `html` that is hosted on the source site.
+
+    WooCommerce only sideloads the gallery (`images` array) when creating a
+    product — it copies the description/short_description HTML verbatim, so any
+    <img> embedded in the copy keeps pointing at the source domain. This finds
+    those source-owned image URLs so the caller can re-host them.
+
+    Returns (ordered_keys, groups) where each key maps to
+      {'submit': <absolute https url to fetch>, 'tokens': {raw strings in html}}
+    Grouping by a scheme-stripped key means an image written as both
+    https://, http:// and //host/… forms is fetched once but every textual
+    variant gets rewritten. External (non-source) images are left untouched."""
+    import re
+    from urllib.parse import urlparse
+
+    if not html:
+        return [], {}
+
+    def _bare(host):
+        h = (host or '').lower().strip()
+        return h[4:] if h.startswith('www.') else h
+
+    src_bare = _bare(urlparse(src_host if '//' in src_host else '//' + src_host).netloc or src_host)
+    token_re = re.compile(
+        r"""(?:https?:)?//[^/"'\s)]+/[^"'\s)]+?\.(?:jpe?g|png|gif|webp|avif|svg|bmp)(?:\?[^"'\s)]*)?""",
+        re.IGNORECASE,
+    )
+
+    order, groups = [], {}
+    for tok in token_re.findall(html):
+        absu = ('https:' + tok) if tok.startswith('//') else tok
+        if _bare(urlparse(absu).netloc) != src_bare:
+            continue  # external image — not ours to re-host
+        key = re.sub(r'^https?:', '', absu)  # //host/path?query
+        if key not in groups:
+            groups[key] = {'submit': absu.replace('&amp;', '&'), 'tokens': set()}
+            order.append(key)
+        groups[key]['tokens'].add(tok)
+    return order, groups
+
+
+def _migrate_inline_images_after_clone(src, new_data, src_url, tgt_url,
+                                       tgt_ck, tgt_cs, new_id, warnings):
+    """Re-host description/short_description images that point at the source
+    site into the target's media library, then rewrite the product HTML.
+
+    WooCommerce never sideloads inline content images (only the `images`
+    gallery), and WC consumer keys can't authenticate WP's /wp/v2/media upload
+    endpoint — so we reuse WC's own sideloading: append the content images to
+    the product's `images` array (PUT #1) to make WC fetch them, read back the
+    new URLs, then PUT #2 to save the rewritten HTML and reset the gallery to
+    the original images only (so inline images don't pollute the gallery).
+
+    Best-effort: any failure leaves the product intact (description still
+    points at the source) and records a warning. Never raises."""
+    import re
+    import requests as req
+    from urllib.parse import urlparse
+
+    orig_desc = src.get('description', '') or ''
+    orig_short = src.get('short_description', '') or ''
+
+    order, groups = _extract_source_image_urls(
+        orig_desc + '\n' + orig_short, urlparse(src_url).netloc)
+    if not order:
+        return  # no inline source images — nothing to do
+
+    MAX_IMG = 100
+    truncated = len(order) > MAX_IMG
+    if truncated:
+        order = order[:MAX_IMG]
+
+    content_urls = [groups[k]['submit'] for k in order]
+
+    # Gallery created by the initial POST — keep these by id across both PUTs.
+    gallery_ids = [im.get('id') for im in (new_data.get('images') or []) if im.get('id')]
+    gcount = len(gallery_ids)
+    put_url = f'{tgt_url}/wp-json/wc/v3/products/{new_id}'
+
+    # PUT #1 — append content images so WC sideloads them into the media library.
+    put1_images = [{'id': gid} for gid in gallery_ids] + [{'src': u} for u in content_urls]
+    try:
+        resp = req.put(put_url, auth=(tgt_ck, tgt_cs), json={'images': put1_images},
+                       timeout=120, headers=_WC_HEADERS)
+    except Exception as e:
+        warnings.append(f'文案内图片迁移失败（描述仍指向源站）：{e}')
+        return
+    data1, err = _parse_wc_response(resp)
+    if err:
+        warnings.append(f'文案内图片迁移失败（描述仍指向源站）：{err}')
+        return
+
+    resp_imgs = data1.get('images') or []
+    new_for_content = resp_imgs[gcount:]
+
+    # Map each source URL -> new target URL. Index alignment is reliable (WC
+    # preserves submission order); fall back to filename matching if counts drift.
+    url_map = {}
+    if len(new_for_content) == len(content_urls):
+        for k, im in zip(order, new_for_content):
+            if im.get('src'):
+                url_map[k] = im['src']
+    else:
+        def _basekey(u):
+            name = urlparse(u).path.rsplit('/', 1)[-1]
+            name = re.sub(r'\.(?:jpe?g|png|gif|webp|avif|svg|bmp)$', '', name, flags=re.I)
+            return re.sub(r'-\d+x\d+$', '', name).lower()
+        new_by_base = {}
+        for im in resp_imgs:
+            if im.get('src'):
+                new_by_base.setdefault(_basekey(im['src']), im['src'])
+        for k in order:
+            ns = new_by_base.get(_basekey(groups[k]['submit']))
+            if ns:
+                url_map[k] = ns
+
+    if not url_map:
+        warnings.append('文案内图片迁移：未匹配到新图片地址，描述仍指向源站')
+        return
+
+    def _rewrite(html):
+        for k, ns in url_map.items():
+            for tok in groups[k]['tokens']:
+                html = html.replace(tok, ns)
+        return html
+
+    # PUT #2 — save rewritten HTML and restore the gallery to the original
+    # images only (drops the inline images from the gallery / featured image;
+    # they remain in the media library, referenced by the description).
+    put2 = {
+        'description': _rewrite(orig_desc),
+        'short_description': _rewrite(orig_short),
+        'images': [{'id': gid} for gid in gallery_ids],
+    }
+    try:
+        resp = req.put(put_url, auth=(tgt_ck, tgt_cs), json=put2,
+                       timeout=120, headers=_WC_HEADERS)
+    except Exception as e:
+        warnings.append(f'文案内图片已上传但描述回写失败：{e}')
+        return
+    _, err = _parse_wc_response(resp)
+    if err:
+        warnings.append(f'文案内图片已上传但描述回写失败：{err}')
+        return
+
+    msg = f'文案内图片迁移：{len(url_map)}/{len(order)} 张已重新托管到目标站'
+    if truncated:
+        msg += f'（图片超过 {MAX_IMG} 张，仅处理前 {MAX_IMG} 张）'
+    warnings.append(msg)
+
+
 def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
                        source_product_id, options):
     """Clone a single product. Returns dict with new_id + warnings, or error key."""
@@ -7884,6 +8170,16 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
             warnings.append(f'变体克隆：{len(var_results["success"])} 成功 / {len(var_results["failed"])} 失败')
         else:
             warnings.append(f'变体克隆：{len(var_results["success"])} 个成功')
+
+    # 5. Inline content images — WC sideloads only the gallery (`images`), not
+    #    images embedded in description/short_description HTML, so re-host those
+    #    too and rewrite the copy. Best-effort: never fails the clone.
+    if options.get('include_images'):
+        try:
+            _migrate_inline_images_after_clone(
+                src, new_data, src_url, tgt_url, tgt_ck, tgt_cs, new_id, warnings)
+        except Exception as e:
+            warnings.append(f'文案内图片迁移异常（描述仍指向源站）：{e}')
 
     return {
         'new_id': new_id,
@@ -10267,16 +10563,23 @@ def change_own_password():
 @login_required
 @user_manager_required
 def get_user_permissions(user_id):
-    """Get user's site permissions"""
+    """Get user's site permissions (site-level grants + country grants + exclusions)."""
     conn = get_db_connection()
-    permissions = conn.execute('''
-        SELECT site_id FROM user_site_permissions WHERE user_id = ?
-    ''', (user_id,)).fetchall()
-    sites = conn.execute('SELECT id, url FROM sites').fetchall()
+    explicit = [r['site_id'] for r in conn.execute(
+        'SELECT site_id FROM user_site_permissions WHERE user_id = ?', (user_id,)).fetchall()]
+    countries = [r['country'] for r in conn.execute(
+        'SELECT country FROM user_country_permissions WHERE user_id = ?', (user_id,)).fetchall()]
+    exclusions = [r['site_id'] for r in conn.execute(
+        'SELECT site_id FROM user_site_exclusions WHERE user_id = ?', (user_id,)).fetchall()]
+    sites = conn.execute('SELECT id, url, country, manager FROM sites ORDER BY country, url').fetchall()
+    urow = conn.execute('SELECT name FROM users WHERE id = ?', (user_id,)).fetchone()
     conn.close()
-    
+
     return jsonify({
-        'allowed_sites': [p['site_id'] for p in permissions],
+        'allowed_sites': explicit,          # explicitly-granted single sites (non-granted countries)
+        'granted_countries': countries,     # fully-granted countries (auto-inherit new sites)
+        'excluded_sites': exclusions,       # sites carved out of a country grant
+        'user_name': urow['name'] if urow else '',   # to flag sites this user MANAGES (auto-editable)
         'all_sites': [dict(s) for s in sites]
     })
 
@@ -10285,21 +10588,28 @@ def get_user_permissions(user_id):
 @login_required
 @user_manager_required
 def update_user_permissions(user_id):
-    """Update user's site permissions"""
+    """Update user's site permissions: explicit single-site grants, country grants
+    (auto-inherit future sites), and per-site exclusions carved out of a grant."""
     data = request.json
-    site_ids = data.get('site_ids', [])
-    
+    site_ids = data.get('site_ids', []) or []
+    country_grants = data.get('country_grants', []) or []
+    site_exclusions = data.get('site_exclusions', []) or []
+
     conn = get_db_connection()
-    # Clear existing permissions
-    conn.execute('DELETE FROM user_site_permissions WHERE user_id = ?', (user_id,))
-    
-    # Add new permissions
-    for site_id in site_ids:
-        conn.execute('INSERT INTO user_site_permissions (user_id, site_id) VALUES (?, ?)',
-                    (user_id, site_id))
-    
-    conn.commit()
-    conn.close()
+    try:
+        # Replace all three sets atomically
+        conn.execute('DELETE FROM user_site_permissions WHERE user_id = ?', (user_id,))
+        conn.execute('DELETE FROM user_country_permissions WHERE user_id = ?', (user_id,))
+        conn.execute('DELETE FROM user_site_exclusions WHERE user_id = ?', (user_id,))
+        for sid in site_ids:
+            conn.execute('INSERT OR IGNORE INTO user_site_permissions (user_id, site_id) VALUES (?, ?)', (user_id, sid))
+        for c in country_grants:
+            conn.execute('INSERT OR IGNORE INTO user_country_permissions (user_id, country) VALUES (?, ?)', (user_id, c))
+        for sid in site_exclusions:
+            conn.execute('INSERT OR IGNORE INTO user_site_exclusions (user_id, site_id) VALUES (?, ?)', (user_id, sid))
+        conn.commit()
+    finally:
+        conn.close()
 
     return jsonify({'success': True})
 
@@ -10699,8 +11009,13 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
             or (status == 'on-hold' and pm_method == 'bacs')
             or (status == 'on-hold' and (o['source'] or '') not in on_hold_shipped_sources)
         )
+        # 'refunded' = fully refunded order: money was returned, so it produced
+        # no net revenue and must NOT count toward net sales (kept in sync with
+        # _revenue_status_cond). Mostly AU today; will grow once online card
+        # payments (with refunds) roll out site-wide. Like draft/trash/cheat it
+        # then lands in no status bucket — intentional, not part of net.
         is_success = (
-            status not in ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat')
+            status not in ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat', 'refunded')
             and not is_pending_unsuccessful
             and not is_undel
         )
@@ -10788,10 +11103,18 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
                 raw_name, url, brands_cache, product_mappings_cache
             )
 
-            # Lookup cost effective on this order's date
+            # Lookup cost effective on this order's date. Try the order's own
+            # warehouse first, THEN fall back to the order's country default
+            # warehouse(s). The fallback makes costing robust to orders carrying a
+            # wrong/cross-country warehouse_id (e.g. a PL order mis-tagged to the
+            # AU 仓库): without it the lookup misses the cost that IS configured
+            # for the order's country, wrongly flagging the line as 未匹配 — and
+            # disagreeing with the 未匹配明细 drill-down (api_recon_unmapped_products),
+            # which already falls back to the country default warehouses.
             cost_entry = None
             if b_id:
-                effective_wh_ids = [order_wh_id] if order_wh_id else country_default_wh_ids.get(order_country, [])
+                country_wh = country_default_wh_ids.get(order_country, [])
+                effective_wh_ids = ([order_wh_id] if order_wh_id else []) + [w for w in country_wh if w != order_wh_id]
                 for ewh in effective_wh_ids:
                     cost_entry = _cost_at_date(cost_idx, b_id, s_id, p_cnt, flav, ewh, order_date)
                     if cost_entry:
@@ -10949,8 +11272,11 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
         'total_shipping_pln': round(total_shipping, 2),
         'shipping_loss': round(total_shipping_loss, 2),
         'total_net_pln': round(total_net, 2),
-        # Cost (two ways)
-        'cost_amount_pln': round(total_net * cost_ratio, 2),         # ratio-based (current contract logic)
+        # Cost (two ways). Contract-basis cost coverage is computed on the
+        # SUCCESSFUL net (净销售 + 未送达损失) — a shipping loss never shrinks the
+        # partner's product-cost coverage; the loss is instead borne 50/50 by the
+        # two profit parties below (kept in sync with _compute_statement_split).
+        'cost_amount_pln': round((total_net + total_shipping_loss) * cost_ratio, 2),
         'actual_cost_pln': round(total_actual_cost, 2),              # real product_costs lookup (incl. 50% fallback)
         'cost_mapped_pln': total_cost_mapped,                        # portion from real product_costs
         'cost_estimated_pln': total_cost_estimated,                  # portion from 50% fallback
@@ -10960,9 +11286,10 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
         # Actual margin (key new field — for 实际毛利 / 实际毛利率 cards)
         'actual_margin_pln': round(actual_margin, 2),
         'actual_margin_pct': actual_margin_pct,
-        # Profit breakdown
-        'partner_profit_pln': round(total_net * pp_ratio, 2),
-        'our_receivable_pln': round(total_net * op_ratio, 2),
+        # Profit breakdown (contract basis): split the successful net by the
+        # ratios, then each profit party bears half the undelivered loss.
+        'partner_profit_pln': round((total_net + total_shipping_loss) * pp_ratio - total_shipping_loss / 2, 2),
+        'our_receivable_pln': round((total_net + total_shipping_loss) * op_ratio - total_shipping_loss / 2, 2),
         # Ratios echoed for UI
         'cost_ratio': cost_ratio,
         'partner_profit_ratio': pp_ratio,
@@ -12255,9 +12582,12 @@ def api_recon_dashboard_monthly_trend():
                 'shipping': round(ship, 2),
                 'shipping_loss': round(loss, 2),
                 'net': round(net, 2),
-                'contract_cost': round(net * cr, 2),
+                # Contract basis: cost coverage on successful net (net+loss), our
+                # receivable also bears half the undelivered loss (kept in sync
+                # with _compute_statement_split / _calc_partner_recon_detail).
+                'contract_cost': round((net + loss) * cr, 2),
                 'actual_cost': round(actual_cost, 2),
-                'our_receivable': round(net * opr, 2),
+                'our_receivable': round((net + loss) * opr - loss / 2, 2),
                 'received': round(rcpt_map.get(ym, 0), 2),
                 'undelivered_rate': round(undel_rate, 2),
                 'failed_rate': round(failed_rate, 2),
@@ -12439,20 +12769,32 @@ def api_recon_dashboard_comparison():
     })
 
 
-def _compute_statement_split(net, actual_cost, cost_ratio, pp_ratio, op_ratio, mode='contract'):
+def _compute_statement_split(net, actual_cost, cost_ratio, pp_ratio, op_ratio, mode='contract', shipping_loss=0):
     """Return (cost_amount, partner_profit, our_receivable) for a statement.
 
-    'contract' (约定毛利): split net sales by the fixed contract ratios —
-        cost = 净销售 × cost_ratio, partner = 净销售 × pp_ratio, ours = 净销售 × op_ratio.
+    The undelivered shipping loss (未送达运费损失) is a SHARED cost borne 50/50 by
+    the partner and us in BOTH modes — it is never a product cost, so it never
+    shrinks the partner's cost coverage.
+
+    'contract' (约定毛利): split the successful net (净销售 + 未送达损失 = 总销售 −
+        运费成本) by the fixed ratios, then charge each side half the loss:
+          cost    = 成功净额 × cost_ratio
+          partner = 成功净额 × pp_ratio − 未送达损失 ÷ 2
+          ours    = 成功净额 × op_ratio − 未送达损失 ÷ 2
+        With no undelivered loss this reduces to the plain 净销售 × ratio split.
     'actual' (实际毛利): the partner first recovers their real product cost, then
         the remaining margin (净销售 − 实际成本) is split between partner and us in
-        proportion to (pp_ratio : op_ratio). Mirrors the 'actual' formula shown in
-        the 概览/计算公式 preview, and reduces to the contract result when the real
-        cost happens to equal 净销售 × cost_ratio. Falls back to 50/50 when pp+op == 0.
+        proportion to (pp_ratio : op_ratio). The loss already sits inside 净销售,
+        so it is split pp:op (= 50/50 when pp==op) automatically — no separate
+        handling needed. Falls back to 50/50 when pp+op == 0.
+
+    cost + partner + ours always reconciles to `net` (the money actually
+    distributed) when the ratios sum to 1.
 
     None ratios mean "unset" → contract defaults (0.5 / 0.25 / 0.25); a real 0 is kept.
     """
     net = net or 0
+    loss = shipping_loss or 0
     cr = 0.5 if cost_ratio is None else float(cost_ratio)
     pp = 0.25 if pp_ratio is None else float(pp_ratio)
     op = 0.25 if op_ratio is None else float(op_ratio)
@@ -12462,7 +12804,11 @@ def _compute_statement_split(net, actual_cost, cost_ratio, pp_ratio, op_ratio, m
         denom = pp + op
         pp_share, op_share = (pp / denom, op / denom) if denom > 0 else (0.5, 0.5)
         return cost, round(remainder * pp_share, 2), round(remainder * op_share, 2)
-    return round(net * cr, 2), round(net * pp, 2), round(net * op, 2)
+    # contract: carve the undelivered loss out, split the successful net by the
+    # ratios, then split the loss 50/50 across the two profit parties.
+    succ_net = net + loss
+    half = loss / 2.0
+    return round(succ_net * cr, 2), round(succ_net * pp - half, 2), round(succ_net * op - half, 2)
 
 
 @app.route('/api/reconciliation/statements/generate', methods=['POST'])
@@ -12498,12 +12844,28 @@ def api_generate_statement():
         return jsonify({'error': '合伙人数据计算失败'}), 500
     net = detail['total_net_pln']
     actual_cost_snapshot = detail['actual_cost_pln']
+
+    # Guard against generating an EMPTY statement. If the chosen period has no
+    # successful (revenue-generating) orders, total_orders/net are 0 and every
+    # split below comes out all-zeros. Silently saving that produces a blank
+    # "bill" that reports success but shows nothing — exactly the
+    # "按照实际毛利生成的账单是空的" report. This happens when a period with no
+    # orders is picked (the year dropdown offers future / pre-launch months),
+    # or while order data is briefly unavailable. Refuse instead of writing the
+    # empty row (and, on regenerate, refuse so we never clobber a good
+    # statement with zeros). A genuinely zero-activity month never needs an
+    # auto-generated statement; 手工录入 covers that rare case.
+    if (detail.get('total_orders') or 0) == 0 and (net or 0) == 0:
+        conn.close()
+        return jsonify({'error': f'{year}-{month:02d} 期间没有可对账的成功订单（净销售额为 0），未生成对账单。请确认所选合伙人与月份正确、且订单已同步后重试。'}), 400
+
     mode = data.get('mode') or 'contract'
     if mode not in ('contract', 'actual'):
         mode = 'contract'
     cost, p_profit, our_recv = _compute_statement_split(
         net, actual_cost_snapshot, partner['cost_ratio'],
-        partner['partner_profit_ratio'], partner['our_profit_ratio'], mode)
+        partner['partner_profit_ratio'], partner['our_profit_ratio'], mode,
+        shipping_loss=detail.get('shipping_loss') or 0)
     # In 实际毛利 mode the margin is only trustworthy if every product has a real
     # cost; unmapped lines fall back to a 50% estimate (would inflate margin).
     unmapped_qty = detail.get('cost_unmapped_qty') or 0
@@ -12650,6 +13012,11 @@ def api_get_statement(stmt_id):
                     'pending_orders': live_detail['pending_orders'],
                     'shipping_loss': live_detail['shipping_loss'],
                     'actual_cost_pln': live_detail['actual_cost_pln'],
+                    # Contract-basis cost reference (净销售 × cost_ratio, loss carved
+                    # out) — needed so the 约定 vs 实际 差额 in the detail modal compares
+                    # against the CONTRACT cost, not the statement's stored cost
+                    # (which equals the actual cost on an 实际毛利 statement → diff 0).
+                    'cost_amount_pln': live_detail['cost_amount_pln'],
                     'cost_unmapped_revenue_pln': live_detail['cost_unmapped_revenue_pln'],
                     'cost_unmapped_qty': live_detail['cost_unmapped_qty'],
                     'by_status': live_detail['by_status'],
@@ -13131,7 +13498,8 @@ def api_resolve_dispute(stmt_id):
             mode = stmt['calc_mode'] or 'contract'
             cost, p_profit, our_recv = _compute_statement_split(
                 net, actual_cost_snapshot, partner['cost_ratio'],
-                partner['partner_profit_ratio'], partner['our_profit_ratio'], mode)
+                partner['partner_profit_ratio'], partner['our_profit_ratio'], mode,
+                shipping_loss=detail.get('shipping_loss') or 0)
             rate, _ = _lookup_partner_rate(partner['currency'], year, month)
             our_recv_cny = round(our_recv * rate, 2) if rate else None
             conn.execute('''UPDATE reconciliation_statements
@@ -13244,6 +13612,12 @@ def api_delete_statement(stmt_id):
         conn.close()
         return jsonify({'error': '已锁定的对账单不能删除'}), 400
     try:
+        # Delete the frozen order snapshot first, then the statement itself.
+        # Same transaction -> atomic. (The schema declares ON DELETE CASCADE, but
+        # get_db_connection() doesn't enable PRAGMA foreign_keys, so we delete
+        # children explicitly to avoid orphan rows piling up in *_statement_orders.)
+        # Note: reconciliation_audit_log is intentionally retained as history.
+        conn.execute('DELETE FROM reconciliation_statement_orders WHERE statement_id = ?', (stmt_id,))
         conn.execute('DELETE FROM reconciliation_statements WHERE id = ?', (stmt_id,))
         conn.commit()
         return jsonify({'success': True})
@@ -14880,6 +15254,20 @@ def settings_api():
                         continue
                     v = '1' if str(value).strip().lower() in ('1', 'true', 'yes', 'on') else '0'
                     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, v))
+                elif key == 'auto_confirm_delivered_enabled':
+                    # Auto-confirm master switch (待确认结局 → 已签收). Admin-only
+                    # (governs an automated action that completes orders + fires
+                    # WC 'completed' emails). Read by the hourly auto_sync.py cron
+                    # via auto_confirm.is_enabled().
+                    if not current_user.is_admin():
+                        continue
+                    v = '1' if str(value).strip().lower() in ('1', 'true', 'yes', 'on') else '0'
+                    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, v))
+                    if v == '1':
+                        # Forward-only: stamp the effective-start (same datetime('now')
+                        # format as carrier_status_at) so ONLY deliveries detected after
+                        # turning on get auto-confirmed — never the existing backlog.
+                        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_confirm_delivered_since', datetime('now'))")
             conn.commit()
             
             # 如果自动同步设置发生变更，同步更新 Crontab 定时任务
@@ -14993,10 +15381,14 @@ def shipping():
     all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
     all_countries = [c['country'] for c in all_countries]
     
+    # Auto-confirm switch state (待确认结局 → 已签收), for the toolbar toggle.
+    _ac_row = conn.execute("SELECT value FROM settings WHERE key='auto_confirm_delivered_enabled'").fetchone()
+    auto_confirm_enabled = bool(_ac_row) and str(_ac_row['value']).strip().lower() in ('1', 'true', 'yes', 'on')
+
     conn.close()
     return render_template('shipping.html', carriers=carriers, managers=managers, sites=sites,
                            all_countries=all_countries, is_super_admin=(current_user.username == 'admin'),
-                           has_au_access=_has_au_access())
+                           has_au_access=_has_au_access(), auto_confirm_enabled=auto_confirm_enabled)
 
 
 def _has_au_access():
@@ -16197,6 +16589,7 @@ def build_custom_lineitem_payload(tracking_number, carrier_slug, tracking_url, l
 @app.route('/api/shipping/ship', methods=['POST'])
 @login_required
 @shipper_required
+@order_site_editable
 def ship_order():
     """Mirror manual tracking entry in WP-admin.
 
@@ -16586,6 +16979,7 @@ def ship_order():
 @app.route('/api/shipping/debug/<order_id>', methods=['POST'])
 @login_required
 @shipper_required
+@order_site_editable
 def debug_tracking_sync(order_id):
     """Debug endpoint to manually resync tracking number to WordPress"""
     import requests as req
@@ -16682,6 +17076,7 @@ def debug_tracking_sync(order_id):
 @app.route('/api/shipping/complete/<order_id>', methods=['POST'])
 @login_required
 @shipper_required
+@order_site_editable
 def complete_order(order_id):
     """Mark order as completed"""
     import requests as req
@@ -17161,6 +17556,7 @@ def get_order_notes(order_id):
 @app.route('/api/order/<order_id>/note', methods=['POST'])
 @login_required
 @shipper_required
+@order_site_editable
 def add_order_note(order_id):
     """Add a note to an order, optionally notifying the customer.
 
@@ -17269,6 +17665,7 @@ def add_order_note(order_id):
 @app.route('/api/order/<order_id>/status', methods=['POST'])
 @login_required
 @editor_required
+@order_site_editable
 def update_order_status(order_id):
     """Update order status manually"""
     import requests as req
@@ -17398,6 +17795,7 @@ def update_order_status(order_id):
 @app.route('/api/order/<order_id>/mark-undelivered', methods=['POST'])
 @login_required
 @shipper_required
+@order_site_editable
 def mark_order_undelivered(order_id):
     """Mark an order as undelivered (refused / returned to sender).
     Stores the lost shipping fee and an audit trail. Adds a remote WooCommerce
@@ -17483,6 +17881,7 @@ def mark_order_undelivered(order_id):
 @app.route('/api/order/<order_id>/confirm-delivery', methods=['POST'])
 @login_required
 @shipper_required
+@order_site_editable
 def confirm_order_delivery(order_id):
     """Approve a shipped order as delivered & accepted (COD collected).
 
@@ -17687,6 +18086,7 @@ def order_carrier_status(order_id):
 @app.route('/api/order/<order_id>/unmark-undelivered', methods=['POST'])
 @login_required
 @shipper_required
+@order_site_editable
 def unmark_order_undelivered(order_id):
     """Reverse a previous mark-undelivered (e.g., the shipper made a mistake)."""
     conn = get_db_connection()
@@ -17734,6 +18134,7 @@ PROBLEM_RETURN_TYPES = {
 @app.route('/api/order/<order_id>/mark-problem-return', methods=['POST'])
 @login_required
 @shipper_required
+@order_site_editable
 def mark_order_problem_return(order_id):
     """Mark an order as a problem return — the package came back but the
     contents were wrong / missing / damaged (e.g. the brick-swap scam).
@@ -17836,6 +18237,7 @@ def mark_order_problem_return(order_id):
 @app.route('/api/order/<order_id>/unmark-problem-return', methods=['POST'])
 @login_required
 @shipper_required
+@order_site_editable
 def unmark_order_problem_return(order_id):
     """Reverse a previous mark-problem-return (e.g., marked by mistake)."""
     conn = get_db_connection()
@@ -20617,7 +21019,7 @@ def _generate_sales_board_excel(data, hide_leader=False):
         ("• 未达标则扣除底薪的 20%。", False, 10),
         ("", False, 10),
         ("【提成规则】", True, 12),
-        ("• 提成 = 提成基数(¥) × 提成率（默认 5%，在「设置目标」里按人配置）", False, 10),
+        ("• 提成 = 提成基数(¥) × 提成率（在「设置目标」里按人配置）", False, 10),
         ("• 提成基数 = 成功订单中 非免提成品牌 的产品小计（item.total），按本月汇率换算为人民币。", False, 10),
         ("• 不计入提成：", False, 10),
         ("    ① 运费（shipping_total）", False, 10),
@@ -21611,13 +22013,21 @@ def set_order_warehouse(order_id):
     warehouse_id = data.get('warehouse_id')
     conn = get_db_connection()
     try:
-        order = conn.execute('SELECT id FROM orders WHERE id=?', (order_id,)).fetchone()
+        order = conn.execute('SELECT id, source FROM orders WHERE id=?', (order_id,)).fetchone()
         if not order:
             return jsonify({'error': '订单不存在'}), 404
         if warehouse_id:
-            wh = conn.execute('SELECT id FROM warehouses WHERE id=?', (warehouse_id,)).fetchone()
+            wh = conn.execute('SELECT id, name, country FROM warehouses WHERE id=?', (warehouse_id,)).fetchone()
             if not wh:
                 return jsonify({'error': '仓库不存在'}), 404
+            # Country-consistency guard: an order must ship from a warehouse in its
+            # own site's country. Cross-country assignment (e.g. a PL order → 澳洲仓库)
+            # is always a mis-click — it silently breaks cost lookup and puts the
+            # order under the wrong warehouse in shipping/inventory views.
+            site = conn.execute('SELECT country FROM sites WHERE url=?', (order['source'],)).fetchone()
+            site_country = site['country'] if site else None
+            if site_country and wh['country'] and wh['country'] != site_country:
+                return jsonify({'error': f'订单来自 {site_country} 站点，不能指派到 {wh["country"]} 仓库「{wh["name"]}」。请选择 {site_country} 的仓库。'}), 400
         conn.execute('UPDATE orders SET warehouse_id=? WHERE id=?', (warehouse_id, order_id))
         conn.commit()
         return jsonify({'success': True})

@@ -2369,6 +2369,26 @@ function renderFormulaBreakdown(d) {
         ? `<div class="formula-note" style="color:#fbbf24;">⚠ ${unmappedQty} 件产品在 product_costs 表中未配置成本（涉及销售额 ${fmt(unmappedRev)} ${curr}），实际成本仅含已配置部分 — 请到产品成本页补全。</div>`
         : '';
 
+    // Undelivered shipping-loss bearing — now a clean 50/50 in BOTH modes:
+    // contract carves it out of the split base and charges each side half;
+    // actual splits it via the pp:op margin shares (= 50/50 when pp==op).
+    let lossBearNote = '';
+    if (loss > 0) {
+        const half = loss / 2;
+        lossBearNote = `<div class="formula-note" style="color:#fbbf24;">↩ 这笔 ${fmt(loss)} ${curr} 未送达运费损失由双方各担一半：合伙人 ${fmt(half)} / 我方 ${fmt(half)} ${curr}（各 50%）</div>`;
+    }
+
+    // Contract-formula building blocks: the undelivered loss is carved OUT of the
+    // split base (净销售额 ＋ 未送达损失 = 成功订单净额) and then charged 50/50 to the
+    // two profit parties. When loss == 0 these collapse to plain 净销售额 × ratio.
+    const hasLoss = loss > 0;
+    // Base expression (caller wraps in <code>): successful net = 净销售额 ＋ 未送达损失.
+    const cBaseName  = hasLoss ? `(${T.net('净销售额')} ＋ ${T.loss('未送达损失')})` : T.net('净销售额');
+    const cBaseSubst = hasLoss ? `(${T.net(fmt(net))} ＋ ${T.loss(fmt(loss))})` : T.net(fmt(net));
+    // Half-loss deduction appended to the two profit lines (own operator + chip).
+    const cHalfName  = hasLoss ? ` <span class="formula-eq">−</span> <code>${T.loss('未送达损失 ÷ 2')}</code>` : '';
+    const cHalfSubst = hasLoss ? ` <span class="formula-eq">−</span> <code>${T.loss(fmt(loss / 2))}</code>` : '';
+
     // Verification of ratios
     const ratioSum = cr + ppr + opr;
     const ratioOK = Math.abs(ratioSum - 1.0) < 0.001;
@@ -2423,6 +2443,7 @@ function renderFormulaBreakdown(d) {
                     </div>
                     ${cnyRow('净销售额', net, T.net)}
                     <div class="formula-note">"成功订单" = 已发货 / 已完成 / 在线已支付的 processing / COD on-hold；"运费损失" = 未送达订单的物流费（包裹被退回，物流公司不退钱）</div>
+                    ${lossBearNote}
                 </div>
             </div>
 
@@ -2453,7 +2474,7 @@ function renderFormulaBreakdown(d) {
                     <div class="formula-name">${T.cost('<i class="bi bi-percent me-1"></i>约定成本')}（合伙人留）</div>
                     <div class="formula-row">
                         <span class="formula-tag">公式：</span>
-                        <code>${T.net('净销售额')}</code>
+                        <code>${cBaseName}</code>
                         <span class="formula-eq">×</span>
                         <code>${T.pctTag(pct(cr))}</code>
                         <span class="formula-eq">=</span>
@@ -2461,14 +2482,14 @@ function renderFormulaBreakdown(d) {
                     </div>
                     <div class="formula-row">
                         <span class="formula-tag">代入：</span>
-                        <code>${T.net(fmt(net))}</code>
+                        <code>${cBaseSubst}</code>
                         <span class="formula-eq">×</span>
                         <code>${T.pctTag(pct(cr))}</code>
                         <span class="formula-eq">=</span>
                         <code class="formula-result">${T.cost(fmt(cost) + ' ' + curr)}</code>
                     </div>
                     ${cnyRow('约定成本', cost, T.cost)}
-                    <div class="formula-note">按合作约定的固定比例 — 用于覆盖产品进价、损耗、囤货成本</div>
+                    <div class="formula-note">${hasLoss ? '按成功订单净额（净销售额＋未送达损失）×约定比例 — 成本补偿不因未送达损失而缩水' : '按合作约定的固定比例 — 用于覆盖产品进价、损耗、囤货成本'}</div>
                 </div>
             </div>` }
 
@@ -2547,21 +2568,22 @@ function renderFormulaBreakdown(d) {
                     <div class="formula-name">${T.pp('<i class="bi bi-piggy-bank me-1"></i>合伙人利润')}（合伙人留）</div>
                     <div class="formula-row">
                         <span class="formula-tag">公式：</span>
-                        <code>${T.net('净销售额')}</code>
+                        <code>${cBaseName}</code>
                         <span class="formula-eq">×</span>
-                        <code>${T.pctTag(pct(ppr))}</code>
+                        <code>${T.pctTag(pct(ppr))}</code>${cHalfName}
                         <span class="formula-eq">=</span>
                         <code>${T.pp('合伙人利润')}</code>
                     </div>
                     <div class="formula-row">
                         <span class="formula-tag">代入：</span>
-                        <code>${T.net(fmt(net))}</code>
+                        <code>${cBaseSubst}</code>
                         <span class="formula-eq">×</span>
-                        <code>${T.pctTag(pct(ppr))}</code>
+                        <code>${T.pctTag(pct(ppr))}</code>${cHalfSubst}
                         <span class="formula-eq">=</span>
                         <code class="formula-result">${T.pp(fmt(pProfit) + ' ' + curr)}</code>
                     </div>
                     ${cnyRow('合伙人利润', pProfit, T.pp)}
+                    ${hasLoss ? `<div class="formula-note">成功订单净额按约定比例分；未送达损失由双方各担一半（本期 ${T.loss(fmt(loss / 2) + ' ' + curr)}）</div>` : ''}
                 </div>
             </div>` }
 
@@ -2597,21 +2619,22 @@ function renderFormulaBreakdown(d) {
                     <div class="formula-name">${T.ours('<i class="bi bi-bank me-1"></i>我方应收')}（合伙人需要打款给我方）</div>
                     <div class="formula-row">
                         <span class="formula-tag">公式：</span>
-                        <code>${T.net('净销售额')}</code>
+                        <code>${cBaseName}</code>
                         <span class="formula-eq">×</span>
-                        <code>${T.pctTag(pct(opr))}</code>
+                        <code>${T.pctTag(pct(opr))}</code>${cHalfName}
                         <span class="formula-eq">=</span>
                         <code>${T.ours('我方应收')}</code>
                     </div>
                     <div class="formula-row">
                         <span class="formula-tag">代入：</span>
-                        <code>${T.net(fmt(net))}</code>
+                        <code>${cBaseSubst}</code>
                         <span class="formula-eq">×</span>
-                        <code>${T.pctTag(pct(opr))}</code>
+                        <code>${T.pctTag(pct(opr))}</code>${cHalfSubst}
                         <span class="formula-eq">=</span>
                         <code class="formula-result">${T.ours(fmt(ourRecv) + ' ' + curr)}</code>
                     </div>
                     ${cnyRow('我方应收', ourRecv, T.ours)}
+                    ${hasLoss ? `<div class="formula-note">成功订单净额按约定比例分；未送达损失由双方各担一半（本期 ${T.loss(fmt(loss / 2) + ' ' + curr)}）</div>` : ''}
                 </div>
             </div>` }
 
@@ -2709,7 +2732,7 @@ function renderFormulaBreakdown(d) {
                 <div class="flow-box flow-deduction">
                     <div class="flow-label">运费损失（未送达 ${d.undelivered_orders || 0} 单）</div>
                     <div class="flow-value">−${fmt(loss)} ${curr}</div>
-                    <div class="flow-note">物流费用，我方承担</div>
+                    <div class="flow-note" title="未送达订单的运费损失先从净销售额中扣除，再参与分账，因此由合伙人与我方共同承担">${mode === 'actual' ? '从净销售扣除，双方各担 50%' : '从净销售扣除，双方按约定比例共担'}</div>
                 </div>
             </div>
 
@@ -2767,7 +2790,8 @@ function renderFormulaBreakdown(d) {
                     ${r ? `<div class="flow-cny">≈ ¥${fmt(ourRecv * r)}</div>` : ''}
                     <div class="flow-target">→ 我方收款</div>
                 </div>
-            </div>` }
+            </div>${hasLoss ? `
+            <div style="text-align:center;color:#fbbf24;font-size:0.82em;margin-top:8px;">↩ 约定成本/利润按成功订单净额（净销售额 ＋ 未送达损失）计算；未送达损失 ${fmt(loss)} ${curr} 由双方各担一半（各 ${fmt(loss / 2)} ${curr}）</div>` : ''}` }
         </div>
     `;
     document.getElementById('formulaBoxBody').innerHTML = html;
@@ -3996,7 +4020,7 @@ async function openStatementDetail(id) {
                         <tbody>
                             <tr><td class="ps-3"><i class="bi bi-check-circle text-success me-2"></i>成功订单</td><td class="text-end">${ld.success_orders} 单</td><td class="text-end text-success">+ ${fmt(s.total_gross_pln)} ${curr}</td><td class="text-muted small">总销售额</td></tr>
                             <tr><td class="ps-3"><i class="bi bi-truck me-2 text-info"></i>运费成本</td><td></td><td class="text-end text-warning">− ${fmt(ld.by_status?.success?.shipping || 0)} ${curr}</td><td class="text-muted small">物流费用，不计入合伙人净额</td></tr>
-                            <tr style="color:#c084fc;"><td class="ps-3"><i class="bi bi-arrow-return-left me-2"></i>未送达订单运费损失</td><td class="text-end">${ld.undelivered_orders} 单</td><td class="text-end" style="color:#fbbf24;">− ${fmt(ld.shipping_loss)} ${curr}</td><td class="text-muted small">未送达即运费由我方承担</td></tr>
+                            <tr style="color:#c084fc;"><td class="ps-3"><i class="bi bi-arrow-return-left me-2"></i>未送达订单运费损失</td><td class="text-end">${ld.undelivered_orders} 单</td><td class="text-end" style="color:#fbbf24;">− ${fmt(ld.shipping_loss)} ${curr}</td><td class="text-muted small" title="未送达订单的运费损失先从净销售额中扣除，再参与分账，因此由合伙人与我方共同承担">${stmtMode === 'actual' ? '从净销售扣除后再分账 → 双方各担 50%' : '从净销售扣除后再分账，双方按约定比例共担'}</td></tr>
                             <tr style="background:rgba(99,102,241,0.1);font-weight:600;border-top:2px solid rgba(255,255,255,0.1);"><td class="ps-3 text-info">= 净销售额</td><td></td><td class="text-end text-info">${fmt(s.total_net_pln)} ${curr}</td><td class="text-muted small">用于分账</td></tr>
                             <tr class="text-muted small"><td class="ps-3 text-muted">未计入对账的：失败 ${ld.failed_orders} / 取消 ${ld.cancelled_orders} / 待支付 ${ld.pending_orders}</td><td colspan="3" class="text-muted small">这些订单状态视为未产生收入</td></tr>
                         </tbody>
@@ -4040,9 +4064,14 @@ async function openStatementDetail(id) {
 
         let actualBlock = '';
         if (ld && ld.actual_cost_pln !== undefined) {
-            const diff = (s.cost_amount_pln || 0) - (ld.actual_cost_pln || 0);
-            const diffPct = (s.cost_amount_pln && ld.actual_cost_pln)
-                ? ((diff / s.cost_amount_pln) * 100).toFixed(1)
+            // Compare CONTRACT cost vs actual cost. Use the live contract-basis
+            // reference (ld.cost_amount_pln), NOT s.cost_amount_pln — on an 实际毛利
+            // statement the stored cost IS the actual cost, so that would always
+            // show a 0 差额. Falls back to the stored value if the ref is missing.
+            const contractCost = (ld.cost_amount_pln != null) ? ld.cost_amount_pln : (s.cost_amount_pln || 0);
+            const diff = contractCost - (ld.actual_cost_pln || 0);
+            const diffPct = (contractCost && ld.actual_cost_pln)
+                ? ((diff / contractCost) * 100).toFixed(1)
                 : null;
             actualBlock = `
                 <div class="row g-2 mt-3 pt-3 border-top border-secondary border-opacity-25">

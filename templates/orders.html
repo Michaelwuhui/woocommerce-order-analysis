@@ -390,8 +390,7 @@
                             <td class="product-cell">
                                 {% for product in order.products %}
                                 <div class="product-item">
-                                    <span class="product-name">{{ product.name[:50] }}{% if product.name|length > 50
-                                        %}...{% endif %}</span>
+                                    <span class="product-name" title="{{ product.name }}">{{ product.name }}</span>
                                     <span class="product-qty">×{{ product.quantity }}</span>
                                     <span class="product-total">{{ "{:.2f}".format(product.total) }} {{ order.currency
                                         or '' }}</span>
@@ -540,7 +539,7 @@
 
     .product-item {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 12px;
         padding: 6px 0;
         border-bottom: 1px solid rgba(255, 255, 255, 0.05);
@@ -554,9 +553,10 @@
         flex: 1;
         color: #c8d4e3;
         font-size: 0.875rem;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        line-height: 1.35;
         min-width: 0;
     }
 

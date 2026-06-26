@@ -231,7 +231,19 @@
                         <span class="text-white-50">（系统查不到轨迹，需点「官网」人工核对签收/拒收）</span>
                     </label>
                 </div>
-                <div class="d-flex gap-2">
+                <div class="d-flex gap-2 align-items-center flex-wrap">
+                    {% if current_user.is_admin() %}
+                    <div class="form-check form-switch mb-0 px-2 py-1 rounded border border-warning border-opacity-50 d-flex align-items-center"
+                         style="background:rgba(255,193,7,0.08);"
+                         title="开启后：从开关打开的那一刻起，新检测到🟢物流已签收的 COD 订单会被每小时自动确认（本地标记签收 + 同步站点为已完成 + 发完成邮件），等同于自动替你点『已签收』。⚠️只管打开之后的单、不追溯之前的存量（避免一次性群发完成邮件）；存量请用右侧批量按钮处理。退回/在途/查无/问题退货一律不动。">
+                        <input class="form-check-input mt-0" type="checkbox" role="switch" id="autoConfirmToggle"
+                               onchange="toggleAutoConfirm(this)" style="cursor:pointer;"
+                               {% if auto_confirm_enabled %}checked{% endif %}>
+                        <label class="form-check-label text-warning small ms-2 mb-0" for="autoConfirmToggle" style="cursor:pointer; white-space:nowrap;">
+                            <i class="bi bi-robot me-1"></i>自动确认「🟢已签收」
+                        </label>
+                    </div>
+                    {% endif %}
                     <button class="ship-action btn btn-sm btn-outline-success" onclick="batchConfirmDelivered(30)" title="只确认已挂满30天及以上的🟢物流已签收订单——超过这个时长基本不会再退回">
                         <i class="bi bi-check2-all me-1"></i>批量确认满30天的「🟢 已签收」
                     </button>
@@ -786,7 +798,7 @@
                             : (o.is_big_order ? ' style="background-color: rgba(220,53,69,0.1);"' : '');
                     const riskBadge = renderRiskBadge(o.customer_risk, { compact: true });
                     return `
-                <tr${rowStyle}>
+                <tr data-editsrc="${o.source || ''}"${rowStyle}>
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : ''}</div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
@@ -896,7 +908,7 @@
                     tbody.innerHTML = orders.map(o => {
                     const shippedRiskBadge = renderRiskBadge(o.customer_risk, { compact: true });
                     return `
-                <tr${o.customer_risk && o.customer_risk.level === 'high' ? ' style="background-color: rgba(220,53,69,0.10);"' : ''}>
+                <tr data-editsrc="${o.source || ''}"${o.customer_risk && o.customer_risk.level === 'high' ? ' style="background-color: rgba(220,53,69,0.10);"' : ''}>
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a></div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
@@ -1043,7 +1055,7 @@
                                     ? `<span class="badge bg-warning text-dark">${o.days_pending} 天</span>`
                                     : `<span class="text-light">${o.days_pending} 天</span>`));
                         return `
-                <tr${rowStyle} data-order-id="${o.id}" data-carrier="${cs}" data-days="${o.days_pending == null ? '' : o.days_pending}">
+                <tr data-editsrc="${o.source || ''}"${rowStyle} data-order-id="${o.id}" data-carrier="${cs}" data-days="${o.days_pending == null ? '' : o.days_pending}">
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a></div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
@@ -1151,6 +1163,28 @@
 
         // Cancel flag for the in-progress batch confirm (set by the 停止 button).
         let batchCancelled = false;
+
+        // ── Auto-confirm switch (待确认结局 → 已签收) ───────────────────────────
+        // Persists settings.auto_confirm_delivered_enabled. FORWARD-ONLY: turning
+        // it on stamps an effective-start (server-side), and only deliveries
+        // detected AFTER that get auto-confirmed — the existing backlog is never
+        // touched (no retro email blast). The headless work runs hourly in
+        // auto_sync.py (auto_confirm.enforce). The existing 批量确认 buttons stay
+        // for manually clearing the backlog.
+        function toggleAutoConfirm(el) {
+            const on = el.checked;
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ auto_confirm_delivered_enabled: on ? '1' : '0' })
+            }).then(r => r.json()).then(() => {
+                if (on) {
+                    showToast('已开启：从现在起新检测到🟢物流已签收的 COD 单会自动确认（不追溯之前的存量单；存量请用右侧批量按钮处理）', 'success', 7000);
+                } else {
+                    showToast('已关闭自动确认', 'info');
+                }
+            }).catch(() => { alert('保存失败，请重试'); el.checked = !on; });
+        }
 
         // Batch-confirm rows whose carrier badge says delivered (🟢物流已签收).
         // minDays (optional): only orders pending >= minDays days (the "满30天"
@@ -1732,7 +1766,7 @@
                 : `<button class="ship-action btn btn-sm btn-outline-danger" onclick="openUndeliveredModal('${o.id}', '${safeNum}', ${o.shipping_total || 0}, '${(o.currency || '').replace(/'/g, "\\'")}', '${(o.tracking_number || '').replace(/'/g, "\\'")}')"><i class="bi bi-arrow-return-left me-1"></i>标记退回</button>`;
 
             return `
-                <tr>
+                <tr data-editsrc="${o.source || ''}">
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a></div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>

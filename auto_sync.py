@@ -147,5 +147,23 @@ def main():
     except Exception as e:
         safe_print(f"[blocklist] enforcement failed: {e}")
 
+    # Auto-confirm carrier-delivered COD orders (待确认结局 → 已签收), if enabled.
+    # Isolated in its own try so a failure here never affects sync.
+    try:
+        import auto_confirm
+        conn = get_db_connection()
+        try:
+            if auto_confirm.is_enabled(conn):
+                ac = auto_confirm.enforce(conn, progress=safe_print, actor='auto-sync')
+                safe_print(f"[auto-confirm] checked={ac['checked']} confirmed={ac['confirmed']} "
+                           f"(synced={ac['synced']} local_only={ac['local_only']}) "
+                           f"errors={ac['errors']} deferred={ac['capped']}")
+            else:
+                safe_print("[auto-confirm] disabled — skipped")
+        finally:
+            conn.close()
+    except Exception as e:
+        safe_print(f"[auto-confirm] enforcement failed: {e}")
+
 if __name__ == '__main__':
     main()

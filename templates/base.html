@@ -580,6 +580,47 @@
             }
         });
 
+        // Edit scope (server-injected): null = 可编辑全部；否则为可编辑站点 URL 列表。
+        // 用于隐藏受限用户在未授权站点订单上的编辑按钮（后端仍有强制校验）。
+        window._editableSources = {{ editable_sources_json|safe }};
+        // Normalize a site/source to a canonical host so different formats match —
+        // sites.url is "https://www.x.pl" while some APIs (e.g. /api/shipping/*)
+        // return a bare "x.pl". Strip scheme/www/trailing-slash, lowercase.
+        window._normSrc = function (u) {
+            return String(u || '').replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/+$/, '').toLowerCase();
+        };
+        window.canEditSite = function (source) {
+            if (window._editableSources == null) return true;   // 不限
+            if (!source) return true;                            // 来源未知 → 不隐藏（后端兜底）
+            var s = window._normSrc(source);
+            return window._editableSources.some(function (e) { return window._normSrc(e) === s; });
+        };
+
+        // Centralized gate for list pages (e.g. 发货管理): hide order-mutation buttons
+        // (class "ship-action") on rows whose site the user can't edit. Rows carry
+        // data-editsrc="<source>". The backend @order_site_editable guard still enforces;
+        // this only removes buttons that would 403 on click. Auto-applies via observer.
+        (function () {
+            if (window._editableSources == null) return;   // unrestricted → nothing to hide
+            function gate(root) {
+                if (!root.querySelectorAll) return;
+                root.querySelectorAll('.ship-action').forEach(function (el) {
+                    if (el.dataset._gated) return;
+                    var tr = el.closest('tr[data-editsrc], [data-editsrc]');
+                    if (tr && !window.canEditSite(tr.getAttribute('data-editsrc'))) {
+                        el.style.display = 'none';
+                        el.dataset._gated = '1';
+                    }
+                });
+            }
+            document.addEventListener('DOMContentLoaded', function () {
+                gate(document);
+                new MutationObserver(function (muts) {
+                    muts.forEach(function (m) { m.addedNodes.forEach(function (n) { if (n.nodeType === 1) gate(n); }); });
+                }).observe(document.body, { childList: true, subtree: true });
+            });
+        })();
+
         (function() {
             fetch('/api/warehouses').then(r => r.json()).then(data => { window._warehousesList = data; }).catch(() => { window._warehousesList = []; });
         })();
@@ -798,6 +839,11 @@
                     var lineItems = order.line_items || [];
                     var shippingLines = order.shipping_lines || [];
                     var metaData = order.meta_data || [];
+                    // Site-level EDIT gate: a restricted user can VIEW this order but
+                    // may only EDIT it when its site is in their authorized scope. The
+                    // backend @order_site_editable guard enforces it; here we hide the
+                    // edit controls and flag the order read-only.
+                    var canEditThisOrder = window.canEditSite ? window.canEditSite(order.source) : true;
 
                     var html = '<div class="row g-3">';
 
@@ -813,6 +859,7 @@
                         html += '<p><strong>状态:</strong> <span style="background:rgba(168,85,247,0.2); color:#c084fc; padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600; border:1px solid rgba(168,85,247,0.4);">未送达</span></p>';
                     } else {
                     {% if current_user.can_edit() %}
+                    if (canEditThisOrder) {
                     html += '<p><strong>状态:</strong> ';
                     html += '<div class="dropdown d-inline-block">';
                     html += '<button class="btn btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" style="background:' + (statusColors[order.status] || '#6b7280') + '; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; color: white; border: none;">';
@@ -826,6 +873,9 @@
                         html += '<li><a class="dropdown-item' + activeClass + '" href="#" onclick="updateOrderStatus(\'' + order.id + '\', \'' + s + '\'); return false;"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + (statusColors[s] || '#6b7280') + ';margin-right:8px;"></span>' + (statusLabels[s] || s) + '</a></li>';
                     });
                     html += '</ul></div></p>';
+                    } else {
+                        html += '<p><strong>状态:</strong> <span style="background:' + (statusColors[order.status] || '#6b7280') + '; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; color: white;">' + (statusLabels[order.status] || order.status) + '</span></p>';
+                    }
                     {% else %}
                     html += '<p><strong>状态:</strong> <span style="background:' + (statusColors[order.status] || '#6b7280') + '; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; color: white;">' + (statusLabels[order.status] || order.status) + '</span></p>';
                     {% endif %}
@@ -835,7 +885,11 @@
                     html += '<p><strong>付款时间:</strong> ' + (order.date_paid ? order.date_paid.replace('T', ' ').substring(0, 16) : '-') + '</p>';
                     html += '<p><strong>付款方式:</strong> ' + (order.payment_method_title || '-') + '</p>';
                     html += '<p><strong>来源网站:</strong> ' + (order.site_manager ? '<span style="background:rgba(23,162,184,0.3);color:#17a2b8;padding:2px 8px;border-radius:10px;font-size:12px;margin-right:6px;">' + order.site_manager + '</span>' : '') + '<span style="color: #a5b4fc;">' + (order.source || '-').replace('https://www.', '').replace('https://', '') + '</span></p>';
+                    if (!canEditThisOrder) {
+                        html += '<p class="mb-2"><span class="badge bg-secondary"><i class="bi bi-lock-fill me-1"></i>只读 · 非授权站点（无法编辑）</span></p>';
+                    }
                     {% if current_user.can_edit() %}
+                    if (canEditThisOrder) {
                     html += '<p><strong>发货仓库:</strong> ';
                     html += '<div class="dropdown d-inline-block">';
                     html += '<button class="btn btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" style="background:rgba(108,117,125,0.3); padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600; color:#a5b4fc; border:1px solid rgba(108,117,125,0.5);">';
@@ -844,11 +898,21 @@
                     html += '<ul class="dropdown-menu dropdown-menu-dark">';
                     html += '<li><h6 class="dropdown-header">选择发货仓库</h6></li>';
                     html += '<li><a class="dropdown-item' + (!order.warehouse_id ? ' active' : '') + '" href="#" onclick="setOrderWarehouse(\'' + order.id + '\', null); return false;">未分配</a></li>';
-                    (window._warehousesList || []).forEach(function(w) {
+                    // Only offer warehouses in the order's own country — cross-country
+                    // assignment is a mis-click (and the backend now rejects it). Fall
+                    // back to the full list when the country is unknown or has no
+                    // matching warehouse, so the menu is never empty.
+                    var _ordCountry = (order.billing && order.billing.country) || '';
+                    var _allWh = window._warehousesList || [];
+                    var _sameWh = _ordCountry ? _allWh.filter(function(w){ return w.country === _ordCountry; }) : [];
+                    (_sameWh.length ? _sameWh : _allWh).forEach(function(w) {
                         var activeClass = (order.warehouse_id == w.id) ? ' active' : '';
                         html += '<li><a class="dropdown-item' + activeClass + '" href="#" onclick="setOrderWarehouse(\'' + order.id + '\', ' + w.id + '); return false;">' + w.name + '</a></li>';
                     });
                     html += '</ul></div></p>';
+                    } else {
+                        html += '<p><strong>发货仓库:</strong> <span style="color:#a5b4fc;">' + (order.warehouse_name || '未分配') + '</span></p>';
+                    }
                     {% else %}
                     html += '<p><strong>发货仓库:</strong> <span style="color:#a5b4fc;">' + (order.warehouse_name || '未分配') + '</span></p>';
                     {% endif %}
@@ -856,7 +920,7 @@
 
                     // Undelivered (refused/returned) panel
                     {% if current_user.can_ship() %}
-                    var canShip = true;
+                    var canShip = canEditThisOrder;   // 有发货权 + 该站点可编辑
                     {% else %}
                     var canShip = false;
                     {% endif %}

@@ -281,9 +281,11 @@
                             <!-- 提成 -->
                             <td class="text-end">
                                 <span class="text-info fw-bold">¥{{ "{:,.2f}".format(d.commission) }}</span>
+                                {% if current_user.is_admin() %}
                                 <div class="text-white-50" style="font-size:0.68em;">
                                     基数¥{{ "{:,.0f}".format(d.commission_base_cny) }} × {{ (d.commission_rate * 100)|int }}%
                                 </div>
+                                {% endif %}
                             </td>
                             <!-- 预计薪资 -->
                             <td class="text-end">
@@ -413,7 +415,7 @@
                 <div class="col-md-4">
                     <p class="mb-2"><i class="bi bi-currency-exchange text-info me-1"></i><strong class="text-white">提成规则：</strong></p>
                     <ul class="mb-0 ps-3">
-                        <li>成功订单销售额 × 5%</li>
+                        <li>成功订单销售额 × 提成率</li>
                         <li>排除品牌：{{ no_commission_brands | join(', ') }}</li>
                     </ul>
                 </div>

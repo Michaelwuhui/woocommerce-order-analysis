@@ -253,7 +253,7 @@
             </div>
             <div class="modal-body">
                 <input type="hidden" id="permUserId">
-                <p class="text-white-50 mb-3">选择该用户可以访问的站点：</p>
+                <p class="text-white-50 mb-3 small">勾选<strong class="text-info">国家</strong>=授权该国全部站点（含以后新增，自动继承）；如只想给部分站点，取消国家勾选后单独勾站，或在整国授权下取消个别站点将其排除。</p>
                 <div id="sitesCheckboxes">
                     <p class="text-muted">加载中...</p>
                 </div>
@@ -580,40 +580,87 @@
                 });
         });
 
-        // Permissions
+        // Permissions — grouped by country. A country can be granted as a whole
+        // (auto-inherits future sites); within a granted country an individual site
+        // can be excluded by unchecking it. Sites in non-granted countries are
+        // permitted only when explicitly checked.
+        const COUNTRY_NAMES = { PL: '波兰', AU: '澳大利亚', AE: '阿联酋', US: '美国', GB: '英国' };
+        const HINT_ON = '整国授权 · 新增站点自动继承（取消勾选某站 = 排除该站）';
+        const HINT_OFF = '未整国授权 · 仅勾选的站点可见';
+
         window.openPermissions = function (userId) {
             document.getElementById('permUserId').value = userId;
             fetch(`/api/users/${userId}/permissions`)
                 .then(res => res.json())
                 .then(data => {
                     const container = document.getElementById('sitesCheckboxes');
-                    if (data.all_sites.length === 0) {
+                    if (!data.all_sites || data.all_sites.length === 0) {
                         container.innerHTML = '<p class="text-muted">暂无站点</p>';
+                        bootstrap.Modal.getOrCreateInstance(document.getElementById('permissionsModal')).show();
                         return;
                     }
-                    container.innerHTML = data.all_sites.map(site => {
-                        const checked = data.allowed_sites.includes(site.id) ? 'checked' : '';
-                        const hostname = new URL(site.url).hostname;
-                        return `
-                        <div class="form-check mb-2">
-                            <input class="form-check-input" type="checkbox" value="${site.id}" id="site_${site.id}" ${checked}>
-                            <label class="form-check-label text-white" for="site_${site.id}">${hostname}</label>
-                        </div>
-                    `;
+                    const grantedC = new Set(data.granted_countries || []);
+                    const excluded = new Set(data.excluded_sites || []);
+                    const allowed = new Set(data.allowed_sites || []);
+                    const groups = {};
+                    data.all_sites.forEach(s => { const c = s.country || ''; (groups[c] = groups[c] || []).push(s); });
+
+                    container.innerHTML = Object.keys(groups).sort().map(c => {
+                        const sites = groups[c];
+                        const cGranted = grantedC.has(c);
+                        const head = c ? `
+                            <div class="form-check">
+                                <input class="form-check-input country-grant" type="checkbox" data-country="${c}" id="ctry_${c}" ${cGranted ? 'checked' : ''}>
+                                <label class="form-check-label text-white fw-bold" for="ctry_${c}">${COUNTRY_NAMES[c] || c} <span class="text-white-50 small">${c} · ${sites.length} 个站点</span></label>
+                                <div class="small ${cGranted ? 'text-info' : 'text-muted'} ms-4" id="ctryhint_${c}">${cGranted ? HINT_ON : HINT_OFF}</div>
+                            </div>`
+                            : `<div class="text-white-50 small">未分配国家的站点（仅可单独勾选）</div>`;
+                        const rows = sites.map(s => {
+                            let host; try { host = new URL(s.url).hostname; } catch (e) { host = s.url; }
+                            const chk = cGranted ? !excluded.has(s.id) : allowed.has(s.id);
+                            const isSelfManager = s.manager && s.manager === (data.user_name || '');
+                            const mgr = isSelfManager
+                                ? `<span class="badge bg-success ms-2" style="font-weight:500;" title="该用户是此站点负责人，已自动获得编辑权限（无需勾选）"><i class="bi bi-person-check me-1"></i>${s.manager} · 负责人·自动可编辑</span>`
+                                : s.manager
+                                    ? `<span class="badge bg-info bg-opacity-25 text-info ms-2" style="font-weight:500;"><i class="bi bi-person me-1"></i>${s.manager}</span>`
+                                    : `<span class="text-muted small ms-2">· 未指定负责人</span>`;
+                            return `<div class="form-check ms-4">
+                                <input class="form-check-input site-check" type="checkbox" data-country="${c}" value="${s.id}" id="site_${s.id}" ${chk ? 'checked' : ''}>
+                                <label class="form-check-label text-white" for="site_${s.id}">${host}${mgr}</label>
+                            </div>`;
+                        }).join('');
+                        return `<div class="country-group mb-3 pb-2 border-bottom border-secondary border-opacity-10">${head}${rows}</div>`;
                     }).join('');
+
+                    // Toggling a country grant checks/unchecks all its sites and updates the hint.
+                    container.querySelectorAll('.country-grant').forEach(cb => {
+                        cb.addEventListener('change', function () {
+                            const c = this.dataset.country, on = this.checked;
+                            container.querySelectorAll(`.site-check[data-country="${c}"]`).forEach(s => { s.checked = on; });
+                            const hint = document.getElementById('ctryhint_' + c);
+                            if (hint) { hint.textContent = on ? HINT_ON : HINT_OFF; hint.className = 'small ms-4 ' + (on ? 'text-info' : 'text-muted'); }
+                        });
+                    });
                     bootstrap.Modal.getOrCreateInstance(document.getElementById('permissionsModal')).show();
                 });
         };
 
         document.getElementById('savePermissionsBtn').addEventListener('click', function () {
             const userId = document.getElementById('permUserId').value;
-            const checkboxes = document.querySelectorAll('#sitesCheckboxes input[type="checkbox"]:checked');
-            const siteIds = Array.from(checkboxes).map(cb => parseInt(cb.value));
+            const container = document.getElementById('sitesCheckboxes');
+            const country_grants = [], site_ids = [], site_exclusions = [];
+            const grantedSet = new Set();
+            container.querySelectorAll('.country-grant:checked').forEach(cb => { country_grants.push(cb.dataset.country); grantedSet.add(cb.dataset.country); });
+            container.querySelectorAll('.site-check').forEach(s => {
+                const id = parseInt(s.value);
+                if (grantedSet.has(s.dataset.country)) { if (!s.checked) site_exclusions.push(id); }   // excluded from a country grant
+                else if (s.checked) { site_ids.push(id); }                                              // explicit single-site grant
+            });
 
             fetch(`/api/users/${userId}/permissions`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ site_ids: siteIds })
+                body: JSON.stringify({ site_ids, country_grants, site_exclusions })
             })
                 .then(res => res.json())
                 .then(data => {
