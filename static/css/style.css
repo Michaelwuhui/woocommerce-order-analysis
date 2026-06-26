@@ -573,3 +573,35 @@ input.flatpickr-input+input,
 .order-modal .text-muted {
     color: #9fafc4 !important;
 }
+
+/* ──────────────────────────────────────────────────────────────────
+   深色主题修正:nav-tabs 激活页 + card-header 文字
+   Bootstrap 的 .nav-tabs .nav-link.active 默认给激活标签白底,比全局
+   .nav-link.active 更具体,导致"白底 + 浅色字"看不见;.card-header 本身
+   没设文字色,纯文本标题(非 <h5>)会继承深色而看不见。这里统一修正。
+   已有的 id 作用域标签样式(#recTabs / #shippingTabs)具体度更高,不受影响。
+   ────────────────────────────────────────────────────────────────── */
+.nav-tabs {
+    border-bottom: 1px solid var(--border-color);
+}
+.nav-tabs .nav-link {
+    color: var(--text-secondary) !important;
+    background: transparent !important;
+    border: 1px solid transparent !important;
+    border-radius: 8px 8px 0 0;
+}
+.nav-tabs .nav-link:hover {
+    color: var(--text-primary) !important;
+    background: rgba(102, 126, 234, 0.10) !important;
+    border-color: transparent !important;
+}
+.nav-tabs .nav-link.active {
+    color: var(--text-primary) !important;
+    background: rgba(102, 126, 234, 0.18) !important;
+    border-color: rgba(102, 126, 234, 0.45) rgba(102, 126, 234, 0.45) transparent !important;
+}
+
+/* card-header 纯文本标题(如「仓库清单」「库存货值(按仓)」)默认色太暗 */
+.card-header {
+    color: var(--text-primary);
+}
