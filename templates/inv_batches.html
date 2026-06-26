@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}批次/保质期 - 苍赋管理系统{% endblock %}
+{% block content %}
+<div class="container-fluid py-4">
+  <h5 class="text-light mb-3"><i class="bi bi-calendar-x me-2"></i>批次与保质期
+    <span class="text-white-50 small ms-2">FEFO 先到期先发 · 临期/过期监控</span></h5>
+
+  <div class="d-flex gap-2 mb-3 flex-wrap align-items-center">
+    <select id="fWh" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:200px" onchange="reload()">
+      <option value="">全部仓库</option>{% for w in warehouses %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select>
+    <input id="fQ" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:220px" placeholder="搜索 SKU/批次号" oninput="reload()">
+    <select id="fStatus" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:150px" onchange="reload()">
+      <option value="">全部状态</option><option value="expired">已过期</option><option value="near">临期</option><option value="ok">正常</option><option value="none">无到期日</option></select>
+    <label class="text-white-50 small">临期阈值(天)</label>
+    <input id="fNear" type="number" value="90" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:90px" onchange="reload()">
+    <div class="form-check form-switch align-self-center"><input class="form-check-input" type="checkbox" id="fRemain" checked onchange="reload()"><label class="form-check-label text-white-50 small" for="fRemain">仅有余量</label></div>
+  </div>
+
+  <!-- 临期/过期概览 -->
+  <div class="row g-3 mb-3">
+    <div class="col-md-3"><div class="card data-card"><div class="card-body py-3">
+      <div class="text-white-50 small">已过期批次</div><div class="h4 mb-0 text-danger" id="sumExpired">-</div><div class="small text-white-50" id="sumExpiredQty"></div></div></div></div>
+    <div class="col-md-3"><div class="card data-card"><div class="card-body py-3">
+      <div class="text-white-50 small">临期批次</div><div class="h4 mb-0 text-warning" id="sumNear">-</div><div class="small text-white-50" id="sumNearQty"></div></div></div></div>
+  </div>
+
+  <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
+    <table class="table table-dark table-hover align-middle mb-0">
+      <thead><tr class="text-white-50 small"><th>仓库</th><th>SKU</th><th>名称</th><th>批次号</th><th>生产日</th><th>到期日</th><th class="text-end">距到期(天)</th><th class="text-end">收货量</th><th class="text-end">剩余</th><th class="text-end">单位成本</th><th>状态</th></tr></thead>
+      <tbody id="bTbody"><tr><td colspan="11" class="text-center text-white-50 py-4">加载中...</td></tr></tbody>
+    </table></div></div></div>
+</div>
+<script>
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const qs=id=>document.getElementById(id);
+const BADGE={expired:'<span class="badge bg-danger">已过期</span>',near:'<span class="badge bg-warning text-dark">临期</span>',ok:'<span class="badge bg-success">正常</span>',none:'<span class="badge bg-secondary">无到期日</span>'};
+async function reload(){
+  const p=new URLSearchParams();
+  if(qs('fWh').value)p.set('warehouse_id',qs('fWh').value);
+  if(qs('fQ').value.trim())p.set('q',qs('fQ').value.trim());
+  if(qs('fStatus').value)p.set('status',qs('fStatus').value);
+  p.set('near_days',qs('fNear').value||90);
+  if(qs('fRemain').checked)p.set('remaining','1');
+  const rows=await (await fetch('/api/inv/batches?'+p)).json();
+  qs('bTbody').innerHTML = rows.length? rows.map(b=>`<tr>
+    <td>${esc(b.warehouse_name)}</td><td><code class="text-info">${esc(b.sku_code)}</code></td><td>${esc(b.sku_name)}</td>
+    <td>${esc(b.batch_no||'')}</td><td class="small">${esc(b.production_date||'')}</td><td class="small">${esc(b.expiry_date||'')}</td>
+    <td class="text-end ${b.days_to_expiry!=null&&b.days_to_expiry<0?'text-danger':(b.days_to_expiry!=null&&b.days_to_expiry<=(qs('fNear').value||90)?'text-warning':'')}">${b.days_to_expiry==null?'—':b.days_to_expiry}</td>
+    <td class="text-end">${b.qty_received}</td><td class="text-end fw-bold">${b.qty_remaining}</td>
+    <td class="text-end small">${b.unit_cost!=null?Number(b.unit_cost).toFixed(2):''} ${esc(b.cost_currency||'')}</td>
+    <td>${BADGE[b.status]||b.status}</td></tr>`).join('')
+    : '<tr><td colspan="11" class="text-center text-white-50 py-4">无符合条件的批次</td></tr>';
+
+  const er=await (await fetch('/api/inv/expiry-report?'+new URLSearchParams({near_days:qs('fNear').value||90,...(qs('fWh').value?{warehouse_id:qs('fWh').value}:{})}))).json();
+  qs('sumExpired').textContent=er.expired_count;qs('sumExpiredQty').textContent='共 '+er.expired_qty+' 件';
+  qs('sumNear').textContent=er.near_count;qs('sumNearQty').textContent='共 '+er.near_qty+' 件';
+}
+reload();
+</script>
+{% endblock %}
