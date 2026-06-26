@@ -22053,6 +22053,8 @@ try:
     app.register_blueprint(inv_push_bp)
     from inv_notify import inv_notify_bp
     app.register_blueprint(inv_notify_bp)
+    from inv_reports import inv_report_bp
+    app.register_blueprint(inv_report_bp)
 except Exception as _e:
     import logging as _logging
     _logging.getLogger(__name__).warning('库存模块未加载: %s', _e)

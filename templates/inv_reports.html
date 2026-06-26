@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}库存报表 - 苍赋管理系统{% endblock %}
+{% block content %}
+<div class="container-fluid py-4">
+  <h5 class="text-light mb-3"><i class="bi bi-graph-up me-2"></i>库存报表</h5>
+
+  <div class="row g-3 mb-4" id="cards"></div>
+
+  <div class="row g-3">
+    <div class="col-lg-6">
+      <div class="card data-card"><div class="card-header bg-transparent border-secondary border-opacity-25"><i class="bi bi-cash-stack me-1"></i>库存货值(按仓)</div>
+        <div class="card-body p-0"><div class="table-responsive"><table class="table table-dark table-sm mb-0">
+          <thead><tr class="text-white-50 small"><th>仓库</th><th class="text-end">数量</th><th class="text-end">货值</th><th>币种</th></tr></thead>
+          <tbody id="valWh"><tr><td colspan="4" class="text-center text-white-50 py-3">加载中...</td></tr></tbody></table></div></div></div>
+    </div>
+    <div class="col-lg-6">
+      <div class="card data-card"><div class="card-header bg-transparent border-secondary border-opacity-25"><i class="bi bi-arrow-down-up me-1"></i>出入库汇总(近30天)</div>
+        <div class="card-body p-0"><div class="table-responsive"><table class="table table-dark table-sm mb-0">
+          <thead><tr class="text-white-50 small"><th>类型</th><th class="text-end">笔数</th><th class="text-end">入</th><th class="text-end">出</th></tr></thead>
+          <tbody id="movSum"><tr><td colspan="4" class="text-center text-white-50 py-3">加载中...</td></tr></tbody></table></div></div></div>
+    </div>
+    <div class="col-lg-6">
+      <div class="card data-card"><div class="card-header bg-transparent border-secondary border-opacity-25"><i class="bi bi-trophy me-1"></i>货值 TOP SKU</div>
+        <div class="card-body p-0"><div class="table-responsive"><table class="table table-dark table-sm mb-0">
+          <thead><tr class="text-white-50 small"><th>SKU</th><th>仓</th><th class="text-end">数量</th><th class="text-end">货值</th></tr></thead>
+          <tbody id="valSku"><tr><td colspan="4" class="text-center text-white-50 py-3">加载中...</td></tr></tbody></table></div></div></div>
+    </div>
+    <div class="col-lg-6">
+      <div class="card data-card"><div class="card-header bg-transparent border-secondary border-opacity-25"><i class="bi bi-diagram-3 me-1"></i>分仓/拆单统计</div>
+        <div class="card-body" id="fulStats"><div class="text-center text-white-50 py-3">加载中...</div></div></div>
+    </div>
+  </div>
+</div>
+<script>
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const qs=id=>document.getElementById(id);
+function card(label,val,sub){return `<div class="col-md-3 col-6"><div class="card data-card"><div class="card-body py-3"><div class="text-white-50 small">${label}</div><div class="h4 mb-0">${val}</div><div class="small text-white-50">${sub||''}</div></div></div></div>`;}
+async function load(){
+  const o=await (await fetch('/api/inv/reports/overview')).json();
+  const val=Object.entries(o.valuation||{}).map(([c,v])=>v+' '+c).join(' / ')||'—';
+  const os=Object.entries(o.order_states||{}).map(([k,v])=>k+':'+v).join(' ')||'—';
+  qs('cards').innerHTML=[
+    card('仓库',o.warehouses),card('SKU 数',o.skus),
+    card('现存 / 可用',o.on_hand+' / '+o.available,'预留 '+o.reserved),
+    card('库存货值',val),
+    card('临期 / 过期',o.near_qty+' / '+o.expired_qty,'件'),
+    card('未读提醒',o.unread_notifications),
+    card('订单库存状态',Object.values(o.order_states||{}).reduce((a,b)=>a+b,0),os),
+  ].join('');
+  const v=await (await fetch('/api/inv/reports/valuation')).json();
+  qs('valWh').innerHTML=v.by_warehouse.length?v.by_warehouse.map(r=>`<tr><td>${esc(r.warehouse_name)}</td><td class="text-end">${r.qty}</td><td class="text-end">${r.value}</td><td>${esc(r.cost_currency||'')}</td></tr>`).join(''):'<tr><td colspan="4" class="text-center text-white-50 py-3">无数据</td></tr>';
+  qs('valSku').innerHTML=v.by_sku.length?v.by_sku.slice(0,15).map(r=>`<tr><td><code class="text-info">${esc(r.sku_code)}</code></td><td>${esc(r.warehouse_name)}</td><td class="text-end">${r.qty}</td><td class="text-end">${r.value}</td></tr>`).join(''):'<tr><td colspan="4" class="text-center text-white-50 py-3">无数据</td></tr>';
+  const from=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
+  const m=await (await fetch('/api/inv/reports/movements?date_from='+from)).json();
+  const TY={purchase_in:'采购入库',sale_out:'销售出库',adjust:'调整',reserve:'预留',release:'释放',return_in:'退货入库',transfer_in:'调拨入',transfer_out:'调拨出',init:'期初'};
+  qs('movSum').innerHTML=m.length?m.map(r=>`<tr><td>${TY[r.movement_type]||r.movement_type}</td><td class="text-end">${r.cnt}</td><td class="text-end text-success">${r.qty_in}</td><td class="text-end text-danger">${r.qty_out}</td></tr>`).join(''):'<tr><td colspan="4" class="text-center text-white-50 py-3">近30天无流水</td></tr>';
+  const f=await (await fetch('/api/inv/reports/fulfillments')).json();
+  qs('fulStats').innerHTML=`<div class="row text-center mb-2">
+    <div class="col"><div class="h4 mb-0">${f.total_orders}</div><div class="small text-white-50">分单订单</div></div>
+    <div class="col"><div class="h4 mb-0 text-info">${f.single_orders}</div><div class="small text-white-50">单仓</div></div>
+    <div class="col"><div class="h4 mb-0 text-warning">${f.split_orders}</div><div class="small text-white-50">拆单</div></div></div>
+    <table class="table table-dark table-sm mb-0"><thead><tr class="text-white-50 small"><th>仓库</th><th class="text-end">分单数</th></tr></thead>
+    <tbody>${f.by_warehouse.map(r=>`<tr><td>${esc(r.warehouse_name)}</td><td class="text-end">${r.fulfillments}</td></tr>`).join('')||'<tr><td colspan=2 class="text-center text-white-50 py-2">无</td></tr>'}</tbody></table>`;
+}
+load();
+</script>
+{% endblock %}
