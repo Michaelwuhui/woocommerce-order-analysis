@@ -22066,12 +22066,12 @@ def inject_inventory_perms():
     is_inv_admin: 是否可管理仓库主数据(超管)。
     """
     try:
-        from inv_common import can_view_inventory, can_manage_inventory
+        from inv_common import can_manage_inventory, can_view_inventory_any
         is_admin = (getattr(current_user, 'username', None) == 'admin'
                     or (getattr(current_user, 'is_authenticated', False)
                         and current_user.is_admin()))
         return {
-            'inv_can_view': bool(is_admin or can_view_inventory() or can_manage_inventory()),
+            'inv_can_view': bool(can_view_inventory_any()),
             'can_manage_inv': bool(is_admin or can_manage_inventory()),
             'is_inv_admin': bool(is_admin),
         }

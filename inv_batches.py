@@ -19,7 +19,7 @@ import datetime
 from flask import Blueprint, render_template, request, jsonify
 from flask_login import login_required
 
-from inv_common import get_conn, inv_view_required
+from inv_common import get_conn, inv_view_required, warehouse_scope_clause
 
 inv_batch_bp = Blueprint('inv_batch', __name__)
 
@@ -141,6 +141,7 @@ def list_batches():
         sql += ' AND (k.sku_code LIKE ? OR k.name LIKE ? OR b.batch_no LIKE ?)'; params += [f'%{q}%', f'%{q}%', f'%{q}%']
     if remaining == '1':
         sql += ' AND b.qty_remaining > 0'
+    sc, sp = warehouse_scope_clause('b.warehouse_id'); sql += sc; params += sp
     sql += ' ORDER BY (b.expiry_date IS NULL), b.expiry_date, b.id'
     rows = conn.execute(sql, params).fetchall()
     conn.close()
@@ -180,6 +181,7 @@ def expiry_report():
     params = []
     if wid:
         sql += ' AND b.warehouse_id=?'; params.append(wid)
+    sc, sp = warehouse_scope_clause('b.warehouse_id'); sql += sc; params += sp
     sql += ' ORDER BY b.expiry_date, b.id'
     rows = conn.execute(sql, params).fetchall()
     conn.close()

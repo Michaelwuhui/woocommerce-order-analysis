@@ -88,6 +88,9 @@
               <option value="self">自营仓</option><option value="partner">合伙人仓</option></select></div>
           <div class="col-md-6" id="partnerWrap" style="display:none;"><label class="form-label text-white-50 small">合伙人名称 *</label>
             <input id="whPartner" class="form-control bg-dark text-white border-secondary" placeholder="如 金毅金谷"></div>
+          <div class="col-md-6" id="partnerIdWrap" style="display:none;"><label class="form-label text-white-50 small">关联合伙人账户(用于只读授权)</label>
+            <select id="whPartnerId" class="form-select bg-dark text-white border-secondary"><option value="">(不关联)</option></select>
+            <div class="form-text text-white-50">关联后,绑定该合伙人的用户只能只读看到此仓</div></div>
           <div class="col-12">
             <div class="form-check form-switch">
               <input class="form-check-input" type="checkbox" id="whFulfillment" checked>
@@ -177,7 +180,8 @@ function openWhModal(){
   document.getElementById('whActive').value='1';
   document.getElementById('whOwnership').value='self';
   document.getElementById('whFulfillment').checked=true;
-  togglePartner();
+  document.getElementById('whPartnerId').value='';
+  loadPartners(); togglePartner();
   new bootstrap.Modal('#whModal').show();
 }
 function editWh(id){
@@ -192,12 +196,21 @@ function editWh(id){
   document.getElementById('whOwnership').value=w.ownership_type||'self';
   document.getElementById('whPartner').value=w.partner_name||'';
   document.getElementById('whFulfillment').checked=!!w.is_fulfillment;
+  loadPartners().then(()=>{document.getElementById('whPartnerId').value=w.partner_id||'';});
   togglePartner();
   new bootstrap.Modal('#whModal').show();
 }
 function togglePartner(){
-  document.getElementById('partnerWrap').style.display =
-    document.getElementById('whOwnership').value==='partner'?'block':'none';
+  const isP=document.getElementById('whOwnership').value==='partner';
+  document.getElementById('partnerWrap').style.display=isP?'block':'none';
+  document.getElementById('partnerIdWrap').style.display=isP?'block':'none';
+}
+let partnersLoaded=false;
+async function loadPartners(){
+  if(partnersLoaded)return;
+  try{const rows=await (await fetch('/api/inv/partners')).json();
+    document.getElementById('whPartnerId').innerHTML='<option value="">(不关联)</option>'+rows.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
+    partnersLoaded=true;}catch(e){}
 }
 async function saveWh(){
   const id = document.getElementById('whId').value;
@@ -209,6 +222,7 @@ async function saveWh(){
     is_active:document.getElementById('whActive').value==='1',
     ownership_type:document.getElementById('whOwnership').value,
     partner_name:document.getElementById('whPartner').value.trim(),
+    partner_id:document.getElementById('whPartnerId').value||null,
     is_fulfillment:document.getElementById('whFulfillment').checked,
     notes:document.getElementById('whNotes').value.trim()
   };

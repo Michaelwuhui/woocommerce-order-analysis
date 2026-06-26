@@ -20,7 +20,7 @@ from flask_login import login_required
 
 from inv_common import (
     get_conn, inv_view_required, inv_manage_required,
-    record_movement, current_operator,
+    record_movement, current_operator, warehouse_scope_clause,
 )
 
 inv_inv_bp = Blueprint('inv_inv', __name__)
@@ -322,6 +322,8 @@ def list_stock():
         sql += ' AND (k.sku_code LIKE ? OR k.name LIKE ?)'; params += [f'%{q}%', f'%{q}%']
     if nonzero == '1':
         sql += ' AND (st.on_hand != 0 OR st.reserved != 0)'
+    # 角色仓库可见性(合伙人只看自己仓)
+    sc, sp = warehouse_scope_clause('st.warehouse_id'); sql += sc; params += sp
     sql += ' ORDER BY w.name, k.sku_code'
     rows = conn.execute(sql, params).fetchall()
     conn.close()
@@ -347,6 +349,7 @@ def list_movements():
         sql += ' AND m.ts >= ?'; params.append(request.args.get('date_from'))
     if request.args.get('date_to'):
         sql += ' AND m.ts <= ?'; params.append(request.args.get('date_to') + ' 23:59:59')
+    sc, sp = warehouse_scope_clause('m.warehouse_id'); sql += sc; params += sp
     try:
         limit = min(2000, int(request.args.get('limit') or 300))
     except ValueError:

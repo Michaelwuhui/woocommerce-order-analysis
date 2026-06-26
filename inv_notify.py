@@ -19,7 +19,7 @@ import datetime
 from flask import Blueprint, render_template, request, jsonify
 from flask_login import login_required
 
-from inv_common import get_conn, inv_view_required, inv_manage_required
+from inv_common import get_conn, inv_view_required, inv_manage_required, warehouse_scope_clause
 import inv_batches
 
 inv_notify_bp = Blueprint('inv_notify', __name__)
@@ -226,6 +226,11 @@ def list_notifications():
         sql += ' AND status=?'; params.append(status)
     if ntype:
         sql += ' AND ntype=?'; params.append(ntype)
+    # 合伙人只看自己仓的通知(warehouse_id 为空的全局通知所有人可见)
+    sc, sp = warehouse_scope_clause('warehouse_id')
+    if sc:
+        sql += ' AND (warehouse_id IS NULL' + sc.replace(' AND ', ' OR ', 1) + ')'
+        params += sp
     sql += ' ORDER BY id DESC LIMIT ?'; params.append(limit)
     rows = conn.execute(sql, params).fetchall()
     conn.close()
@@ -238,9 +243,13 @@ def list_notifications():
 def unread_count():
     conn = get_conn()
     try:
-        n = conn.execute("SELECT COUNT(*) FROM inv_notifications WHERE status='unread'").fetchone()[0]
+        sc, sp = warehouse_scope_clause('warehouse_id')
+        scope = ''
+        if sc:
+            scope = ' AND (warehouse_id IS NULL' + sc.replace(' AND ', ' OR ', 1) + ')'
+        n = conn.execute(f"SELECT COUNT(*) FROM inv_notifications WHERE status='unread'{scope}", sp).fetchone()[0]
         by = {r['ntype']: r['n'] for r in conn.execute(
-            "SELECT ntype, COUNT(*) AS n FROM inv_notifications WHERE status='unread' GROUP BY ntype").fetchall()}
+            f"SELECT ntype, COUNT(*) AS n FROM inv_notifications WHERE status='unread'{scope} GROUP BY ntype", sp).fetchall()}
         return jsonify({'unread': n, 'by_type': by})
     finally:
         conn.close()

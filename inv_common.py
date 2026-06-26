@@ -156,6 +156,94 @@ def can_manage_inventory():
     return _user_flag('can_manage_inventory')
 
 
+def can_ship():
+    """发货员标志(复用现有 users.can_ship)。"""
+    return _user_flag('can_ship')
+
+
+# ───────────────────── 角色与仓库可见范围(模块9) ─────────────────────
+# 角色:
+#   管理员(admin)          → 全部仓库,读写。
+#   内部库存管理(can_manage_inventory) → 全部仓库,读写。
+#   内部库存查看(can_view_inventory)   → 全部仓库,只读。
+#   发货员(can_ship)        → 全部仓库,只读(发货时查库存)。
+#   合伙人(partner_users)   → 只读,且只能看自己仓(inv_warehouse_ext.partner_id 关联)。
+
+def _is_admin():
+    from flask_login import current_user
+    return (getattr(current_user, 'username', None) == 'admin'
+            or (hasattr(current_user, 'is_admin') and getattr(current_user, 'is_authenticated', False)
+                and current_user.is_admin()))
+
+
+def current_partner_ids():
+    """当前用户绑定的合伙人 id 列表(partner_users)。非合伙人返回 []。"""
+    from flask_login import current_user
+    if not getattr(current_user, 'is_authenticated', False):
+        return []
+    try:
+        conn = get_conn()
+        rows = conn.execute('SELECT partner_id FROM partner_users WHERE user_id=?',
+                            (current_user.id,)).fetchall()
+        conn.close()
+        return [r['partner_id'] for r in rows]
+    except Exception:
+        return []
+
+
+def is_partner_user():
+    return len(current_partner_ids()) > 0
+
+
+def partner_warehouse_ids():
+    """合伙人用户能看的仓库 id(inv_warehouse_ext.partner_id 命中其合伙人)。"""
+    pids = current_partner_ids()
+    if not pids:
+        return []
+    try:
+        conn = get_conn()
+        q = ','.join('?' * len(pids))
+        rows = conn.execute(
+            f'SELECT warehouse_id FROM inv_warehouse_ext WHERE partner_id IN ({q})', pids).fetchall()
+        conn.close()
+        return [r['warehouse_id'] for r in rows]
+    except Exception:
+        return []
+
+
+def visible_warehouse_ids():
+    """当前用户可见仓库范围。None=全部;list=受限(合伙人只看自己仓)。
+
+    内部角色(管理员/库存管理/库存查看/发货员)看全部;合伙人受限。
+    既是内部又是合伙人时按内部处理(看全部)。
+    """
+    if _is_admin() or can_view_inventory() or can_manage_inventory() or can_ship():
+        return None
+    if is_partner_user():
+        return partner_warehouse_ids()
+    return []  # 无任何库存权限 → 看不到(理论上不会进到这)
+
+
+def warehouse_scope_clause(col='warehouse_id'):
+    """返回 (sql_fragment, params) 用于在查询里追加仓库可见性过滤。
+
+    None(全部)→ ('', []);受限 → (' AND col IN (?,..)', ids);
+    空 → (' AND 1=0', []) 即什么都看不到。
+    """
+    ids = visible_warehouse_ids()
+    if ids is None:
+        return '', []
+    if not ids:
+        return ' AND 1=0', []
+    return f' AND {col} IN ({",".join("?" * len(ids))})', list(ids)
+
+
+def can_view_inventory_any():
+    """是否能进入库存模块(任一内部库存角色 或 合伙人)。"""
+    return bool(_is_admin() or can_view_inventory() or can_manage_inventory()
+                or can_ship() or is_partner_user())
+
+
 def _deny(message='您没有权限访问库存管理。', code=403, json=False):
     from flask import jsonify, render_template_string
     if json:
@@ -182,7 +270,7 @@ def inv_view_required(f):
         from flask import redirect, url_for
         if not getattr(current_user, 'is_authenticated', False):
             return redirect(url_for('login'))
-        if not (can_view_inventory() or can_manage_inventory()):
+        if not can_view_inventory_any():
             return _deny('库存管理需要授权,请联系管理员。')
         return f(*args, **kwargs)
     return wrapper

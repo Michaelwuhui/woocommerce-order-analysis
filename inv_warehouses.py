@@ -19,7 +19,7 @@ from flask import Blueprint, render_template, request, jsonify
 from flask_login import login_required
 
 from inv_common import (
-    get_conn, inv_view_required, inv_admin_required,
+    get_conn, inv_view_required, inv_admin_required, warehouse_scope_clause,
 )
 
 inv_wh_bp = Blueprint('inv_wh', __name__)
@@ -40,22 +40,35 @@ def warehouses_page():
 @login_required
 @inv_view_required
 def list_warehouses():
-    """列出所有仓库 + 库存扩展属性(left join,无扩展则给默认自营)。"""
+    """列出仓库 + 库存扩展属性。合伙人只看自己仓(warehouse_scope_clause)。"""
     conn = get_conn()
+    sc, params = warehouse_scope_clause('w.id')
     rows = conn.execute('''
         SELECT w.id, w.name, w.code, w.country, w.default_currency, w.is_active, w.notes,
                COALESCE(we.ownership_type, 'self') AS ownership_type,
-               we.partner_name,
-               we.partner_id,
-               COALESCE(we.is_fulfillment, 1) AS is_fulfillment,
-               we.region,
+               we.partner_name, we.partner_id,
+               COALESCE(we.is_fulfillment, 1) AS is_fulfillment, we.region,
                (SELECT COUNT(*) FROM inv_market_warehouses mw WHERE mw.warehouse_id = w.id) AS route_count
         FROM warehouses w
         LEFT JOIN inv_warehouse_ext we ON we.warehouse_id = w.id
-        ORDER BY w.is_active DESC, w.country, w.name
-    ''').fetchall()
+        WHERE 1=1''' + sc + ' ORDER BY w.is_active DESC, w.country, w.name', params).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@inv_wh_bp.route('/api/inv/partners', methods=['GET'])
+@login_required
+@inv_view_required
+def list_partners():
+    """合伙人下拉(供仓库归属选择,把合伙人仓关联到 partners.id)。"""
+    conn = get_conn()
+    try:
+        rows = conn.execute('SELECT id, name, code FROM partners ORDER BY name').fetchall()
+        return jsonify([dict(r) for r in rows])
+    except Exception:
+        return jsonify([])
+    finally:
+        conn.close()
 
 
 @inv_wh_bp.route('/api/inv/warehouses', methods=['POST'])
@@ -71,6 +84,7 @@ def create_warehouse():
     notes = (d.get('notes') or '').strip()
     ownership = d.get('ownership_type') or 'self'
     partner_name = (d.get('partner_name') or '').strip() or None
+    partner_id = d.get('partner_id') or None
     is_fulfillment = 1 if d.get('is_fulfillment', True) else 0
 
     if not name or not code or not country:
@@ -79,6 +93,8 @@ def create_warehouse():
         return jsonify({'error': 'ownership_type 必须是 self 或 partner'}), 400
     if ownership == 'partner' and not partner_name:
         return jsonify({'error': '合伙人仓必须填写合伙人名称'}), 400
+    if ownership == 'self':
+        partner_id = None
 
     conn = get_conn()
     try:
@@ -87,9 +103,9 @@ def create_warehouse():
             (name, code, country, currency, notes))
         wid = cur.lastrowid
         conn.execute('''INSERT INTO inv_warehouse_ext
-                        (warehouse_id, ownership_type, partner_name, is_fulfillment)
-                        VALUES (?,?,?,?)''',
-                     (wid, ownership, partner_name, is_fulfillment))
+                        (warehouse_id, ownership_type, partner_name, partner_id, is_fulfillment)
+                        VALUES (?,?,?,?,?)''',
+                     (wid, ownership, partner_name, partner_id, is_fulfillment))
         conn.commit()
         return jsonify({'success': True, 'id': wid})
     except Exception as e:
@@ -114,12 +130,14 @@ def update_warehouse(wid):
 
         ownership = d.get('ownership_type', 'self')
         partner_name = (d.get('partner_name') or '').strip() or None
+        partner_id = d.get('partner_id') or None
         if ownership not in ('self', 'partner'):
             return jsonify({'error': 'ownership_type 必须是 self 或 partner'}), 400
         if ownership == 'partner' and not partner_name:
             return jsonify({'error': '合伙人仓必须填写合伙人名称'}), 400
         if ownership == 'self':
             partner_name = None  # 自营仓清空合伙人名
+            partner_id = None
 
         # warehouses 主数据(只更新这几列,不触碰其它列含义)
         conn.execute('''UPDATE warehouses SET name=?, code=?, country=?, default_currency=?,
@@ -130,14 +148,15 @@ def update_warehouse(wid):
 
         is_fulfillment = 1 if d.get('is_fulfillment', True) else 0
         conn.execute('''INSERT INTO inv_warehouse_ext
-                        (warehouse_id, ownership_type, partner_name, is_fulfillment)
-                        VALUES (?,?,?,?)
+                        (warehouse_id, ownership_type, partner_name, partner_id, is_fulfillment)
+                        VALUES (?,?,?,?,?)
                         ON CONFLICT(warehouse_id) DO UPDATE SET
                             ownership_type=excluded.ownership_type,
                             partner_name=excluded.partner_name,
+                            partner_id=excluded.partner_id,
                             is_fulfillment=excluded.is_fulfillment,
                             updated_at=CURRENT_TIMESTAMP''',
-                     (wid, ownership, partner_name, is_fulfillment))
+                     (wid, ownership, partner_name, partner_id, is_fulfillment))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
