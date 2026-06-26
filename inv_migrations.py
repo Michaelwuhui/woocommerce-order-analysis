@@ -434,11 +434,49 @@ def down_004(conn):
     conn.commit()
 
 
+# ───────────────── 005: 通知中心 + SKU 补货点 ─────────────────
+
+def up_005(conn):
+    """inv_notifications(站内通知)+ 给 inv_skus 加 reorder_point(补货点,纯新增列)。"""
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS inv_notifications (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ntype        TEXT NOT NULL,        -- restock / near_expiry / expired / slow_moving
+            severity     TEXT NOT NULL DEFAULT 'info',  -- info / warning / danger
+            title        TEXT NOT NULL,
+            body         TEXT,
+            sku_id       INTEGER,
+            warehouse_id INTEGER,
+            ref_type     TEXT,
+            ref_id       TEXT,
+            dedup_key    TEXT,                 -- 同一未读问题去重
+            status       TEXT NOT NULL DEFAULT 'unread',  -- unread / read / dismissed
+            emailed      INTEGER DEFAULT 0,
+            created_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at   TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_inv_notif_status ON inv_notifications(status, ntype)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_inv_notif_dedup ON inv_notifications(dedup_key, status)')
+    try:
+        conn.execute('ALTER TABLE inv_skus ADD COLUMN reorder_point INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+
+
+def down_005(conn):
+    conn.execute('DROP TABLE IF EXISTS inv_notifications')
+    # 不删 inv_skus.reorder_point(纯新增列,删列有风险且违反"禁止删列")
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
     ('003', 'order_inventory_state', up_003, down_003),
     ('004', 'inv_push_logs', up_004, down_004),
+    ('005', 'notifications', up_005, down_005),
 ]
 
 

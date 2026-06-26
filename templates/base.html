@@ -212,6 +212,7 @@
                             <li><a class="dropdown-item" href="{{ url_for('inv_batch.batches_page') }}"><i class="bi bi-calendar-x me-2"></i>批次/保质期</a></li>
                             <li><a class="dropdown-item" href="{{ url_for('inv_ord.orders_page') }}"><i class="bi bi-arrow-left-right me-2"></i>订单库存联动</a></li>
                             <li><a class="dropdown-item" href="{{ url_for('inv_push.push_page') }}"><i class="bi bi-cloud-upload me-2"></i>库存下推/对账</a></li>
+                            <li><a class="dropdown-item" href="{{ url_for('inv_notify.notifications_page') }}"><i class="bi bi-bell me-2"></i>库存通知中心</a></li>
                             <li><a class="dropdown-item" href="{{ url_for('inv_wh.warehouses_page') }}"><i class="bi bi-buildings me-2"></i>仓库管理</a></li>
                             <li><a class="dropdown-item" href="{{ url_for('inv_sku.skus_page') }}"><i class="bi bi-upc-scan me-2"></i>SKU 主档</a></li>
                         </ul>
@@ -227,6 +228,24 @@
                     {% endif %}
                 </ul>
                 <ul class="navbar-nav">
+                    {% if inv_can_view %}
+                    <!-- 库存通知铃铛 -->
+                    <li class="nav-item dropdown me-2">
+                        <a class="nav-link position-relative" href="#" id="invBell" data-bs-toggle="dropdown" title="库存通知">
+                            <i class="bi bi-bell"></i>
+                            <span id="invBellBadge" class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger" style="display:none;font-size:.6rem;">0</span>
+                        </a>
+                        <ul class="dropdown-menu dropdown-menu-end dropdown-menu-dark" style="min-width:340px;max-height:420px;overflow:auto;" id="invBellMenu">
+                            <li class="dropdown-header d-flex justify-content-between align-items-center">
+                                <span>库存通知</span>
+                                <a href="#" class="small" onclick="invMarkAllRead(event)">全部已读</a>
+                            </li>
+                            <li><div id="invBellList" class="px-2 py-1 text-white-50 small">加载中...</div></li>
+                            <li><hr class="dropdown-divider"></li>
+                            <li><a class="dropdown-item text-center small" href="{{ url_for('inv_notify.notifications_page') }}">查看全部 →</a></li>
+                        </ul>
+                    </li>
+                    {% endif %}
                     <!-- Display Mode Toggle -->
                     <li class="nav-item d-flex align-items-center me-3">
                         <div class="form-check form-switch mb-0">
@@ -2345,6 +2364,48 @@
         }
     })();
     </script>
+    {% if inv_can_view %}
+    <script>
+    // 库存通知铃铛:轮询未读数 + 下拉列表 + 首次有未读弹 toast
+    (function(){
+      const SEV={info:'text-info',warning:'text-warning',danger:'text-danger'};
+      function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+      let shownToast=false;
+      async function poll(){
+        try{
+          const j=await (await fetch('/api/inv/notifications/unread-count')).json();
+          const b=document.getElementById('invBellBadge');
+          if(b){ if(j.unread>0){b.style.display='';b.textContent=j.unread>99?'99+':j.unread;} else b.style.display='none'; }
+          if(j.unread>0 && !shownToast && !sessionStorage.getItem('invToastShown')){
+            shownToast=true; sessionStorage.setItem('invToastShown','1'); showToast(j.unread,j.by_type);
+          }
+        }catch(e){}
+      }
+      function showToast(n,by){
+        const parts=Object.entries(by||{}).map(([k,v])=>({restock:'补货',near_expiry:'临期',expired:'过期',slow_moving:'滞销'}[k]||k)+':'+v).join(' / ');
+        const d=document.createElement('div');
+        d.style.cssText='position:fixed;right:20px;bottom:20px;z-index:2000;background:#1e293b;border:1px solid #334155;border-radius:12px;padding:14px 18px;color:#e2e8f0;box-shadow:0 10px 30px rgba(0,0,0,.5);max-width:340px;';
+        d.innerHTML='<div class="fw-bold mb-1"><i class="bi bi-bell-fill text-warning me-1"></i>库存提醒 '+n+' 条未读</div><div class="small text-white-50">'+esc(parts)+'</div><div class="mt-2"><a href="/inventory/notifications" class="btn btn-sm btn-primary">查看</a> <button class="btn btn-sm btn-outline-light" onclick="this.closest(\'div\').remove()">关闭</button></div>';
+        document.body.appendChild(d); setTimeout(()=>d.remove(),12000);
+      }
+      window.invLoadBell=async function(){
+        const list=document.getElementById('invBellList'); if(!list)return;
+        const rows=await (await fetch('/api/inv/notifications?status=unread&limit=15')).json();
+        list.innerHTML = rows.length? rows.map(r=>`<div class="border-bottom border-secondary border-opacity-25 py-1">
+          <div class="${SEV[r.severity]||''}"><i class="bi bi-dot"></i>${esc(r.title)}</div>
+          <div class="text-white-50" style="font-size:.75rem">${esc(r.body||'')}</div>
+          <div><a href="#" class="small" onclick="invMark(${r.id},'read',event)">标记已读</a> ·
+               <a href="#" class="small text-white-50" onclick="invMark(${r.id},'dismiss',event)">忽略</a></div>
+        </div>`).join('') : '<div class="text-white-50">暂无未读通知</div>';
+      };
+      window.invMark=async function(id,act,ev){ if(ev)ev.preventDefault(); await fetch(`/api/inv/notifications/${id}/${act}`,{method:'POST'}); invLoadBell(); poll(); };
+      window.invMarkAllRead=async function(ev){ if(ev)ev.preventDefault(); await fetch('/api/inv/notifications/mark-all-read',{method:'POST'}); invLoadBell(); poll(); };
+      const bell=document.getElementById('invBell');
+      if(bell) bell.addEventListener('click', ()=>setTimeout(invLoadBell,50));
+      poll(); setInterval(poll, 60000);
+    })();
+    </script>
+    {% endif %}
 </body>
 
 </html>
