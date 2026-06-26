@@ -13,6 +13,7 @@
         <div class="input-group input-group-sm">
           <input id="oid" class="form-control bg-dark text-white border-secondary" placeholder="订单ID 如 1-50354">
           <button class="btn btn-outline-info" onclick="viewState()">查看</button>
+          <button class="btn btn-outline-light" onclick="previewAlloc()">分仓预览</button>
           {% if can_manage_inv %}<button class="btn btn-primary" onclick="processOne()">处理</button>{% endif %}
         </div></div>
       {% if can_manage_inv %}
@@ -54,6 +55,17 @@ async function viewState(){
     <table class="table table-dark table-sm mt-2 mb-0"><thead><tr class="small text-white-50"><th>商品</th><th>数量</th><th>SKU</th><th>折合</th><th>路径</th></tr></thead><tbody>
     ${j.resolved.lines.map(l=>`<tr class="${l.sku_id?'':'text-warning'}"><td>${esc(l.name)}</td><td>${l.qty}</td><td>${l.sku_code?('<code>'+esc(l.sku_code)+'</code>'):'未映射'}</td><td>${l.sku_qty}</td><td>${VIA[l.match_via]||l.match_via}</td></tr>`).join('')}
     </tbody></table></div>`;
+}
+async function previewAlloc(){
+  const oid=qs('oid').value.trim();if(!oid)return;
+  const r=await fetch('/api/inv/allocate-preview/'+encodeURIComponent(oid));const j=await r.json();
+  if(!r.ok){qs('stateDetail').innerHTML='<span class="text-danger">'+esc(j.error||'失败')+'</span>';return;}
+  if(j.blocked){qs('stateDetail').innerHTML='<span class="text-warning">有 '+j.unmatched+' 行未映射,无法分仓</span>';return;}
+  const p=j.plan;
+  let html=`<div class="border border-secondary border-opacity-25 rounded p-2">市场 <b>${esc(j.market||'?')}</b> · 方案 <b>${esc(p.reason)}</b> ${p.is_split?'<span class="badge bg-warning text-dark">拆单</span>':'<span class="badge bg-success">单仓</span>'}`;
+  html+=p.allocations.map(a=>`<div class="mt-1">📦 <b>${esc(a.name)}</b> ${a.ownership_type==='partner'?('<span class="badge bg-warning text-dark">合伙人'+(a.partner_name?(' '+esc(a.partner_name)):'')+'</span>'):'<span class="badge bg-info">自营</span>'}: ${a.lines.map(l=>esc(l.sku_code||l.sku_id)+'×'+l.qty).join(', ')}</div>`).join('');
+  if(p.shortage&&Object.keys(p.shortage).length)html+=`<div class="text-danger mt-1">缺货: ${JSON.stringify(p.shortage)}</div>`;
+  html+='</div>';qs('stateDetail').innerHTML=html;
 }
 async function processOne(){
   const oid=qs('oid').value.trim();if(!oid)return;

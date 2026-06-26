@@ -32,6 +32,7 @@ from inv_common import (
 )
 import inv_resolver
 import inv_batches
+import inv_allocator
 
 inv_ord_bp = Blueprint('inv_ord', __name__)
 
@@ -69,33 +70,10 @@ def order_market(conn, order):
     return (s['country'].upper() if s and s['country'] else None)
 
 
-def pick_warehouse(conn, order, market):
-    """选仓(单仓版)。返回 warehouse_id 或 None。
-
-    1) orders.warehouse_id 若已指派,直接用;
-    2) 否则按市场路由取首选(priority 最小)的、参与分仓的活跃仓;
-    3) 再否则取该市场国家下任一活跃仓。
-    """
-    wid = order['warehouse_id'] if 'warehouse_id' in order.keys() else None
-    if wid:
-        return wid
-    if market:
-        r = conn.execute('''SELECT mw.warehouse_id FROM inv_market_warehouses mw
-                            JOIN warehouses w ON w.id=mw.warehouse_id
-                            LEFT JOIN inv_warehouse_ext we ON we.warehouse_id=w.id
-                            WHERE mw.market_code=? AND mw.is_active=1 AND w.is_active=1
-                              AND COALESCE(we.is_fulfillment,1)=1
-                            ORDER BY mw.priority, mw.id LIMIT 1''', (market,)).fetchone()
-        if r:
-            return r['warehouse_id']
-        r = conn.execute("SELECT id FROM warehouses WHERE country=? AND is_active=1 ORDER BY id LIMIT 1",
-                         (market,)).fetchone()
-        if r:
-            return r['id']
-    return None
-
-
-# ───────────────────────── 效果施加/冲销 ─────────────────────────
+# ───────────────────────── 效果施加/冲销(多仓) ─────────────────────────
+# committed_json 形如:
+#   {'allocations': [ {warehouse_id, mode:'reserved'|'shipped',
+#                      lines:[{sku_id,qty}], batches:[{batch_id,qty}]}, ... ]}
 
 def _aggregate_sku_lines(resolved):
     """把解析结果按 sku_id 聚合 sku 总数(同 SKU 多行合并)。"""
@@ -106,58 +84,91 @@ def _aggregate_sku_lines(resolved):
     return agg
 
 
-def _unreserve(conn, st, uid, uname):
-    """冲销已有预留(committed mode=reserved)。"""
-    c = json.loads(st['committed_json'] or '{}')
-    wid = c.get('warehouse_id')
-    for ln in c.get('lines', []):
-        record_movement(conn, warehouse_id=wid, sku_id=ln['sku_id'], movement_type='release',
-                        reserved_delta=-ln['qty'], ref_type='order', ref_id=st['order_id'],
-                        order_id=st['order_id'], operator_id=uid, operator_name=uname,
-                        note='释放预留(状态变更)')
+def _committed_allocs(st):
+    if not st or not st['committed_json']:
+        return []
+    return (json.loads(st['committed_json']) or {}).get('allocations', [])
 
 
-def _unship(conn, st, uid, uname):
-    """冲销已有出库(committed mode=shipped):退货入库 + 批次回补。"""
-    c = json.loads(st['committed_json'] or '{}')
-    wid = c.get('warehouse_id')
-    # 批次回补(按当时分配)
-    for b in c.get('batches', []):
-        inv_batches.restock_batch(conn, b['batch_id'], b['qty'])
-    for ln in c.get('lines', []):
-        record_movement(conn, warehouse_id=wid, sku_id=ln['sku_id'], movement_type='return_in',
-                        qty_delta=ln['qty'], ref_type='order', ref_id=st['order_id'],
-                        order_id=st['order_id'], operator_id=uid, operator_name=uname,
-                        note='退货入库(状态变更)')
-
-
-def _apply_reserve(conn, order_id, wid, sku_agg, uid, uname):
-    for sku_id, qty in sku_agg.items():
-        record_movement(conn, warehouse_id=wid, sku_id=sku_id, movement_type='reserve',
-                        reserved_delta=qty, ref_type='order', ref_id=order_id,
+def _reserve_alloc(conn, order_id, alloc, uid, uname):
+    """对一个仓的分配做预留。"""
+    wid = alloc['warehouse_id']
+    for ln in alloc['lines']:
+        record_movement(conn, warehouse_id=wid, sku_id=ln['sku_id'], movement_type='reserve',
+                        reserved_delta=ln['qty'], ref_type='order', ref_id=order_id,
                         order_id=order_id, operator_id=uid, operator_name=uname, note='订单预留')
-    return {'mode': 'reserved', 'warehouse_id': wid,
-            'lines': [{'sku_id': k, 'qty': v} for k, v in sku_agg.items()], 'batches': []}
+    return {'warehouse_id': wid, 'mode': 'reserved',
+            'lines': [dict(l) for l in alloc['lines']], 'batches': []}
 
 
-def _apply_ship(conn, order_id, wid, sku_agg, uid, uname, from_reserved):
-    """出库:扣 on_hand + FEFO 批次。from_reserved=True 时同时释放对应预留。"""
+def _ship_alloc(conn, order_id, alloc, uid, uname, from_reserved):
+    """对一个仓的分配做出库:扣 on_hand + FEFO 批次;from_reserved 时释放预留。"""
+    wid = alloc['warehouse_id']
     batches = []
-    for sku_id, qty in sku_agg.items():
-        allocs, shortage = inv_batches.plan_fefo(conn, wid, sku_id, qty)
-        # 即使批次不足(shortage>0),也按 on_hand 扣减(负库存由调用前校验/允许超卖策略决定);
-        # 这里记录实际可分配批次,剩余无批次部分不挂批次。
+    for ln in alloc['lines']:
+        allocs, _short = inv_batches.plan_fefo(conn, wid, ln['sku_id'], ln['qty'])
         inv_batches.consume_batches(conn, allocs)
         for a in allocs:
             batches.append({'batch_id': a['batch_id'], 'qty': a['qty']})
-        reserved_delta = -qty if from_reserved else 0
-        record_movement(conn, warehouse_id=wid, sku_id=sku_id, movement_type='sale_out',
-                        qty_delta=-qty, reserved_delta=reserved_delta,
+        record_movement(conn, warehouse_id=wid, sku_id=ln['sku_id'], movement_type='sale_out',
+                        qty_delta=-ln['qty'], reserved_delta=(-ln['qty'] if from_reserved else 0),
                         ref_type='order', ref_id=order_id, order_id=order_id,
                         operator_id=uid, operator_name=uname,
                         note='销售出库' + ('(原预留转出)' if from_reserved else ''))
-    return {'mode': 'shipped', 'warehouse_id': wid,
-            'lines': [{'sku_id': k, 'qty': v} for k, v in sku_agg.items()], 'batches': batches}
+    return {'warehouse_id': wid, 'mode': 'shipped',
+            'lines': [dict(l) for l in alloc['lines']], 'batches': batches}
+
+
+def _unreserve_allocs(conn, order_id, allocs, uid, uname):
+    for a in allocs:
+        for ln in a.get('lines', []):
+            record_movement(conn, warehouse_id=a['warehouse_id'], sku_id=ln['sku_id'],
+                            movement_type='release', reserved_delta=-ln['qty'],
+                            ref_type='order', ref_id=order_id, order_id=order_id,
+                            operator_id=uid, operator_name=uname, note='释放预留(状态变更)')
+
+
+def _unship_allocs(conn, order_id, allocs, uid, uname):
+    for a in allocs:
+        for b in a.get('batches', []):
+            inv_batches.restock_batch(conn, b['batch_id'], b['qty'])
+        for ln in a.get('lines', []):
+            record_movement(conn, warehouse_id=a['warehouse_id'], sku_id=ln['sku_id'],
+                            movement_type='return_in', qty_delta=ln['qty'],
+                            ref_type='order', ref_id=order_id, order_id=order_id,
+                            operator_id=uid, operator_name=uname, note='退货入库(状态变更)')
+
+
+def _undo_current(conn, order_id, st, uid, uname):
+    """按当前状态冲销已提交效果(预留→释放;出库→退货回补)。"""
+    if not st:
+        return
+    if st['inv_state'] == 'reserved':
+        _unreserve_allocs(conn, order_id, _committed_allocs(st), uid, uname)
+    elif st['inv_state'] == 'shipped':
+        _unship_allocs(conn, order_id, _committed_allocs(st), uid, uname)
+
+
+# ── inv_fulfillments:由 committed 派生,每次状态转换重建 ──
+
+def _clear_fulfillments(conn, order_id):
+    conn.execute('DELETE FROM inv_fulfillments WHERE order_id=?', (order_id,))  # 级联删 items
+
+
+def _rebuild_fulfillments(conn, order_id, source, committed_allocs, status, uid, uname):
+    _clear_fulfillments(conn, order_id)
+    n = len(committed_allocs)
+    for i, a in enumerate(committed_allocs, 1):
+        cur = conn.execute('''INSERT INTO inv_fulfillments
+            (order_id, source, warehouse_id, status, is_split, split_index, split_total,
+             operator_id, operator_name)
+            VALUES (?,?,?,?,?,?,?,?,?)''',
+            (order_id, source, a['warehouse_id'], status, 1 if n > 1 else 0, i, n, uid, uname))
+        fid = cur.lastrowid
+        # 把批次按 sku 粗略对应到 item(单 sku 单 item;批次明细在流水里已可追溯)
+        for ln in a.get('lines', []):
+            conn.execute('INSERT INTO inv_fulfillment_items (fulfillment_id, sku_id, qty) VALUES (?,?,?)',
+                         (fid, ln['sku_id'], ln['qty']))
 
 
 def _save_state(conn, order_id, source, inv_state, wid, committed, status, market, note=None):
@@ -173,10 +184,37 @@ def _save_state(conn, order_id, source, inv_state, wid, committed, status, marke
          status, market, note))
 
 
-# ───────────────────────── 幂等处理器 ─────────────────────────
+def _plan_allocations(conn, order, market, sku_agg):
+    """决定分配方案。
+
+    设计要点:现有系统给每张订单都自动设了 orders.warehouse_id(按站点国家)。
+    若直接尊重它,自动分仓/拆单就永远不会发生。因此:
+      - 该市场**已配置**路由(inv_market_warehouses 有候选仓)→ 用分配引擎
+        (单仓优先,缺货拆单)——这是本系统的核心目标行为;
+      - 该市场**未配置**路由 → 回退到订单既有 warehouse_id(单仓),
+        保证未接入自动分仓的市场(如 AU/AE)照旧工作。
+    未来新市场只要在仓库管理里加路由,就自动切换到分仓引擎,无需改代码。
+
+    返回 (allocations_for_apply, shortage, is_split, plan_reason)。
+    """
+    cands = inv_allocator.candidate_warehouses(conn, market)
+    if cands:
+        plan = inv_allocator.allocate(conn, market, sku_agg)
+        allocs = [{'warehouse_id': a['warehouse_id'], 'lines': a['lines']} for a in plan['allocations']]
+        return allocs, plan['shortage'], plan['is_split'], plan['reason']
+    # 未配置该市场路由 → 回退订单既有仓库(单仓)
+    forced = order['warehouse_id'] if 'warehouse_id' in order.keys() else None
+    if forced:
+        return ([{'warehouse_id': forced,
+                  'lines': [{'sku_id': k, 'qty': v} for k, v in sku_agg.items()]}],
+                {}, False, 'legacy_warehouse')
+    return [], dict(sku_agg), False, 'no_warehouse'
+
+
+# ───────────────────────── 幂等处理器(多仓) ─────────────────────────
 
 def process_order(conn, order_id, caches=None, commit=True):
-    """把单张订单的库存对齐到其当前状态。幂等。返回处理摘要 dict。"""
+    """把单张订单的库存对齐到其当前状态。幂等。支持多仓自动拆单。"""
     uid, uname = current_operator()
     order = conn.execute('SELECT * FROM orders WHERE id=?', (order_id,)).fetchone()
     if not order:
@@ -186,10 +224,9 @@ def process_order(conn, order_id, caches=None, commit=True):
     target = target_effect(status)
     st = conn.execute('SELECT * FROM inv_order_state WHERE order_id=?', (order_id,)).fetchone()
     cur_state = st['inv_state'] if st else 'none'
-
     market = order_market(conn, order)
 
-    # 忽略的状态(如未知)——记录但不动库存
+    # 不参与联动的状态
     if target is None:
         _save_state(conn, order_id, order['source'], cur_state if st else 'none',
                     (st['warehouse_id'] if st else None),
@@ -199,77 +236,98 @@ def process_order(conn, order_id, caches=None, commit=True):
             conn.commit()
         return {'order_id': order_id, 'status': status, 'action': 'ignored', 'inv_state': cur_state}
 
-    # 解析 line_items → SKU
     if caches is None:
         caches = inv_resolver.build_caches(conn)
     resolved = inv_resolver.resolve_order(conn, order, caches)
     sku_agg = _aggregate_sku_lines(resolved)
 
-    # 有未映射:无法安全扣减 → 先冲销旧效果(避免悬挂),标 blocked
+    # 未映射:冲销旧效果并标 blocked
     if resolved['unmatched'] > 0 or not sku_agg:
-        if cur_state == 'reserved':
-            _unreserve(conn, st, uid, uname)
-        elif cur_state == 'shipped':
-            _unship(conn, st, uid, uname)
-        _save_state(conn, order_id, order['source'], 'blocked', (st['warehouse_id'] if st else None),
-                    None, status, market,
+        _undo_current(conn, order_id, st, uid, uname)
+        _clear_fulfillments(conn, order_id)
+        _save_state(conn, order_id, order['source'], 'blocked', None, None, status, market,
                     note=f"{resolved['unmatched']} 行未映射,无法扣减")
         if commit:
             conn.commit()
         return {'order_id': order_id, 'status': status, 'action': 'blocked',
                 'unmatched': resolved['unmatched'], 'inv_state': 'blocked'}
 
-    wid = pick_warehouse(conn, order, market)
-    if not wid:
-        _save_state(conn, order_id, order['source'], 'blocked', None, None, status, market,
-                    note='无可用仓库(未配置市场路由?)')
-        if commit:
-            conn.commit()
-        return {'order_id': order_id, 'status': status, 'action': 'blocked', 'reason': 'no_warehouse'}
-
-    # ---- 目标 = clear(释放/退货) ----
+    # ---- clear:释放/退货 ----
     if target == 'clear':
         if cur_state == 'reserved':
-            _unreserve(conn, st, uid, uname)
-            new_state = 'released'
+            _unreserve_allocs(conn, order_id, _committed_allocs(st), uid, uname); new_state = 'released'
         elif cur_state == 'shipped':
-            _unship(conn, st, uid, uname)
-            new_state = 'returned'
+            _unship_allocs(conn, order_id, _committed_allocs(st), uid, uname); new_state = 'returned'
         else:
             new_state = cur_state if cur_state in ('released', 'returned') else 'released'
-        _save_state(conn, order_id, order['source'], new_state, wid, None, status, market)
+        _clear_fulfillments(conn, order_id)
+        _save_state(conn, order_id, order['source'], new_state, None, None, status, market)
         if commit:
             conn.commit()
         return {'order_id': order_id, 'status': status, 'action': new_state, 'inv_state': new_state}
 
-    # ---- 目标 = reserved ----
+    # ---- reserved ----
     if target == 'reserved':
         if cur_state == 'reserved':
             if commit:
                 conn.commit()
             return {'order_id': order_id, 'status': status, 'action': 'noop', 'inv_state': 'reserved'}
         if cur_state == 'shipped':
-            _unship(conn, st, uid, uname)  # 出库回退→再预留
-        committed = _apply_reserve(conn, order_id, wid, sku_agg, uid, uname)
-        _save_state(conn, order_id, order['source'], 'reserved', wid, committed, status, market)
+            _unship_allocs(conn, order_id, _committed_allocs(st), uid, uname)  # 回退出库
+        allocs, shortage, is_split, reason = _plan_allocations(conn, order, market, sku_agg)
+        if not allocs:
+            _clear_fulfillments(conn, order_id)
+            _save_state(conn, order_id, order['source'], 'blocked', None, None, status, market,
+                        note='无可用仓库/库存(无法分配)')
+            if commit:
+                conn.commit()
+            return {'order_id': order_id, 'status': status, 'action': 'blocked', 'reason': reason}
+        committed_allocs = [_reserve_alloc(conn, order_id, a, uid, uname) for a in allocs]
+        committed = {'allocations': committed_allocs}
+        _rebuild_fulfillments(conn, order_id, order['source'], committed_allocs, 'reserved', uid, uname)
+        note = ('部分缺货:' + json.dumps(shortage)) if shortage else (('拆 %d 仓' % len(allocs)) if is_split else None)
+        _save_state(conn, order_id, order['source'], 'reserved',
+                    (allocs[0]['warehouse_id'] if len(allocs) == 1 else None),
+                    committed, status, market, note=note)
         if commit:
             conn.commit()
         return {'order_id': order_id, 'status': status, 'action': 'reserved', 'inv_state': 'reserved',
-                'warehouse_id': wid, 'skus': len(sku_agg)}
+                'is_split': is_split, 'warehouses': [a['warehouse_id'] for a in allocs],
+                'shortage': shortage}
 
-    # ---- 目标 = shipped ----
+    # ---- shipped ----
     if target == 'shipped':
         if cur_state == 'shipped':
             if commit:
                 conn.commit()
             return {'order_id': order_id, 'status': status, 'action': 'noop', 'inv_state': 'shipped'}
-        from_reserved = (cur_state == 'reserved')
-        committed = _apply_ship(conn, order_id, wid, sku_agg, uid, uname, from_reserved)
-        _save_state(conn, order_id, order['source'], 'shipped', wid, committed, status, market)
+        if cur_state == 'reserved':
+            # 出库已预留的相同分配(保持与预留一致,不重新分配)
+            committed_allocs = [_ship_alloc(conn, order_id, a, uid, uname, from_reserved=True)
+                                for a in _committed_allocs(st)]
+            shortage, is_split = {}, len(committed_allocs) > 1
+        else:
+            allocs, shortage, is_split, reason = _plan_allocations(conn, order, market, sku_agg)
+            if not allocs:
+                _clear_fulfillments(conn, order_id)
+                _save_state(conn, order_id, order['source'], 'blocked', None, None, status, market,
+                            note='无可用仓库/库存(无法分配)')
+                if commit:
+                    conn.commit()
+                return {'order_id': order_id, 'status': status, 'action': 'blocked', 'reason': reason}
+            committed_allocs = [_ship_alloc(conn, order_id, a, uid, uname, from_reserved=False)
+                                for a in allocs]
+        committed = {'allocations': committed_allocs}
+        _rebuild_fulfillments(conn, order_id, order['source'], committed_allocs, 'shipped', uid, uname)
+        note = ('部分缺货:' + json.dumps(shortage)) if shortage else (('拆 %d 仓' % len(committed_allocs)) if is_split else None)
+        _save_state(conn, order_id, order['source'], 'shipped',
+                    (committed_allocs[0]['warehouse_id'] if len(committed_allocs) == 1 else None),
+                    committed, status, market, note=note)
         if commit:
             conn.commit()
         return {'order_id': order_id, 'status': status, 'action': 'shipped', 'inv_state': 'shipped',
-                'warehouse_id': wid, 'skus': len(sku_agg), 'batches': len(committed['batches'])}
+                'is_split': is_split, 'warehouses': [a['warehouse_id'] for a in committed_allocs],
+                'shortage': shortage}
 
 
 # ───────────────────────────── API ─────────────────────────────
@@ -301,6 +359,63 @@ def get_order_state(order_id):
             'committed': (json.loads(st['committed_json']) if st and st['committed_json'] else None),
             'resolved': resolved,
         })
+    finally:
+        conn.close()
+
+
+@inv_ord_bp.route('/api/inv/allocate-preview/<path:order_id>', methods=['GET'])
+@login_required
+@inv_view_required
+def allocate_preview(order_id):
+    """分仓预览(不写库):展示该订单按市场路由+实时可用会怎么分/拆/缺货。"""
+    conn = get_conn()
+    try:
+        order = conn.execute('SELECT * FROM orders WHERE id=?', (order_id,)).fetchone()
+        if not order:
+            return jsonify({'error': '订单不存在'}), 404
+        resolved = inv_resolver.resolve_order(conn, order)
+        sku_agg = _aggregate_sku_lines(resolved)
+        market = order_market(conn, order)
+        if resolved['unmatched'] > 0 or not sku_agg:
+            return jsonify({'order_id': order_id, 'market': market, 'blocked': True,
+                            'unmatched': resolved['unmatched'], 'resolved': resolved})
+        forced = order['warehouse_id'] if 'warehouse_id' in order.keys() else None
+        plan = inv_allocator.allocate(conn, market, sku_agg)
+        # 附 SKU 名称便于展示
+        names = {r['id']: r['sku_code'] for r in conn.execute(
+            'SELECT id, sku_code FROM inv_skus WHERE id IN (%s)' %
+            (','.join('?' * len(sku_agg)) or 'NULL'), list(sku_agg.keys())).fetchall()} if sku_agg else {}
+        for a in plan['allocations']:
+            for ln in a['lines']:
+                ln['sku_code'] = names.get(ln['sku_id'])
+        return jsonify({'order_id': order_id, 'market': market, 'forced_warehouse_id': forced,
+                        'needs': [{'sku_id': k, 'sku_code': names.get(k), 'qty': v} for k, v in sku_agg.items()],
+                        'plan': plan})
+    finally:
+        conn.close()
+
+
+@inv_ord_bp.route('/api/inv/fulfillments/<path:order_id>', methods=['GET'])
+@login_required
+@inv_view_required
+def list_fulfillments(order_id):
+    """订单的分单(fulfillment)明细。"""
+    conn = get_conn()
+    try:
+        fuls = conn.execute('''SELECT f.*, w.name AS warehouse_name,
+                                COALESCE(we.ownership_type,'self') AS ownership_type, we.partner_name
+                               FROM inv_fulfillments f
+                               LEFT JOIN warehouses w ON w.id=f.warehouse_id
+                               LEFT JOIN inv_warehouse_ext we ON we.warehouse_id=f.warehouse_id
+                               WHERE f.order_id=? ORDER BY f.split_index''', (order_id,)).fetchall()
+        out = []
+        for f in fuls:
+            items = conn.execute('''SELECT i.*, k.sku_code, k.name AS sku_name
+                                    FROM inv_fulfillment_items i JOIN inv_skus k ON k.id=i.sku_id
+                                    WHERE i.fulfillment_id=?''', (f['id'],)).fetchall()
+            d = dict(f); d['items'] = [dict(x) for x in items]
+            out.append(d)
+        return jsonify(out)
     finally:
         conn.close()
 
