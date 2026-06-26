@@ -371,9 +371,43 @@ def down_002(conn):
     conn.commit()
 
 
+# ───────────────── 003: 订单库存联动状态表 ─────────────────
+
+def up_003(conn):
+    """inv_order_state:记录每张订单当前的库存联动状态,使卖出扣减幂等。
+
+    committed_json 保存当前已提交的明细与批次分配,以便订单状态回退时精确冲销。
+    inv_state: reserved(已预留) | shipped(已出库) | released(已释放) |
+               returned(已退货入库) | blocked(有未映射,无法扣减) | none。
+    """
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS inv_order_state (
+            order_id          TEXT PRIMARY KEY,   -- 软关联 orders.id(<site>-<woo>)
+            source            TEXT,
+            inv_state         TEXT NOT NULL DEFAULT 'none',
+            warehouse_id      INTEGER,
+            committed_json    TEXT,               -- {mode, warehouse_id, lines:[{sku_id,qty}], batches:[{batch_id,qty}]}
+            last_order_status TEXT,
+            market_code       TEXT,
+            note              TEXT,
+            processed_at      TEXT,
+            created_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at        TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_inv_ostate_state ON inv_order_state(inv_state)')
+    conn.commit()
+
+
+def down_003(conn):
+    conn.execute('DROP TABLE IF EXISTS inv_order_state')
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
+    ('003', 'order_inventory_state', up_003, down_003),
 ]
 
 
