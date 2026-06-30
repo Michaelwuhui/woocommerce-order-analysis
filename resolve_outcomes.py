@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import carrier_tracking as ct
 
 DB_FILE = 'woocommerce_orders.db'
-DEFAULT_MIN_AGE_DAYS = 7
+DEFAULT_MIN_AGE_DAYS = None
 INPOST_THROTTLE = 0.35
 
 
@@ -107,7 +107,9 @@ def extract_tracking(order):
 
 
 def fetch_candidates(conn, min_age_days, limit, recheck_hours, live, au_sites=None):
-    cutoff = (datetime.now() - timedelta(days=min_age_days)).strftime('%Y-%m-%dT%H:%M:%S')
+    cutoff = None
+    if min_age_days is not None:
+        cutoff = (datetime.now() - timedelta(days=min_age_days)).strftime('%Y-%m-%dT%H:%M:%S')
     recheck_clause = ''
     if live and recheck_hours is not None:
         # On cron runs, skip rows whose carrier_status was refreshed recently,
@@ -123,22 +125,41 @@ def fetch_candidates(conn, min_age_days, limit, recheck_hours, live, au_sites=No
     params = []
     if au_sites:
         ph = ','.join(['?'] * len(au_sites))
-        pay_clause = f"(payment_method = 'cod' OR source IN ({ph}))"
+        pay_clause = f"(o.payment_method = 'cod' OR o.source IN ({ph}))"
         params.extend(au_sites)
     else:
-        pay_clause = "payment_method = 'cod'"
-    params.append(cutoff)
+        pay_clause = "o.payment_method = 'cod'"
+    age_clause = ''
+    shipped_expr = "datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '))"
+    if cutoff is not None:
+        age_clause = "AND " + shipped_expr + " <= ?"
+        params.append(cutoff)
+    else:
+        age_clause = """
+          AND datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' ')) <= datetime(
+              'now',
+              '-' || CASE COALESCE(s.country, '')
+                       WHEN 'PL' THEN 1
+                       WHEN 'AU' THEN 10
+                       ELSE 7
+                     END || ' days'
+          )
+        """
     q = f"""
-        SELECT id, number, date_created, billing, meta_data, line_items, shipping_lines
-        FROM orders
+        SELECT o.id, o.number, o.date_created, o.billing, o.meta_data, o.line_items, o.shipping_lines
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN shipping_logs sl ON sl.id = (
+            SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
+        )
         WHERE {pay_clause}
-          AND status IN ('on-hold', 'shipped', 'partial-shipped')
-          AND COALESCE(is_undelivered, 0) = 0
-          AND COALESCE(is_problem_return, 0) = 0
-          AND COALESCE(delivery_confirmed, 0) = 0
-          AND date_created <= ?
+          AND o.status IN ('on-hold', 'shipped', 'partial-shipped')
+          AND COALESCE(o.is_undelivered, 0) = 0
+          AND COALESCE(o.is_problem_return, 0) = 0
+          AND COALESCE(o.delivery_confirmed, 0) = 0
+          {age_clause}
           {recheck_clause}
-        ORDER BY date_created DESC
+        ORDER BY o.date_created DESC
     """
     rows = conn.execute(q, params).fetchall()
     return rows[:limit] if limit else rows
@@ -153,7 +174,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--live', action='store_true', help='write carrier_status (default: dry-run, no writes, no 17track quota spend)')
     ap.add_argument('--limit', type=int, default=0)
-    ap.add_argument('--min-age-days', type=int, default=DEFAULT_MIN_AGE_DAYS)
+    ap.add_argument('--min-age-days', type=int, default=DEFAULT_MIN_AGE_DAYS,
+                    help='override country defaults (PL=3, AU=10, other=7)')
     ap.add_argument('--recheck-hours', type=int, default=12)
     ap.add_argument('--carrier', choices=['inpost', 'dpd', 'other', 'all'], default='all')
     ap.add_argument('--throttle', type=float, default=INPOST_THROTTLE)

@@ -5,6 +5,10 @@
   <h5 class="text-light mb-3"><i class="bi bi-clipboard-data me-2"></i>库存台账与出入库
     <span class="text-white-50 small ms-2">现存/预留/可用 · 采购入库 · 流水审计</span></h5>
 
+  <div class="row g-3 mb-3" id="overviewCards">
+    <div class="col-12 text-white-50 small">加载库存概览...</div>
+  </div>
+
   <ul class="nav nav-tabs mb-3" role="tablist">
     <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tabStock" onclick="loadStock()">库存台账</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabMov" onclick="loadMovements()">出入库流水</button></li>
@@ -19,7 +23,7 @@
         <select id="stockWh" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:220px" onchange="loadStock()">
           <option value="">全部仓库</option>{% for w in warehouses %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}
         </select>
-        <input id="stockQ" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:240px" placeholder="搜索 SKU" oninput="loadStock()">
+        <input id="stockQ" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:240px" placeholder="搜索 SKU" oninput="loadStockDebounced()">
         <div class="form-check form-switch align-self-center ms-2"><input class="form-check-input" type="checkbox" id="stockNonzero" checked onchange="loadStock()"><label class="form-check-label text-white-50 small" for="stockNonzero">仅非零</label></div>
         {% if can_manage_inv %}<button class="btn btn-sm btn-outline-warning ms-auto" onclick="openAdjustModal()"><i class="bi bi-sliders"></i> 手工调整</button>{% endif %}
       </div>
@@ -58,7 +62,7 @@
       </div>
       <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
         <table class="table table-dark table-hover align-middle mb-0">
-          <thead><tr class="text-white-50 small"><th>单号</th><th>仓库</th><th>供应商</th><th>明细</th><th class="text-end">总数量</th><th class="text-end">金额</th><th>状态</th><th>下单日</th>{% if can_manage_inv %}<th class="text-end">操作</th>{% endif %}</tr></thead>
+          <thead><tr class="text-white-50 small"><th>单号</th><th>仓库</th><th>供应商</th><th>明细</th><th class="text-end">总数量</th><th class="text-end">金额</th><th>状态</th><th>下单日</th><th class="text-end">操作</th></tr></thead>
           <tbody id="poTbody"><tr><td colspan="9" class="text-center text-white-50 py-4">加载中...</td></tr></tbody>
         </table></div></div></div>
     </div>
@@ -79,21 +83,23 @@
 <div class="modal fade" id="adjustModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content bg-dark border border-secondary border-opacity-25">
   <div class="modal-header border-bottom border-secondary border-opacity-25"><h5 class="modal-title text-white">手工库存调整</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
   <div class="modal-body"><div class="row g-2">
-    <div class="col-md-6"><label class="form-label text-white-50 small">仓库 *</label><select id="adjWh" class="form-select form-select-sm bg-dark text-white border-secondary"><option value="">选择</option>{% for w in warehouses %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select></div>
+    <div class="col-md-6"><label class="form-label text-white-50 small">仓库 *</label><select id="adjWh" class="form-select form-select-sm bg-dark text-white border-secondary" onchange="refreshAdjustPreview()"><option value="">选择</option>{% for w in warehouses %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select></div>
     <div class="col-md-6"><label class="form-label text-white-50 small">SKU *</label>
       <input id="adjSkuSearch" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="搜索 SKU" oninput="searchAdjSku()">
       <input type="hidden" id="adjSkuId"><div id="adjSkuChosen" class="small text-info mt-1">未选</div>
       <div id="adjSkuResults" class="list-group mt-1" style="max-height:140px;overflow:auto"></div></div>
-    <div class="col-md-6"><label class="form-label text-white-50 small">调整量(盘盈+ / 盘亏−) *</label><input id="adjDelta" type="number" class="form-control form-control-sm bg-dark text-white border-secondary"></div>
+    <div class="col-md-6"><label class="form-label text-white-50 small">调整量(盘盈+ / 盘亏-) *</label><input id="adjDelta" type="number" class="form-control form-control-sm bg-dark text-white border-secondary" oninput="renderAdjustPreview()"></div>
     <div class="col-12"><label class="form-label text-white-50 small">原因 *</label><input id="adjReason" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="如 盘点差异 / 报损"></div>
+    <div class="col-12"><div id="adjPreview" class="small text-white-50 border border-secondary border-opacity-25 rounded p-2">选择仓库和 SKU 后显示当前数量。</div></div>
   </div></div>
   <div class="modal-footer border-top border-secondary border-opacity-25"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-warning" onclick="saveAdjust()">提交调整</button></div>
 </div></div></div>
 
 <!-- 采购单 Modal -->
 <div class="modal fade" id="poModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content bg-dark border border-secondary border-opacity-25">
-  <div class="modal-header border-bottom border-secondary border-opacity-25"><h5 class="modal-title text-white">新建采购单</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+  <div class="modal-header border-bottom border-secondary border-opacity-25"><h5 class="modal-title text-white"><span id="poModalTitle">新建采购单</span></h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
   <div class="modal-body">
+    <input type="hidden" id="poId">
     <div class="row g-2 mb-3">
       <div class="col-md-4"><label class="form-label text-white-50 small">入库仓库 *</label><select id="poWh" class="form-select form-select-sm bg-dark text-white border-secondary"><option value="">选择</option>{% for w in warehouses %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select></div>
       <div class="col-md-4"><label class="form-label text-white-50 small">供应商</label><select id="poSup" class="form-select form-select-sm bg-dark text-white border-secondary"><option value="">(无)</option></select></div>
@@ -107,7 +113,14 @@
       <tbody id="poItemsBody"></tbody></table></div>
     <input id="poNote" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="备注">
   </div>
-  <div class="modal-footer border-top border-secondary border-opacity-25"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" onclick="savePo()">保存采购单(草稿)</button></div>
+  <div class="modal-footer border-top border-secondary border-opacity-25"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="poSaveBtn" onclick="savePo()">保存采购单(草稿)</button></div>
+</div></div></div>
+
+<!-- 采购单详情 Modal -->
+<div class="modal fade" id="poDetailModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content bg-dark border border-secondary border-opacity-25">
+  <div class="modal-header border-bottom border-secondary border-opacity-25"><h5 class="modal-title text-white" id="poDetailTitle">采购单详情</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+  <div class="modal-body" id="poDetailBody"><div class="text-white-50">加载中...</div></div>
+  <div class="modal-footer border-top border-secondary border-opacity-25"><button class="btn btn-secondary" data-bs-dismiss="modal">关闭</button></div>
 </div></div></div>
 
 <!-- 供应商 Modal -->
@@ -129,11 +142,38 @@ function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;
 const TYPE_CN={purchase_in:'采购入库',sale_out:'销售出库',adjust:'手工调整',reserve:'预留',release:'释放预留',return_in:'退货入库',transfer_in:'调拨入',transfer_out:'调拨出',init:'期初'};
 const qs=id=>document.getElementById(id);
 
+function invCard(label,val,sub,cls){
+  return `<div class="col-xl-2 col-md-3 col-6"><div class="card data-card h-100"><div class="card-body py-3">
+    <div class="text-white-50 small">${label}</div><div class="h4 mb-0 ${cls||''}">${val}</div><div class="small text-white-50">${sub||''}</div>
+  </div></div></div>`;
+}
+async function loadOverview(){
+  try{
+    const o=await (await fetch('/api/inv/overview')).json();
+    qs('overviewCards').innerHTML=[
+      invCard('现存 / 可用',`${o.on_hand} / ${o.available}`,'预留 '+o.reserved),
+      invCard('今日入库',o.today_in,'采购入库','text-success'),
+      invCard('今日出库',o.today_out,'销售出库','text-danger'),
+      invCard('待收货采购单',o.draft_pos,'草稿单','text-info'),
+      invCard('临期 / 过期',`${o.near_qty} / ${o.expired_qty}`,'90 天内 / 已过期',o.expired_qty>0?'text-danger':(o.near_qty>0?'text-warning':'')),
+      invCard('库存待办',o.blocked_orders+o.unread_notifications,`阻塞 ${o.blocked_orders} · 提醒 ${o.unread_notifications}`,o.blocked_orders?'text-warning':'')
+    ].join('');
+  }catch(e){
+    qs('overviewCards').innerHTML='<div class="col-12 text-danger small">库存概览加载失败</div>';
+  }
+}
+
 // ---- 台账 ----
+let stockTimer;
+function loadStockDebounced(){clearTimeout(stockTimer);stockTimer=setTimeout(loadStock,250);}
 async function loadStock(){
   const p=new URLSearchParams();const wh=qs('stockWh').value;const q=qs('stockQ').value.trim();
   if(wh)p.set('warehouse_id',wh);if(q)p.set('q',q);if(qs('stockNonzero').checked)p.set('nonzero','1');
-  const rows=await (await fetch('/api/inv/stock?'+p)).json();
+  qs('stockTbody').innerHTML='<tr><td colspan="7" class="text-center text-white-50 py-4">加载中...</td></tr>';
+  let rows=[];
+  try{rows=await (await fetch('/api/inv/stock?'+p)).json();}catch(e){
+    qs('stockTbody').innerHTML='<tr><td colspan="7" class="text-center text-danger py-4">库存加载失败</td></tr>';return;
+  }
   qs('stockTbody').innerHTML = rows.length? rows.map(s=>`<tr>
     <td>${esc(s.warehouse_name)}</td><td><code class="text-info">${esc(s.sku_code)}</code></td><td>${esc(s.sku_name)}</td>
     <td class="text-end">${s.on_hand}</td><td class="text-end text-warning">${s.reserved}</td>
@@ -168,20 +208,22 @@ async function loadPos(){
     <td><code>${esc(p.po_no)}</code></td><td>${esc(p.warehouse_name||'')}</td><td>${esc(p.supplier_name||'')}</td>
     <td>${p.item_count}</td><td class="text-end">${p.total_qty}</td><td class="text-end">${(p.total_amount||0).toFixed(2)} ${esc(p.currency)}</td>
     <td>${ST[p.status]||p.status}</td><td class="small">${esc(p.order_date||'')}</td>
-    ${CAN_MANAGE?`<td class="text-end">
-      ${p.status==='draft'?`<button class="btn btn-sm btn-success me-1" onclick="receivePo(${p.id},'${esc(p.po_no)}')"><i class="bi bi-box-arrow-in-down"></i> 收货</button>
+    <td class="text-end">
+      <button class="btn btn-sm btn-outline-info me-1" onclick="viewPo(${p.id})"><i class="bi bi-eye"></i></button>
+      ${CAN_MANAGE&&p.status==='draft'?`<button class="btn btn-sm btn-outline-light me-1" onclick="editPo(${p.id})"><i class="bi bi-pencil"></i></button>
+        <button class="btn btn-sm btn-success me-1" onclick="receivePo(${p.id},'${esc(p.po_no)}')"><i class="bi bi-box-arrow-in-down"></i> 收货</button>
         <button class="btn btn-sm btn-outline-danger" onclick="cancelPo(${p.id})"><i class="bi bi-x"></i></button>`:''}
-    </td>`:''}</tr>`).join('')
+    </td></tr>`).join('')
     : '<tr><td colspan="9" class="text-center text-white-50 py-4">暂无采购单</td></tr>';
 }
 async function receivePo(id,no){if(!confirm(`确认对 ${no} 收货入库?将生成批次并增加库存,不可撤销。`))return;
   const r=await fetch(`/api/inv/purchase-orders/${id}/receive`,{method:'POST'});const j=await r.json();
-  if(!r.ok){alert(j.error||'收货失败');return;}alert('收货成功,已入库 '+j.received.length+' 个 SKU 批次。');loadPos();loadStock();}
+  if(!r.ok){alert(j.error||'收货失败');return;}alert('收货成功,已入库 '+j.received.length+' 个 SKU 批次。');loadPos();loadStock();loadOverview();}
 async function cancelPo(id){if(!confirm('取消该采购单?'))return;
-  const r=await fetch(`/api/inv/purchase-orders/${id}/cancel`,{method:'POST'});const j=await r.json();if(!r.ok){alert(j.error||'失败');return;}loadPos();}
+  const r=await fetch(`/api/inv/purchase-orders/${id}/cancel`,{method:'POST'});const j=await r.json();if(!r.ok){alert(j.error||'失败');return;}loadPos();loadOverview();}
 
 let poRowSeq=0;
-function addPoRow(prefill){poRowSeq++;const id=poRowSeq;
+function addPoRow(prefill){poRowSeq++;const id=poRowSeq;prefill=prefill||{};
   const tr=document.createElement('tr');tr.id='poRow'+id;
   tr.innerHTML=`<td><input class="form-control form-control-sm bg-dark text-white border-secondary poSkuSearch" placeholder="搜SKU" oninput="searchPoSku(${id})"><input type="hidden" class="poSkuId"><div class="small text-info poSkuChosen"></div><div class="list-group poSkuResults" style="max-height:120px;overflow:auto;position:absolute;z-index:10;"></div></td>
     <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary poQty" style="width:70px"></td>
@@ -190,6 +232,15 @@ function addPoRow(prefill){poRowSeq++;const id=poRowSeq;
     <td><input type="date" class="form-control form-control-sm bg-dark text-white border-secondary poExp" style="width:140px"></td>
     <td><button class="btn btn-sm btn-outline-danger" onclick="this.closest('tr').remove()"><i class="bi bi-x"></i></button></td>`;
   qs('poItemsBody').appendChild(tr);
+  if(prefill.sku_id){
+    tr.querySelector('.poSkuId').value=prefill.sku_id;
+    tr.querySelector('.poSkuSearch').value=prefill.sku_code||'';
+    tr.querySelector('.poSkuChosen').textContent=prefill.sku_code||'';
+    tr.querySelector('.poQty').value=prefill.qty||'';
+    tr.querySelector('.poCost').value=prefill.unit_cost||'';
+    tr.querySelector('.poBatch').value=prefill.batch_no||'';
+    tr.querySelector('.poExp').value=prefill.expiry_date||'';
+  }
 }
 let poSkuTimer;
 async function searchPoSku(rowId){clearTimeout(poSkuTimer);poSkuTimer=setTimeout(async()=>{
@@ -199,12 +250,44 @@ async function searchPoSku(rowId){clearTimeout(poSkuTimer);poSkuTimer=setTimeout
   box.innerHTML=rows.slice(0,10).map(s=>`<button type="button" class="list-group-item list-group-item-action bg-dark text-white border-secondary py-1" onclick='pickPoSku(${rowId},${s.id},${JSON.stringify(s.sku_code)})'><code class="text-info">${esc(s.sku_code)}</code> ${esc(s.name)}</button>`).join('');
 },250);}
 function pickPoSku(rowId,id,code){const tr=qs('poRow'+rowId);tr.querySelector('.poSkuId').value=id;tr.querySelector('.poSkuChosen').textContent=code;tr.querySelector('.poSkuResults').innerHTML='';tr.querySelector('.poSkuSearch').value=code;}
-function openPoModal(){qs('poWh').value='';qs('poCur').value='CNY';qs('poNote').value='';qs('poDate').value=new Date().toISOString().slice(0,10);
-  qs('poItemsBody').innerHTML='';addPoRow();
-  fetch('/api/inv/suppliers').then(r=>r.json()).then(rows=>{qs('poSup').innerHTML='<option value="">(无)</option>'+rows.filter(s=>s.is_active).map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join('');});
+async function loadSupplierOptions(selected){
+  const rows=await (await fetch('/api/inv/suppliers')).json();
+  qs('poSup').innerHTML='<option value="">(无)</option>'+rows.filter(s=>s.is_active||String(s.id)===String(selected||'')).map(s=>`<option value="${s.id}">${esc(s.name)}${s.is_active?'':' (停用)'}</option>`).join('');
+  qs('poSup').value=selected||'';
+}
+async function openPoModal(){
+  qs('poModalTitle').textContent='新建采购单';qs('poSaveBtn').textContent='保存采购单(草稿)';
+  qs('poId').value='';qs('poWh').value='';qs('poCur').value='CNY';qs('poNote').value='';qs('poDate').value=new Date().toISOString().slice(0,10);
+  qs('poItemsBody').innerHTML='';addPoRow();await loadSupplierOptions();
   new bootstrap.Modal('#poModal').show();}
+async function editPo(id){
+  const r=await fetch(`/api/inv/purchase-orders/${id}`);const p=await r.json();
+  if(!r.ok){alert(p.error||'加载失败');return;}
+  if(p.status!=='draft'){alert('仅草稿采购单可编辑');return;}
+  qs('poModalTitle').textContent='编辑采购单 '+p.po_no;qs('poSaveBtn').textContent='保存修改';
+  qs('poId').value=p.id;qs('poWh').value=p.warehouse_id;qs('poCur').value=p.currency||'CNY';qs('poNote').value=p.note||'';qs('poDate').value=p.order_date||new Date().toISOString().slice(0,10);
+  await loadSupplierOptions(p.supplier_id);
+  qs('poItemsBody').innerHTML='';(p.items||[]).forEach(it=>addPoRow(it));if(!(p.items||[]).length)addPoRow();
+  new bootstrap.Modal('#poModal').show();
+}
+async function viewPo(id){
+  const r=await fetch(`/api/inv/purchase-orders/${id}`);const p=await r.json();
+  if(!r.ok){alert(p.error||'加载失败');return;}
+  qs('poDetailTitle').textContent='采购单 '+p.po_no;
+  const rows=(p.items||[]).map(it=>`<tr><td><code class="text-info">${esc(it.sku_code)}</code></td><td>${esc(it.sku_name)}</td><td class="text-end">${it.qty}</td><td class="text-end">${Number(it.unit_cost||0).toFixed(2)}</td><td>${esc(it.batch_no||'')}</td><td>${esc(it.expiry_date||'')}</td><td class="text-end">${it.received_qty||0}</td></tr>`).join('');
+  qs('poDetailBody').innerHTML=`<div class="row g-2 small mb-3">
+    <div class="col-md-3 text-white-50">状态</div><div class="col-md-3">${esc(p.status)}</div>
+    <div class="col-md-3 text-white-50">仓库</div><div class="col-md-3">${esc(p.warehouse_name||'')}</div>
+    <div class="col-md-3 text-white-50">供应商</div><div class="col-md-3">${esc(p.supplier_name||'')}</div>
+    <div class="col-md-3 text-white-50">金额</div><div class="col-md-3">${Number(p.total_amount||0).toFixed(2)} ${esc(p.currency||'')}</div>
+    <div class="col-md-3 text-white-50">下单日</div><div class="col-md-3">${esc(p.order_date||'')}</div>
+    <div class="col-md-3 text-white-50">收货日</div><div class="col-md-3">${esc(p.received_date||'')}</div>
+    <div class="col-12 text-white-50">备注: ${esc(p.note||'')}</div>
+  </div><div class="table-responsive"><table class="table table-dark table-sm mb-0"><thead><tr class="text-white-50 small"><th>SKU</th><th>名称</th><th class="text-end">数量</th><th class="text-end">单价</th><th>批次</th><th>到期日</th><th class="text-end">已收</th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="text-center text-white-50 py-3">无明细</td></tr>'}</tbody></table></div>`;
+  new bootstrap.Modal('#poDetailModal').show();
+}
 async function savePo(){
-  const items=[];let bad=false;
+  const items=[];
   qs('poItemsBody').querySelectorAll('tr').forEach(tr=>{
     const sku=tr.querySelector('.poSkuId').value;const qty=tr.querySelector('.poQty').value;
     if(!sku||!qty){return;}
@@ -214,9 +297,10 @@ async function savePo(){
   if(!qs('poWh').value){alert('请选择入库仓库');return;}
   if(!items.length){alert('请至少填写一条有效明细(SKU+数量)');return;}
   const body={warehouse_id:qs('poWh').value,supplier_id:qs('poSup').value||null,currency:qs('poCur').value.trim(),order_date:qs('poDate').value,note:qs('poNote').value.trim(),items};
-  const r=await fetch('/api/inv/purchase-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const id=qs('poId').value;
+  const r=await fetch(id?`/api/inv/purchase-orders/${id}`:'/api/inv/purchase-orders',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json();if(!r.ok){alert(j.error||'保存失败');return;}
-  bootstrap.Modal.getInstance('#poModal').hide();loadPos();
+  bootstrap.Modal.getInstance('#poModal').hide();loadPos();loadOverview();
 }
 // ---- 供应商 ----
 async function loadSuppliers(){
@@ -236,21 +320,47 @@ async function saveSup(){const id=qs('supId').value;
   const r=await fetch(id?`/api/inv/suppliers/${id}`:'/api/inv/suppliers',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json();if(!r.ok){alert(j.error||'失败');return;}bootstrap.Modal.getInstance('#supModal').hide();loadSuppliers();}
 // ---- 调整 ----
-let adjTimer;
-function openAdjustModal(){['adjWh','adjSkuSearch','adjSkuId','adjDelta','adjReason'].forEach(i=>qs(i).value='');qs('adjSkuChosen').textContent='未选';qs('adjSkuResults').innerHTML='';new bootstrap.Modal('#adjustModal').show();}
+let adjTimer;let adjStock=null;
+function openAdjustModal(){['adjWh','adjSkuSearch','adjSkuId','adjDelta','adjReason'].forEach(i=>qs(i).value='');qs('adjSkuChosen').textContent='未选';qs('adjSkuResults').innerHTML='';adjStock=null;renderAdjustPreview();new bootstrap.Modal('#adjustModal').show();}
 async function searchAdjSku(){clearTimeout(adjTimer);adjTimer=setTimeout(async()=>{
   const q=qs('adjSkuSearch').value.trim();if(!q){qs('adjSkuResults').innerHTML='';return;}
   const rows=await (await fetch('/api/inv/skus?active=1&q='+encodeURIComponent(q))).json();
   qs('adjSkuResults').innerHTML=rows.slice(0,12).map(s=>`<button type="button" class="list-group-item list-group-item-action bg-dark text-white border-secondary py-1" onclick='pickAdjSku(${s.id},${JSON.stringify(s.sku_code)})'><code class="text-info">${esc(s.sku_code)}</code> ${esc(s.name)}</button>`).join('');
 },250);}
-function pickAdjSku(id,code){qs('adjSkuId').value=id;qs('adjSkuChosen').textContent=code;qs('adjSkuResults').innerHTML='';}
+function pickAdjSku(id,code){qs('adjSkuId').value=id;qs('adjSkuChosen').textContent=code;qs('adjSkuResults').innerHTML='';refreshAdjustPreview();}
+async function refreshAdjustPreview(){
+  adjStock=null;
+  const wid=qs('adjWh').value, sku=qs('adjSkuId').value;
+  if(!wid||!sku){renderAdjustPreview();return;}
+  try{
+    const r=await fetch(`/api/inv/stock-level?warehouse_id=${encodeURIComponent(wid)}&sku_id=${encodeURIComponent(sku)}`);
+    const j=await r.json();if(!r.ok){qs('adjPreview').innerHTML='<span class="text-danger">'+esc(j.error||'库存查询失败')+'</span>';return;}
+    adjStock=j;renderAdjustPreview();
+  }catch(e){qs('adjPreview').innerHTML='<span class="text-danger">库存查询失败</span>';}
+}
+function renderAdjustPreview(){
+  if(!adjStock){qs('adjPreview').textContent='选择仓库和 SKU 后显示当前数量。';return;}
+  const delta=parseInt(qs('adjDelta').value||0);
+  const after=Number(adjStock.on_hand||0)+delta;
+  const afterAvail=after-Number(adjStock.reserved||0);
+  const bad=after<0||afterAvail<0;
+  qs('adjPreview').innerHTML=`<div>当前 <b>${esc(adjStock.warehouse_name)}</b> / <code class="text-info">${esc(adjStock.sku_code)}</code></div>
+    <div>现存 ${adjStock.on_hand} · 预留 ${adjStock.reserved} · 可用 ${adjStock.available}</div>
+    <div class="${bad?'text-danger':'text-success'}">调整后: 现存 ${after} · 可用 ${afterAvail}${bad?' (不可提交)':''}</div>`;
+}
 async function saveAdjust(){
   const body={warehouse_id:qs('adjWh').value,sku_id:qs('adjSkuId').value,qty_delta:parseInt(qs('adjDelta').value),reason:qs('adjReason').value.trim()};
   if(!body.warehouse_id||!body.sku_id){alert('请选择仓库与 SKU');return;}
+  if(!Number.isInteger(body.qty_delta)||body.qty_delta===0){alert('调整量必须是非零整数');return;}
+  if(adjStock){
+    const after=Number(adjStock.on_hand||0)+body.qty_delta;
+    const afterAvail=after-Number(adjStock.reserved||0);
+    if(after<0||afterAvail<0){alert('调整后库存或可用数为负,请检查调整量');return;}
+  }
   const r=await fetch('/api/inv/adjust',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json();if(!r.ok){alert(j.error||'调整失败');return;}
-  bootstrap.Modal.getInstance('#adjustModal').hide();loadStock();
+  bootstrap.Modal.getInstance('#adjustModal').hide();loadStock();loadOverview();
 }
-loadStock();
+loadOverview();loadStock();
 </script>
 {% endblock %}

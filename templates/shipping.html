@@ -235,7 +235,7 @@
                     {% if current_user.is_admin() %}
                     <div class="form-check form-switch mb-0 px-2 py-1 rounded border border-warning border-opacity-50 d-flex align-items-center"
                          style="background:rgba(255,193,7,0.08);"
-                         title="开启后：从开关打开的那一刻起，新检测到🟢物流已签收的 COD 订单会被每小时自动确认（本地标记签收 + 同步站点为已完成 + 发完成邮件），等同于自动替你点『已签收』。⚠️只管打开之后的单、不追溯之前的存量（避免一次性群发完成邮件）；存量请用右侧批量按钮处理。退回/在途/查无/问题退货一律不动。">
+                         title="开启后：系统会从发货后开始查物流（PL 次日、AU 14天、其它7天进入确认队列），新检测到🟢物流已签收的 COD 订单会被每小时自动确认（本地标记签收 + 同步站点为已完成 + 发完成邮件）。退回/在途/查无/问题退货一律不动。">
                         <input class="form-check-input mt-0" type="checkbox" role="switch" id="autoConfirmToggle"
                                onchange="toggleAutoConfirm(this)" style="cursor:pointer;"
                                {% if auto_confirm_enabled %}checked{% endif %}>
@@ -243,6 +243,12 @@
                             <i class="bi bi-robot me-1"></i>自动确认「🟢已签收」
                         </label>
                     </div>
+                    <span class="badge bg-dark text-white-50 border border-secondary border-opacity-50"
+                          title="自动候选会按最新发货时间起算：PL 发货后次日，AU 14天，其它7天。只自动确认🟢已签收；🔴退回不会自动确认。">
+                        自动候选 {{ auto_confirm_stats.candidates if auto_confirm_stats else 0 }}
+                        · 存量 {{ auto_confirm_stats.backlog if auto_confirm_stats else 0 }}
+                        · 退回 {{ auto_confirm_stats.returned if auto_confirm_stats else 0 }}
+                    </span>
                     {% endif %}
                     <button class="ship-action btn btn-sm btn-outline-success" onclick="batchConfirmDelivered(30)" title="只确认已挂满30天及以上的🟢物流已签收订单——超过这个时长基本不会再退回">
                         <i class="bi bi-check2-all me-1"></i>批量确认满30天的「🟢 已签收」
@@ -1179,7 +1185,7 @@
                 body: JSON.stringify({ auto_confirm_delivered_enabled: on ? '1' : '0' })
             }).then(r => r.json()).then(() => {
                 if (on) {
-                    showToast('已开启：从现在起新检测到🟢物流已签收的 COD 单会自动确认（不追溯之前的存量单；存量请用右侧批量按钮处理）', 'success', 7000);
+                    showToast('已开启：系统会按发货时间自动追踪，PL 次日起新检测到🟢已签收的 COD 单会自动确认；退回/在途/查无不自动处理。', 'success', 7000);
                 } else {
                     showToast('已关闭自动确认', 'info');
                 }

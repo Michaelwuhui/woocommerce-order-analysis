@@ -15,7 +15,7 @@ inv_inventory.py — 模块 3:库存台账 + 出入库流水 + 采购入库。
 """
 
 import datetime
-from flask import Blueprint, render_template, request, jsonify
+from flask import Blueprint, render_template, request, jsonify, redirect, url_for
 from flask_login import login_required
 
 from inv_common import (
@@ -27,6 +27,14 @@ inv_inv_bp = Blueprint('inv_inv', __name__)
 
 
 # ───────────────────────────── 页面 ─────────────────────────────
+
+@inv_inv_bp.route('/inventory')
+@inv_inv_bp.route('/inventory/')
+@login_required
+@inv_view_required
+def inventory_home():
+    return redirect(url_for('inv_inv.stock_page'))
+
 
 @inv_inv_bp.route('/inventory/stock')
 @login_required
@@ -91,6 +99,73 @@ def update_supplier(sid):
 
 
 # ─────────────────────────── 采购单 API ───────────────────────────
+
+@inv_inv_bp.route('/api/inv/overview', methods=['GET'])
+@login_required
+@inv_view_required
+def inventory_overview():
+    """库存工作台概览:首页卡片和待办入口用。"""
+    conn = get_conn()
+    try:
+        sc, sp = warehouse_scope_clause('warehouse_id')
+        stock = conn.execute(f'''
+            SELECT COALESCE(SUM(on_hand),0) AS on_hand,
+                   COALESCE(SUM(reserved),0) AS reserved,
+                   COALESCE(SUM(on_hand - reserved),0) AS available,
+                   COUNT(*) AS stock_rows,
+                   SUM(CASE WHEN on_hand > 0 AND on_hand <= reserved THEN 1 ELSE 0 END) AS tight_rows
+            FROM inv_stock WHERE 1=1{sc}
+        ''', sp).fetchone()
+        today = datetime.date.today().isoformat()
+        today_start = today + ' 00:00:00'
+        today_in = conn.execute(f'''
+            SELECT COALESCE(SUM(qty_delta),0) AS qty
+            FROM inv_movements
+            WHERE movement_type='purchase_in' AND ts >= ?{sc}
+        ''', [today_start] + sp).fetchone()['qty']
+        today_out = conn.execute(f'''
+            SELECT COALESCE(SUM(-qty_delta),0) AS qty
+            FROM inv_movements
+            WHERE movement_type='sale_out' AND ts >= ?{sc}
+        ''', [today_start] + sp).fetchone()['qty']
+        draft_pos = conn.execute(f'''
+            SELECT COUNT(*) AS n FROM inv_purchase_orders WHERE status='draft'{sc}
+        ''', sp).fetchone()['n']
+        near = conn.execute(f'''
+            SELECT COALESCE(SUM(qty_remaining),0) AS qty
+            FROM inv_batches
+            WHERE qty_remaining > 0 AND expiry_date IS NOT NULL
+              AND expiry_date >= ? AND expiry_date <= date(?, '+90 day'){sc}
+        ''', [today, today] + sp).fetchone()['qty']
+        expired = conn.execute(f'''
+            SELECT COALESCE(SUM(qty_remaining),0) AS qty
+            FROM inv_batches
+            WHERE qty_remaining > 0 AND expiry_date IS NOT NULL AND expiry_date < ?{sc}
+        ''', [today] + sp).fetchone()['qty']
+        blocked = conn.execute(
+            "SELECT COUNT(*) AS n FROM inv_order_state WHERE inv_state='blocked'"
+        ).fetchone()['n']
+        unread_scope, unread_params = warehouse_scope_clause('warehouse_id')
+        unread = conn.execute(f'''
+            SELECT COUNT(*) AS n FROM inv_notifications
+            WHERE status='unread'{unread_scope}
+        ''', unread_params).fetchone()['n']
+        return jsonify({
+            'on_hand': stock['on_hand'] or 0,
+            'reserved': stock['reserved'] or 0,
+            'available': stock['available'] or 0,
+            'stock_rows': stock['stock_rows'] or 0,
+            'tight_rows': stock['tight_rows'] or 0,
+            'today_in': today_in or 0,
+            'today_out': today_out or 0,
+            'draft_pos': draft_pos or 0,
+            'near_qty': near or 0,
+            'expired_qty': expired or 0,
+            'blocked_orders': blocked or 0,
+            'unread_notifications': unread or 0,
+        })
+    finally:
+        conn.close()
 
 @inv_inv_bp.route('/api/inv/purchase-orders', methods=['GET'])
 @login_required
@@ -184,6 +259,58 @@ def create_po():
                  it.get('batch_no'), it.get('production_date'), it.get('expiry_date'), it.get('note')))
         conn.commit()
         return jsonify({'success': True, 'id': pid, 'po_no': po_no})
+    finally:
+        conn.close()
+
+
+@inv_inv_bp.route('/api/inv/purchase-orders/<int:pid>', methods=['PUT'])
+@login_required
+@inv_manage_required
+def update_po(pid):
+    """编辑草稿采购单。已收货/取消的单据保持锁定。"""
+    d = request.get_json(force=True) or {}
+    warehouse_id = d.get('warehouse_id')
+    items = d.get('items') or []
+    if not warehouse_id:
+        return jsonify({'error': '入库仓库必填'}), 400
+    if not items:
+        return jsonify({'error': '至少一条采购明细'}), 400
+    conn = get_conn()
+    try:
+        po = conn.execute('SELECT status FROM inv_purchase_orders WHERE id=?', (pid,)).fetchone()
+        if not po:
+            return jsonify({'error': '采购单不存在'}), 404
+        if po['status'] != 'draft':
+            return jsonify({'error': '仅草稿采购单可编辑'}), 400
+        if not conn.execute('SELECT 1 FROM warehouses WHERE id=?', (warehouse_id,)).fetchone():
+            return jsonify({'error': '仓库不存在'}), 404
+        total = 0.0
+        clean_items = []
+        for it in items:
+            if not it.get('sku_id') or not it.get('qty'):
+                return jsonify({'error': '明细需含 sku_id 与 qty'}), 400
+            qty = int(it['qty'])
+            if qty <= 0:
+                return jsonify({'error': '明细数量必须大于 0'}), 400
+            unit_cost = float(it.get('unit_cost') or 0)
+            total += qty * unit_cost
+            clean_items.append((it['sku_id'], qty, unit_cost, it.get('batch_no'),
+                                it.get('production_date'), it.get('expiry_date'), it.get('note')))
+        conn.execute('''UPDATE inv_purchase_orders
+                           SET supplier_id=?, warehouse_id=?, order_date=?, currency=?,
+                               total_amount=?, note=?, updated_at=CURRENT_TIMESTAMP
+                         WHERE id=?''',
+                     (d.get('supplier_id') or None, warehouse_id,
+                      d.get('order_date') or datetime.date.today().isoformat(),
+                      (d.get('currency') or 'CNY'), total, d.get('note'), pid))
+        conn.execute('DELETE FROM inv_purchase_order_items WHERE po_id=?', (pid,))
+        conn.executemany('''INSERT INTO inv_purchase_order_items
+            (po_id, sku_id, qty, unit_cost, batch_no, production_date, expiry_date, note)
+            VALUES (?,?,?,?,?,?,?,?)''',
+            [(pid, sku_id, qty, unit_cost, batch_no, production_date, expiry_date, note)
+             for sku_id, qty, unit_cost, batch_no, production_date, expiry_date, note in clean_items])
+        conn.commit()
+        return jsonify({'success': True, 'id': pid})
     finally:
         conn.close()
 
@@ -284,10 +411,13 @@ def adjust_stock():
     uid, uname = current_operator()
     conn = get_conn()
     try:
-        cur = conn.execute('SELECT on_hand FROM inv_stock WHERE warehouse_id=? AND sku_id=?', (wid, sku_id)).fetchone()
+        cur = conn.execute('SELECT on_hand, reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?', (wid, sku_id)).fetchone()
         on_hand = cur['on_hand'] if cur else 0
+        reserved = cur['reserved'] if cur else 0
         if on_hand + qty_delta < 0:
             return jsonify({'error': f'调整后现存为负(当前 {on_hand},调整 {qty_delta})'}), 400
+        if on_hand + qty_delta < reserved:
+            return jsonify({'error': f'调整后可用为负(现存 {on_hand},预留 {reserved},调整 {qty_delta})'}), 400
         mid = record_movement(conn, warehouse_id=wid, sku_id=sku_id, movement_type='adjust',
                               qty_delta=qty_delta, ref_type='manual',
                               operator_id=uid, operator_name=uname, note=reason)
@@ -328,6 +458,40 @@ def list_stock():
     rows = conn.execute(sql, params).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@inv_inv_bp.route('/api/inv/stock-level', methods=['GET'])
+@login_required
+@inv_view_required
+def stock_level():
+    """查询单个仓库 SKU 的当前数量,用于手工调整前预览。"""
+    wid = request.args.get('warehouse_id')
+    sku_id = request.args.get('sku_id')
+    if not wid or not sku_id:
+        return jsonify({'error': 'warehouse_id 与 sku_id 必填'}), 400
+    conn = get_conn()
+    try:
+        sc, sp = warehouse_scope_clause('st.warehouse_id')
+        row = conn.execute('''SELECT st.on_hand, st.reserved,
+                                     (st.on_hand - st.reserved) AS available,
+                                     k.sku_code, k.name AS sku_name,
+                                     w.name AS warehouse_name
+                              FROM inv_stock st
+                              JOIN inv_skus k ON k.id=st.sku_id
+                              JOIN warehouses w ON w.id=st.warehouse_id
+                              WHERE st.warehouse_id=? AND st.sku_id=?''' + sc,
+                           [wid, sku_id] + sp).fetchone()
+        if not row:
+            sc2, sp2 = warehouse_scope_clause('w.id')
+            meta = conn.execute('''SELECT k.sku_code, k.name AS sku_name, w.name AS warehouse_name
+                                   FROM inv_skus k CROSS JOIN warehouses w
+                                   WHERE k.id=? AND w.id=?''' + sc2, [sku_id, wid] + sp2).fetchone()
+            if not meta:
+                return jsonify({'error': '仓库或 SKU 不存在'}), 404
+            return jsonify({**dict(meta), 'on_hand': 0, 'reserved': 0, 'available': 0})
+        return jsonify(dict(row))
+    finally:
+        conn.close()
 
 
 @inv_inv_bp.route('/api/inv/movements', methods=['GET'])

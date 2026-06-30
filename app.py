@@ -15393,11 +15393,89 @@ def shipping():
     # Auto-confirm switch state (待确认结局 → 已签收), for the toolbar toggle.
     _ac_row = conn.execute("SELECT value FROM settings WHERE key='auto_confirm_delivered_enabled'").fetchone()
     auto_confirm_enabled = bool(_ac_row) and str(_ac_row['value']).strip().lower() in ('1', 'true', 'yes', 'on')
+    _ac_since_row = conn.execute("SELECT value FROM settings WHERE key='auto_confirm_delivered_since'").fetchone()
+    auto_confirm_since = _ac_since_row['value'] if _ac_since_row and _ac_since_row['value'] else ''
+
+    auto_confirm_stats = {'candidates': 0, 'backlog': 0, 'returned': 0, 'since': auto_confirm_since}
+    outcome_scope_sql = ''
+    outcome_scope_params = []
+    if allowed_sources is None:
+        pass
+    elif not allowed_sources:
+        outcome_scope_sql = ' AND 1=0'
+    else:
+        placeholders = ','.join(['?' for _ in allowed_sources])
+        outcome_scope_sql = f' AND o.source IN ({placeholders})'
+        outcome_scope_params.extend(allowed_sources)
+    outcome_base = """
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN shipping_logs sl ON sl.id = (
+            SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
+        )
+        WHERE o.status IN ('on-hold', 'shipped', 'partial-shipped')
+          AND o.payment_method = 'cod'
+          AND COALESCE(o.is_undelivered, 0) = 0
+          AND COALESCE(o.is_problem_return, 0) = 0
+          AND COALESCE(o.delivery_confirmed, 0) = 0
+    """
+    pending_age_case = (
+        "CASE COALESCE(s.country, '') "
+        "WHEN 'PL' THEN 1 "
+        "WHEN 'AU' THEN 14 "
+        "ELSE 7 END"
+    )
+    shipped_expr = "datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '))"
+    current_actionable_expr = (
+        "max(o.carrier_status_at, "
+        "datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '), '+' || "
+        f"{pending_age_case} || ' days'))"
+    )
+    ready_sql = f" AND {shipped_expr} <= datetime('now', '-' || {pending_age_case} || ' days')"
+    current_ready_expr = f"{shipped_expr} <= datetime('now', '-' || {pending_age_case} || ' days')"
+    candidate_params = []
+    if auto_confirm_since and auto_confirm_since < '2026-06-30 16:20:00':
+        legacy_actionable_expr = (
+            "max(o.carrier_status_at, "
+            "datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '), '+14 days'))"
+        )
+        legacy_ready_expr = f"{shipped_expr} <= datetime('now', '-14 days')"
+        candidate_condition = (
+            f"(({current_ready_expr} AND {current_actionable_expr} >= ?) "
+            f"OR ({legacy_ready_expr} AND {legacy_actionable_expr} >= ?))"
+        )
+        candidate_params = [auto_confirm_since, auto_confirm_since]
+    else:
+        candidate_condition = f"({current_ready_expr} AND {current_actionable_expr} >= ?)"
+        if auto_confirm_since:
+            candidate_params = [auto_confirm_since]
+    if auto_confirm_since:
+        auto_confirm_stats['candidates'] = conn.execute(
+            f"SELECT COUNT(*) {outcome_base} AND o.carrier_status = 'delivered' "
+            f"AND o.carrier_status_at IS NOT NULL AND {candidate_condition}{outcome_scope_sql}",
+            candidate_params + outcome_scope_params
+        ).fetchone()[0]
+        auto_confirm_stats['backlog'] = conn.execute(
+            f"SELECT COUNT(*) {outcome_base} AND o.carrier_status = 'delivered' "
+            f"AND o.carrier_status_at IS NOT NULL{ready_sql} "
+            f"AND NOT ({candidate_condition}){outcome_scope_sql}",
+            candidate_params + outcome_scope_params
+        ).fetchone()[0]
+    else:
+        auto_confirm_stats['backlog'] = conn.execute(
+            f"SELECT COUNT(*) {outcome_base} AND o.carrier_status = 'delivered'{ready_sql}{outcome_scope_sql}",
+            outcome_scope_params
+        ).fetchone()[0]
+    auto_confirm_stats['returned'] = conn.execute(
+        f"SELECT COUNT(*) {outcome_base} AND o.carrier_status = 'returned'{ready_sql}{outcome_scope_sql}",
+        outcome_scope_params
+    ).fetchone()[0]
 
     conn.close()
     return render_template('shipping.html', carriers=carriers, managers=managers, sites=sites,
                            all_countries=all_countries, is_super_admin=(current_user.username == 'admin'),
-                           has_au_access=_has_au_access(), auto_confirm_enabled=auto_confirm_enabled)
+                           has_au_access=_has_au_access(), auto_confirm_enabled=auto_confirm_enabled,
+                           auto_confirm_stats=auto_confirm_stats)
 
 
 def _has_au_access():
@@ -15915,14 +15993,14 @@ def get_pending_outcome_orders():
     from datetime import timedelta
     conn = get_db_connection()
 
+    explicit_days = 'days' in request.args
     try:
-        days = int(request.args.get('days', 14))
+        days = int(request.args.get('days')) if explicit_days else None
     except (TypeError, ValueError):
-        days = 14
-    days = max(0, min(days, 3650))
-    # date_created is stored ISO 'T'-separated (e.g. 2025-06-17T19:39:35); match
-    # that format so the string comparison below is apples-to-apples.
-    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
+        days = None
+    if days is not None:
+        days = max(0, min(days, 3650))
+        cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
 
     source_filter = request.args.get('source', '')
     country_filter = request.args.get('country', '')
@@ -15954,9 +16032,24 @@ def get_pending_outcome_orders():
           AND COALESCE(o.is_undelivered, 0) = 0
           AND COALESCE(o.is_problem_return, 0) = 0
           AND COALESCE(o.delivery_confirmed, 0) = 0
-          AND o.date_created <= ?
     '''
-    params = [cutoff]
+    params = []
+    if days is not None:
+        query += """
+          AND datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' ')) <= ?
+        """
+        params.append(cutoff)
+    else:
+        query += """
+          AND datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' ')) <= datetime(
+              'now',
+              '-' || CASE COALESCE(s.country, '')
+                       WHEN 'PL' THEN 1
+                       WHEN 'AU' THEN 14
+                       ELSE 7
+                     END || ' days'
+          )
+        """
 
     allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
     if allowed_sources is not None:

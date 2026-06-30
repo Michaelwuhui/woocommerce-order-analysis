@@ -178,6 +178,7 @@ body {
     border: 1px solid var(--border-color);
     border-radius: 16px;
     overflow: hidden;
+    color: var(--text-primary);
 }
 
 .card-header {
@@ -202,6 +203,48 @@ body {
 
 .data-card {
     box-shadow: var(--shadow-sm);
+}
+
+/* Bootstrap's cards and semantic text utilities are tuned for light pages by
+   default. On our dark dashboard cards, unclassified numbers and green/red/yellow
+   utility text need explicit contrast so KPI values do not disappear. */
+.data-card .h1,
+.data-card .h2,
+.data-card .h3,
+.data-card .h4,
+.data-card .h5,
+.data-card .h6,
+.data-card h1,
+.data-card h2,
+.data-card h3,
+.data-card h4,
+.data-card h5,
+.data-card h6 {
+    color: var(--text-primary);
+}
+
+.data-card .text-success,
+.table-dark .text-success,
+.modal-content.bg-dark .text-success {
+    color: #5ee787 !important;
+}
+
+.data-card .text-danger,
+.table-dark .text-danger,
+.modal-content.bg-dark .text-danger {
+    color: #ff7b86 !important;
+}
+
+.data-card .text-warning,
+.table-dark .text-warning,
+.modal-content.bg-dark .text-warning {
+    color: #ffd666 !important;
+}
+
+.data-card .text-info,
+.table-dark .text-info,
+.modal-content.bg-dark .text-info {
+    color: #67e8f9 !important;
 }
 
 /* Tables */

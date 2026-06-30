@@ -29,6 +29,12 @@ from datetime import datetime
 from oid_utils import woo_post_id  # raw WC post id for REST write-back
 
 ENABLE_KEY = 'auto_confirm_delivered_enabled'
+DEFAULT_PENDING_OUTCOME_DAYS = 7
+COUNTRY_PENDING_OUTCOME_DAYS = {
+    'PL': 1,
+    'AU': 14,
+}
+AGE_GATE_FIX_CUTOFF = '2026-06-30 16:20:00'
 # Forward-only "effective start" timestamp, stamped (via SQL datetime('now'), so
 # it matches carrier_status_at's UTC 'YYYY-MM-DD HH:MM:SS' format) every time the
 # switch is turned on. Only deliveries DETECTED at/after this are auto-confirmed,
@@ -74,29 +80,35 @@ def get_since(conn):
 
 def find_confirmable_orders(conn, since):
     """COD orders in the 待确认结局 queue the carrier reports as delivered AND
-    first detected at/after `since` (forward-only — the pre-existing backlog is
-    never touched).
+    first became actionable at/after `since` (forward-only — the pre-existing
+    backlog is never touched).
 
     Same candidate definition as /api/shipping/pending-outcome, narrowed to
-    carrier_status='delivered'. carrier_status is only ever set on orders aged
-    >= resolve_outcomes.DEFAULT_MIN_AGE_DAYS (7d), so no extra age gate is
-    needed — a delivered COD parcel means the courier collected the cash.
+    carrier_status='delivered'. A row becomes actionable only after the shipping
+    page's country-specific age gate AND after the carrier status is known. This matters for
+    parcels detected as delivered before auto-confirm was enabled but that did
+    not enter the 待确认结局 queue until after it was enabled.
     `since` is a 'YYYY-MM-DD HH:MM:SS' UTC string (carrier_status_at's format).
     """
+    actionable_sql, actionable_params = _actionable_since_sql(since)
     return conn.execute(
         """
-        SELECT id, number, source, status
-        FROM orders
-        WHERE status IN ('on-hold', 'shipped', 'partial-shipped')
-          AND payment_method = 'cod'
-          AND COALESCE(is_undelivered, 0) = 0
-          AND COALESCE(is_problem_return, 0) = 0
-          AND COALESCE(delivery_confirmed, 0) = 0
-          AND carrier_status = 'delivered'
-          AND carrier_status_at IS NOT NULL
-          AND carrier_status_at >= ?
-        ORDER BY date_created ASC
-        """, (since,)
+        SELECT o.id, o.number, o.source, o.status
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN shipping_logs sl ON sl.id = (
+            SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
+        )
+        WHERE o.status IN ('on-hold', 'shipped', 'partial-shipped')
+          AND o.payment_method = 'cod'
+          AND COALESCE(o.is_undelivered, 0) = 0
+          AND COALESCE(o.is_problem_return, 0) = 0
+          AND COALESCE(o.delivery_confirmed, 0) = 0
+          AND o.carrier_status = 'delivered'
+          AND o.carrier_status_at IS NOT NULL
+          AND """ + actionable_sql + """
+        ORDER BY o.date_created ASC
+        """, actionable_params
     ).fetchall()
 
 
@@ -105,19 +117,59 @@ def count_confirmable(conn, since):
     the forward-only `since` window)."""
     if not since:
         return 0
+    actionable_sql, actionable_params = _actionable_since_sql(since)
     return conn.execute(
         """
-        SELECT COUNT(*) FROM orders
-        WHERE status IN ('on-hold', 'shipped', 'partial-shipped')
-          AND payment_method = 'cod'
-          AND COALESCE(is_undelivered, 0) = 0
-          AND COALESCE(is_problem_return, 0) = 0
-          AND COALESCE(delivery_confirmed, 0) = 0
-          AND carrier_status = 'delivered'
-          AND carrier_status_at IS NOT NULL
-          AND carrier_status_at >= ?
-        """, (since,)
+        SELECT COUNT(*)
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN shipping_logs sl ON sl.id = (
+            SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
+        )
+        WHERE o.status IN ('on-hold', 'shipped', 'partial-shipped')
+          AND o.payment_method = 'cod'
+          AND COALESCE(o.is_undelivered, 0) = 0
+          AND COALESCE(o.is_problem_return, 0) = 0
+          AND COALESCE(o.delivery_confirmed, 0) = 0
+          AND o.carrier_status = 'delivered'
+          AND o.carrier_status_at IS NOT NULL
+          AND """ + actionable_sql + """
+        """, actionable_params
     ).fetchone()[0]
+
+
+def _pending_age_case_sql():
+    """Country-specific age gate matching the shipping pending-outcome queue."""
+    return (
+        "CASE COALESCE(s.country, '') "
+        "WHEN 'PL' THEN 1 "
+        "WHEN 'AU' THEN 14 "
+        f"ELSE {DEFAULT_PENDING_OUTCOME_DAYS} END"
+    )
+
+
+def _actionable_since_sql(since):
+    """Forward-only check, with one compatibility bridge for the old 14-day gate.
+
+    Auto-confirm was originally enabled while the UI still used a 14-day pending
+    gate. PL has since moved to 4 days. For switches stamped before this fix, the
+    old 14-day actionable time is OR'ed once so orders that were invisible under
+    the old UI are not lost. Future switch-on events use only the country gate.
+    """
+    age_case = _pending_age_case_sql()
+    shipped = "datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '))"
+    current_actionable = (
+        f"max(o.carrier_status_at, datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '), "
+        f"'+' || {age_case} || ' days')) >= ?"
+    )
+    current_ready = f"{shipped} <= datetime('now', '-' || {age_case} || ' days')"
+    if since < AGE_GATE_FIX_CUTOFF:
+        legacy_actionable = (
+            "max(o.carrier_status_at, datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '), '+14 days')) >= ?"
+        )
+        legacy_ready = f"{shipped} <= datetime('now', '-14 days')"
+        return f"(({current_ready} AND {current_actionable}) OR ({legacy_ready} AND {legacy_actionable}))", (since, since)
+    return f"({current_ready} AND {current_actionable})", (since,)
 
 
 def _load_sites(conn):
