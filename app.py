@@ -15426,40 +15426,13 @@ def shipping():
         "ELSE 7 END"
     )
     shipped_expr = "datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '))"
-    current_actionable_expr = (
-        "max(o.carrier_status_at, "
-        "datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '), '+' || "
-        f"{pending_age_case} || ' days'))"
-    )
     ready_sql = f" AND {shipped_expr} <= datetime('now', '-' || {pending_age_case} || ' days')"
-    current_ready_expr = f"{shipped_expr} <= datetime('now', '-' || {pending_age_case} || ' days')"
-    candidate_params = []
-    if auto_confirm_since and auto_confirm_since < '2026-06-30 16:20:00':
-        legacy_actionable_expr = (
-            "max(o.carrier_status_at, "
-            "datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '), '+14 days'))"
-        )
-        legacy_ready_expr = f"{shipped_expr} <= datetime('now', '-14 days')"
-        candidate_condition = (
-            f"(({current_ready_expr} AND {current_actionable_expr} >= ?) "
-            f"OR ({legacy_ready_expr} AND {legacy_actionable_expr} >= ?))"
-        )
-        candidate_params = [auto_confirm_since, auto_confirm_since]
-    else:
-        candidate_condition = f"({current_ready_expr} AND {current_actionable_expr} >= ?)"
-        if auto_confirm_since:
-            candidate_params = [auto_confirm_since]
     if auto_confirm_since:
         auto_confirm_stats['candidates'] = conn.execute(
             f"SELECT COUNT(*) {outcome_base} AND o.carrier_status = 'delivered' "
-            f"AND o.carrier_status_at IS NOT NULL AND {candidate_condition}{outcome_scope_sql}",
-            candidate_params + outcome_scope_params
-        ).fetchone()[0]
-        auto_confirm_stats['backlog'] = conn.execute(
-            f"SELECT COUNT(*) {outcome_base} AND o.carrier_status = 'delivered' "
             f"AND o.carrier_status_at IS NOT NULL{ready_sql} "
-            f"AND NOT ({candidate_condition}){outcome_scope_sql}",
-            candidate_params + outcome_scope_params
+            f"{outcome_scope_sql}",
+            outcome_scope_params
         ).fetchone()[0]
     else:
         auto_confirm_stats['backlog'] = conn.execute(

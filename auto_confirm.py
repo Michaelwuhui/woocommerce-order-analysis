@@ -34,14 +34,12 @@ COUNTRY_PENDING_OUTCOME_DAYS = {
     'PL': 1,
     'AU': 14,
 }
-AGE_GATE_FIX_CUTOFF = '2026-06-30 16:20:00'
 # Forward-only "effective start" timestamp, stamped (via SQL datetime('now'), so
-# it matches carrier_status_at's UTC 'YYYY-MM-DD HH:MM:SS' format) every time the
-# switch is turned on. Only deliveries DETECTED at/after this are auto-confirmed,
-# so flipping the switch never retroactively confirms / emails the existing
-# backlog. A delivered order's carrier_status_at is frozen at first detection
-# (resolve_outcomes stops re-checking terminal statuses), so this comparison is
-# stable.
+# it matches DB timestamps) every time the switch is turned on. It is kept for
+# audit/visibility, but auto-confirm now follows the queue state itself: if a COD
+# order is already old enough to be in 待确认结局 and the carrier says delivered,
+# it can be confirmed. This matches the operator workflow after the PL gate moved
+# from 14 days to next-day review.
 SINCE_KEY = 'auto_confirm_delivered_since'
 
 # Per-run cap. When first switched on there can be a large backlog of delivered
@@ -79,18 +77,14 @@ def get_since(conn):
 
 
 def find_confirmable_orders(conn, since):
-    """COD orders in the 待确认结局 queue the carrier reports as delivered AND
-    first became actionable at/after `since` (forward-only — the pre-existing
-    backlog is never touched).
+    """COD orders in the 待确认结局 queue whose carrier status is delivered.
 
     Same candidate definition as /api/shipping/pending-outcome, narrowed to
-    carrier_status='delivered'. A row becomes actionable only after the shipping
-    page's country-specific age gate AND after the carrier status is known. This matters for
-    parcels detected as delivered before auto-confirm was enabled but that did
-    not enter the 待确认结局 queue until after it was enabled.
-    `since` is a 'YYYY-MM-DD HH:MM:SS' UTC string (carrier_status_at's format).
+    carrier_status='delivered'. The `since` argument is retained for API
+    compatibility and audit context, but does not exclude already-actionable
+    queue rows.
     """
-    actionable_sql, actionable_params = _actionable_since_sql(since)
+    ready_sql = _ready_sql()
     return conn.execute(
         """
         SELECT o.id, o.number, o.source, o.status
@@ -106,18 +100,17 @@ def find_confirmable_orders(conn, since):
           AND COALESCE(o.delivery_confirmed, 0) = 0
           AND o.carrier_status = 'delivered'
           AND o.carrier_status_at IS NOT NULL
-          AND """ + actionable_sql + """
+          AND """ + ready_sql + """
         ORDER BY o.date_created ASC
-        """, actionable_params
+        """
     ).fetchall()
 
 
 def count_confirmable(conn, since):
-    """Cheap COUNT for the UI (how many would be auto-confirmed right now, given
-    the forward-only `since` window)."""
+    """Cheap COUNT for the UI (how many would be auto-confirmed right now)."""
     if not since:
         return 0
-    actionable_sql, actionable_params = _actionable_since_sql(since)
+    ready_sql = _ready_sql()
     return conn.execute(
         """
         SELECT COUNT(*)
@@ -133,8 +126,8 @@ def count_confirmable(conn, since):
           AND COALESCE(o.delivery_confirmed, 0) = 0
           AND o.carrier_status = 'delivered'
           AND o.carrier_status_at IS NOT NULL
-          AND """ + actionable_sql + """
-        """, actionable_params
+          AND """ + ready_sql + """
+        """
     ).fetchone()[0]
 
 
@@ -148,28 +141,11 @@ def _pending_age_case_sql():
     )
 
 
-def _actionable_since_sql(since):
-    """Forward-only check, with one compatibility bridge for the old 14-day gate.
-
-    Auto-confirm was originally enabled while the UI still used a 14-day pending
-    gate. PL has since moved to 4 days. For switches stamped before this fix, the
-    old 14-day actionable time is OR'ed once so orders that were invisible under
-    the old UI are not lost. Future switch-on events use only the country gate.
-    """
+def _ready_sql():
+    """Country-specific age gate matching the shipping pending-outcome queue."""
     age_case = _pending_age_case_sql()
     shipped = "datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '))"
-    current_actionable = (
-        f"max(o.carrier_status_at, datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '), "
-        f"'+' || {age_case} || ' days')) >= ?"
-    )
-    current_ready = f"{shipped} <= datetime('now', '-' || {age_case} || ' days')"
-    if since < AGE_GATE_FIX_CUTOFF:
-        legacy_actionable = (
-            "max(o.carrier_status_at, datetime(replace(substr(COALESCE(sl.shipped_at, o.date_modified, o.date_created), 1, 19), 'T', ' '), '+14 days')) >= ?"
-        )
-        legacy_ready = f"{shipped} <= datetime('now', '-14 days')"
-        return f"(({current_ready} AND {current_actionable}) OR ({legacy_ready} AND {legacy_actionable}))", (since, since)
-    return f"({current_ready} AND {current_actionable})", (since,)
+    return f"{shipped} <= datetime('now', '-' || {age_case} || ' days')"
 
 
 def _load_sites(conn):
