@@ -19137,7 +19137,7 @@ def aggregate_traffic_by_week(traffic_data):
     return result
 
 
-def get_orders_for_report(start_date, end_date, granularity='month', source=None, country=None):
+def get_orders_for_report(start_date, end_date, granularity='month', source=None, country=None, manager=None):
     """Get orders aggregated by source and time period for report
     
     Args:
@@ -19175,13 +19175,25 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
     '''
     params = [start_date, end_date + 'T23:59:59']
     
+    site_filters = []
+    site_filter_params = []
     if country:
-        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country,)).fetchall()
-        country_urls = [s['url'] for s in country_sites]
-        if country_urls:
-            placeholders = ', '.join(['?' for _ in country_urls])
+        site_filters.append('country = ?')
+        site_filter_params.append(country)
+    if manager:
+        site_filters.append('manager = ?')
+        site_filter_params.append(manager)
+
+    if site_filters:
+        filtered_sites = conn.execute(
+            f'SELECT url FROM sites WHERE {" AND ".join(site_filters)}',
+            site_filter_params
+        ).fetchall()
+        filtered_urls = [s['url'] for s in filtered_sites]
+        if filtered_urls:
+            placeholders = ', '.join(['?' for _ in filtered_urls])
             query += f' AND source IN ({placeholders})'
-            params.extend(country_urls)
+            params.extend(filtered_urls)
         else:
             query += ' AND 1=0'
     
@@ -19232,8 +19244,10 @@ def report():
     conn = get_db_connection()
     all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
     all_countries = [c['country'] for c in all_countries]
+    all_managers = conn.execute('SELECT DISTINCT manager FROM sites WHERE manager IS NOT NULL AND manager != "" ORDER BY manager').fetchall()
+    all_managers = [m['manager'] for m in all_managers]
     conn.close()
-    resp = make_response(render_template('report.html', all_countries=all_countries))
+    resp = make_response(render_template('report.html', all_countries=all_countries, all_managers=all_managers))
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     resp.headers['Pragma'] = 'no-cache'
     return resp
@@ -19250,6 +19264,7 @@ def api_report_data():
     end_date = request.args.get('end_date', '')
     granularity = request.args.get('granularity', 'month')  # day, week, month
     country = request.args.get('country', '')
+    manager = request.args.get('manager', '')
     
     # Validate granularity
     if granularity not in ('day', 'week', 'month'):
@@ -19261,8 +19276,8 @@ def api_report_data():
         start_dt = datetime.now() - timedelta(days=180)
         start_date = start_dt.strftime('%Y-%m-%d')
     
-    # Cache Logic - include granularity and country in key
-    cache_key = f"traffic_{start_date}_{end_date}_{granularity}_{country}"
+    # Cache Logic - include granularity, country, and manager in key
+    cache_key = f"traffic_{start_date}_{end_date}_{granularity}_{country}_{manager}"
     force_refresh = request.args.get('force', 'false') == 'true'
     
     # Try load from server cache first (if not forced)
@@ -19280,10 +19295,10 @@ def api_report_data():
     
     all_traffic = {}
     # Use the new function with granularity support
-    orders_data = get_orders_for_report(start_date, end_date, granularity, country=country)
+    orders_data = get_orders_for_report(start_date, end_date, granularity, country=country, manager=manager)
     
     # Get sites config from database
-    db_sites = conn.execute('SELECT url, mask_id FROM sites').fetchall()
+    db_sites = conn.execute('SELECT url, mask_id, manager, country FROM sites').fetchall()
     
     def normalize_domain(url):
         if not url: return "unknown"
@@ -19303,19 +19318,24 @@ def api_report_data():
         if site['mask_id']:
             site_mask_map[domain] = site['mask_id']
             
-    # Filter sites by country if selected
-    if country:
-        country_sites = conn.execute('SELECT url FROM sites WHERE country = ?', (country,)).fetchall()
-        country_domains = set([normalize_domain(s['url']) for s in country_sites])
-        
-        # Filter site_mask_map to only include sites from this country
-        site_mask_map = {k: v for k, v in site_mask_map.items() if k in country_domains}
+    # Filter sites by country / manager if selected
+    if country or manager:
+        filtered_domains = set()
+        for site in db_sites:
+            if country and (site['country'] or '') != country:
+                continue
+            if manager and (site['manager'] or '') != manager:
+                continue
+            filtered_domains.add(normalize_domain(site['url']))
+
+        site_mask_map = {k: v for k, v in site_mask_map.items() if k in filtered_domains}
             
     # Add hardcoded sites if not in DB (backward compatibility)
-    for site, mask_id in LA_API_CONFIG['sites'].items():
-        norm_site = normalize_domain(site)
-        if norm_site not in site_mask_map:
-            site_mask_map[norm_site] = mask_id
+    if not country and not manager:
+        for site, mask_id in LA_API_CONFIG['sites'].items():
+            norm_site = normalize_domain(site)
+            if norm_site not in site_mask_map:
+                site_mask_map[norm_site] = mask_id
             
     # Fetch traffic data for each site
     for site_name, mask_id in site_mask_map.items():
@@ -19408,7 +19428,8 @@ def api_report_data():
         'sites': list(site_mask_map.keys()),
         'site_currencies': site_currencies,  # Currency per site
         'date_range': {'start': start_date, 'end': end_date},
-        'granularity': granularity
+        'granularity': granularity,
+        'filters': {'country': country, 'manager': manager}
     }
 
     
@@ -19443,12 +19464,15 @@ def report_cache_sync():
              
         start_date = data.get('start_date')
         end_date = data.get('end_date')
+        granularity = data.get('granularity', 'month')
+        country = data.get('country', '')
+        manager = data.get('manager', '')
         traffic_data = data.get('data') # Expecting the full result object structure
         
         if not start_date or not end_date or not traffic_data:
             return jsonify({'success': False, 'error': '数据不完整'}), 400
             
-        cache_key = f"traffic_{start_date}_{end_date}"
+        cache_key = f"traffic_{start_date}_{end_date}_{granularity}_{country}_{manager}"
         
         # Verify structure roughly
         if 'data' not in traffic_data or 'months' not in traffic_data:
