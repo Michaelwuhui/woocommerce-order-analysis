@@ -19277,7 +19277,7 @@ def api_report_data():
         start_date = start_dt.strftime('%Y-%m-%d')
     
     # Cache Logic - include granularity, country, and manager in key
-    cache_key = f"traffic_v4_{start_date}_{end_date}_{granularity}_{country}_{manager}"
+    cache_key = f"traffic_v5_{start_date}_{end_date}_{granularity}_{country}_{manager}"
     force_refresh = request.args.get('force', 'false') == 'true'
     
     # Try load from server cache first (if not forced)
@@ -19311,6 +19311,20 @@ def api_report_data():
             url = url.replace('www.', '')
         return url.split('/')[0]
 
+    def date_to_period(date_value):
+        if not date_value:
+            return ''
+        date_str = str(date_value)[:10]
+        try:
+            if granularity == 'day':
+                return date_str
+            if granularity == 'week':
+                dt = datetime.strptime(date_str, '%Y-%m-%d')
+                return f"{dt.isocalendar()[0]}-W{dt.isocalendar()[1]:02d}"
+            return date_str[:7]
+        except Exception:
+            return date_str[:7]
+
     # Create mask_id mapping (normalized)
     site_mask_map = {}
     site_meta = {}
@@ -19322,6 +19336,24 @@ def api_report_data():
         }
         if site['mask_id']:
             site_mask_map[domain] = site['mask_id']
+
+    first_order_rows = conn.execute('''
+        SELECT source, MIN(date_created) AS first_order_at
+        FROM orders
+        WHERE source IS NOT NULL AND source != ''
+          AND status NOT IN ('checkout-draft', 'trash')
+        GROUP BY source
+    ''').fetchall()
+    site_first_periods = {}
+    for row in first_order_rows:
+        domain = normalize_domain(row['source'])
+        first_period = date_to_period(row['first_order_at'])
+        if first_period and (domain not in site_first_periods or first_period < site_first_periods[domain]):
+            site_first_periods[domain] = first_period
+
+    for domain, first_period in site_first_periods.items():
+        site_meta.setdefault(domain, {'country': '', 'manager': ''})
+        site_meta[domain]['first_order_period'] = first_period
             
     # Filter sites by country / manager if selected
     if country or manager:
@@ -19366,6 +19398,9 @@ def api_report_data():
             aggregated_traffic = aggregate_traffic_by_month(traffic_list)
         
         for period, data in aggregated_traffic.items():
+            first_period = site_first_periods.get(site_name)
+            if first_period and period < first_period:
+                continue
             all_periods.add(period)
             if period not in combined[site_name]:
                 combined[site_name][period] = {}
@@ -19479,7 +19514,7 @@ def report_cache_sync():
         if not start_date or not end_date or not traffic_data:
             return jsonify({'success': False, 'error': '数据不完整'}), 400
             
-        cache_key = f"traffic_v4_{start_date}_{end_date}_{granularity}_{country}_{manager}"
+        cache_key = f"traffic_v5_{start_date}_{end_date}_{granularity}_{country}_{manager}"
         
         # Verify structure roughly
         if 'data' not in traffic_data or 'months' not in traffic_data:

@@ -232,7 +232,7 @@
             <small class="text-white-50 font-monospace" id="dateRangeInfo"></small>
         </div>
         <div class="card-body p-0">
-            <div class="table-responsive">
+            <div class="table-responsive report-table-responsive">
                 <table class="table table-bordered table-hover mb-0" id="reportTable">
                     <thead class="table-dark">
                         <tr>
@@ -261,7 +261,7 @@
         position: sticky;
         left: 0;
         background: #fff;
-        z-index: 1;
+        z-index: 3;
         min-width: 140px;
         max-width: 150px;
         overflow: hidden;
@@ -272,8 +272,28 @@
         position: sticky;
         left: 140px;
         background: #fff;
-        z-index: 1;
+        z-index: 3;
         min-width: 100px;
+    }
+
+    .report-table-responsive {
+        overflow-x: auto;
+        overflow-y: visible;
+    }
+
+    #reportTable thead th {
+        position: sticky;
+        top: 76px;
+        z-index: 6;
+        background: #111827 !important;
+        color: #e5e7eb;
+        box-shadow: 0 1px 0 rgba(148, 163, 184, 0.35);
+    }
+
+    #reportTable thead th.sticky-col,
+    #reportTable thead th.sticky-col-2 {
+        z-index: 8;
+        background: #111827 !important;
     }
 
     .table thead th {
@@ -730,8 +750,8 @@
 
         // Try load from cache first
         if (!forceRefresh) {
-            const cachedData = localStorage.getItem('report_last_result_v4');
-            const cachedParams = localStorage.getItem('report_last_params_v4');
+            const cachedData = localStorage.getItem('report_last_result_v5');
+            const cachedParams = localStorage.getItem('report_last_params_v5');
 
             if (cachedData && cachedParams) {
                 try {
@@ -770,8 +790,8 @@
                 localStorage.setItem('report_startDate', startDate);
                 localStorage.setItem('report_endDate', endDate);
                 localStorage.setItem('report_granularity', granularity);
-                localStorage.setItem('report_last_result_v4', JSON.stringify(result));
-                localStorage.setItem('report_last_params_v4', JSON.stringify({ start: startDate, end: endDate, granularity: granularity }));
+                localStorage.setItem('report_last_result_v5', JSON.stringify(result));
+                localStorage.setItem('report_last_params_v5', JSON.stringify({ start: startDate, end: endDate, granularity: granularity }));
 
                 currentResult = result;
 
