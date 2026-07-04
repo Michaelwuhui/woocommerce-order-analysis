@@ -19277,7 +19277,7 @@ def api_report_data():
         start_date = start_dt.strftime('%Y-%m-%d')
     
     # Cache Logic - include granularity, country, and manager in key
-    cache_key = f"traffic_{start_date}_{end_date}_{granularity}_{country}_{manager}"
+    cache_key = f"traffic_v4_{start_date}_{end_date}_{granularity}_{country}_{manager}"
     force_refresh = request.args.get('force', 'false') == 'true'
     
     # Try load from server cache first (if not forced)
@@ -19313,8 +19313,13 @@ def api_report_data():
 
     # Create mask_id mapping (normalized)
     site_mask_map = {}
+    site_meta = {}
     for site in db_sites:
         domain = normalize_domain(site['url'])
+        site_meta[domain] = {
+            'country': site['country'] or '',
+            'manager': site['manager'] or ''
+        }
         if site['mask_id']:
             site_mask_map[domain] = site['mask_id']
             
@@ -19336,6 +19341,7 @@ def api_report_data():
             norm_site = normalize_domain(site)
             if norm_site not in site_mask_map:
                 site_mask_map[norm_site] = mask_id
+            site_meta.setdefault(norm_site, {'country': '', 'manager': ''})
             
     # Fetch traffic data for each site
     for site_name, mask_id in site_mask_map.items():
@@ -19426,6 +19432,7 @@ def api_report_data():
         'periods': sorted_periods,
         'months': sorted_periods,   # Keep for backward compatibility
         'sites': list(site_mask_map.keys()),
+        'site_meta': site_meta,
         'site_currencies': site_currencies,  # Currency per site
         'date_range': {'start': start_date, 'end': end_date},
         'granularity': granularity,
@@ -19472,7 +19479,7 @@ def report_cache_sync():
         if not start_date or not end_date or not traffic_data:
             return jsonify({'success': False, 'error': '数据不完整'}), 400
             
-        cache_key = f"traffic_{start_date}_{end_date}_{granularity}_{country}_{manager}"
+        cache_key = f"traffic_v4_{start_date}_{end_date}_{granularity}_{country}_{manager}"
         
         # Verify structure roughly
         if 'data' not in traffic_data or 'months' not in traffic_data:

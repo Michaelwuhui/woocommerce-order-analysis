@@ -439,6 +439,29 @@
         updateCheckAllState();
     }
 
+    function getAllReportSites(result) {
+        if (!result) return [];
+        return Array.from(new Set([...(result.sites || []), ...Object.keys(result.data || {})]));
+    }
+
+    function getFilteredReportSites(result) {
+        const siteMeta = (result && result.site_meta) || {};
+        return getAllReportSites(result).filter(site => {
+            const meta = siteMeta[site] || {};
+            if (currentCountry && (meta.country || '') !== currentCountry) return false;
+            if (currentManager && (meta.manager || '') !== currentManager) return false;
+            return true;
+        });
+    }
+
+    function refreshReportView() {
+        if (!currentResult) return;
+        initSitesFilter(getFilteredReportSites(currentResult));
+        renderReport(currentResult);
+        document.getElementById('reportCard').style.display = 'block';
+        document.getElementById('chartCard').style.display = 'block';
+    }
+
     // Sites Filter Logic
     function initSitesFilter(sites) {
         const container = document.getElementById('sitesFilterList');
@@ -592,7 +615,7 @@
         currentCountry = country;
         localStorage.setItem('report_country', country);
         updateCountryUI(country);
-        loadReportData(true);
+        refreshReportView();
     }
 
     function updateCountryUI(country) {
@@ -620,7 +643,7 @@
         currentManager = manager;
         localStorage.setItem('report_manager', manager);
         updateManagerUI(manager);
-        loadReportData(true);
+        refreshReportView();
     }
 
     function updateManagerUI(manager) {
@@ -707,24 +730,18 @@
 
         // Try load from cache first
         if (!forceRefresh) {
-            const cachedData = localStorage.getItem('report_last_result_v3');
-            const cachedParams = localStorage.getItem('report_last_params_v3');
+            const cachedData = localStorage.getItem('report_last_result_v4');
+            const cachedParams = localStorage.getItem('report_last_params_v4');
 
             if (cachedData && cachedParams) {
                 try {
                     const params = JSON.parse(cachedParams);
-                    // Match current date inputs AND granularity AND country
-                    if (params.start === startDate && params.end === endDate && params.granularity === granularity && params.country === currentCountry && params.manager === currentManager) {
+                    // Match current date inputs AND granularity. Country/manager/site are local slices.
+                    if (params.start === startDate && params.end === endDate && params.granularity === granularity) {
                         const result = JSON.parse(cachedData);
                         currentResult = result;
 
-                        // Init sites filter
-                        const allSites = Array.from(new Set([...result.sites, ...Object.keys(result.data)]));
-                        initSitesFilter(allSites);
-
-                        renderReport(result);
-                        document.getElementById('reportCard').style.display = 'block';
-                        document.getElementById('chartCard').style.display = 'block';
+                        refreshReportView();
                         document.getElementById('dateRangeInfo').innerHTML =
                             `${result.date_range.start} ~ ${result.date_range.end} <small class="text-white-50 ms-2">(缓存数据)</small>`;
                         return;
@@ -741,9 +758,7 @@
             const query = new URLSearchParams({
                 start_date: startDate,
                 end_date: endDate,
-                granularity: granularity,
-                country: currentCountry,
-                manager: currentManager
+                granularity: granularity
             });
             if (forceRefresh) query.set('force', 'true');
             const url = `/api/report/data?${query.toString()}`;
@@ -755,18 +770,12 @@
                 localStorage.setItem('report_startDate', startDate);
                 localStorage.setItem('report_endDate', endDate);
                 localStorage.setItem('report_granularity', granularity);
-                localStorage.setItem('report_last_result_v3', JSON.stringify(result));
-                localStorage.setItem('report_last_params_v3', JSON.stringify({ start: startDate, end: endDate, granularity: granularity, country: currentCountry, manager: currentManager }));
+                localStorage.setItem('report_last_result_v4', JSON.stringify(result));
+                localStorage.setItem('report_last_params_v4', JSON.stringify({ start: startDate, end: endDate, granularity: granularity }));
 
                 currentResult = result;
 
-                // Init sites filter
-                const allSites = Array.from(new Set([...result.sites, ...Object.keys(result.data)]));
-                initSitesFilter(allSites);
-
-                renderReport(result);
-                document.getElementById('reportCard').style.display = 'block';
-                document.getElementById('chartCard').style.display = 'block';
+                refreshReportView();
                 document.getElementById('dateRangeInfo').textContent =
                     `${result.date_range.start} ~ ${result.date_range.end}`;
             } else {
@@ -797,8 +806,8 @@
             start_date: startDate,
             end_date: endDate,
             granularity: currentGranularity,
-            country: currentCountry,
-            manager: currentManager,
+            country: '',
+            manager: '',
             data: currentResult
         };
 
@@ -852,11 +861,12 @@
 
         if (activeMetrics.length === 0) {
             document.getElementById('reportBody').innerHTML = '<tr><td colspan="100" class="text-center text-white-50 py-4">请至少选择一个指标</td></tr>';
+            clearTrendView();
             return;
         }
 
         // Get Selected Sites
-        let allSitesRaw = new Set([...sites, ...Object.keys(data)]);
+        let allSitesRaw = new Set(getFilteredReportSites(result));
         const siteChecks = document.querySelectorAll('.site-check');
         let activeSites = Array.from(allSitesRaw);
 
@@ -867,6 +877,7 @@
 
         if (activeSites.length === 0) {
             document.getElementById('reportBody').innerHTML = '<tr><td colspan="100" class="text-center text-white-50 py-4">请至少选择一个站点</td></tr>';
+            clearTrendView();
             return;
         }
 
@@ -986,6 +997,15 @@
         });
         // Update Chart
         updateChart(activeSites, months, data, activeMetrics);
+    }
+
+    function clearTrendView() {
+        if (trendChart) {
+            trendChart.destroy();
+            trendChart = null;
+        }
+        const wrapper = document.getElementById('trendSummaryWrapper');
+        if (wrapper) wrapper.style.display = 'none';
     }
 
     function updateChart(activeSites, months, allData, activeMetrics) {
