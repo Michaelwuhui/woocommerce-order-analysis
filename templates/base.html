@@ -1206,10 +1206,36 @@
                         html += '<div class="timeline">';
 
                         order.order_notes.forEach(function (note) {
-                            var isSystem = note.note.includes('Order status changed') || note.note.includes('订单状态');
-                            var bgClass = isSystem ? 'bg-secondary bg-opacity-10' : 'bg-info bg-opacity-10';
-                            var borderClass = isSystem ? 'border-secondary' : 'border-info';
-                            var textClass = isSystem ? 'text-secondary' : 'text-info';
+                            var noteText = String(note.note || '');
+                            var escapedNote = noteText
+                                .replace(/&/g, '&amp;')
+                                .replace(/</g, '&lt;')
+                                .replace(/>/g, '&gt;')
+                                .replace(/"/g, '&quot;')
+                                .replace(/'/g, '&#39;')
+                                .replace(/\n/g, '<br>');
+                            var isCustomerNote = !!note.customer_note;
+                            var isSystem = !isCustomerNote && (
+                                noteText.includes('Order status changed') ||
+                                noteText.includes('订单状态') ||
+                                noteText.includes('状态订单') ||
+                                noteText.includes('Zmniejszenie stanu magazynowego') ||
+                                noteText.includes('Płatność przy odbiorze') ||
+                                noteText.includes('Wstrzymano stan magazynowy')
+                            );
+                            var bgClass = isCustomerNote ? 'bg-warning bg-opacity-10' : (isSystem ? 'bg-secondary bg-opacity-10' : 'bg-info bg-opacity-10');
+                            var borderClass = isCustomerNote ? 'border-warning' : (isSystem ? 'border-secondary' : 'border-info');
+                            var noteLabel = isCustomerNote
+                                ? '<span class="badge bg-warning text-dark me-2"><i class="bi bi-envelope-check me-1"></i>客户须知</span><span class="badge bg-success bg-opacity-25 text-success">已发邮件</span>'
+                                : (isSystem
+                                    ? '<span class="badge bg-secondary bg-opacity-25 text-light me-2"><i class="bi bi-gear me-1"></i>系统记录</span>'
+                                    : '<span class="badge bg-info bg-opacity-25 text-info me-2"><i class="bi bi-pencil-square me-1"></i>内部备注</span>');
+                            var authorText = String(note.author || 'System')
+                                .replace(/&/g, '&amp;')
+                                .replace(/</g, '&lt;')
+                                .replace(/>/g, '&gt;')
+                                .replace(/"/g, '&quot;')
+                                .replace(/'/g, '&#39;');
 
                             html += '<div class="d-flex mb-3">';
                             html += '<div class="d-flex flex-column align-items-center me-3" style="min-width: 60px;">';
@@ -1217,8 +1243,9 @@
                             html += '<small style="color: #94a3b8; font-size: 10px;">' + note.date_created.substring(11, 16) + '</small>';
                             html += '</div>';
                             html += '<div class="p-2 rounded w-100 ' + bgClass + ' border-start border-3 ' + borderClass + '" style="font-size: 13px;">';
-                            html += '<div class="mb-1" style="color: #e2e8f0;">' + note.note + '</div>';
-                            html += '<div class="small" style="color: #94a3b8;">by ' + (note.author || 'System') + '</div>';
+                            html += '<div class="mb-2">' + noteLabel + '</div>';
+                            html += '<div class="mb-1" style="color: #e2e8f0;">' + escapedNote + '</div>';
+                            html += '<div class="small" style="color: #94a3b8;">by ' + authorText + '</div>';
                             html += '</div></div>';
                         });
 
@@ -1587,7 +1614,27 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ note: note, notify_customer: notifyCustomer })
             })
-                .then(function (res) { return res.json(); })
+                .then(function (res) {
+                    return res.text().then(function (text) {
+                        var data;
+                        try {
+                            data = text ? JSON.parse(text) : {};
+                        } catch (e) {
+                            var preview = text.replace(/\s+/g, ' ').trim().substring(0, 160);
+                            data = {
+                                success: false,
+                                error: '服务器返回了非 JSON 响应（HTTP ' + res.status + '）。'
+                                    + '如果刚刚勾选了发送邮件，可能是邮件发送太慢导致网关超时；'
+                                    + '请先刷新备注历史确认是否已添加，避免重复发送。'
+                                    + (preview ? ' 响应开头: ' + preview : '')
+                            };
+                        }
+                        if (!res.ok && data.success !== true) {
+                            data.error = data.error || ('请求失败（HTTP ' + res.status + '）');
+                        }
+                        return data;
+                    });
+                })
                 .then(function (data) {
                     btn.disabled = false;
                     btn.innerHTML = originalText;

@@ -363,9 +363,23 @@ def sync_order_notes(wcapi, site_url, connection=None):
             # so they collide across sites — using them as the local PK silently
             # overwrites notes from earlier-synced sites.
             insert_query = """
-            INSERT OR REPLACE INTO order_notes (
+            INSERT INTO order_notes (
                 wc_note_id, order_id, note, date_created, customer_note, author, added_by_user
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(order_id, wc_note_id) DO UPDATE SET
+                note = excluded.note,
+                date_created = excluded.date_created,
+                customer_note = excluded.customer_note,
+                author = CASE
+                    WHEN order_notes.added_by_user = 1
+                         AND COALESCE(order_notes.author, '') NOT IN ('', 'WooCommerce')
+                    THEN order_notes.author
+                    ELSE excluded.author
+                END,
+                added_by_user = CASE
+                    WHEN order_notes.added_by_user = 1 THEN 1
+                    ELSE excluded.added_by_user
+                END
             """
 
             processed_notes = []
@@ -464,4 +478,3 @@ def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_d
         return {"status": "error", "message": str(e)}
     finally:
         close_thread_db_connection()
-

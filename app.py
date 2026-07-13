@@ -4914,6 +4914,28 @@ def get_order_details(order_id):
     # Use orders.id (WC post ID); order['number'] can be a customer-facing
     # sequential number that the REST API rejects with 404.
     order_dict['order_notes'] = []
+    local_note_authors = {}
+    def _local_order_notes():
+        return [dict(n) for n in conn.execute('''
+            SELECT COALESCE(wc_note_id, id) AS id, note, date_created,
+                   customer_note, author, added_by_user
+            FROM order_notes
+            WHERE order_id = ?
+            ORDER BY date_created DESC
+        ''', (order['id'],)).fetchall()]
+
+    try:
+        for local_note in conn.execute('''
+            SELECT wc_note_id, author, added_by_user
+            FROM order_notes
+            WHERE order_id = ? AND wc_note_id IS NOT NULL
+        ''', (order['id'],)).fetchall():
+            author = (local_note['author'] or '').strip()
+            if local_note['added_by_user'] and author and author != 'WooCommerce':
+                local_note_authors[int(local_note['wc_note_id'])] = author
+    except Exception as e:
+        print(f"Warning: Failed to load local note authors for order {order['id']}: {e}")
+
     if site_row and site_row['consumer_key'] and site_row['consumer_secret']:
         try:
             import requests as req
@@ -4921,14 +4943,27 @@ def get_order_details(order_id):
             response = req.get(
                 api_url,
                 auth=(site_row['consumer_key'], site_row['consumer_secret']),
-                timeout=5
+                timeout=(5, 12)
             )
             if response.status_code == 200:
-                order_dict['order_notes'] = response.json()
+                remote_notes = response.json()
+                for note in remote_notes:
+                    try:
+                        note_id = int(note.get('id'))
+                    except (TypeError, ValueError):
+                        note_id = None
+                    if note_id in local_note_authors:
+                        note['author'] = local_note_authors[note_id]
+                        note['added_by_user'] = True
+                order_dict['order_notes'] = remote_notes
             else:
                 print(f"Warning: Failed to fetch notes for order {order['id']}: {response.status_code} {response.text}")
+                order_dict['order_notes'] = _local_order_notes()
         except Exception as e:
             print(f"Error fetching notes for order {order['id']}: {e}")
+            order_dict['order_notes'] = _local_order_notes()
+    else:
+        order_dict['order_notes'] = _local_order_notes()
 
     # Get local shipping log if exists (for manually shipped orders not yet synced)
     shipping_log = conn.execute('SELECT tracking_number, carrier_slug, shipped_at FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
@@ -17635,13 +17670,11 @@ def get_order_notes(order_id):
 def add_order_note(order_id):
     """Add a note to an order, optionally notifying the customer.
 
-    When notify_customer is True, WP runs the email send synchronously through
-    whatever SMTP plugin is installed (FluentSMTP, etc) BEFORE returning the
-    response. A slow SMTP relay can easily push that past the default 30 s
-    timeout. So we:
-      - bump the read timeout to 90 s when an email is involved
-      - on timeout, do a verify GET to see if the note actually landed
-        (the POST likely succeeded server-side; only the response was lost)
+    When notify_customer is True, WP sends the customer-note email
+    synchronously before returning. If that runs longer than nginx/proxy
+    timeouts, the browser receives an HTML gateway error even though the note
+    may have been written. Keep our read timeout below the proxy window, then
+    verify by GET so the client still gets JSON.
     """
     import requests as req
 
@@ -17671,10 +17704,83 @@ def add_order_note(order_id):
         "Accept": "application/json",
     }
     auth = (site['consumer_key'], site['consumer_secret'])
-    # (connect, read) — connect should be fast; read needs to absorb SMTP latency
-    timeout = (10, 90 if notify_customer else 30)
+    # (connect, read). Keep notify_customer below common 60s proxy timeouts so
+    # Flask can return a JSON result instead of the browser seeing an HTML 504.
+    timeout = (10, 45 if notify_customer else 30)
+
+    def _remote_note_matches(remote_note):
+        if str(remote_note.get('note', '')).strip() != note.strip():
+            return False
+        if bool(remote_note.get('customer_note', False)) != bool(notify_customer):
+            return False
+        return True
+
+    def _save_remote_note_locally(remote_note, submitted_by_current_user=False):
+        if not remote_note or 'id' not in remote_note:
+            return
+        from datetime import datetime
+        display_author = remote_note.get('author', '')
+        if submitted_by_current_user and current_user.is_authenticated:
+            display_author = (current_user.name or current_user.username or display_author or '').strip()
+        added_by_user = 1 if (submitted_by_current_user or remote_note.get('added_by_user', True)) else 0
+        conn2 = get_db_connection()
+        try:
+            conn2.execute('''
+                INSERT INTO order_notes (
+                    wc_note_id, order_id, note, date_created, customer_note, author, added_by_user
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(order_id, wc_note_id) DO UPDATE SET
+                    note = excluded.note,
+                    date_created = excluded.date_created,
+                    customer_note = excluded.customer_note,
+                    author = CASE
+                        WHEN order_notes.added_by_user = 1
+                             AND COALESCE(order_notes.author, '') NOT IN ('', 'WooCommerce')
+                        THEN order_notes.author
+                        ELSE excluded.author
+                    END,
+                    added_by_user = CASE
+                        WHEN order_notes.added_by_user = 1 THEN 1
+                        ELSE excluded.added_by_user
+                    END
+            ''', (
+                remote_note.get('id'),
+                order_id,
+                remote_note.get('note', note),
+                remote_note.get('date_created', datetime.now().isoformat()),
+                1 if remote_note.get('customer_note', notify_customer) else 0,
+                display_author,
+                added_by_user,
+            ))
+            conn2.commit()
+        finally:
+            conn2.close()
+
+    def _find_existing_remote_note(read_timeout=15):
+        check = req.get(url, auth=auth, timeout=(10, read_timeout), headers=headers)
+        if check.status_code != 200:
+            return None
+        for remote_note in check.json() or []:
+            if _remote_note_matches(remote_note):
+                return remote_note
+        return None
 
     try:
+        # Customer notes trigger email. If the exact same customer-facing note is
+        # already present remotely, a retry should not send the same email again.
+        if notify_customer:
+            try:
+                existing_note = _find_existing_remote_note()
+                if existing_note:
+                    _save_remote_note_locally(existing_note)
+                    return jsonify({
+                        'success': True,
+                        'message': '备注已存在，已避免重复发送客户邮件',
+                        'duplicate_avoided': True,
+                    })
+            except Exception as dup_check_err:
+                app.logger.warning(f"add_order_note duplicate check failed for {order_id}: {dup_check_err}")
+
         try:
             resp = req.post(
                 url,
@@ -17686,22 +17792,21 @@ def add_order_note(order_id):
             # Fetch the latest notes and look for ours by exact content match.
             app.logger.warning(f"add_order_note: read timeout for order {order_id}, verifying via GET...")
             try:
-                check = req.get(url, auth=auth, timeout=(10, 30), headers=headers)
-                if check.status_code == 200:
-                    for n in check.json() or []:
-                        if str(n.get('note', '')).strip() == note.strip():
-                            return jsonify({
-                                'success': True,
-                                'message': '备注已添加（远端响应超时，但已确认入库）'
-                                           + ('，邮件可能仍在发送中' if notify_customer else ''),
-                                'verified_by_get': True,
-                            })
+                existing_note = _find_existing_remote_note(read_timeout=10)
+                if existing_note:
+                    _save_remote_note_locally(existing_note, submitted_by_current_user=True)
+                    return jsonify({
+                        'success': True,
+                        'message': '备注已添加（远端响应超时，但已确认入库）'
+                                   + ('，邮件可能仍在发送中' if notify_customer else ''),
+                        'verified_by_get': True,
+                    })
             except Exception as verify_err:
                 app.logger.warning(f"add_order_note verify GET failed: {verify_err}")
             return jsonify({
                 'success': False,
-                'error': '请求超时（90s）。如果勾选了「发送邮件」，邮件服务器响应可能慢；'
-                         '请稍后到 WordPress 后台确认备注是否已添加。',
+                'error': '请求已提交到 WooCommerce，但邮件发送响应超时，系统未能确认结果。'
+                         '请先刷新备注历史或到 WordPress 后台确认，避免重复发送。',
             }), 504
 
         if resp.status_code not in (200, 201):
@@ -17710,24 +17815,7 @@ def add_order_note(order_id):
         # Save the new note locally so it shows up immediately without waiting for the next sync
         try:
             note_data = resp.json()
-            if note_data and 'id' in note_data:
-                from datetime import datetime
-                conn = get_db_connection()
-                conn.execute('''
-                    INSERT OR REPLACE INTO order_notes (
-                        wc_note_id, order_id, note, date_created, customer_note, author, added_by_user
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    note_data.get('id'),
-                    order_id,
-                    note_data.get('note', note),
-                    note_data.get('date_created', datetime.now().isoformat()),
-                    1 if notify_customer else 0,
-                    note_data.get('author', current_user.username if current_user.is_authenticated else ''),
-                    1,
-                ))
-                conn.commit()
-                conn.close()
+            _save_remote_note_locally(note_data, submitted_by_current_user=True)
         except Exception as db_err:
             app.logger.error(f"Failed to save note to local DB: {db_err}")
 
