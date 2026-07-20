@@ -100,6 +100,12 @@ def find_confirmable_orders(conn, since):
           AND COALESCE(o.delivery_confirmed, 0) = 0
           AND o.carrier_status = 'delivered'
           AND o.carrier_status_at IS NOT NULL
+          AND (NOT EXISTS (
+                 SELECT 1 FROM oms_order_fulfillment_state ofs WHERE ofs.order_id=o.id
+               ) OR EXISTS (
+                 SELECT 1 FROM oms_order_fulfillment_state ofs
+                 WHERE ofs.order_id=o.id AND ofs.aggregate_status='delivered'
+               ))
           AND """ + ready_sql + """
         ORDER BY o.date_created ASC
         """
@@ -126,6 +132,12 @@ def count_confirmable(conn, since):
           AND COALESCE(o.delivery_confirmed, 0) = 0
           AND o.carrier_status = 'delivered'
           AND o.carrier_status_at IS NOT NULL
+          AND (NOT EXISTS (
+                 SELECT 1 FROM oms_order_fulfillment_state ofs WHERE ofs.order_id=o.id
+               ) OR EXISTS (
+                 SELECT 1 FROM oms_order_fulfillment_state ofs
+                 WHERE ofs.order_id=o.id AND ofs.aggregate_status='delivered'
+               ))
           AND """ + ready_sql + """
         """
     ).fetchone()[0]

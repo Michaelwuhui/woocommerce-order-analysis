@@ -797,7 +797,9 @@
                     // High-risk rows: stronger tint to grab attention even when
                     // it's not also a "big order". Falls back to the big-order
                     // tint, then no tint.
-                    const rowStyle = (o.customer_risk && o.customer_risk.level === 'high')
+                    const rowStyle = (o.has_shortage || o.manual_review)
+                        ? ' style="background-color: rgba(220,53,69,0.28); outline: 2px solid rgba(220,53,69,0.7);"'
+                        : (o.customer_risk && o.customer_risk.level === 'high')
                         ? ' style="background-color: rgba(220,53,69,0.18);"'
                         : (o.customer_risk && o.customer_risk.level === 'medium')
                             ? ' style="background-color: rgba(245,158,11,0.12);"'
@@ -806,8 +808,9 @@
                     return `
                 <tr data-editsrc="${o.source || ''}"${rowStyle}>
                     <td class="ps-3">
-                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : ''}</div>
+                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : ''}${o.has_shortage ? ' <span class="badge bg-danger"><i class="bi bi-exclamation-octagon-fill me-1"></i>缺货</span>' : ''}${o.manual_review ? ` <span class="badge bg-danger" title="${o.manual_reason || ''}">人工处理</span>` : ''}</div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
+                        ${o.fulfillment_warehouses && o.fulfillment_warehouses.length ? `<small class="d-block text-warning"><i class="bi bi-boxes me-1"></i>${o.fulfillment_warehouses.join(' + ')}</small>` : ''}
                         <small class="text-muted d-block"><i class="bi bi-calendar3 me-1"></i>下单 ${o.date_created ? o.date_created.replace('T', ' ').substring(0, 16) : '-'}</small>
                     </td>
 
@@ -892,9 +895,7 @@
                         <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="printLabel('${o.id}')" title="打印">
                             <i class="bi bi-printer"></i>
                         </a>
-                        <button class="ship-action btn btn-sm ${o.parcels_shipped ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal("${o.id}", ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])})'>
-                            <i class="bi bi-truck me-1"></i>${o.parcels_shipped ? '继续发货' : '发货'}
-                        </button>
+                        ${o.fulfillment_status ? `<a class="btn btn-sm btn-warning px-3" href="/fulfillment?search=${encodeURIComponent(o.number)}"><i class="bi bi-boxes me-1"></i>多仓处理</a>` : `<button class="ship-action btn btn-sm ${o.parcels_shipped ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal("${o.id}", ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])})'><i class="bi bi-truck me-1"></i>${o.parcels_shipped ? '继续发货' : '发货'}</button>`}
                     </td>
                 </tr>
             `;

@@ -471,12 +471,469 @@ def down_005(conn):
     conn.commit()
 
 
+# ───────────────── 006: 多仓履约 V2 + 外部 WMS 可靠性底座 ─────────────────
+
+def up_006(conn):
+    """Add the durable multi-warehouse fulfillment domain.
+
+    These tables are intentionally separate from the original
+    ``inv_fulfillments`` tables.  The old tables are rebuilt from order state
+    and are unsuitable for an external WMS identity that must never disappear.
+    """
+
+    conn.executescript('''
+        CREATE TABLE IF NOT EXISTS oms_order_items (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id           TEXT NOT NULL,
+            woo_line_item_id   TEXT NOT NULL,
+            line_index         INTEGER NOT NULL DEFAULT 0,
+            wc_product_id      INTEGER,
+            wc_variation_id    INTEGER DEFAULT 0,
+            wc_sku             TEXT,
+            sku_id             INTEGER,
+            name               TEXT NOT NULL,
+            ordered_qty        INTEGER NOT NULL,
+            cancelled_qty      INTEGER NOT NULL DEFAULT 0,
+            allocated_qty      INTEGER NOT NULL DEFAULT 0,
+            shortage_qty       INTEGER NOT NULL DEFAULT 0,
+            raw_json           TEXT,
+            created_at         TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at         TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(order_id, woo_line_item_id),
+            FOREIGN KEY (sku_id) REFERENCES inv_skus(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_oi_order ON oms_order_items(order_id);
+        CREATE INDEX IF NOT EXISTS idx_oms_oi_sku ON oms_order_items(sku_id);
+
+        CREATE TABLE IF NOT EXISTS oms_order_fulfillment_state (
+            order_id               TEXT PRIMARY KEY,
+            revision               INTEGER NOT NULL DEFAULT 0,
+            plan_hash              TEXT,
+            aggregate_status       TEXT NOT NULL DEFAULT 'unallocated',
+            has_shortage           INTEGER NOT NULL DEFAULT 0,
+            manual_review          INTEGER NOT NULL DEFAULT 0,
+            manual_reason          TEXT,
+            completion_sync_status TEXT NOT NULL DEFAULT 'not_ready',
+            last_planned_at        TEXT,
+            created_at             TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at             TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_ofs_status
+            ON oms_order_fulfillment_state(aggregate_status, has_shortage, manual_review);
+
+        CREATE TABLE IF NOT EXISTS oms_sku_warehouses (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku_id        INTEGER NOT NULL,
+            warehouse_id  INTEGER NOT NULL,
+            is_primary    INTEGER NOT NULL DEFAULT 0,
+            is_enabled    INTEGER NOT NULL DEFAULT 1,
+            wms_product_name_zh TEXT,
+            wms_product_name_en TEXT,
+            wms_product_image   TEXT,
+            product_type        TEXT NOT NULL DEFAULT 'P',
+            notes         TEXT,
+            created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(sku_id, warehouse_id),
+            FOREIGN KEY (sku_id) REFERENCES inv_skus(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_sw_warehouse ON oms_sku_warehouses(warehouse_id, is_enabled);
+
+        CREATE TABLE IF NOT EXISTS oms_warehouse_integrations (
+            warehouse_id       INTEGER PRIMARY KEY,
+            provider           TEXT NOT NULL DEFAULT 'internal',
+            external_code      TEXT,
+            channel_code       TEXT,
+            base_url           TEXT,
+            is_enabled         INTEGER NOT NULL DEFAULT 1,
+            auto_submit        INTEGER NOT NULL DEFAULT 0,
+            inventory_authority TEXT NOT NULL DEFAULT 'local',
+            tracking_mode      TEXT NOT NULL DEFAULT 'official_and_third_party',
+            config_json        TEXT,
+            created_at         TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at         TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS oms_shipping_costs (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_code    TEXT NOT NULL,
+            warehouse_id   INTEGER NOT NULL,
+            service_code   TEXT NOT NULL DEFAULT 'default',
+            amount         REAL,
+            currency       TEXT NOT NULL DEFAULT 'EUR',
+            is_active      INTEGER NOT NULL DEFAULT 1,
+            effective_from TEXT,
+            effective_to   TEXT,
+            notes          TEXT,
+            created_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(market_code, warehouse_id, service_code)
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_cost_market ON oms_shipping_costs(market_code, is_active, amount);
+
+        CREATE TABLE IF NOT EXISTS oms_fulfillments (
+            id                     TEXT PRIMARY KEY,
+            order_id               TEXT NOT NULL,
+            warehouse_id           INTEGER NOT NULL,
+            revision               INTEGER NOT NULL DEFAULT 1,
+            status                 TEXT NOT NULL DEFAULT 'planned',
+            mode                   TEXT NOT NULL DEFAULT 'internal',
+            provider               TEXT,
+            external_warehouse_code TEXT,
+            external_invoice_code  TEXT,
+            channel_code           TEXT,
+            idempotency_key        TEXT NOT NULL,
+            plan_hash              TEXT,
+            payload_hash           TEXT,
+            external_pick_code     TEXT,
+            external_label_url     TEXT,
+            last_error_code        TEXT,
+            last_error_message     TEXT,
+            retry_count            INTEGER NOT NULL DEFAULT 0,
+            next_retry_at          TEXT,
+            row_version            INTEGER NOT NULL DEFAULT 1,
+            operator_id            INTEGER,
+            operator_name          TEXT,
+            submitted_at           TEXT,
+            accepted_at            TEXT,
+            shipped_at             TEXT,
+            delivered_at           TEXT,
+            cancelled_at           TEXT,
+            created_at             TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at             TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(order_id, warehouse_id, revision),
+            UNIQUE(idempotency_key),
+            UNIQUE(provider, external_invoice_code)
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_ful_order ON oms_fulfillments(order_id, revision);
+        CREATE INDEX IF NOT EXISTS idx_oms_ful_queue ON oms_fulfillments(warehouse_id, status, updated_at);
+
+        CREATE TABLE IF NOT EXISTS oms_fulfillment_items (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            fulfillment_id    TEXT NOT NULL,
+            order_item_id     INTEGER NOT NULL,
+            sku_id            INTEGER NOT NULL,
+            allocated_qty     INTEGER NOT NULL,
+            fulfilled_qty     INTEGER NOT NULL DEFAULT 0,
+            cancelled_qty     INTEGER NOT NULL DEFAULT 0,
+            sku_code_snapshot TEXT,
+            barcode_snapshot  TEXT,
+            name_snapshot     TEXT,
+            raw_json          TEXT,
+            created_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(fulfillment_id, order_item_id),
+            FOREIGN KEY (fulfillment_id) REFERENCES oms_fulfillments(id) ON DELETE RESTRICT,
+            FOREIGN KEY (order_item_id) REFERENCES oms_order_items(id) ON DELETE RESTRICT,
+            FOREIGN KEY (sku_id) REFERENCES inv_skus(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_fi_fulfillment ON oms_fulfillment_items(fulfillment_id);
+
+        CREATE TABLE IF NOT EXISTS oms_shipments (
+            id                   TEXT PRIMARY KEY,
+            fulfillment_id       TEXT NOT NULL,
+            external_shipment_id TEXT,
+            carrier_slug         TEXT,
+            carrier_name         TEXT,
+            tracking_number      TEXT,
+            label_url            TEXT,
+            weight_kg            REAL,
+            status               TEXT NOT NULL DEFAULT 'label_pending',
+            tracking_source      TEXT,
+            woo_sync_status      TEXT NOT NULL DEFAULT 'pending',
+            notification_status  TEXT NOT NULL DEFAULT 'pending',
+            shipped_at           TEXT,
+            delivered_at         TEXT,
+            created_at           TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at           TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(carrier_slug, tracking_number),
+            UNIQUE(fulfillment_id, external_shipment_id),
+            FOREIGN KEY (fulfillment_id) REFERENCES oms_fulfillments(id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_ship_ful ON oms_shipments(fulfillment_id);
+        CREATE INDEX IF NOT EXISTS idx_oms_ship_track ON oms_shipments(tracking_number, status);
+
+        CREATE TABLE IF NOT EXISTS oms_shipment_items (
+            shipment_id        TEXT NOT NULL,
+            fulfillment_item_id INTEGER NOT NULL,
+            quantity           INTEGER NOT NULL,
+            PRIMARY KEY (shipment_id, fulfillment_item_id),
+            FOREIGN KEY (shipment_id) REFERENCES oms_shipments(id) ON DELETE RESTRICT,
+            FOREIGN KEY (fulfillment_item_id) REFERENCES oms_fulfillment_items(id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS oms_tracking_events (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            shipment_id       TEXT NOT NULL,
+            provider          TEXT NOT NULL,
+            external_event_id TEXT,
+            event_fingerprint TEXT NOT NULL,
+            raw_status        TEXT,
+            normalized_status TEXT NOT NULL,
+            event_at          TEXT,
+            received_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+            location          TEXT,
+            description       TEXT,
+            payload_hash      TEXT,
+            raw_payload       TEXT,
+            UNIQUE(shipment_id, event_fingerprint),
+            FOREIGN KEY (shipment_id) REFERENCES oms_shipments(id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_te_shipment ON oms_tracking_events(shipment_id, event_at);
+
+        CREATE TABLE IF NOT EXISTS oms_integration_jobs (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_type         TEXT NOT NULL,
+            aggregate_type   TEXT,
+            aggregate_id     TEXT,
+            idempotency_key  TEXT NOT NULL UNIQUE,
+            payload_json     TEXT,
+            payload_hash     TEXT,
+            status           TEXT NOT NULL DEFAULT 'pending',
+            attempts         INTEGER NOT NULL DEFAULT 0,
+            max_attempts     INTEGER NOT NULL DEFAULT 10,
+            available_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+            locked_at        TEXT,
+            locked_by        TEXT,
+            lease_expires_at TEXT,
+            last_error_code  TEXT,
+            last_error       TEXT,
+            created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+            completed_at     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_jobs_ready
+            ON oms_integration_jobs(status, available_at, lease_expires_at);
+
+        CREATE TABLE IF NOT EXISTS oms_webhook_inbox (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider          TEXT NOT NULL,
+            external_event_id TEXT,
+            payload_hash      TEXT NOT NULL,
+            headers_json      TEXT,
+            payload_json      TEXT,
+            status            TEXT NOT NULL DEFAULT 'received',
+            received_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+            processed_at      TEXT,
+            error             TEXT,
+            UNIQUE(provider, external_event_id),
+            UNIQUE(provider, payload_hash)
+        );
+
+        CREATE TABLE IF NOT EXISTS oms_external_api_calls (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            correlation_id     TEXT NOT NULL,
+            job_id             INTEGER,
+            provider           TEXT NOT NULL,
+            operation          TEXT NOT NULL,
+            method             TEXT NOT NULL,
+            endpoint           TEXT NOT NULL,
+            request_hash       TEXT,
+            request_redacted   TEXT,
+            response_http_code INTEGER,
+            response_code      TEXT,
+            response_redacted  TEXT,
+            duration_ms        INTEGER,
+            attempt            INTEGER NOT NULL DEFAULT 1,
+            outcome            TEXT NOT NULL,
+            error              TEXT,
+            created_at         TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES oms_integration_jobs(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_api_corr ON oms_external_api_calls(correlation_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS oms_domain_events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            aggregate_type TEXT NOT NULL,
+            aggregate_id   TEXT NOT NULL,
+            event_type     TEXT NOT NULL,
+            from_status    TEXT,
+            to_status      TEXT,
+            actor_type     TEXT NOT NULL DEFAULT 'system',
+            actor_id       TEXT,
+            actor_name     TEXT,
+            correlation_id TEXT,
+            reason         TEXT,
+            payload_json   TEXT,
+            created_at     TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_de_aggregate
+            ON oms_domain_events(aggregate_type, aggregate_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS oms_warehouse_user_permissions (
+            user_id        INTEGER NOT NULL,
+            warehouse_id   INTEGER NOT NULL,
+            can_view       INTEGER NOT NULL DEFAULT 1,
+            can_pick       INTEGER NOT NULL DEFAULT 0,
+            can_pack       INTEGER NOT NULL DEFAULT 0,
+            can_ship       INTEGER NOT NULL DEFAULT 0,
+            can_cancel     INTEGER NOT NULL DEFAULT 0,
+            can_retry      INTEGER NOT NULL DEFAULT 0,
+            can_reconcile  INTEGER NOT NULL DEFAULT 0,
+            created_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, warehouse_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS oms_shipment_notifications (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            shipment_id      TEXT NOT NULL,
+            channel          TEXT NOT NULL DEFAULT 'email',
+            template_version TEXT NOT NULL DEFAULT 'ast-v1',
+            status           TEXT NOT NULL DEFAULT 'pending',
+            attempts         INTEGER NOT NULL DEFAULT 0,
+            provider_message_id TEXT,
+            last_error       TEXT,
+            sent_at          TEXT,
+            created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(shipment_id, channel, template_version),
+            FOREIGN KEY (shipment_id) REFERENCES oms_shipments(id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS oms_external_stock (
+            warehouse_id      INTEGER NOT NULL,
+            sku_barcode       TEXT NOT NULL,
+            sku_id            INTEGER,
+            quantity          INTEGER NOT NULL DEFAULT 0,
+            lock_quantity     INTEGER NOT NULL DEFAULT 0,
+            available_quantity INTEGER NOT NULL DEFAULT 0,
+            source_updated_at TEXT,
+            synced_at         TEXT DEFAULT CURRENT_TIMESTAMP,
+            raw_json          TEXT,
+            PRIMARY KEY (warehouse_id, sku_barcode),
+            FOREIGN KEY (sku_id) REFERENCES inv_skus(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_es_sku ON oms_external_stock(warehouse_id, sku_id);
+
+        CREATE TABLE IF NOT EXISTS oms_reconciliation_issues (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_type     TEXT NOT NULL,
+            severity       TEXT NOT NULL DEFAULT 'warning',
+            aggregate_type TEXT,
+            aggregate_id   TEXT,
+            dedup_key      TEXT NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'open',
+            detail_json    TEXT,
+            first_seen_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+            resolved_at    TEXT,
+            resolved_by    INTEGER,
+            UNIQUE(dedup_key, status)
+        );
+    ''')
+
+    hu = conn.execute(
+        "SELECT id FROM warehouses WHERE country='HU' OR code='HU' ORDER BY id LIMIT 1"
+    ).fetchone()
+    pl = conn.execute(
+        "SELECT id FROM warehouses WHERE country='PL' OR code='PL' ORDER BY id LIMIT 1"
+    ).fetchone()
+    hu_id = hu['id'] if hu else None
+    pl_id = pl['id'] if pl else None
+
+    if hu_id:
+        conn.execute('''
+            INSERT INTO oms_warehouse_integrations
+                (warehouse_id, provider, external_code, channel_code, base_url,
+                 is_enabled, auto_submit, inventory_authority, tracking_mode, config_json)
+            VALUES (?, 'hungary_wms', 'HU01', '欧洲直发-25',
+                    'http://cod.kuasuda.com/apicall', 1, 0, 'external_wms',
+                    'official_and_third_party', '{"country_format":"zh-CN","pack_type":0}')
+            ON CONFLICT(warehouse_id) DO UPDATE SET
+                provider=excluded.provider,
+                external_code=excluded.external_code,
+                channel_code=excluded.channel_code,
+                base_url=excluded.base_url,
+                inventory_authority=excluded.inventory_authority,
+                tracking_mode=excluded.tracking_mode,
+                updated_at=CURRENT_TIMESTAMP
+        ''', (hu_id,))
+    if pl_id:
+        conn.execute('''
+            INSERT INTO oms_warehouse_integrations
+                (warehouse_id, provider, is_enabled, auto_submit,
+                 inventory_authority, tracking_mode, config_json)
+            VALUES (?, 'internal', 1, 0, 'local',
+                    'official_and_third_party', '{}')
+            ON CONFLICT(warehouse_id) DO UPDATE SET
+                provider='internal', inventory_authority='local',
+                tracking_mode='official_and_third_party', updated_at=CURRENT_TIMESTAMP
+        ''', (pl_id,))
+
+    # All three stores may use both warehouses.  Site preference is applied by
+    # the planner; Czech orders additionally compare configured shipping cost.
+    routes = (
+        ('PL', pl_id, 10, '波兰站双仓有货时优先波兰仓'),
+        ('PL', hu_id, 20, '波兰站匈牙利仓备选'),
+        ('HU', hu_id, 10, '匈牙利站双仓有货时优先匈牙利仓'),
+        ('HU', pl_id, 20, '匈牙利站波兰仓备选'),
+        ('CZ', hu_id, 10, '捷克站按运费成本选择;未配置成本时使用本优先级'),
+        ('CZ', pl_id, 20, '捷克站按运费成本选择;未配置成本时使用本优先级'),
+    )
+    for market, warehouse_id, priority, note in routes:
+        if warehouse_id:
+            conn.execute('''
+                INSERT INTO inv_market_warehouses
+                    (market_code, warehouse_id, priority, is_active, notes)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(market_code, warehouse_id) DO UPDATE SET
+                    priority=excluded.priority, is_active=1, notes=excluded.notes,
+                    updated_at=CURRENT_TIMESTAMP
+            ''', (market, warehouse_id, priority, note))
+
+    # Deploy the schema dark.  Planning/worker/WMS writes are enabled only
+    # after SKU mappings, warehouse permissions and CZ cost routes are ready.
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('oms_fulfillment_enabled', '0')"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('oms_auto_plan_enabled', '0')"
+    )
+    conn.commit()
+
+
+def down_006(conn):
+    """Rollback only the new V2 domain; external WMS actions are never undone."""
+
+    hu = conn.execute(
+        "SELECT id FROM warehouses WHERE country='HU' OR code='HU' ORDER BY id LIMIT 1"
+    ).fetchone()
+    pl = conn.execute(
+        "SELECT id FROM warehouses WHERE country='PL' OR code='PL' ORDER BY id LIMIT 1"
+    ).fetchone()
+    if hu and pl:
+        conn.execute(
+            "DELETE FROM inv_market_warehouses WHERE market_code='PL' AND warehouse_id=?",
+            (hu['id'],),
+        )
+        conn.execute(
+            "DELETE FROM inv_market_warehouses WHERE market_code='HU' AND warehouse_id=?",
+            (pl['id'],),
+        )
+    for table in (
+        'oms_reconciliation_issues', 'oms_external_stock',
+        'oms_shipment_notifications', 'oms_warehouse_user_permissions',
+        'oms_domain_events', 'oms_external_api_calls', 'oms_webhook_inbox',
+        'oms_integration_jobs', 'oms_tracking_events', 'oms_shipment_items',
+        'oms_shipments', 'oms_fulfillment_items', 'oms_fulfillments',
+        'oms_shipping_costs', 'oms_warehouse_integrations',
+        'oms_sku_warehouses', 'oms_order_fulfillment_state', 'oms_order_items',
+    ):
+        conn.execute(f'DROP TABLE IF EXISTS {table}')
+    conn.execute(
+        "DELETE FROM settings WHERE key IN ('oms_fulfillment_enabled','oms_auto_plan_enabled')"
+    )
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
     ('003', 'order_inventory_state', up_003, down_003),
     ('004', 'inv_push_logs', up_004, down_004),
     ('005', 'notifications', up_005, down_005),
+    ('006', 'multi_warehouse_fulfillment_v2', up_006, down_006),
 ]
 
 

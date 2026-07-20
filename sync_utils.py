@@ -1,4 +1,5 @@
 import json
+import hashlib
 import time
 import sqlite3
 import threading
@@ -12,6 +13,52 @@ DB_FILE = 'woocommerce_orders.db'
 
 # Proxy configuration (optional)
 PROXY_CONFIG = {}
+
+
+def _flag_enabled(conn, key):
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return bool(row and str(row[0]).strip().lower() in {'1', 'true', 'yes', 'on'})
+
+
+def _enqueue_fulfillment_plans(candidates):
+    """Queue planning after the Woo order transaction has committed.
+
+    A separate row-factory connection isolates fulfillment failures from the
+    core sync.  The dark-launch flags prevent historical orders being planned
+    until operations explicitly enables the workflow.
+    """
+    if not candidates:
+        return
+    try:
+        from fulfillment_common import get_conn
+        from fulfillment_service import enqueue_job
+
+        conn = get_conn()
+        try:
+            if not _flag_enabled(conn, 'oms_fulfillment_enabled') or not _flag_enabled(conn, 'oms_auto_plan_enabled'):
+                return
+            for item in candidates:
+                if item['status'] not in {'processing', 'offline', 'on-hold', 'partial-shipped', 'shipped'}:
+                    continue
+                site = conn.execute(
+                    "SELECT country FROM sites WHERE url=?", (item['source'],)
+                ).fetchone()
+                if not site or str(site['country'] or '').upper() not in {'PL', 'CZ', 'HU'}:
+                    continue
+                version = hashlib.sha256(
+                    f"{item['order_id']}|{item.get('date_modified') or ''}|{item['status']}".encode('utf-8')
+                ).hexdigest()[:20]
+                enqueue_job(
+                    conn, 'PLAN_ORDER', 'order', item['order_id'],
+                    f"plan:{item['order_id']}:{version}", {'order_id': item['order_id']},
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        # Order sync remains authoritative and must not fail because the
+        # optional fulfillment queue is unavailable during rollout.
+        print(f"[fulfillment] enqueue skipped: {exc}")
 
 # 线程局部存储，用于数据库连接复用
 _thread_local = threading.local()
@@ -145,6 +192,7 @@ def save_orders_to_db(orders_data, connection=None):
             return
 
         processed_orders = []
+        planning_candidates = []
         for order in orders_data:
             woo_id = order.get('id')
             site_id = site_id_for_source(connection, order.get('source'))
@@ -174,9 +222,16 @@ def save_orders_to_db(orders_data, connection=None):
             processed_order.append(woo_id)                      # woo_id
             processed_order.append(datetime.now().isoformat())  # updated_at
             processed_orders.append(tuple(processed_order))
+            planning_candidates.append({
+                'order_id': oid,
+                'status': order.get('status'),
+                'date_modified': order.get('date_modified'),
+                'source': order.get('source'),
+            })
 
         cursor.executemany(insert_query, processed_orders)
         connection.commit()
+        _enqueue_fulfillment_plans(planning_candidates)
         
     except Exception as e:
         print(f"Error saving orders: {e}")
