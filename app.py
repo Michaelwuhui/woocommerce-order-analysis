@@ -146,6 +146,27 @@ class User(UserMixin):
         except sqlite3.OperationalError:
             return False
 
+    def can_manage_own_products(self):
+        """Product-manager scope limiter: when enabled, even an admin-role user
+        may only manage sites whose sites.manager matches their user name."""
+        if self.username == 'admin':
+            return False
+        conn = get_db_connection()
+        try:
+            user = conn.execute('SELECT can_manage_own_products FROM users WHERE id = ?', (self.id,)).fetchone()
+            conn.close()
+            return bool(user and user['can_manage_own_products'] == 1)
+        except sqlite3.OperationalError:
+            return False
+
+    def product_manager_own_scoped(self):
+        """Whether product management should be limited to the user's own sites.
+        Non-admin operators are always own-scoped; admin-role users are scoped
+        only when the explicit limiter is enabled. Built-in admin is unscoped."""
+        if self.username == 'admin':
+            return False
+        return (not self.is_admin()) or self.can_manage_own_products()
+
     def can_manage_users(self):
         """Check if user can manage other users and permissions (super admin privilege)"""
         # 'admin' username always has this right as a safety net
@@ -2297,6 +2318,25 @@ def orders():
         od['customer_risk'] = _assess_customer_risk(billing, shipping, risk_idx, current_order_id=order['id'])
 
         processed_orders.append(od)
+
+    # Add the V2 fulfillment aggregate without changing the legacy order
+    # query.  This makes shortages/manual holds impossible to miss on the
+    # main order list while remaining compatible before migration 006.
+    if processed_orders and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='oms_order_fulfillment_state'"
+    ).fetchone():
+        displayed_ids = [o['id'] for o in processed_orders]
+        placeholders = ','.join('?' for _ in displayed_ids)
+        state_map = {
+            r['order_id']: dict(r) for r in conn.execute(
+                f'''SELECT order_id, aggregate_status, has_shortage,
+                           manual_review, manual_reason
+                    FROM oms_order_fulfillment_state
+                    WHERE order_id IN ({placeholders})''', displayed_ids
+            ).fetchall()
+        }
+        for od in processed_orders:
+            od['fulfillment_state'] = state_map.get(od['id'])
     
     # Get available sources (filtered by permissions and manager)
     conn = get_db_connection()
@@ -4984,6 +5024,57 @@ def get_order_details(order_id):
         wh = conn.execute('SELECT name FROM warehouses WHERE id=?', (order_dict['warehouse_id'],)).fetchone()
         order_dict['warehouse_name'] = wh['name'] if wh else None
 
+    # Per-warehouse shipments and both official/third-party tracking timelines.
+    # Explicit warehouse operators only receive fulfillments from their scope.
+    order_dict['fulfillment'] = None
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='oms_order_fulfillment_state'"
+    ).fetchone():
+        ff_state = conn.execute(
+            "SELECT * FROM oms_order_fulfillment_state WHERE order_id=?", (order_id,)
+        ).fetchone()
+        if ff_state:
+            perm_rows = conn.execute(
+                "SELECT warehouse_id, can_view FROM oms_warehouse_user_permissions WHERE user_id=?",
+                (current_user.id,),
+            ).fetchall()
+            explicit_scope = bool(perm_rows) and getattr(current_user, 'username', None) != 'admin'
+            allowed_wh = [r['warehouse_id'] for r in perm_rows if r['can_view']]
+            ff_sql = '''SELECT f.*, w.name AS warehouse_name
+                        FROM oms_fulfillments f LEFT JOIN warehouses w ON w.id=f.warehouse_id
+                        WHERE f.order_id=? AND f.revision=? AND f.status!='superseded' '''
+            ff_params = [order_id, ff_state['revision']]
+            if explicit_scope:
+                if allowed_wh:
+                    ff_sql += f" AND f.warehouse_id IN ({','.join('?' for _ in allowed_wh)})"
+                    ff_params.extend(allowed_wh)
+                else:
+                    ff_sql += " AND 1=0"
+            ff_output = []
+            for ff in conn.execute(ff_sql + " ORDER BY f.warehouse_id", ff_params).fetchall():
+                ff_data = dict(ff)
+                ff_data['items'] = [dict(r) for r in conn.execute(
+                    '''SELECT fi.sku_code_snapshot, fi.name_snapshot,
+                              fi.allocated_qty, fi.fulfilled_qty, fi.cancelled_qty
+                       FROM oms_fulfillment_items fi WHERE fi.fulfillment_id=? ORDER BY fi.id''',
+                    (ff['id'],),
+                ).fetchall()]
+                ff_data['shipments'] = []
+                for shipment in conn.execute(
+                    "SELECT * FROM oms_shipments WHERE fulfillment_id=? ORDER BY created_at", (ff['id'],)
+                ).fetchall():
+                    shipment_data = dict(shipment)
+                    shipment_data['events'] = [dict(r) for r in conn.execute(
+                        '''SELECT provider, normalized_status, raw_status, event_at,
+                                  received_at, location, description
+                           FROM oms_tracking_events WHERE shipment_id=?
+                           ORDER BY COALESCE(event_at, received_at) DESC LIMIT 50''',
+                        (shipment['id'],),
+                    ).fetchall()]
+                    ff_data['shipments'].append(shipment_data)
+                ff_output.append(ff_data)
+            order_dict['fulfillment'] = {'state': dict(ff_state), 'fulfillments': ff_output}
+
     conn.close()
 
     return jsonify(order_dict)
@@ -6353,6 +6444,15 @@ def init_sales_board_tables():
     except:
         pass  # Column already exists
 
+    # Optional limiter for product management: admin-role users can be restricted
+    # to sites they are the named manager of. Regular non-admins are already
+    # own-scoped by product_manager_own_scoped().
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_manage_own_products INTEGER DEFAULT 0')
+        conn.commit()
+    except:
+        pass  # Column already exists
+
     # Sales targets table - monthly targets per manager
     conn.execute('''
         CREATE TABLE IF NOT EXISTS sales_targets (
@@ -7291,8 +7391,10 @@ def _resolve_site_for_product_edit(conn, site_id):
     if not site:
         raise ValueError(f'站点 {site_id} 不存在')
 
-    # Site-level permission check: name must match site manager (admin bypasses)
-    if not current_user.is_admin():
+    # Site-level permission check: own-scoped product managers must match the
+    # site's named manager. Built-in super admin and unscoped admin-role users
+    # can manage all sites.
+    if current_user.product_manager_own_scoped():
         user_name = (current_user.name or '').strip()
         site_manager = (site['manager'] or '').strip()
         if not user_name or not site_manager or user_name != site_manager:
@@ -8318,8 +8420,8 @@ def product_manager():
         ORDER BY country, manager, url
     ''').fetchall()
 
-    # Non-admin: restrict to sites where the user is the named manager.
-    if not current_user.is_admin():
+    # Own-scoped product managers only see sites where they are the named manager.
+    if current_user.product_manager_own_scoped():
         user_name = (current_user.name or '').strip()
         sites = [s for s in sites if user_name and (s['manager'] or '').strip() == user_name]
 
@@ -10368,23 +10470,25 @@ def get_users():
     # them on startup, so in practice the first SELECT succeeds.
     SCHEMAS = [
         # 0: latest — incl. 库存权限 can_view_inventory / can_manage_inventory
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, created_at FROM users',
+        # 0a: missing product own-scope column
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, 0 as can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, created_at FROM users',
         # 0b: 库存列尚未迁移时回退(其余同上)
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, 0 as can_view_inventory, 0 as can_manage_inventory, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, 0 as can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, 0 as can_view_inventory, 0 as can_manage_inventory, created_at FROM users',
         # 1: missing can_edit_costs
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, 0 as can_manage_own_products, can_view_costs, 0 as can_edit_costs, created_at FROM users',
         # 2: missing can_view_costs
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, 0 as can_manage_own_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
         # 3: missing can_manage_products
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, 0 as can_manage_products, 0 as can_manage_own_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
         # 4: missing can_edit_reconciliation
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_manage_own_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
         # 5: missing can_view_reconciliation
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_manage_own_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
         # 6: missing can_manage_users
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_manage_own_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
         # 7: oldest — only can_ship
-        'SELECT id, username, name, role, can_ship, 0 as can_view_report, 0 as can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, 0 as can_view_report, 0 as can_view_sales_board, 0 as can_manage_users, 0 as can_view_reconciliation, 0 as can_edit_reconciliation, 0 as can_manage_products, 0 as can_manage_own_products, 0 as can_view_costs, 0 as can_edit_costs, created_at FROM users',
     ]
     users = None
     for sql in SCHEMAS:
@@ -10410,6 +10514,7 @@ def get_users():
         u.setdefault('can_manage_blocklist', 0)
         u.setdefault('can_view_inventory', 0)
         u.setdefault('can_manage_inventory', 0)
+        u.setdefault('can_manage_own_products', 0)
         u['site_count'] = site_counts.get(u.get('name') or '', 0)
         # Mark users that the current operator cannot modify
         u['is_super_admin'] = (u['username'] == 'admin')
@@ -10467,6 +10572,9 @@ def update_user(user_id):
     can_view_sales_board = data.get('can_view_sales_board', 0)
     can_view_own_sales_board = data.get('can_view_own_sales_board', 0)
     can_manage_products = 1 if data.get('can_manage_products') else 0
+    can_manage_own_products = 1 if data.get('can_manage_own_products') else 0
+    if can_manage_own_products:
+        can_manage_products = 1
     # Shipping perm pair (operator-level, like can_ship): "ship" implies "view".
     can_view_shipping_val = 1 if (data.get('can_view_shipping') or can_ship) else 0
 
@@ -10526,20 +10634,20 @@ def update_user(user_id):
             if can_manage_inventory_val and not can_view_inventory_val:
                 can_view_inventory_val = 1
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, user_id))
         else:
             # Non-superadmin: cannot change can_manage_users, can_view_sales_board, or set role to admin
             # but CAN grant can_manage_products (a regular operator-level permission)
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_manage_products=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_manage_products, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_manage_products=?, can_manage_own_products=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_manage_products, can_manage_own_products, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_manage_products=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_manage_products, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_manage_products=?, can_manage_own_products=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_manage_products, can_manage_own_products, user_id))
         conn.commit()
         return jsonify({'success': True})
     finally:
@@ -15895,6 +16003,74 @@ def get_pending_orders():
     
     orders = conn.execute(query, params).fetchall()
 
+    # V2 warehouse scope is row-level.  Once an order has a fulfillment plan,
+    # explicitly scoped operators only receive the items allocated to their
+    # warehouse (for example, a PL operator never sees HU items).
+    fulfillment_state_map = {}
+    fulfillment_products_map = {}
+    fulfillment_warehouses_map = {}
+    explicit_warehouse_scope = False
+    if orders and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='oms_order_fulfillment_state'"
+    ).fetchone():
+        order_ids_for_scope = [o['id'] for o in orders]
+        scope_ph = ','.join('?' for _ in order_ids_for_scope)
+        fulfillment_state_map = {
+            r['order_id']: dict(r) for r in conn.execute(
+                f'''SELECT order_id, revision, aggregate_status, has_shortage,
+                           manual_review, manual_reason
+                    FROM oms_order_fulfillment_state
+                    WHERE order_id IN ({scope_ph})''', order_ids_for_scope
+            ).fetchall()
+        }
+        permission_rows = conn.execute(
+            "SELECT warehouse_id, can_view FROM oms_warehouse_user_permissions WHERE user_id=?",
+            (current_user.id,),
+        ).fetchall()
+        explicit_warehouse_scope = bool(permission_rows) and getattr(current_user, 'username', None) != 'admin'
+        allowed_warehouse_ids = [r['warehouse_id'] for r in permission_rows if r['can_view']]
+        fulfillment_query = f'''SELECT f.id, f.order_id, f.warehouse_id, w.name AS warehouse_name
+                                FROM oms_fulfillments f
+                                JOIN oms_order_fulfillment_state ofs
+                                  ON ofs.order_id=f.order_id AND ofs.revision=f.revision
+                                LEFT JOIN warehouses w ON w.id=f.warehouse_id
+                                WHERE f.order_id IN ({scope_ph}) AND f.status!='superseded' '''
+        fulfillment_params = list(order_ids_for_scope)
+        if explicit_warehouse_scope:
+            if allowed_warehouse_ids:
+                fulfillment_query += f" AND f.warehouse_id IN ({','.join('?' for _ in allowed_warehouse_ids)})"
+                fulfillment_params.extend(allowed_warehouse_ids)
+            else:
+                fulfillment_query += " AND 1=0"
+        visible_fulfillments = conn.execute(fulfillment_query, fulfillment_params).fetchall()
+        visible_fids = []
+        for f in visible_fulfillments:
+            visible_fids.append(f['id'])
+            fulfillment_warehouses_map.setdefault(f['order_id'], set()).add(f['warehouse_name'] or str(f['warehouse_id']))
+        if visible_fids:
+            fid_ph = ','.join('?' for _ in visible_fids)
+            for r in conn.execute(
+                f'''SELECT f.order_id, w.name AS warehouse_name, fi.allocated_qty,
+                           oi.name, oi.raw_json
+                    FROM oms_fulfillment_items fi
+                    JOIN oms_fulfillments f ON f.id=fi.fulfillment_id
+                    JOIN oms_order_items oi ON oi.id=fi.order_item_id
+                    LEFT JOIN warehouses w ON w.id=f.warehouse_id
+                    WHERE fi.fulfillment_id IN ({fid_ph}) ORDER BY f.order_id, fi.id''',
+                visible_fids,
+            ).fetchall():
+                raw_item = parse_json_field(r['raw_json'])
+                ordered = max(1, int(raw_item.get('quantity') or 1)) if isinstance(raw_item, dict) else 1
+                total = float(raw_item.get('total') or 0) if isinstance(raw_item, dict) else 0
+                fulfillment_products_map.setdefault(r['order_id'], []).append({
+                    'name': f"{r['name']}（{r['warehouse_name'] or '仓库'}）",
+                    'quantity': int(r['allocated_qty'] or 0),
+                    'total': total * int(r['allocated_qty'] or 0) / ordered,
+                })
+        if explicit_warehouse_scope:
+            visible_order_ids = set(fulfillment_warehouses_map)
+            orders = [o for o in orders if o['id'] not in fulfillment_state_map or o['id'] in visible_order_ids]
+
     # Parcels already shipped for these orders (split shipment / 分批发货).
     # shipping_logs is local-only and untouched by sync, so a partial order
     # keeps its 'processing' status and stays in this queue; the parcel rows
@@ -15925,7 +16101,7 @@ def get_pending_orders():
     for order in orders:
         billing = parse_json_field(order['billing'])
         shipping_info = parse_json_field(order['shipping'])
-        line_items = parse_json_field(order['line_items'])
+        line_items = fulfillment_products_map.get(order['id']) or parse_json_field(order['line_items'])
         shipping_lines = parse_json_field(order['shipping_lines'])
         shipping_method = shipping_lines[0].get('method_title', 'Unknown') if shipping_lines and len(shipping_lines) > 0 else ''
 
@@ -15976,6 +16152,11 @@ def get_pending_orders():
             'customer_note': order['customer_note'] or '',
             'warehouse_id': order['warehouse_id'],
             'warehouse_name': order['warehouse_name'] or '',
+            'fulfillment_warehouses': sorted(fulfillment_warehouses_map.get(order['id'], set())),
+            'fulfillment_status': fulfillment_state_map.get(order['id'], {}).get('aggregate_status'),
+            'has_shortage': bool(fulfillment_state_map.get(order['id'], {}).get('has_shortage')),
+            'manual_review': bool(fulfillment_state_map.get(order['id'], {}).get('manual_review')),
+            'manual_reason': fulfillment_state_map.get(order['id'], {}).get('manual_reason') or '',
             'customer_risk': customer_risk,
             'parcels': parcels_map.get(order['id'], []),
             'parcels_shipped': len(parcels_map.get(order['id'], [])),
@@ -16749,6 +16930,17 @@ def ship_order():
         conn.close()
         return jsonify({'success': False, 'error': '订单不存在'}), 404
 
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='oms_order_fulfillment_state'"
+    ).fetchone() and conn.execute(
+        "SELECT 1 FROM oms_order_fulfillment_state WHERE order_id=?", (order_id,)
+    ).fetchone():
+        conn.close()
+        return jsonify({
+            'success': False,
+            'error': '该订单已启用多仓履约，请在「多仓履约」中按仓库录入运单'
+        }), 409
+
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
     if not site:
         conn.close()
@@ -16850,6 +17042,68 @@ def ship_order():
     warnings = []
     remote_success = False
 
+    def _decode_nested_json(value):
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return value
+        return value
+
+    def _value_contains_tracking(value, tn):
+        value = _decode_nested_json(value)
+        if isinstance(value, dict):
+            return any(_value_contains_tracking(v, tn) for v in value.values())
+        if isinstance(value, list):
+            return any(_value_contains_tracking(v, tn) for v in value)
+        return str(value or '').strip() == tn
+
+    def _remote_order_has_tracking(payload):
+        if not isinstance(payload, dict):
+            return False
+
+        for meta in payload.get('meta_data') or []:
+            if not isinstance(meta, dict):
+                continue
+            if meta.get('key') in ('_tracking_number', 'tracking_number') and str(meta.get('value') or '').strip() == tracking_number:
+                return True
+            if meta.get('key') == '_wc_shipment_tracking_items' and _value_contains_tracking(meta.get('value'), tracking_number):
+                return True
+
+        for item in payload.get('line_items') or []:
+            if not isinstance(item, dict):
+                continue
+            for meta in item.get('meta_data') or []:
+                if not isinstance(meta, dict):
+                    continue
+                if meta.get('key') in ('_vi_wot_order_item_tracking_data', 'tracking_number') and _value_contains_tracking(meta.get('value'), tracking_number):
+                    return True
+        return False
+
+    def _remote_order_applied(payload):
+        if not isinstance(payload, dict):
+            return False
+        remote_id = str(payload.get('id') or '')
+        if remote_id and remote_id != str(woo_post_id(order['id'])):
+            return False
+        status_ok = more_batches or payload.get('status') == target_status
+        return status_ok and _remote_order_has_tracking(payload)
+
+    def _verify_remote_saved(reason):
+        try:
+            check = req.get(
+                status_url,
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=30,
+                headers=api_headers,
+            )
+            if check.status_code == 200 and _remote_order_applied(check.json()):
+                warnings.append(reason)
+                return True
+        except Exception as verify_err:
+            print(f"[SHIP] verify remote saved failed: {verify_err}")
+        return False
+
     # PUT with retry. The same payload is idempotent so retrying after timeout is safe.
     for attempt in range(3):
         try:
@@ -16864,6 +17118,16 @@ def ship_order():
             if resp.status_code in (200, 201):
                 remote_success = True
                 break
+            try:
+                if _remote_order_applied(resp.json()):
+                    remote_success = True
+                    warnings.append(f"远程返回 {resp.status_code}，但返回内容确认运单已写入")
+                    break
+            except Exception:
+                pass
+            if _verify_remote_saved(f"远程返回 {resp.status_code}，但二次查询确认运单已写入"):
+                remote_success = True
+                break
             body = (resp.text or '')[:300]
             if body.lstrip().startswith(('<!', '<html')):
                 warnings.append(f"WP 返回 HTML（疑似 WAF 拦截 / 认证失败），HTTP {resp.status_code}")
@@ -16873,18 +17137,9 @@ def ship_order():
             print(f"[SHIP] {site['url']} order {order['id']} attempt {attempt+1} timed out: {e}")
             # Verify by GET — the PUT may have actually applied even if the
             # response never made it back.
-            try:
-                check = req.get(status_url, auth=(site['consumer_key'], site['consumer_secret']), timeout=30)
-                # On a final batch we confirm via the status flip; during a
-                # partial batch (more_batches) status is intentionally unchanged,
-                # so a reachable 200 is the best confirmation we can get (the PUT
-                # is idempotent, so retrying is harmless anyway).
-                if check.status_code == 200 and (more_batches or check.json().get('status') == target_status):
-                    remote_success = True
-                    warnings.append("PUT 响应超时，但二次查询确认订单可达")
-                    break
-            except Exception as verify_err:
-                print(f"[SHIP] verify after timeout failed: {verify_err}")
+            if _verify_remote_saved("PUT 响应超时，但二次查询确认运单已写入"):
+                remote_success = True
+                break
             if attempt < 2:
                 time.sleep(2)
         except Exception as e:
@@ -17197,6 +17452,12 @@ def complete_order(order_id):
     if not order:
         conn.close()
         return jsonify({'success': False, 'error': '订单不存在'}), 404
+
+    from fulfillment_service import completion_guard
+    may_complete, completion_error = completion_guard(conn, order_id)
+    if not may_complete:
+        conn.close()
+        return jsonify({'success': False, 'error': completion_error}), 409
     
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
     if not site:
@@ -17852,7 +18113,37 @@ def update_order_status(order_id):
     if not order:
         conn.close()
         return jsonify({'success': False, 'error': '订单不存在'}), 404
-    
+
+    has_fulfillment = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='oms_order_fulfillment_state'"
+    ).fetchone() and conn.execute(
+        "SELECT 1 FROM oms_order_fulfillment_state WHERE order_id=?", (order_id,)
+    ).fetchone()
+    if has_fulfillment and new_status == 'completed':
+        from fulfillment_service import completion_guard
+        may_complete, completion_error = completion_guard(conn, order_id)
+        if not may_complete:
+            conn.close()
+            return jsonify({'success': False, 'error': completion_error}), 409
+    if has_fulfillment and new_status == 'cancelled':
+        shipped = conn.execute(
+            "SELECT COUNT(*) AS n FROM oms_fulfillments WHERE order_id=? AND status IN ('shipped','delivered')",
+            (order_id,),
+        ).fetchone()['n']
+        if shipped:
+            from fulfillment_service import mark_manual_review
+            mark_manual_review(
+                conn, order_id, '已有仓库发货，整单取消必须人工处理',
+                actor={'type': 'user', 'id': current_user.id, 'name': current_user.name},
+            )
+            conn.close()
+            return jsonify({'success': False, 'error': '已有仓库发货，订单已标记人工处理'}), 409
+        conn.close()
+        return jsonify({
+            'success': False,
+            'error': '该订单已启用多仓履约，请先在「多仓履约」逐仓取消'
+        }), 409
+
     old_status = order['status']
     
     # Check if status is actually changing
@@ -18068,6 +18359,12 @@ def confirm_order_delivery(order_id):
     if order['is_undelivered'] or order['is_problem_return']:
         conn.close()
         return jsonify({'success': False, 'error': '该订单已标记为未送达/问题退货，不能再标记签收'}), 409
+
+    from fulfillment_service import completion_guard
+    may_complete, completion_error = completion_guard(conn, order_id)
+    if not may_complete:
+        conn.close()
+        return jsonify({'success': False, 'error': completion_error}), 409
 
     # 1. Local confirm — source of truth for the queue; always first.
     if not order['delivery_confirmed']:
@@ -19365,7 +19662,8 @@ def api_report_data():
         start_date = start_dt.strftime('%Y-%m-%d')
     
     # Cache Logic - include granularity, country, and manager in key
-    cache_key = f"traffic_v5_{start_date}_{end_date}_{granularity}_{country}_{manager}"
+    report_cache_version = 'v6'
+    cache_key = f"traffic_{report_cache_version}_{start_date}_{end_date}_{granularity}_{country}_{manager}"
     force_refresh = request.args.get('force', 'false') == 'true'
     
     # Try load from server cache first (if not forced)
@@ -19559,6 +19857,7 @@ def api_report_data():
         'site_currencies': site_currencies,  # Currency per site
         'date_range': {'start': start_date, 'end': end_date},
         'granularity': granularity,
+        'cache_version': report_cache_version,
         'filters': {'country': country, 'manager': manager}
     }
 
@@ -19602,7 +19901,7 @@ def report_cache_sync():
         if not start_date or not end_date or not traffic_data:
             return jsonify({'success': False, 'error': '数据不完整'}), 400
             
-        cache_key = f"traffic_v5_{start_date}_{end_date}_{granularity}_{country}_{manager}"
+        cache_key = f"traffic_v6_{start_date}_{end_date}_{granularity}_{country}_{manager}"
         
         # Verify structure roughly
         if 'data' not in traffic_data or 'months' not in traffic_data:
@@ -22288,6 +22587,12 @@ except Exception as _e:
     import logging as _logging
     _logging.getLogger(__name__).warning('库存模块未加载: %s', _e)
 
+try:
+    from fulfillment_api import fulfillment_bp
+    app.register_blueprint(fulfillment_bp)
+except Exception as _e:
+    app.logger.warning('多仓履约模块未加载: %s', _e)
+
 
 @app.context_processor
 def inject_inventory_perms():
@@ -22298,9 +22603,7 @@ def inject_inventory_perms():
     """
     try:
         from inv_common import can_manage_inventory, can_view_inventory_any
-        is_admin = (getattr(current_user, 'username', None) == 'admin'
-                    or (getattr(current_user, 'is_authenticated', False)
-                        and current_user.is_admin()))
+        is_admin = (getattr(current_user, 'username', None) == 'admin')
         return {
             'inv_can_view': bool(can_view_inventory_any()),
             'can_manage_inv': bool(is_admin or can_manage_inventory()),

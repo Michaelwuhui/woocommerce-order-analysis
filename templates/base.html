@@ -177,6 +177,14 @@
                         </a>
                     </li>
                     {% endif %}
+                    {% if current_user.is_admin() or current_user.can_ship() or current_user.can_view_shipping() or inv_can_view %}
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('fulfillment.') else '' }}"
+                            href="{{ url_for('fulfillment.fulfillment_page') }}">
+                            <i class="bi bi-boxes me-1"></i>多仓履约
+                        </a>
+                    </li>
+                    {% endif %}
                     {% if current_user.can_view_sales_board() or current_user.can_view_own_sales_board() %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint == 'sales_board' else '' }}"
@@ -954,6 +962,34 @@
                     html += '<p><strong>发货仓库:</strong> <span style="color:#a5b4fc;">' + (order.warehouse_name || '未分配') + '</span></p>';
                     {% endif %}
                     html += '</div></div></div>';
+
+                    // Multi-warehouse fulfillment: each warehouse and parcel
+                    // remains independent, including official + third-party events.
+                    if (order.fulfillment) {
+                        var ff = order.fulfillment;
+                        var ffState = ff.state || {};
+                        var ffProblem = ffState.has_shortage || ffState.manual_review;
+                        var safeFf = function(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function(c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); };
+                        html += '<div class="col-12"><div class="info-card" style="border-color:' + (ffProblem ? 'rgba(220,53,69,.7)' : 'rgba(23,162,184,.45)') + '">';
+                        html += '<div class="card-header"><h6 class="' + (ffProblem ? 'text-danger' : 'text-info') + '"><i class="bi bi-boxes me-2"></i>多仓履约 · ' + safeFf(ffState.aggregate_status || '') + '</h6></div><div class="card-body">';
+                        if (ffProblem) html += '<div class="alert alert-danger py-2"><b><i class="bi bi-exclamation-octagon-fill me-1"></i>' + (ffState.has_shortage ? '缺货；' : '') + (ffState.manual_review ? '需要人工处理' : '') + '</b><div>' + safeFf(ffState.manual_reason || '') + '</div></div>';
+                        (ff.fulfillments || []).forEach(function(f) {
+                            html += '<div class="border border-secondary rounded p-2 mb-2"><div class="d-flex justify-content-between"><b>' + safeFf(f.warehouse_name || f.warehouse_id) + '</b><span class="badge bg-info text-dark">' + safeFf(f.status) + '</span></div>';
+                            html += '<div class="small text-muted mb-2">' + safeFf(f.external_invoice_code || '') + (f.external_pick_code ? ' · 拣货码 ' + safeFf(f.external_pick_code) : '') + '</div>';
+                            (f.items || []).forEach(function(i) { html += '<div class="small">' + safeFf(i.name_snapshot || i.sku_code_snapshot) + ' ×' + Number(i.allocated_qty || 0) + '</div>'; });
+                            (f.shipments || []).forEach(function(s) {
+                                html += '<div class="mt-2 p-2 bg-black rounded"><b>' + safeFf(s.carrier_name || s.carrier_slug || '物流') + '</b> · <span class="text-info">' + safeFf(s.tracking_number || '待生成') + '</span> · ' + safeFf(s.status);
+                                var providers = {};
+                                (s.events || []).forEach(function(e) { providers[e.provider || 'unknown'] = true; });
+                                var providerText = Object.keys(providers).map(function(p) { return p === 'hungary_wms' ? '官方 WMS' : p; }).join(' + ');
+                                if (providerText) html += '<div class="small text-warning">跟踪来源：' + safeFf(providerText) + '</div>';
+                                (s.events || []).slice(0, 4).forEach(function(e) { html += '<div class="small text-muted">' + safeFf(e.event_at || e.received_at) + ' · ' + safeFf(e.description || e.raw_status || e.normalized_status) + '</div>'; });
+                                html += '</div>';
+                            });
+                            html += '</div>';
+                        });
+                        html += '<a class="btn btn-sm btn-outline-info" href="/fulfillment?search=' + encodeURIComponent(order.number) + '"><i class="bi bi-boxes me-1"></i>进入多仓履约</a></div></div></div>';
+                    }
 
                     // Undelivered (refused/returned) panel
                     {% if current_user.can_ship() %}

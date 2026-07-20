@@ -1,0 +1,23 @@
+[Unit]
+Description=Woo Analysis multi-warehouse fulfillment worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/www/wwwroot/woo-analysis
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/woo-analysis/fulfillment.env
+ExecStart=/www/wwwroot/woo-analysis/venv/bin/python /www/wwwroot/woo-analysis/fulfillment_worker.py --idle-sleep 5
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

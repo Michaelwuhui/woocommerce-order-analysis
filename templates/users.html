@@ -177,7 +177,14 @@
                             <input class="form-check-input" type="checkbox" id="editCanManageProducts">
                             <label class="form-check-label text-white-50" for="editCanManageProducts">
                                 <i class="bi bi-pencil-square me-1"></i>产品管理权限
-                                <small class="text-muted">（可编辑该用户名下站点的库存/价格；具体能改哪些站取决于"分配的站点"）</small>
+                                <small class="text-muted">（可访问产品管理；管理员默认可管理全部站点）</small>
+                            </label>
+                        </div>
+                        <div class="form-check mt-1 ms-4" id="wrapCanManageOwnProducts">
+                            <input class="form-check-input" type="checkbox" id="editCanManageOwnProducts">
+                            <label class="form-check-label text-white-50" for="editCanManageOwnProducts">
+                                <i class="bi bi-person-lock me-1"></i>产品管理 · 仅本人站点
+                                <small class="text-muted" id="ownProductsHint">（只显示并允许管理该用户负责的站点）</small>
                             </label>
                         </div>
                         {% if is_super_admin %}
@@ -317,7 +324,7 @@
             } else if (btn.classList.contains('btn-edit')) {
                 const user = window._usersData && window._usersData[userId];
                 if (user) {
-                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0, user.can_view_own_sales_board || 0, user.site_count || 0, user.can_view_shipping || 0, user.can_manage_blocklist || 0, user.can_view_inventory || 0, user.can_manage_inventory || 0);
+                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_manage_own_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0, user.can_view_own_sales_board || 0, user.site_count || 0, user.can_view_shipping || 0, user.can_manage_blocklist || 0, user.can_view_inventory || 0, user.can_manage_inventory || 0);
                 }
             } else if (btn.classList.contains('btn-delete')) {
                 deleteUser(userId);
@@ -414,7 +421,7 @@
         });
 
         // Edit User
-        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_view_costs, can_edit_costs, can_view_own_sales_board, site_count, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory) {
+        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, site_count, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory) {
             document.getElementById('editUserId').value = id;
             document.getElementById('editUsername').value = username;
             document.getElementById('editName').value = name;
@@ -426,6 +433,9 @@
             document.getElementById('editCanViewReport').checked = can_view_report == 1;
             var pmEl = document.getElementById('editCanManageProducts');
             if (pmEl) pmEl.checked = can_manage_products == 1;
+            var ownPmEl = document.getElementById('editCanManageOwnProducts');
+            if (ownPmEl) ownPmEl.checked = can_manage_own_products == 1;
+            updateProductManageScopeState();
             var sbEl = document.getElementById('editCanViewSalesBoard');
             if (sbEl) sbEl.checked = can_view_sales_board == 1;
             // 销售看板·仅本人站点: only enableable when the user has sites under them
@@ -526,6 +536,31 @@
             var shipEl = document.getElementById('editCanShip');
             if (shipEl) shipEl.addEventListener('change', updateShipViewState);
         })();
+        function updateProductManageScopeState() {
+            var pmEl = document.getElementById('editCanManageProducts');
+            var ownPmEl = document.getElementById('editCanManageOwnProducts');
+            var wrap = document.getElementById('wrapCanManageOwnProducts');
+            if (!pmEl || !ownPmEl) return;
+            if (!pmEl.checked) {
+                ownPmEl.checked = false;
+                ownPmEl.disabled = true;
+                if (wrap) wrap.style.opacity = '0.5';
+            } else {
+                ownPmEl.disabled = false;
+                if (wrap) wrap.style.opacity = '1';
+            }
+        }
+        (function wireProductPerms() {
+            var pmEl = document.getElementById('editCanManageProducts');
+            var ownPmEl = document.getElementById('editCanManageOwnProducts');
+            if (pmEl) pmEl.addEventListener('change', updateProductManageScopeState);
+            if (ownPmEl) ownPmEl.addEventListener('change', function () {
+                if (ownPmEl.checked && pmEl && !pmEl.checked) {
+                    pmEl.checked = true;
+                    updateProductManageScopeState();
+                }
+            });
+        })();
         (function wireReconPerms() {
             var vEl = document.getElementById('editCanViewReconciliation');
             var eEl = document.getElementById('editCanEditReconciliation');
@@ -564,6 +599,7 @@
                     can_view_shipping: (document.getElementById('editCanViewShipping') || {}).checked ? 1 : 0,
                     can_view_report: document.getElementById('editCanViewReport').checked ? 1 : 0,
                     can_manage_products: (document.getElementById('editCanManageProducts') || {}).checked ? 1 : 0,
+                    can_manage_own_products: (document.getElementById('editCanManageOwnProducts') || {}).checked ? 1 : 0,
                     can_view_sales_board: (document.getElementById('editCanViewSalesBoard') || {}).checked ? 1 : 0,
                     can_view_own_sales_board: (document.getElementById('editCanViewOwnSalesBoard') || {}).checked ? 1 : 0,
                     can_view_reconciliation: (document.getElementById('editCanViewReconciliation') || {}).checked ? 1 : 0,

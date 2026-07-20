@@ -163,17 +163,15 @@ def can_ship():
 
 # ───────────────────── 角色与仓库可见范围(模块9) ─────────────────────
 # 角色:
-#   管理员(admin)          → 全部仓库,读写。
+#   内置超级管理员(username=admin) → 全部仓库,读写。
 #   内部库存管理(can_manage_inventory) → 全部仓库,读写。
 #   内部库存查看(can_view_inventory)   → 全部仓库,只读。
-#   发货员(can_ship)        → 全部仓库,只读(发货时查库存)。
 #   合伙人(partner_users)   → 只读,且只能看自己仓(inv_warehouse_ext.partner_id 关联)。
+# 注意:普通 admin 角色不再自动拥有库存权限,也必须显式勾选库存查看/操作。
 
 def _is_admin():
     from flask_login import current_user
-    return (getattr(current_user, 'username', None) == 'admin'
-            or (hasattr(current_user, 'is_admin') and getattr(current_user, 'is_authenticated', False)
-                and current_user.is_admin()))
+    return getattr(current_user, 'username', None) == 'admin'
 
 
 def current_partner_ids():
@@ -214,10 +212,10 @@ def partner_warehouse_ids():
 def visible_warehouse_ids():
     """当前用户可见仓库范围。None=全部;list=受限(合伙人只看自己仓)。
 
-    内部角色(管理员/库存管理/库存查看/发货员)看全部;合伙人受限。
+    内部角色(库存管理/库存查看)看全部;合伙人受限。
     既是内部又是合伙人时按内部处理(看全部)。
     """
-    if _is_admin() or can_view_inventory() or can_manage_inventory() or can_ship():
+    if _is_admin() or can_view_inventory() or can_manage_inventory():
         return None
     if is_partner_user():
         return partner_warehouse_ids()
@@ -241,7 +239,7 @@ def warehouse_scope_clause(col='warehouse_id'):
 def can_view_inventory_any():
     """是否能进入库存模块(任一内部库存角色 或 合伙人)。"""
     return bool(_is_admin() or can_view_inventory() or can_manage_inventory()
-                or can_ship() or is_partner_user())
+                or is_partner_user())
 
 
 def _deny(message='您没有权限访问库存管理。', code=403, json=False):

@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}多仓履约 - 苍赋管理系统{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-3">
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+    <div><h1 class="h3 mb-1"><i class="bi bi-boxes me-2"></i>多仓履约</h1><div class="text-muted">订单仍为一单；波兰仓、匈牙利仓分别处理商品和包裹。</div></div>
+    <div class="d-flex gap-2">{% if can_manage_fulfillment %}<button class="btn btn-outline-warning" onclick="openFfConfig()"><i class="bi bi-gear me-1"></i>配置</button>{% endif %}<button class="btn btn-outline-info" onclick="loadFulfillments()"><i class="bi bi-arrow-clockwise me-1"></i>刷新</button></div>
+  </div>
+  <div id="fulfillmentAlert"></div>
+  <div class="card bg-dark border-secondary mb-3"><div class="card-body row g-2 align-items-end">
+    <div class="col-md-3"><label class="form-label">搜索</label><input id="ffSearch" class="form-control" value="{{ request.args.get('search', '') }}" placeholder="订单号 / WMS 单号 / 拣货码"></div>
+    <div class="col-md-2"><label class="form-label">仓库</label><select id="ffWarehouse" class="form-select"><option value="">全部仓库</option></select></div>
+    <div class="col-md-2"><label class="form-label">状态</label><select id="ffStatus" class="form-select"><option value="">全部状态</option><option value="stock_shortage">缺货</option><option value="ready_to_pick">待拣货</option><option value="ready_to_submit">待提交 WMS</option><option value="accepted">WMS 已接单</option><option value="picking">拣货中</option><option value="packed">已打包</option><option value="shipped">已发货</option><option value="delivered">已签收</option><option value="manual_hold">人工处理</option></select></div>
+    <div class="col-md-2"><button class="btn btn-primary w-100" onclick="loadFulfillments()">查询</button></div>
+    <div class="col-md-3 text-md-end"><span id="ffSummary" class="small text-muted"></span></div>
+  </div></div>
+  <div class="card bg-dark border-secondary"><div class="table-responsive"><table class="table table-dark table-hover align-middle mb-0">
+    <thead><tr><th>订单</th><th>仓库 / 商品</th><th>履约状态</th><th>WMS</th><th>包裹</th><th>异常</th><th></th></tr></thead>
+    <tbody id="ffRows"><tr><td colspan="7" class="text-center py-5 text-muted">正在加载…</td></tr></tbody>
+  </table></div></div>
+</div>
+
+<div class="modal fade" id="ffDetailModal" tabindex="-1"><div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content bg-dark text-light border-secondary">
+  <div class="modal-header border-secondary"><h5 class="modal-title">履约详情</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body" id="ffDetail"></div>
+</div></div></div>
+
+{% if can_manage_fulfillment %}
+<div class="modal fade" id="ffConfigModal" tabindex="-1"><div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content bg-dark text-light border-secondary">
+  <div class="modal-header border-secondary"><h5 class="modal-title">多仓履约配置</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+  <div class="modal-body">
+    <div class="alert alert-warning">建议顺序：SKU 仓库映射 → 捷克运费 → 员工权限 → 启用履约 → 小范围验证 → 最后开启自动分仓和 WMS 自动提交。</div>
+    <div class="card bg-black border-secondary mb-3"><div class="card-header">上线开关</div><div class="card-body row g-3 align-items-end">
+      <div class="col-md-3 form-check form-switch ms-3"><input class="form-check-input" id="cfgEnabled" type="checkbox"><label class="form-check-label" for="cfgEnabled">启用后台履约任务</label></div>
+      <div class="col-md-3 form-check form-switch"><input class="form-check-input" id="cfgAutoPlan" type="checkbox"><label class="form-check-label" for="cfgAutoPlan">新同步订单自动分仓</label></div>
+      <div class="col-md-3 form-check form-switch"><input class="form-check-input" id="cfgAutoSubmit" type="checkbox"><label class="form-check-label" for="cfgAutoSubmit">匈牙利单自动提交 WMS</label></div>
+      <div class="col-md-2"><button class="btn btn-warning w-100" onclick="saveFfSwitches()">保存开关</button></div>
+      <div class="col-12 small text-muted">WMS 密钥仅从服务器环境变量读取，本页面不会显示或保存密钥。</div>
+    </div></div>
+    <div class="row g-3">
+      <div class="col-lg-6"><div class="card bg-black border-secondary h-100"><div class="card-header">SKU → 仓库 / WMS 商品资料</div><div class="card-body row g-2">
+        <div class="col-12"><select id="cfgSku" class="form-select"></select></div><div class="col-12"><select id="cfgSkuWh" class="form-select"></select></div>
+        <div class="col-6"><input id="cfgNameZh" class="form-control" placeholder="WMS 中文品名（匈牙利必填）"></div><div class="col-6"><input id="cfgNameEn" class="form-control" placeholder="英文品名/规格"></div>
+        <div class="col-12"><input id="cfgImage" class="form-control" placeholder="商品图片 URL"></div><div class="col-12 form-check ms-2"><input id="cfgPrimary" class="form-check-input" type="checkbox"><label class="form-check-label">此 SKU 主仓</label></div>
+        <div class="col-12"><button class="btn btn-primary" onclick="saveSkuWh()">保存 SKU 仓库映射</button></div><div id="cfgSkuResult" class="small text-muted"></div>
+      </div></div></div>
+      <div class="col-lg-6"><div class="card bg-black border-secondary h-100"><div class="card-header">捷克站仓库运费</div><div class="card-body row g-2">
+        <div class="col-12"><select id="cfgCostWh" class="form-select"></select></div><div class="col-5"><input id="cfgCostAmount" type="number" step="0.01" class="form-control" placeholder="运费"></div><div class="col-3"><input id="cfgCostCurrency" class="form-control" value="EUR"></div><div class="col-4"><input id="cfgCostService" class="form-control" value="default" placeholder="服务代码"></div>
+        <div class="col-12"><button class="btn btn-primary" onclick="saveCost()">保存捷克运费</button></div><div id="cfgCostResult" class="small text-muted"></div>
+      </div></div></div>
+      <div class="col-12"><div class="card bg-black border-secondary"><div class="card-header">仓库员工权限</div><div class="card-body row g-2 align-items-center">
+        <div class="col-md-4"><select id="cfgUser" class="form-select"></select></div><div class="col-md-3"><select id="cfgPermWh" class="form-select"></select></div>
+        <div class="col-md-3 form-check"><input id="cfgFullOps" class="form-check-input" type="checkbox" checked><label class="form-check-label">拣货、打包、发货权限</label></div><div class="col-md-2"><button class="btn btn-primary w-100" onclick="savePermission()">保存权限</button></div>
+        <div id="cfgPermResult" class="small text-muted"></div>
+      </div></div></div>
+    </div>
+  </div>
+</div></div></div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{{ super() }}
+<script>
+const ffCanManage={{ 'true' if can_manage_fulfillment else 'false' }};
+const ffLabels={planned:'已规划',ready_to_pick:'待拣货',ready_to_submit:'待提交 WMS',submitting:'提交中',submission_unknown:'提交结果待核验',accepted:'WMS 已接单',picking:'拣货中',packed:'已打包',shipped:'已发货',delivered:'已签收',stock_shortage:'缺货',manual_hold:'人工处理',cancel_pending:'取消处理中',cancelled:'已取消',failed:'失败'};
+const esc=s=>String(s==null?'':s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+function ffAlert(message,danger=true){document.getElementById('fulfillmentAlert').innerHTML=`<div class="alert ${danger?'alert-danger':'alert-success'}">${esc(message)}</div>`;}
+async function ffJson(url,options={}){const r=await fetch(url,{headers:{'Content-Type':'application/json'},...options});const d=await r.json().catch(()=>({error:`HTTP ${r.status}`}));if(!r.ok)throw new Error(d.error||`HTTP ${r.status}`);return d;}
+function badge(status){const danger=['stock_shortage','manual_hold','failed','submission_unknown'].includes(status);return `<span class="badge ${danger?'bg-danger':'bg-info text-dark'}">${esc(ffLabels[status]||status)}</span>`;}
+async function loadFulfillments(){
+ const q=new URLSearchParams({search:document.getElementById('ffSearch').value,status:document.getElementById('ffStatus').value,warehouse_id:document.getElementById('ffWarehouse').value});
+ try{const d=await ffJson('/api/fulfillment/orders?'+q.toString());const wh=document.getElementById('ffWarehouse'),selected=wh.value;wh.innerHTML='<option value="">全部仓库</option>'+d.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)} (${esc(w.country||'')})</option>`).join('');wh.value=selected;
+ document.getElementById('ffSummary').textContent=Object.entries(d.summary||{}).map(([k,v])=>`${ffLabels[k]||k}: ${v}`).join(' · ');
+ document.getElementById('ffRows').innerHTML=d.items.length?d.items.map(f=>{const problem=Number(f.has_shortage)||Number(f.manual_review);const products=(f.items||[]).map(i=>`<div>${esc(i.order_item_name||i.name_snapshot||i.sku_code_snapshot)} <b>×${i.allocated_qty}</b></div>`).join('');return `<tr class="${problem?'table-danger':''}"><td><a href="#" onclick="showFulfillment('${esc(f.order_id)}');return false" class="link-info"><b>#${esc(f.order_number)}</b></a><div class="small text-muted">${esc(f.market_code||'')} · ${esc((f.order_date||'').slice(0,16))}</div></td><td><b>${esc(f.warehouse_name||f.warehouse_country)}</b>${products}</td><td>${badge(f.status)}<div class="small mt-1">订单：${esc(f.aggregate_status||'')}</div></td><td><div>${esc(f.external_invoice_code||'-')}</div>${f.external_pick_code?`<div class="small">拣货码 ${esc(f.external_pick_code)}</div>`:''}</td><td>${f.parcel_count||0}</td><td>${problem?`<div class="fw-bold text-danger"><i class="bi bi-exclamation-octagon-fill me-1"></i>${f.has_shortage?'缺货；':''}${f.manual_review?'需人工处理':''}</div><div class="small">${esc(f.manual_reason||'')}</div>`:'-'}</td><td><button class="btn btn-sm btn-outline-light" onclick="showFulfillment('${esc(f.order_id)}')">处理</button></td></tr>`;}).join(''):'<tr><td colspan="7" class="text-center py-5 text-muted">没有符合条件的履约单</td></tr>';
+ }catch(e){ffAlert(e.message);}}
+async function showFulfillment(orderId){try{const d=await ffJson('/api/fulfillment/order/'+encodeURIComponent(orderId));const warning=(d.state.has_shortage||d.state.manual_review)?`<div class="alert alert-danger"><b><i class="bi bi-exclamation-triangle-fill me-1"></i>该订单需要人工处理</b><div>${esc(d.state.manual_reason||'存在缺货')}</div></div>`:'';
+ document.getElementById('ffDetail').innerHTML=warning+d.fulfillments.map(f=>{const items=(f.items||[]).map(i=>`<tr><td>${esc(i.order_item_name||i.name_snapshot)}</td><td>${esc(i.sku_code_snapshot||'')}</td><td>${i.allocated_qty}</td><td class="text-danger">${i.shortage_qty||0}</td></tr>`).join('');const parcels=(f.shipments||[]).map(s=>`<div class="border border-secondary rounded p-2 mb-2"><b>${esc(s.carrier_name||s.carrier_slug||'物流')}</b> · <span class="text-info">${esc(s.tracking_number||'待生成')}</span> ${badge(s.status)} <button class="btn btn-sm btn-outline-info float-end" onclick="refreshTrack('${esc(s.id)}','${esc(orderId)}')">查物流</button><div class="small text-muted mt-2">${(s.events||[]).slice(0,5).map(e=>`${esc(e.event_at||e.received_at)} ${esc(e.description||e.raw_status||e.normalized_status)}`).join('<br>')||'暂无轨迹'}</div></div>`).join('')||'<div class="text-muted">尚无包裹</div>';const submit=(ffCanManage&&f.mode==='external_wms'&&['ready_to_submit','submission_unknown','failed'].includes(f.status))?`<button class="btn btn-warning btn-sm" onclick="submitWms('${esc(f.id)}','${esc(orderId)}')">提交/核验 WMS</button>`:'';const internal=f.mode==='internal'?`<button class="btn btn-success btn-sm" onclick="manualShipment('${esc(f.id)}','${esc(orderId)}')">录入运单并发货</button>`:'';const cancel=ffCanManage&&!['shipped','delivered','cancelled','superseded'].includes(f.status)?`<button class="btn btn-outline-danger btn-sm" onclick="cancelFf('${esc(f.id)}','${esc(orderId)}')">取消履约</button>`:'';return `<div class="card bg-black border-secondary mb-3"><div class="card-header d-flex flex-wrap justify-content-between gap-2"><div><b>${esc(f.warehouse_name)}</b> ${badge(f.status)} <span class="small text-muted">${esc(f.external_invoice_code||'')}</span></div><div class="d-flex gap-1"><button class="btn btn-outline-info btn-sm" onclick="transitionFf('${esc(f.id)}','picking','${esc(orderId)}')">开始拣货</button><button class="btn btn-outline-info btn-sm" onclick="transitionFf('${esc(f.id)}','packed','${esc(orderId)}')">打包完成</button>${internal}${submit}${cancel}</div></div><div class="card-body"><table class="table table-dark table-sm"><thead><tr><th>商品</th><th>SKU</th><th>分配</th><th>缺货</th></tr></thead><tbody>${items}</tbody></table><h6>包裹与物流</h6>${parcels}</div></div>`;}).join('');bootstrap.Modal.getOrCreateInstance(document.getElementById('ffDetailModal')).show();}catch(e){ffAlert(e.message);}}
+async function transitionFf(id,status,orderId){try{await ffJson(`/api/fulfillment/${id}/transition`,{method:'POST',body:JSON.stringify({status})});await showFulfillment(orderId);loadFulfillments();}catch(e){ffAlert(e.message);}}
+async function manualShipment(id,orderId){const tracking=prompt('请输入运单号');if(!tracking)return;const carrier=prompt('请输入物流商代码（如 inpost / dpd / gls）','custom')||'custom';try{await ffJson(`/api/fulfillment/${id}/shipment`,{method:'POST',body:JSON.stringify({tracking_number:tracking,carrier_slug:carrier,carrier_name:carrier})});await showFulfillment(orderId);loadFulfillments();}catch(e){ffAlert(e.message);}}
+async function submitWms(id,orderId){if(!confirm('确认将该匈牙利仓履约单加入 WMS 提交队列？'))return;try{await ffJson(`/api/fulfillment/${id}/submit-wms`,{method:'POST',body:'{}'});ffAlert('已进入幂等提交队列',false);await showFulfillment(orderId);}catch(e){ffAlert(e.message);}}
+async function cancelFf(id,orderId){const reason=prompt('请输入取消原因（若另一个仓已发货，系统会自动转人工处理）','客户取消/人工调整');if(!reason)return;try{await ffJson(`/api/fulfillment/${id}/cancel`,{method:'POST',body:JSON.stringify({reason})});ffAlert('取消请求已处理或进入 WMS 队列',false);await showFulfillment(orderId);loadFulfillments();}catch(e){ffAlert(e.message);await showFulfillment(orderId);}}
+async function refreshTrack(id,orderId){try{await ffJson(`/api/fulfillment/shipment/${id}/track`,{method:'POST',body:'{}'});ffAlert('已加入官方 + 第三方物流查询队列',false);await showFulfillment(orderId);}catch(e){ffAlert(e.message);}}
+{% if can_manage_fulfillment %}
+let ffCfg=null;
+function fillSelect(id,rows,value,label){document.getElementById(id).innerHTML=rows.map(r=>`<option value="${r[value]}">${esc(label(r))}</option>`).join('');}
+async function openFfConfig(){try{ffCfg=await ffJson('/api/fulfillment/config/options');document.getElementById('cfgEnabled').checked=!!ffCfg.settings.oms_fulfillment_enabled;document.getElementById('cfgAutoPlan').checked=!!ffCfg.settings.oms_auto_plan_enabled;const hu=ffCfg.integrations.find(i=>i.provider==='hungary_wms');document.getElementById('cfgAutoSubmit').checked=!!(hu&&hu.auto_submit);document.getElementById('cfgAutoSubmit').dataset.warehouseId=hu?hu.warehouse_id:'';fillSelect('cfgSku',ffCfg.skus,'id',r=>`${r.sku_code} · ${r.name}`);['cfgSkuWh','cfgCostWh','cfgPermWh'].forEach(id=>fillSelect(id,ffCfg.warehouses,'id',r=>`${r.name} (${r.country||''})`));fillSelect('cfgUser',ffCfg.users,'id',r=>`${r.name||r.username} · ${r.username}`);bootstrap.Modal.getOrCreateInstance(document.getElementById('ffConfigModal')).show();}catch(e){ffAlert(e.message);}}
+async function saveFfSwitches(){if(document.getElementById('cfgAutoSubmit').checked&&!confirm('开启 WMS 自动提交后，满足条件的匈牙利履约单会真实下发仓库。确认继续？'))return;const b={oms_fulfillment_enabled:document.getElementById('cfgEnabled').checked,oms_auto_plan_enabled:document.getElementById('cfgAutoPlan').checked,warehouse_id:document.getElementById('cfgAutoSubmit').dataset.warehouseId,auto_submit:document.getElementById('cfgAutoSubmit').checked};try{await ffJson('/api/fulfillment/config/options',{method:'POST',body:JSON.stringify(b)});ffAlert('上线开关已保存',false);}catch(e){ffAlert(e.message);}}
+async function saveSkuWh(){const b={sku_id:document.getElementById('cfgSku').value,warehouse_id:document.getElementById('cfgSkuWh').value,wms_product_name_zh:document.getElementById('cfgNameZh').value,wms_product_name_en:document.getElementById('cfgNameEn').value,wms_product_image:document.getElementById('cfgImage').value,is_primary:document.getElementById('cfgPrimary').checked,is_enabled:true,product_type:'P'};try{const d=await ffJson('/api/fulfillment/config/sku-warehouses',{method:'POST',body:JSON.stringify(b)});document.getElementById('cfgSkuResult').textContent=`已保存；当前映射 ${d.length} 条`;}catch(e){ffAlert(e.message);}}
+async function saveCost(){const b={market_code:'CZ',warehouse_id:document.getElementById('cfgCostWh').value,amount:Number(document.getElementById('cfgCostAmount').value),currency:document.getElementById('cfgCostCurrency').value,service_code:document.getElementById('cfgCostService').value,is_active:true};try{const d=await ffJson('/api/fulfillment/config/shipping-costs',{method:'POST',body:JSON.stringify(b)});document.getElementById('cfgCostResult').textContent=`已保存；当前成本规则 ${d.length} 条`;}catch(e){ffAlert(e.message);}}
+async function savePermission(){const ops=document.getElementById('cfgFullOps').checked,b={user_id:document.getElementById('cfgUser').value,warehouse_id:document.getElementById('cfgPermWh').value,can_view:true,can_pick:ops,can_pack:ops,can_ship:ops,can_cancel:false,can_retry:false,can_reconcile:false};try{const d=await ffJson('/api/fulfillment/config/permissions',{method:'POST',body:JSON.stringify(b)});document.getElementById('cfgPermResult').textContent=`已保存；当前仓库权限 ${d.length} 条`;}catch(e){ffAlert(e.message);}}
+{% endif %}
+document.getElementById('ffSearch').addEventListener('keydown',e=>{if(e.key==='Enter')loadFulfillments();});loadFulfillments();
+</script>
+{% endblock %}

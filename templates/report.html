@@ -276,24 +276,29 @@
         min-width: 100px;
     }
 
-    .report-table-responsive {
-        overflow-x: auto;
-        overflow-y: visible;
+    #reportStickyHeader {
+        position: fixed;
+        top: var(--report-sticky-top, 52px);
+        left: 0;
+        display: none;
+        overflow: hidden;
+        z-index: 1029;
+        pointer-events: none;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
     }
 
-    #reportTable thead th {
-        position: sticky;
-        top: 76px;
-        z-index: 6;
+    #reportStickyHeader table {
+        margin-bottom: 0;
+        table-layout: fixed;
+        transform: translateX(var(--report-sticky-x, 0px));
+    }
+
+    #reportStickyHeader th {
         background: #111827 !important;
         color: #e5e7eb;
-        box-shadow: 0 1px 0 rgba(148, 163, 184, 0.35);
-    }
-
-    #reportTable thead th.sticky-col,
-    #reportTable thead th.sticky-col-2 {
-        z-index: 8;
-        background: #111827 !important;
+        text-align: center;
+        vertical-align: middle;
+        white-space: nowrap;
     }
 
     .table thead th {
@@ -381,6 +386,7 @@
 
 <script>
     // Global Constants
+    const REPORT_DATA_CACHE_VERSION = 'v6';
     const ALL_METRICS = [
         { key: 'uv', label: 'UV (访客数)', class: 'metric-uv', sum: true },
         { key: 'pv', label: 'PV (浏览量)', class: 'metric-pv', sum: true },
@@ -401,6 +407,7 @@
     // Initialize
     document.addEventListener('DOMContentLoaded', function () {
         initMetricsFilter();
+        initReportStickyHeader();
 
         const savedStart = localStorage.getItem('report_startDate');
         const savedEnd = localStorage.getItem('report_endDate');
@@ -480,6 +487,7 @@
         renderReport(currentResult);
         document.getElementById('reportCard').style.display = 'block';
         document.getElementById('chartCard').style.display = 'block';
+        syncReportStickyHeader();
     }
 
     // Sites Filter Logic
@@ -750,8 +758,8 @@
 
         // Try load from cache first
         if (!forceRefresh) {
-            const cachedData = localStorage.getItem('report_last_result_v5');
-            const cachedParams = localStorage.getItem('report_last_params_v5');
+            const cachedData = localStorage.getItem(`report_last_result_${REPORT_DATA_CACHE_VERSION}`);
+            const cachedParams = localStorage.getItem(`report_last_params_${REPORT_DATA_CACHE_VERSION}`);
 
             if (cachedData && cachedParams) {
                 try {
@@ -759,12 +767,14 @@
                     // Match current date inputs AND granularity. Country/manager/site are local slices.
                     if (params.start === startDate && params.end === endDate && params.granularity === granularity) {
                         const result = JSON.parse(cachedData);
-                        currentResult = result;
+                        if (result.cache_version === REPORT_DATA_CACHE_VERSION) {
+                            currentResult = result;
 
-                        refreshReportView();
-                        document.getElementById('dateRangeInfo').innerHTML =
-                            `${result.date_range.start} ~ ${result.date_range.end} <small class="text-white-50 ms-2">(缓存数据)</small>`;
-                        return;
+                            refreshReportView();
+                            document.getElementById('dateRangeInfo').innerHTML =
+                                `${result.date_range.start} ~ ${result.date_range.end} <small class="text-white-50 ms-2">(缓存数据)</small>`;
+                            return;
+                        }
                     }
                 } catch (e) { console.error('Cache parse error', e); }
             }
@@ -790,8 +800,8 @@
                 localStorage.setItem('report_startDate', startDate);
                 localStorage.setItem('report_endDate', endDate);
                 localStorage.setItem('report_granularity', granularity);
-                localStorage.setItem('report_last_result_v5', JSON.stringify(result));
-                localStorage.setItem('report_last_params_v5', JSON.stringify({ start: startDate, end: endDate, granularity: granularity }));
+                localStorage.setItem(`report_last_result_${REPORT_DATA_CACHE_VERSION}`, JSON.stringify(result));
+                localStorage.setItem(`report_last_params_${REPORT_DATA_CACHE_VERSION}`, JSON.stringify({ start: startDate, end: endDate, granularity: granularity }));
 
                 currentResult = result;
 
@@ -1017,6 +1027,68 @@
         });
         // Update Chart
         updateChart(activeSites, months, data, activeMetrics);
+        syncReportStickyHeader();
+    }
+
+    function initReportStickyHeader() {
+        const existing = document.getElementById('reportStickyHeader');
+        if (!existing) {
+            const holder = document.createElement('div');
+            holder.id = 'reportStickyHeader';
+            document.body.appendChild(holder);
+        }
+
+        window.addEventListener('scroll', syncReportStickyHeader, { passive: true });
+        window.addEventListener('resize', syncReportStickyHeader);
+
+        const wrapper = document.querySelector('#reportCard .report-table-responsive');
+        if (wrapper) {
+            wrapper.addEventListener('scroll', syncReportStickyHeader, { passive: true });
+        }
+    }
+
+    function syncReportStickyHeader() {
+        const holder = document.getElementById('reportStickyHeader');
+        const table = document.getElementById('reportTable');
+        const wrapper = document.querySelector('#reportCard .report-table-responsive');
+        if (!holder || !table || !wrapper || document.getElementById('reportCard').style.display === 'none') {
+            if (holder) holder.style.display = 'none';
+            return;
+        }
+
+        const thead = table.querySelector('thead');
+        const headerCells = Array.from(table.querySelectorAll('thead th'));
+        if (!thead || headerCells.length === 0) {
+            holder.style.display = 'none';
+            return;
+        }
+
+        const nav = document.querySelector('.navbar.fixed-top');
+        const stickyTop = nav ? Math.ceil(nav.getBoundingClientRect().height) : 0;
+        document.documentElement.style.setProperty('--report-sticky-top', `${stickyTop}px`);
+
+        const tableRect = table.getBoundingClientRect();
+        const theadRect = thead.getBoundingClientRect();
+        const wrapperRect = wrapper.getBoundingClientRect();
+        const shouldShow = theadRect.bottom <= stickyTop && tableRect.bottom > stickyTop + theadRect.height;
+        if (!shouldShow) {
+            holder.style.display = 'none';
+            return;
+        }
+
+        holder.style.display = 'block';
+        holder.style.left = `${wrapperRect.left}px`;
+        holder.style.width = `${wrapperRect.width}px`;
+        holder.style.setProperty('--report-sticky-x', `${-wrapper.scrollLeft}px`);
+
+        const widths = headerCells.map(cell => cell.getBoundingClientRect().width);
+        const headerHtml = thead.innerHTML.replace(/id="[^"]*"/g, '');
+        holder.innerHTML = `<table class="${table.className}" style="width:${tableRect.width}px;"><thead class="table-dark">${headerHtml}</thead></table>`;
+        holder.querySelectorAll('th').forEach((cell, index) => {
+            cell.style.width = `${widths[index] || 100}px`;
+            cell.style.minWidth = `${widths[index] || 100}px`;
+            cell.style.maxWidth = `${widths[index] || 100}px`;
+        });
     }
 
     function clearTrendView() {
@@ -1026,6 +1098,8 @@
         }
         const wrapper = document.getElementById('trendSummaryWrapper');
         if (wrapper) wrapper.style.display = 'none';
+        const holder = document.getElementById('reportStickyHeader');
+        if (holder) holder.style.display = 'none';
     }
 
     function updateChart(activeSites, months, allData, activeMetrics) {

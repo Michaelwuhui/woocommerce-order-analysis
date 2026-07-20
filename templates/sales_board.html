@@ -15,7 +15,8 @@
         <div class="d-flex align-items-center gap-3">
             <div class="d-flex align-items-center gap-2">
                 <span class="text-secondary"><i class="bi bi-calendar-range me-1"></i>月份：</span>
-                <input type="text" class="form-control form-control-sm bg-dark text-white border-secondary border-opacity-25 flatpickr-month"
+                <input type="text" id="salesBoardMonthPicker"
+                    class="form-control form-control-sm bg-dark text-white border-secondary border-opacity-25 flatpickr-month"
                     style="width: 140px;" value="{{ selected_month }}" onchange="updateMonth(this.value)">
             </div>
             {% if current_user.is_admin() and not self_view %}
@@ -482,7 +483,7 @@
                                 <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w3" value="{{ d.weekly_targets.get('w3', 0)|int }}" step="1" style="width:100%;"></td>
                                 <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w4" value="{{ d.weekly_targets.get('w4', 0)|int }}" step="1" style="width:100%;"></td>
                                 <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w5" value="{{ d.weekly_targets.get('w5', 0)|int }}" step="1" style="width:100%;"></td>
-                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-salary" value="{{ d.base_salary|int }}" step="100" style="width:100%;"></td>
+                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-salary" value="{{ d.base_salary|int }}" step="100" min="0" style="width:100%;"></td>
                                 <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-commission" value="{{ (d.commission_rate * 100)|round(1) }}" step="0.5" min="0" max="100" style="width:100%;"></td>
                                 <td><input type="text" class="form-control form-control-sm bg-dark text-white border-secondary target-notes" value="{{ d.notes }}" style="width:100%;"></td>
                             </tr>
@@ -493,7 +494,7 @@
             </div>
             <div class="modal-footer border-top border-secondary border-opacity-25">
                 <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
-                <button type="button" class="btn btn-primary" onclick="saveTargets()">
+                <button type="button" class="btn btn-primary" id="saveTargetsBtn" onclick="saveTargets()">
                     <i class="bi bi-check-lg me-1"></i>保存全部
                 </button>
             </div>
@@ -727,13 +728,21 @@ document.addEventListener('DOMContentLoaded', function() {
         locale: "zh",
         theme: "dark",
         disableMobile: true,
-        allowInput: true
+        allowInput: true,
+        onChange: function(selectedDates, dateStr, instance) {
+            // flatpickr does not reliably emit the native change event on every
+            // browser. Navigate explicitly so targets are saved to the month
+            // the user selected instead of the previously rendered month.
+            if (instance.input.id === 'salesBoardMonthPicker') {
+                updateMonth(dateStr);
+            }
+        }
     });
 });
 
 function updateMonth(value) {
-    if (value) {
-        window.location.href = '/sales-board?month=' + encodeURIComponent(value);
+    if (value && value !== '{{ selected_month }}') {
+        window.location.assign('/sales-board?month=' + encodeURIComponent(value));
     }
 }
 
@@ -997,6 +1006,22 @@ function autoFillAll() {
 }
 
 function saveTargets() {
+    var renderedMonth = '{{ selected_month }}';
+    var monthPicker = document.getElementById('salesBoardMonthPicker');
+    if (monthPicker && monthPicker.value && monthPicker.value !== renderedMonth) {
+        showToast('月份正在切换，请稍候再保存', 'error');
+        updateMonth(monthPicker.value);
+        return;
+    }
+
+    var saveBtn = document.getElementById('saveTargetsBtn');
+    if (saveBtn && saveBtn.disabled) return;
+    var originalBtnHtml = saveBtn ? saveBtn.innerHTML : '';
+    if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status"></span>保存并校验中...';
+    }
+
     var rows = document.querySelectorAll('#targetTable tbody tr');
     var targets = [];
     rows.forEach(function(row) {
@@ -1012,25 +1037,105 @@ function saveTargets() {
                 w4: parseFloat(row.querySelector('.target-w4').value) || 0,
                 w5: parseFloat(row.querySelector('.target-w5').value) || 0
             },
-            base_salary: (function(v){ var n = parseFloat(v); return isNaN(n) ? 7000 : n; })(row.querySelector('.target-salary').value),
+            // An emptied number input represents an intentional zero salary.
+            // Do not silently replace it with the historical 7000 default.
+            base_salary: (function(v){ var n = parseFloat(v); return isNaN(n) ? 0 : n; })(row.querySelector('.target-salary').value),
             commission_rate: (function(v){ var n = parseFloat(v); return isNaN(n) ? 5 : n; })(row.querySelector('.target-commission').value) / 100,
             notes: row.querySelector('.target-notes').value || ''
         });
     });
 
+    var changedManagers = Array.from(rows).filter(function(row) {
+        return Array.from(row.querySelectorAll('.target-monthly, .target-w1, .target-w2, .target-w3, .target-w4, .target-w5, .target-salary, .target-commission, .target-notes'))
+            .some(function(input) {
+                if (input.type === 'number') {
+                    return Math.abs(Number(input.value || 0) - Number(input.defaultValue || 0)) >= 0.001;
+                }
+                return String(input.value || '') !== String(input.defaultValue || '');
+            });
+    }).map(function(row) { return row.dataset.manager; });
+
+    if (changedManagers.length === 0) {
+        showToast('未检测到任何目标修改，请先修改数值再保存', 'error');
+        if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.innerHTML = originalBtnHtml;
+        }
+        return;
+    }
+
     fetch('/api/sales-targets/batch', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
+        cache: 'no-store',
         body: JSON.stringify({targets: targets})
     })
-    .then(function(res) { return res.json(); })
+    .then(readSalesTargetResponse)
     .then(function(data) {
-        if (data.success) {
-            showToast('目标已保存', 'success');
-            setTimeout(function() { location.reload(); }, 1000);
-        } else {
-            showToast('保存失败: ' + (data.error || '未知错误'), 'error');
+        if (!data.success) {
+            throw new Error(data.error || '服务器未确认保存');
         }
+        return fetch('/api/sales-targets?month=' + encodeURIComponent(renderedMonth) + '&_verify=' + Date.now(), {
+            cache: 'no-store',
+            headers: {'Cache-Control': 'no-cache'}
+        });
+    })
+    .then(readSalesTargetResponse)
+    .then(function(savedRows) {
+        var savedByManager = {};
+        savedRows.forEach(function(row) { savedByManager[row.manager] = row; });
+
+        var mismatched = targets.filter(function(target) {
+            var saved = savedByManager[target.manager];
+            if (!saved) return true;
+            var weekly = saved.weekly_targets;
+            if (typeof weekly === 'string') {
+                try { weekly = JSON.parse(weekly); } catch (e) { return true; }
+            }
+            weekly = weekly || {};
+            var sameNumber = function(a, b) { return Math.abs(Number(a || 0) - Number(b || 0)) < 0.001; };
+            return !sameNumber(saved.monthly_target, target.monthly_target) ||
+                !sameNumber(weekly.w1, target.weekly_targets.w1) ||
+                !sameNumber(weekly.w2, target.weekly_targets.w2) ||
+                !sameNumber(weekly.w3, target.weekly_targets.w3) ||
+                !sameNumber(weekly.w4, target.weekly_targets.w4) ||
+                !sameNumber(weekly.w5, target.weekly_targets.w5) ||
+                !sameNumber(saved.base_salary, target.base_salary) ||
+                !sameNumber(saved.commission_rate, target.commission_rate) ||
+                String(saved.notes || '') !== String(target.notes || '');
+        });
+
+        if (mismatched.length) {
+            throw new Error('服务器回读校验不一致：' + mismatched.map(function(t) { return t.manager; }).join('、'));
+        }
+
+        showToast('已保存并校验，实际修改 ' + changedManagers.length + ' 人目标，正在刷新...', 'success');
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('targetModal')).hide();
+        setTimeout(function() {
+            window.location.replace('/sales-board?month=' + encodeURIComponent(renderedMonth) + '&_refresh=' + Date.now());
+        }, 700);
+    })
+    .catch(function(err) {
+        showToast('保存失败：' + (err.message || '网络异常'), 'error');
+        if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.innerHTML = originalBtnHtml;
+        }
+    });
+}
+
+function readSalesTargetResponse(res) {
+    return res.text().then(function(text) {
+        var data;
+        try {
+            data = text ? JSON.parse(text) : {};
+        } catch (e) {
+            throw new Error('服务器返回了无法识别的内容（HTTP ' + res.status + '）');
+        }
+        if (!res.ok) {
+            throw new Error(data.error || ('HTTP ' + res.status));
+        }
+        return data;
     });
 }
 

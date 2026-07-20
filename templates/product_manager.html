@@ -1450,7 +1450,73 @@
         modal.show();
     }
 
-    function applyBatchOp() {
+    async function parseProductManagerJson(response) {
+        const text = await response.text();
+        let data;
+        try {
+            data = text ? JSON.parse(text) : {};
+        } catch (err) {
+            // Reverse proxies and login redirects often return HTML. Surface a
+            // useful message instead of leaking JSON.parse's "Unexpected token <".
+            const preview = text
+                .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+                .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 160);
+            throw new Error(
+                `服务器返回了非 JSON 响应（HTTP ${response.status}）` +
+                (preview ? `：${preview}` : '')
+            );
+        }
+
+        if (!response.ok) {
+            throw new Error(data.error || data.message || `HTTP ${response.status}`);
+        }
+        return data;
+    }
+
+    async function updateOneBatchItem(item) {
+        const isVariation = Boolean(item.parent_id);
+        const url = isVariation
+            ? `/api/product-manager/products/${currentSiteId}/${item.parent_id}/variations/${item.product_id}`
+            : `/api/product-manager/products/${currentSiteId}/${item.product_id}`;
+        const payload = {...item};
+        delete payload.product_id;
+        delete payload.parent_id;
+
+        try {
+            const response = await fetch(url, {
+                method: 'PUT',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify(payload),
+            });
+            const data = await parseProductManagerJson(response);
+            if (!data.success) {
+                throw new Error(data.error || '未知错误');
+            }
+            return {
+                ok: true,
+                item: {
+                    product_id: item.product_id,
+                    parent_id: item.parent_id,
+                    ...(data.variation || data.product || {}),
+                },
+            };
+        } catch (err) {
+            return {
+                ok: false,
+                item: {
+                    product_id: item.product_id,
+                    parent_id: item.parent_id,
+                    error: err.message || String(err),
+                },
+            };
+        }
+    }
+
+    async function applyBatchOp() {
         const type = $('pmBatchApplyBtn').dataset.opType;
         const rowKeys = Array.from(selectedRows);
         if (rowKeys.length === 0) return;
@@ -1512,30 +1578,52 @@
         applyBtn.disabled = true;
         applyBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>处理中...';
 
-        fetch('/api/product-manager/bulk', {
-            method: 'POST',
-            headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({ site_id: currentSiteId, items }),
-        })
-            .then(r => r.json())
-            .then(data => {
-                applyBtn.disabled = false;
-                applyBtn.innerHTML = '应用';
-                bootstrap.Modal.getInstance($('pmBatchModal'))?.hide();
-                if (skippedVariableParents > 0) {
-                    data.skip_note = `跳过 ${skippedVariableParents} 个可变产品父行（请展开变体后选择具体变体）`;
-                }
-                showBatchResult(data);
-                // Refresh table to reflect canonical state. Variation cache is invalidated.
-                Object.keys(variationsCache).forEach(k => delete variationsCache[k]);
-                expandedParents.clear();
-                loadProducts(currentPage);
-            })
-            .catch(err => {
-                applyBtn.disabled = false;
-                applyBtn.innerHTML = '应用';
-                alert('请求失败: ' + err.message);
-            });
+        // A single server request used to update every row serially. On sites
+        // with slow WooMultistore hooks, 13 rows could exceed Gunicorn's 120s
+        // limit and the proxy would return an HTML error page. Keep each remote
+        // write in its own request and use a small concurrency so one slow item
+        // cannot kill the entire batch. Variations go first so the variable
+        // parent's final stock status is applied last.
+        const orderedItems = [
+            ...items.filter(item => item.parent_id),
+            ...items.filter(item => !item.parent_id),
+        ];
+        const results = {success: [], failed: []};
+        let cursor = 0;
+        let completed = 0;
+        const workerCount = Math.min(2, orderedItems.length);
+
+        async function worker() {
+            while (cursor < orderedItems.length) {
+                const item = orderedItems[cursor++];
+                const result = await updateOneBatchItem(item);
+                if (result.ok) results.success.push(result.item);
+                else results.failed.push(result.item);
+                completed++;
+                applyBtn.innerHTML = `<span class="spinner-border spinner-border-sm me-2"></span>处理中 ${completed}/${orderedItems.length}...`;
+            }
+        }
+
+        try {
+            await Promise.all(Array.from({length: workerCount}, () => worker()));
+            const data = {
+                success_count: results.success.length,
+                failed_count: results.failed.length,
+                results,
+            };
+            bootstrap.Modal.getInstance($('pmBatchModal'))?.hide();
+            if (skippedVariableParents > 0) {
+                data.skip_note = `跳过 ${skippedVariableParents} 个可变产品父行（请展开变体后选择具体变体）`;
+            }
+            showBatchResult(data);
+            // Refresh table to reflect canonical state. Variation cache is invalidated.
+            Object.keys(variationsCache).forEach(k => delete variationsCache[k]);
+            expandedParents.clear();
+            loadProducts(currentPage);
+        } finally {
+            applyBtn.disabled = false;
+            applyBtn.innerHTML = '应用';
+        }
     }
 
     function showBatchResult(data) {

@@ -341,7 +341,19 @@
                                     order.source.replace('https://www.', '').replace('https://', '') }}</span>{% endif
                                 %}</td>
                             <td><span class="status-badge {{ order.status|status_class(order.payment_method, order.is_undelivered) }}">{{ order.status|status_label(order.payment_method, order.is_undelivered)
-                                    }}</span></td>
+                                    }}</span>
+                                {% if order.fulfillment_state %}
+                                {% set fs = order.fulfillment_state %}
+                                <div class="mt-1">
+                                    <a href="{{ url_for('fulfillment.fulfillment_page') }}?search={{ order.number }}"
+                                       class="badge text-decoration-none {{ 'bg-danger' if fs.has_shortage or fs.manual_review else 'bg-info text-dark' }}"
+                                       title="{{ fs.manual_reason or fs.aggregate_status }}">
+                                        <i class="bi {{ 'bi-exclamation-octagon-fill' if fs.has_shortage or fs.manual_review else 'bi-boxes' }} me-1"></i>
+                                        {% if fs.has_shortage %}缺货{% elif fs.manual_review %}人工处理{% else %}{{ fs.aggregate_status }}{% endif %}
+                                    </a>
+                                </div>
+                                {% endif %}
+                            </td>
                             <td class="customer-cell">
                                 {% if customer_attributes and order.customer_email in customer_attributes %}
                                 {% set attrs = customer_attributes[order.customer_email] %}
