@@ -198,8 +198,14 @@ class WmsClient:
         )
 
     def cancel_invoice(self, invoice_code: str) -> WmsResult:
-        return self._request(
-            "DELETE", f"/invoice/{quote(str(invoice_code), safe='')}", unknown_on_timeout=True
+        # Supplier confirmation (2026-07-21): outbound cancellation/intercept
+        # is not exposed through the API and must be handled in the logistics
+        # group by their operations team.  Fail closed so no guessed endpoint
+        # can be called accidentally.
+        raise WmsError(
+            "供应商 WMS 不支持 API 取消；请在物流群联系运营人工拦截",
+            code="cancel_not_supported",
+            retryable=False,
         )
 
     def labels(self, invoice_codes: list[str]) -> WmsResult:

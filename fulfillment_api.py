@@ -474,15 +474,17 @@ def api_cancel_fulfillment(fulfillment_id):
             )
             return jsonify({"error": "WMS 提交结果尚未确认；已转人工处理"}), 409
         if fulfillment["mode"] == "external_wms" and fulfillment["submitted_at"]:
-            transition_fulfillment(
-                conn, fulfillment_id, "cancel_pending", actor=_actor(), reason=reason
+            manual_reason = (
+                "匈牙利 WMS 不支持 API 取消；请在物流群联系对方运营人工拦截。"
+                f"申请原因：{reason}"
             )
-            job_id = enqueue_job(
-                conn, "CANCEL_HU_FULFILLMENT", "fulfillment", fulfillment_id,
-                f"cancel:{fulfillment['idempotency_key']}", {"fulfillment_id": fulfillment_id},
+            mark_manual_review(
+                conn, fulfillment["order_id"], manual_reason, actor=_actor()
             )
-            conn.commit()
-            return jsonify({"queued": True, "job_id": job_id})
+            return jsonify({
+                "manual_required": True,
+                "message": "已标记人工处理；请在物流群联系对方运营拦截该出库单",
+            }), 202
         # Not yet sent to an external warehouse: local cancellation is final.
         transition_fulfillment(
             conn, fulfillment_id, "cancelled", actor=_actor(), reason=reason

@@ -1,8 +1,9 @@
 import sqlite3
 import unittest
+from unittest.mock import patch
 
 from fulfillment_service import enqueue_job
-from fulfillment_worker import claim_job, finish_job, retry_job
+from fulfillment_worker import claim_job, finish_job, handle_verify_submission, retry_job
 
 
 class DurableJobTests(unittest.TestCase):
@@ -56,6 +57,42 @@ class DurableJobTests(unittest.TestCase):
         job = claim_job(self.db)
         self.assertEqual(jid, job["id"])
         self.assertEqual(2, job["attempts"])
+
+    def test_unknown_wms_submission_never_auto_resubmits(self):
+        fulfillment = {
+            "id": "F1",
+            "order_id": "O1",
+            "status": "submission_unknown",
+            "external_invoice_code": "INV-1",
+        }
+
+        class Result:
+            def fetchone(self):
+                return fulfillment
+
+        class Conn:
+            committed = False
+
+            def execute(self, _sql, _params=()):
+                return Result()
+
+            def commit(self):
+                self.committed = True
+
+        conn = Conn()
+        job = {"id": 9, "aggregate_id": "F1", "attempts": 3}
+        with patch("fulfillment_worker._query_wms_fulfillment", return_value=(None, "corr")), \
+             patch("fulfillment_worker.transition_fulfillment") as transition, \
+             patch("fulfillment_worker.mark_manual_review") as manual, \
+             patch("fulfillment_worker.enqueue_job") as enqueue:
+            result = handle_verify_submission(conn, job, {"fulfillment_id": "F1"})
+
+        self.assertEqual({"not_found": True, "manual_review": True, "resubmit": False}, result)
+        transition.assert_called_once()
+        self.assertEqual("manual_review", transition.call_args.args[2])
+        manual.assert_called_once()
+        enqueue.assert_not_called()
+        self.assertTrue(conn.committed)
 
 
 if __name__ == "__main__":

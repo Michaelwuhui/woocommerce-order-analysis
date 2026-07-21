@@ -418,13 +418,17 @@ def handle_verify_submission(conn, job: dict, payload: dict):
     if not row:
         if job["attempts"] < 3:
             raise RetryTask("WMS 暂未返回该 invoiceCode，继续查询", code="not_found_yet", delay_seconds=60)
-        transition_fulfillment(conn, fid, "ready_to_submit", reason="连续查询确认 WMS 未找到发货单", correlation_id=correlation)
-        enqueue_job(
-            conn, "SUBMIT_HU_FULFILLMENT", "fulfillment", fid,
-            f"resubmit:{fulfillment['idempotency_key']}:{job['id']}", {"fulfillment_id": fid},
+        # The supplier has not confirmed invoiceCode idempotency or the final
+        # consistency window.  Re-submitting after an unknown timeout could
+        # create a duplicate outbound order, so stop automation and require a
+        # human to reconcile with the supplier.
+        reason = "WMS 提交结果连续查询仍未知；为避免重复出库，已停止自动重提并转人工核对"
+        transition_fulfillment(
+            conn, fid, "manual_review", reason=reason, correlation_id=correlation
         )
+        mark_manual_review(conn, fulfillment["order_id"], reason, commit=False)
         conn.commit()
-        return {"not_found": True, "resubmit": True}
+        return {"not_found": True, "manual_review": True, "resubmit": False}
     pick_code = row.get("pickCode") or fulfillment["external_pick_code"]
     tracking_number = row.get("expressCode") or row.get("trackingNumber")
     transition_fulfillment(
@@ -486,30 +490,15 @@ def handle_cancel_wms(conn, job: dict, payload: dict):
         return {"noop": "cancelled"}
     if fulfillment["status"] != "cancel_pending":
         raise DomainError(f"履约状态 {fulfillment['status']} 不能执行 WMS 取消", "not_cancellable")
-    integration = conn.execute(
-        "SELECT * FROM oms_warehouse_integrations WHERE warehouse_id=?", (fulfillment["warehouse_id"],)
-    ).fetchone()
-    client = WmsClient(base_url=integration["base_url"] if integration else None)
-    correlation = uuid.uuid4().hex
-    try:
-        result = client.cancel_invoice(fulfillment["external_invoice_code"])
-    except WmsError as exc:
-        _audit_wms_error(conn, job, "cancel_invoice", exc, correlation)
-        if exc.unknown_outcome:
-            enqueue_job(
-                conn, "POLL_WMS_STATUS", "fulfillment", fid,
-                f"verify-cancel:{fid}:{job['attempts']}", {"fulfillment_id": fid},
-                available_at=_future(60),
-            )
-            conn.commit()
-        raise
-    _audit_wms_success(conn, job, "cancel_invoice", result, correlation)
+    # Backward-compatible guard for any cancellation job queued by an older
+    # web process.  The supplier does not expose cancellation through the API.
+    reason = "匈牙利 WMS 不支持 API 取消；请在物流群联系对方运营人工拦截"
     transition_fulfillment(
-        conn, fid, "cancelled", reason="WMS 已确认取消", correlation_id=correlation
+        conn, fid, "manual_review", reason=reason
     )
-    recompute_order_status(conn, fulfillment["order_id"], commit=False)
+    mark_manual_review(conn, fulfillment["order_id"], reason, commit=False)
     conn.commit()
-    return {"cancelled": True}
+    return {"manual_required": True, "cancelled": False}
 
 
 def handle_poll_wms_status(conn, job: dict, payload: dict):
