@@ -47,6 +47,17 @@ class WmsAdapterTests(unittest.TestCase):
             client.inventory()
         self.assertEqual("insecure_http_blocked", ctx.exception.code)
 
+    def test_cancel_is_never_sent_to_an_undocumented_endpoint(self):
+        session = FakeSession()
+        client = WmsClient(
+            base_url="https://example.test", salt="secret", session=session
+        )
+        with self.assertRaises(WmsError) as ctx:
+            client.cancel_invoice("INV-1")
+        self.assertEqual("cancel_not_supported", ctx.exception.code)
+        self.assertFalse(ctx.exception.retryable)
+        self.assertEqual([], session.calls)
+
     def test_tracking_normalization(self):
         self.assertEqual("delivered", normalize_wms_tracking_status("delivered"))
         self.assertEqual("in_transit", normalize_wms_tracking_status("transit"))
