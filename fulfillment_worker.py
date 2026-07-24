@@ -9,6 +9,7 @@ import json
 import os
 import random
 import socket
+import sqlite3
 import sys
 import time
 import traceback
@@ -755,6 +756,28 @@ def run_one(conn) -> bool:
     return True
 
 
+def run_iteration(conn, *, seed: bool = False) -> bool:
+    """Run one worker iteration without exiting on a transient SQLite lock."""
+
+    try:
+        if seed:
+            seed_periodic_jobs(conn)
+        return run_one(conn)
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+            raise
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        print(
+            f"[worker] SQLite 暂时繁忙，保留任务并等待下一轮: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
@@ -764,10 +787,10 @@ def main():
     last_seed = 0.0
     try:
         while True:
-            if time.monotonic() - last_seed > 60:
-                seed_periodic_jobs(conn)
+            should_seed = time.monotonic() - last_seed > 60
+            worked = run_iteration(conn, seed=should_seed)
+            if should_seed:
                 last_seed = time.monotonic()
-            worked = run_one(conn)
             if args.once:
                 break
             if not worked:

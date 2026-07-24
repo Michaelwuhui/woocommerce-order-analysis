@@ -3,7 +3,13 @@ import unittest
 from unittest.mock import patch
 
 from fulfillment_service import enqueue_job
-from fulfillment_worker import claim_job, finish_job, handle_verify_submission, retry_job
+from fulfillment_worker import (
+    claim_job,
+    finish_job,
+    handle_verify_submission,
+    retry_job,
+    run_iteration,
+)
 
 
 class DurableJobTests(unittest.TestCase):
@@ -57,6 +63,16 @@ class DurableJobTests(unittest.TestCase):
         job = claim_job(self.db)
         self.assertEqual(jid, job["id"])
         self.assertEqual(2, job["attempts"])
+
+    def test_database_lock_does_not_exit_worker_iteration(self):
+        with patch(
+            "fulfillment_worker.claim_job",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            self.assertFalse(run_iteration(self.db))
+        self.assertTrue(
+            self.db.execute("SELECT 1").fetchone()[0]
+        )
 
     def test_unknown_wms_submission_never_auto_resubmits(self):
         fulfillment = {

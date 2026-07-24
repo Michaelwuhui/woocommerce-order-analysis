@@ -196,6 +196,64 @@ def _actor():
     }
 
 
+def _rollout_readiness(conn) -> dict:
+    counts = {
+        "sku_count": conn.execute(
+            "SELECT COUNT(*) AS n FROM inv_skus WHERE is_active=1"
+        ).fetchone()["n"],
+        "site_sku_map_count": conn.execute(
+            "SELECT COUNT(*) AS n FROM inv_site_sku_map WHERE is_active=1"
+        ).fetchone()["n"],
+        "warehouse_sku_map_count": conn.execute(
+            "SELECT COUNT(*) AS n FROM oms_sku_warehouses WHERE is_enabled=1"
+        ).fetchone()["n"],
+        "wms_ready_sku_count": conn.execute(
+            '''SELECT COUNT(*) AS n
+               FROM oms_sku_warehouses sw
+               JOIN inv_skus s ON s.id=sw.sku_id
+               JOIN oms_warehouse_integrations wi ON wi.warehouse_id=sw.warehouse_id
+               WHERE sw.is_enabled=1 AND s.is_active=1
+                 AND wi.provider='hungary_wms' AND wi.is_enabled=1
+                 AND trim(COALESCE(s.barcode,''))!=''
+                 AND trim(COALESCE(sw.wms_product_name_zh,''))!=''
+                 AND trim(COALESCE(sw.wms_product_name_en,''))!='' '''
+        ).fetchone()["n"],
+        "wms_stocked_sku_count": conn.execute(
+            '''SELECT COUNT(DISTINCT es.sku_id) AS n
+               FROM oms_external_stock es
+               JOIN oms_warehouse_integrations wi ON wi.warehouse_id=es.warehouse_id
+               WHERE wi.provider='hungary_wms' AND wi.is_enabled=1
+                 AND es.sku_id IS NOT NULL AND es.available_quantity>0'''
+        ).fetchone()["n"],
+    }
+    can_auto_plan = all(
+        counts[key] > 0
+        for key in ("sku_count", "site_sku_map_count", "warehouse_sku_map_count")
+    )
+    can_auto_submit = (
+        can_auto_plan
+        and counts["wms_ready_sku_count"] > 0
+        and counts["wms_stocked_sku_count"] > 0
+    )
+    blockers = []
+    if counts["sku_count"] <= 0:
+        blockers.append("SKU 主档为空")
+    if counts["site_sku_map_count"] <= 0:
+        blockers.append("站点商品与 SKU 映射为空")
+    if counts["warehouse_sku_map_count"] <= 0:
+        blockers.append("SKU 仓库归属为空")
+    if counts["wms_ready_sku_count"] <= 0:
+        blockers.append("没有同时具备条码、中英文品名的匈牙利 WMS SKU")
+    if counts["wms_stocked_sku_count"] <= 0:
+        blockers.append("HU01 当前没有可识别的可用库存")
+    return {
+        **counts,
+        "can_auto_plan": can_auto_plan,
+        "can_auto_submit": can_auto_submit,
+        "blockers": blockers,
+    }
+
+
 def _domain_error(exc: DomainError):
     status = 403 if exc.code == "warehouse_forbidden" else 404 if exc.code.endswith("not_found") else 409
     return jsonify({"error": str(exc), "code": exc.code}), status
@@ -244,6 +302,8 @@ def list_fulfillment_orders():
             limit = 200
         rows = conn.execute(
             f'''SELECT f.*, w.name AS warehouse_name, w.country AS warehouse_country,
+                       ff.cod_collection_role, ff.cod_amount, ff.cod_currency,
+                       ff.settlement_mode, ff.reconciliation_status,
                        o.number AS order_number, o.date_created AS order_date,
                        o.source, s.country AS market_code,
                        ofs.aggregate_status, ofs.has_shortage, ofs.manual_review,
@@ -253,6 +313,7 @@ def list_fulfillment_orders():
                 JOIN orders o ON o.id=f.order_id
                 LEFT JOIN sites s ON s.url=o.source
                 LEFT JOIN warehouses w ON w.id=f.warehouse_id
+                LEFT JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
                 LEFT JOIN oms_order_fulfillment_state ofs ON ofs.order_id=f.order_id
                 WHERE {' AND '.join(where)}
                 ORDER BY ofs.manual_review DESC, ofs.has_shortage DESC,
@@ -303,8 +364,13 @@ def fulfillment_order_detail(order_id):
         ).fetchone()
         if not state:
             return jsonify({"error": "订单尚未建立履约计划"}), 404
-        query = '''SELECT f.*, w.name AS warehouse_name, w.country AS warehouse_country
+        query = '''SELECT f.*, w.name AS warehouse_name, w.country AS warehouse_country,
+                          ff.cod_collection_role, ff.cod_amount, ff.cod_currency,
+                          ff.settlement_mode, ff.statement_month,
+                          ff.warehouse_storage_fee, ff.warehouse_shipping_fee,
+                          ff.fee_currency, ff.reconciliation_status
                    FROM oms_fulfillments f LEFT JOIN warehouses w ON w.id=f.warehouse_id
+                   LEFT JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
                    WHERE f.order_id=? AND f.revision=? AND f.status!='superseded' '''
         params = [order_id, state["revision"]]
         if allowed is not None:
@@ -688,6 +754,19 @@ def api_fulfillment_options():
     try:
         if request.method == "POST":
             body = request.get_json(silent=True) or {}
+            readiness = _rollout_readiness(conn)
+            if body.get("oms_auto_plan_enabled") and not readiness["can_auto_plan"]:
+                return jsonify({
+                    "error": "自动分仓尚未达到上线条件",
+                    "code": "auto_plan_not_ready",
+                    "readiness": readiness,
+                }), 409
+            if body.get("auto_submit") and not readiness["can_auto_submit"]:
+                return jsonify({
+                    "error": "匈牙利 WMS 自动提交尚未达到上线条件",
+                    "code": "wms_auto_submit_not_ready",
+                    "readiness": readiness,
+                }), 409
             for key in ("oms_fulfillment_enabled", "oms_auto_plan_enabled"):
                 if key in body:
                     value = "1" if body.get(key) else "0"
@@ -715,6 +794,7 @@ def api_fulfillment_options():
             "SELECT key, value FROM settings WHERE key IN ('oms_fulfillment_enabled','oms_auto_plan_enabled')"
         ).fetchall()
         settings = {r["key"]: str(r["value"]).lower() in {"1", "true", "yes", "on"} for r in setting_rows}
+        readiness = _rollout_readiness(conn)
         integrations = [dict(r) for r in conn.execute(
             '''SELECT wi.warehouse_id, wi.provider, wi.external_code, wi.channel_code,
                       wi.is_enabled, wi.auto_submit, wi.inventory_authority,
@@ -724,6 +804,7 @@ def api_fulfillment_options():
         ).fetchall()]
         return jsonify({
             "settings": settings,
+            "readiness": readiness,
             "integrations": integrations,
             "warehouses": [dict(r) for r in conn.execute(
                 "SELECT id, name, country FROM warehouses WHERE is_active=1 ORDER BY country, name"

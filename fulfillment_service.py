@@ -494,6 +494,65 @@ def _upsert_order_state(
     )
 
 
+def _money_text(value: Any) -> str:
+    try:
+        return format(Decimal(str(value or "0")).quantize(Decimal("0.01")), "f")
+    except (InvalidOperation, TypeError, ValueError):
+        return "0.00"
+
+
+def _financial_terms_by_warehouse(
+    conn: sqlite3.Connection,
+    order: sqlite3.Row | dict,
+    warehouse_ids,
+) -> dict[int, dict]:
+    """Assign customer COD ownership without mixing in warehouse fees."""
+
+    ids = sorted({int(warehouse_id) for warehouse_id in warehouse_ids})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    countries = {
+        int(row["id"]): (row["country"] or "").upper()
+        for row in conn.execute(
+            f"SELECT id, country FROM warehouses WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+    }
+    assigned_countries = set(countries.values())
+    is_cod = str(order["payment_method"] or "").lower() == "cod"
+    split_pl_hu = {"PL", "HU"}.issubset(assigned_countries)
+    full_cod_amount = _money_text(order["total"])
+    currency = order["currency"] or "EUR"
+    result = {}
+    for warehouse_id in ids:
+        country = countries.get(warehouse_id, "")
+        if not is_cod:
+            role, cod_amount = "not_applicable", "0.00"
+        elif split_pl_hu:
+            # The Poland parcel collects the complete customer COD.  Hungary
+            # receives a shipping instruction only and must never collect COD.
+            role = "collector" if country == "PL" else "instruction_only"
+            cod_amount = full_cod_amount if country == "PL" else "0.00"
+        else:
+            role, cod_amount = "collector", full_cod_amount
+        result[warehouse_id] = {
+            "payment_method": order["payment_method"] or "",
+            "cod_collection_role": role,
+            "cod_amount": cod_amount,
+            "cod_currency": currency,
+            "settlement_mode": "monthly_statement" if country == "HU" else "internal",
+            "fee_currency": currency,
+            "reconciliation_status": "unbilled",
+            "notes": (
+                "匈牙利仓仓储费与运输费按供应商月结账单核对"
+                if country == "HU"
+                else "波兰仓负责客户 COD 代收" if role == "collector" else ""
+            ),
+        }
+    return result
+
+
 def plan_order(
     conn: sqlite3.Connection,
     order_id: str,
@@ -575,6 +634,7 @@ def plan_order(
                 "qty": remaining, "reason": "out_of_stock",
             })
 
+    financial_terms = _financial_terms_by_warehouse(conn, order, assignments.keys())
     canonical_plan = {
         "order_id": order_id,
         "market": market,
@@ -591,6 +651,10 @@ def plan_order(
         ],
         "shortages": sorted(shortages, key=lambda x: (x["order_item_id"], x["reason"])),
         "reason": sorted(plan_reasons),
+        "financial_terms": [
+            {"warehouse_id": warehouse_id, **financial_terms[warehouse_id]}
+            for warehouse_id in sorted(financial_terms)
+        ],
     }
     plan_hash = _hash(canonical_plan)
     if old_state and old_state["plan_hash"] == plan_hash:
@@ -660,6 +724,35 @@ def plan_order(
                 actor_name,
             ),
         )
+        finance = financial_terms[warehouse_id]
+        conn.execute(
+            '''INSERT INTO oms_fulfillment_financials
+               (fulfillment_id, payment_method, cod_collection_role, cod_amount,
+                cod_currency, settlement_mode, fee_currency,
+                reconciliation_status, notes)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(fulfillment_id) DO UPDATE SET
+                 payment_method=excluded.payment_method,
+                 cod_collection_role=excluded.cod_collection_role,
+                 cod_amount=excluded.cod_amount,
+                 cod_currency=excluded.cod_currency,
+                 settlement_mode=excluded.settlement_mode,
+                 fee_currency=excluded.fee_currency,
+                 reconciliation_status=excluded.reconciliation_status,
+                 notes=excluded.notes,
+                 updated_at=CURRENT_TIMESTAMP''',
+            (
+                fid,
+                finance["payment_method"],
+                finance["cod_collection_role"],
+                finance["cod_amount"],
+                finance["cod_currency"],
+                finance["settlement_mode"],
+                finance["fee_currency"],
+                finance["reconciliation_status"],
+                finance["notes"],
+            ),
+        )
         allocated_by_item = defaultdict(int)
         for line in lines:
             sku = conn.execute(
@@ -696,7 +789,11 @@ def plan_order(
             "created",
             to_status=status,
             actor=actor,
-            payload={"revision": revision, "warehouse_id": warehouse_id},
+            payload={
+                "revision": revision,
+                "warehouse_id": warehouse_id,
+                "financial_terms": finance,
+            },
         )
         created.append(fid)
         if mode == "external_wms" and not has_shortage and integration and integration["auto_submit"]:
@@ -755,10 +852,15 @@ def build_invoice_code(order: sqlite3.Row | dict, integration: sqlite3.Row | dic
 def build_wms_payload(conn: sqlite3.Connection, fulfillment_id: str) -> dict:
     fulfillment = conn.execute(
         '''SELECT f.*, wi.config_json, o.total, o.currency, o.payment_method,
-                  o.billing, o.shipping, o.line_items, o.source
+                  o.billing, o.shipping, o.line_items, o.source,
+                  w.country AS warehouse_country,
+                  ff.cod_collection_role, ff.cod_amount,
+                  ff.cod_currency, ff.settlement_mode
            FROM oms_fulfillments f
            JOIN orders o ON o.id=f.order_id
+           LEFT JOIN warehouses w ON w.id=f.warehouse_id
            LEFT JOIN oms_warehouse_integrations wi ON wi.warehouse_id=f.warehouse_id
+           LEFT JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
            WHERE f.id=?''',
         (fulfillment_id,),
     ).fetchone()
@@ -825,7 +927,30 @@ def build_wms_payload(conn: sqlite3.Connection, fulfillment_id: str) -> dict:
             pass
 
     is_cod = (fulfillment["payment_method"] or "").lower() == "cod"
-    total = str(fulfillment["total"] or "0") if is_cod else "0"
+    role = fulfillment["cod_collection_role"]
+    if not is_cod:
+        total = "0.00"
+    elif role == "collector":
+        total = _money_text(fulfillment["cod_amount"])
+    elif role == "instruction_only":
+        total = "0.00"
+    else:
+        # Compatibility fallback for a pre-007 row: a Hungary fulfillment in
+        # a Poland+Hungary split must still fail safe to zero COD.
+        countries = {
+            (row["country"] or "").upper()
+            for row in conn.execute(
+                '''SELECT w.country
+                   FROM oms_fulfillments f
+                   LEFT JOIN warehouses w ON w.id=f.warehouse_id
+                   WHERE f.order_id=? AND f.revision=? AND f.status!='superseded' ''',
+                (fulfillment["order_id"], fulfillment["revision"]),
+            ).fetchall()
+        }
+        if (fulfillment["warehouse_country"] or "").upper() == "HU" and {"PL", "HU"}.issubset(countries):
+            total = "0.00"
+        else:
+            total = _money_text(fulfillment["total"])
     address_1 = (address.get("address_1") or "").strip()
     address_2 = (address.get("address_2") or "").strip()
     if not address_1:
