@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import time
 from typing import Any
@@ -10,7 +11,12 @@ from typing import Any
 import requests
 
 from fulfillment_common import json_load, utcnow
-from fulfillment_service import DomainError, completion_guard, record_event
+from fulfillment_service import (
+    DomainError,
+    SHIPMENT_NOTIFICATION_TEMPLATE_VERSION,
+    completion_guard,
+    record_event,
+)
 from oid_utils import woo_post_id
 
 
@@ -27,6 +33,7 @@ API_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
 }
+NOTIFICATION_TEMPLATE_VERSION = SHIPMENT_NOTIFICATION_TEMPLATE_VERSION
 
 
 def detect_tracking_format(conn, site_url: str) -> str:
@@ -243,13 +250,66 @@ def _request(method: str, url: str, site, *, payload=None, timeout=60):
         return {}
 
 
-def _post_customer_note(site, order, shipment, tracking_url: str = "") -> None:
-    tracking = shipment["tracking_number"]
-    carrier = shipment["carrier_name"] or shipment["carrier_slug"] or "物流商"
+def _shipment_financial_context(conn, fulfillment_id: str) -> dict:
+    row = conn.execute(
+        '''SELECT ff.*, w.name AS warehouse_name, w.country AS warehouse_country,
+                  (SELECT COUNT(*)
+                   FROM oms_fulfillments active
+                   WHERE active.order_id=f.order_id
+                     AND active.revision=f.revision
+                     AND active.status NOT IN ('cancelled','superseded')) AS fulfillment_count
+           FROM oms_fulfillments f
+           LEFT JOIN warehouses w ON w.id=f.warehouse_id
+           LEFT JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
+           WHERE f.id=?''',
+        (fulfillment_id,),
+    ).fetchone()
+    return dict(row) if row else {}
+
+
+def _customer_note_body(conn, order, shipment: dict, tracking_url: str = "") -> str:
+    tracking = html.escape(str(shipment["tracking_number"]))
+    carrier = html.escape(
+        str(shipment.get("carrier_name") or shipment.get("carrier_slug") or "物流商")
+    )
+    finance = _shipment_financial_context(conn, shipment["fulfillment_id"])
+    warehouse = html.escape(
+        str(finance.get("warehouse_name") or finance.get("warehouse_country") or "仓库")
+    )
     if tracking_url:
-        body = f"您的订单已有一个包裹通过 {carrier} 发出。运单号：<a href='{tracking_url}'>{tracking}</a>。订单内其他商品可能由另一仓库分批发出。"
+        safe_url = html.escape(str(tracking_url), quote=True)
+        tracking_part = f"<a href='{safe_url}'>{tracking}</a>"
     else:
-        body = f"您的订单已有一个包裹通过 {carrier} 发出。运单号：{tracking}。订单内其他商品可能由另一仓库分批发出。"
+        tracking_part = tracking
+    body = (
+        f"您的订单已有一个包裹从 {warehouse} 通过 {carrier} 发出。"
+        f"运单号：{tracking_part}。"
+    )
+    if str(order["payment_method"] or "").lower() == "cod":
+        if not finance or finance.get("cod_collection_role") not in {"collector", "instruction_only"}:
+            raise WooError("包裹缺少 COD 金额快照，已阻止发送含糊的客户通知", code="cod_notice_missing")
+        amount = html.escape(str(finance.get("cod_amount") or "0.00"))
+        currency = html.escape(str(finance.get("cod_currency") or order["currency"] or ""))
+        body += f"本包裹货到付款金额：{amount} {currency}。"
+        if int(finance.get("fulfillment_count") or 0) > 1:
+            shipping = str(finance.get("customer_shipping_amount") or "0.00")
+            if float(shipping) > 0:
+                body += (
+                    f"其中包含本订单全部客户运费 {html.escape(shipping)} {currency}；"
+                    "其他仓库包裹不会重复收取订单运费。"
+                )
+            else:
+                body += "本包裹只收取所含商品金额，不重复收取订单运费。"
+            body += "同一订单的其他仓库包裹将分别收取对应商品金额。"
+    else:
+        body += "本包裹无需货到付款。"
+    if int(finance.get("fulfillment_count") or 0) > 1:
+        body += "订单内其他商品将由另一仓库分批发出。"
+    return body
+
+
+def _post_customer_note(conn, site, order, shipment, tracking_url: str = "") -> None:
+    body = _customer_note_body(conn, order, shipment, tracking_url)
     url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes"
     _request("POST", url, site, payload={"note": body, "customer_note": True}, timeout=45)
 
@@ -257,51 +317,63 @@ def _post_customer_note(site, order, shipment, tracking_url: str = "") -> None:
 def _notify_shipment(conn, site, order, shipment: dict, fmt: str, final: bool) -> str:
     notification = conn.execute(
         '''SELECT * FROM oms_shipment_notifications
-           WHERE shipment_id=? AND channel='email' AND template_version='ast-v1' ''',
-        (shipment["id"],),
+           WHERE shipment_id=? AND channel='email' AND template_version=? ''',
+        (shipment["id"], NOTIFICATION_TEMPLATE_VERSION),
     ).fetchone()
     if notification and notification["status"] == "sent":
         return "already_sent"
     try:
-        trigger_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/trigger-shipment-email"
-        response = requests.post(
-            trigger_url,
-            json={"tracking_number": shipment["tracking_number"], "carrier_slug": shipment["carrier_slug"]},
-            params={"consumer_key": site["consumer_key"], "consumer_secret": site["consumer_secret"]},
-            headers=API_HEADERS,
-            timeout=30,
+        finance = _shipment_financial_context(conn, shipment["fulfillment_id"])
+        split_cod = (
+            str(order["payment_method"] or "").lower() == "cod"
+            and int(finance.get("fulfillment_count") or 0) > 1
         )
-        data = response.json() if response.status_code == 200 and response.text else {}
-        plugin = data.get("plugin")
-        sent = data.get("email_sent")
-        # AST only sends on the final status->shipped transition.  A partial
-        # shipment has no status transition, so guarantee the per-parcel notice
-        # with an idempotent Woo customer note.
-        if fmt == "ast" and not final:
-            _post_customer_note(site, order, shipment)
-            result = "sent_partial_customer_note"
-        elif sent is True or (fmt == "ast" and final):
-            result = f"sent_{plugin or fmt}"
-        elif response.status_code == 404 or sent is False:
-            _post_customer_note(site, order, shipment)
-            result = "sent_customer_note_fallback"
+        if split_cod:
+            # A single generic AST template cannot explain two different COD
+            # amounts safely.  Use one idempotent customer-note email per
+            # parcel; tracking metadata is still written to AST.
+            _post_customer_note(conn, site, order, shipment)
+            result = "sent_split_cod_customer_note"
         else:
-            # AST final email is queued asynchronously and returns null.
-            result = f"scheduled_{plugin or fmt}"
+            trigger_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/trigger-shipment-email"
+            response = requests.post(
+                trigger_url,
+                json={"tracking_number": shipment["tracking_number"], "carrier_slug": shipment["carrier_slug"]},
+                params={"consumer_key": site["consumer_key"], "consumer_secret": site["consumer_secret"]},
+                headers=API_HEADERS,
+                timeout=30,
+            )
+            data = response.json() if response.status_code == 200 and response.text else {}
+            plugin = data.get("plugin")
+            sent = data.get("email_sent")
+            # AST only sends on the final status->shipped transition.  A partial
+            # shipment has no status transition, so guarantee the per-parcel
+            # notice with an idempotent Woo customer note.
+            if fmt == "ast" and not final:
+                _post_customer_note(conn, site, order, shipment)
+                result = "sent_partial_customer_note"
+            elif sent is True or (fmt == "ast" and final):
+                result = f"sent_{plugin or fmt}"
+            elif response.status_code == 404 or sent is False:
+                _post_customer_note(conn, site, order, shipment)
+                result = "sent_customer_note_fallback"
+            else:
+                # AST final email is queued asynchronously and returns null.
+                result = f"scheduled_{plugin or fmt}"
     except Exception as exc:
         conn.execute(
             '''UPDATE oms_shipment_notifications
                SET status='failed', attempts=attempts+1, last_error=?, updated_at=CURRENT_TIMESTAMP
-               WHERE shipment_id=? AND channel='email' AND template_version='ast-v1' ''',
-            (str(exc)[:500], shipment["id"]),
+               WHERE shipment_id=? AND channel='email' AND template_version=? ''',
+            (str(exc)[:500], shipment["id"], NOTIFICATION_TEMPLATE_VERSION),
         )
         raise WooError(f"发货邮件触发失败: {exc}", code="email_failed", retryable=True) from exc
     conn.execute(
         '''UPDATE oms_shipment_notifications
            SET status='sent', attempts=attempts+1, provider_message_id=?,
                sent_at=?, last_error=NULL, updated_at=CURRENT_TIMESTAMP
-           WHERE shipment_id=? AND channel='email' AND template_version='ast-v1' ''',
-        (result, utcnow(), shipment["id"]),
+           WHERE shipment_id=? AND channel='email' AND template_version=? ''',
+        (result, utcnow(), shipment["id"], NOTIFICATION_TEMPLATE_VERSION),
     )
     return result
 
