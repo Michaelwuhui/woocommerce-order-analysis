@@ -303,6 +303,9 @@ def list_fulfillment_orders():
         rows = conn.execute(
             f'''SELECT f.*, w.name AS warehouse_name, w.country AS warehouse_country,
                        ff.cod_collection_role, ff.cod_amount, ff.cod_currency,
+                       ff.merchandise_amount, ff.customer_shipping_amount,
+                       ff.order_adjustment_amount, ff.source_order_total,
+                       ff.source_shipping_total, ff.allocation_method,
                        ff.settlement_mode, ff.reconciliation_status,
                        o.number AS order_number, o.date_created AS order_date,
                        o.source, s.country AS market_code,
@@ -366,6 +369,9 @@ def fulfillment_order_detail(order_id):
             return jsonify({"error": "订单尚未建立履约计划"}), 404
         query = '''SELECT f.*, w.name AS warehouse_name, w.country AS warehouse_country,
                           ff.cod_collection_role, ff.cod_amount, ff.cod_currency,
+                          ff.merchandise_amount, ff.customer_shipping_amount,
+                          ff.order_adjustment_amount, ff.source_order_total,
+                          ff.source_shipping_total, ff.allocation_method,
                           ff.settlement_mode, ff.statement_month,
                           ff.warehouse_storage_fee, ff.warehouse_shipping_fee,
                           ff.fee_currency, ff.reconciliation_status

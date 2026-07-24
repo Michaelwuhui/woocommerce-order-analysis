@@ -494,21 +494,92 @@ def _upsert_order_state(
     )
 
 
-def _money_text(value: Any) -> str:
+MONEY_QUANTUM = Decimal("0.01")
+SHIPMENT_NOTIFICATION_TEMPLATE_VERSION = "ast-v2-cod-allocation"
+
+
+def _money_decimal(value: Any) -> Decimal:
     try:
-        return format(Decimal(str(value or "0")).quantize(Decimal("0.01")), "f")
+        return Decimal(str(value if value not in (None, "") else "0"))
     except (InvalidOperation, TypeError, ValueError):
-        return "0.00"
+        return Decimal("0")
+
+
+def _money_text(value: Any) -> str:
+    return format(_money_decimal(value).quantize(MONEY_QUANTUM), "f")
+
+
+def _allocated_merchandise_by_warehouse(
+    assignments: dict[int, list[dict]],
+    items: list[dict],
+) -> dict[int, Decimal]:
+    """Allocate Woo line gross totals by fulfillment quantity.
+
+    WooCommerce line ``total`` is the after-discount merchandise amount and
+    ``total_tax`` is added because COD collects the customer's gross payable
+    amount.  Rounding is performed per order line, with the final warehouse
+    receiving that line's remainder so no cent is lost or duplicated.
+    """
+
+    result = {
+        int(warehouse_id): Decimal("0.00")
+        for warehouse_id in assignments
+    }
+    quantities_by_item: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for warehouse_id, lines in assignments.items():
+        for line in lines:
+            quantities_by_item[int(line["order_item_id"])][int(warehouse_id)] += int(line["qty"])
+
+    items_by_id = {int(item["id"]): item for item in items}
+    for order_item_id, warehouse_quantities in quantities_by_item.items():
+        item = items_by_id.get(order_item_id)
+        if not item:
+            raise DomainError("分仓商品行不存在，无法计算 COD 金额", "financial_item_missing")
+        raw = json_load(item["raw_json"], {}) or {}
+        if "total" not in raw:
+            raise DomainError(
+                f"商品“{item['name']}”缺少 WooCommerce 最终金额，无法安全计算 COD",
+                "line_amount_missing",
+            )
+        ordered_qty = int(item["ordered_qty"] or raw.get("quantity") or 0)
+        if ordered_qty <= 0:
+            raise DomainError(
+                f"商品“{item['name']}”数量无效，无法安全计算 COD",
+                "line_quantity_invalid",
+            )
+        line_gross = _money_decimal(raw.get("total")) + _money_decimal(raw.get("total_tax"))
+        allocated_qty = sum(warehouse_quantities.values())
+        allocated_gross = (
+            line_gross * Decimal(allocated_qty) / Decimal(ordered_qty)
+        ).quantize(MONEY_QUANTUM)
+        remaining = allocated_gross
+        ordered_warehouses = sorted(warehouse_quantities)
+        for position, warehouse_id in enumerate(ordered_warehouses):
+            if position == len(ordered_warehouses) - 1:
+                share = remaining
+            else:
+                share = (
+                    line_gross
+                    * Decimal(warehouse_quantities[warehouse_id])
+                    / Decimal(ordered_qty)
+                ).quantize(MONEY_QUANTUM)
+                remaining -= share
+            result[warehouse_id] += share
+    return {
+        warehouse_id: amount.quantize(MONEY_QUANTUM)
+        for warehouse_id, amount in result.items()
+    }
 
 
 def _financial_terms_by_warehouse(
     conn: sqlite3.Connection,
     order: sqlite3.Row | dict,
-    warehouse_ids,
+    assignments: dict[int, list[dict]],
+    items: list[dict],
 ) -> dict[int, dict]:
-    """Assign customer COD ownership without mixing in warehouse fees."""
+    """Snapshot customer charges without mixing in warehouse settlement fees."""
 
-    ids = sorted({int(warehouse_id) for warehouse_id in warehouse_ids})
+    ids = sorted({int(warehouse_id) for warehouse_id in assignments})
     if not ids:
         return {}
     placeholders = ",".join("?" for _ in ids)
@@ -522,33 +593,79 @@ def _financial_terms_by_warehouse(
     assigned_countries = set(countries.values())
     is_cod = str(order["payment_method"] or "").lower() == "cod"
     split_pl_hu = {"PL", "HU"}.issubset(assigned_countries)
-    full_cod_amount = _money_text(order["total"])
+    order_total = _money_decimal(order["total"]).quantize(MONEY_QUANTUM)
+    shipping_total = _money_decimal(order["shipping_total"]).quantize(MONEY_QUANTUM)
     currency = order["currency"] or "EUR"
+    merchandise = _allocated_merchandise_by_warehouse(assignments, items)
+
+    # Customer shipping is an order-level charge.  Poland collects it for a
+    # PL+HU split; a single-warehouse order collects its own complete total.
+    poland_ids = [warehouse_id for warehouse_id in ids if countries.get(warehouse_id) == "PL"]
+    shipping_collector_id = poland_ids[0] if poland_ids else ids[0]
+    merchandise_total = sum(merchandise.values(), Decimal("0.00"))
+    residual = (order_total - merchandise_total).quantize(MONEY_QUANTUM)
+
+    cod_by_warehouse = {
+        warehouse_id: merchandise.get(warehouse_id, Decimal("0.00"))
+        for warehouse_id in ids
+    }
+    if is_cod:
+        cod_by_warehouse[shipping_collector_id] += residual
+        if any(amount < 0 for amount in cod_by_warehouse.values()):
+            raise DomainError(
+                "分仓 COD 金额出现负数；订单总额与商品金额不一致，已阻止发货",
+                "cod_allocation_negative",
+            )
+        allocated_total = sum(cod_by_warehouse.values(), Decimal("0.00")).quantize(MONEY_QUANTUM)
+        if allocated_total != order_total:
+            raise DomainError(
+                "分仓 COD 金额合计与 WooCommerce 订单总额不一致，已阻止发货",
+                "cod_allocation_mismatch",
+            )
+
     result = {}
     for warehouse_id in ids:
         country = countries.get(warehouse_id, "")
+        customer_shipping = shipping_total if warehouse_id == shipping_collector_id else Decimal("0.00")
+        order_adjustment = (
+            residual - shipping_total
+            if warehouse_id == shipping_collector_id
+            else Decimal("0.00")
+        )
         if not is_cod:
             role, cod_amount = "not_applicable", "0.00"
-        elif split_pl_hu:
-            # The Poland parcel collects the complete customer COD.  Hungary
-            # receives a shipping instruction only and must never collect COD.
-            role = "collector" if country == "PL" else "instruction_only"
-            cod_amount = full_cod_amount if country == "PL" else "0.00"
         else:
-            role, cod_amount = "collector", full_cod_amount
+            cod_amount = _money_text(cod_by_warehouse[warehouse_id])
+            role = "collector" if _money_decimal(cod_amount) > 0 else "instruction_only"
+        if split_pl_hu and country == "PL":
+            notes = "波兰仓代收本仓商品金额和订单全部客户运费"
+        elif split_pl_hu and country == "HU":
+            notes = "匈牙利仓仅代收本仓商品金额；仓储费与运输费按供应商月结账单核对"
+        elif country == "HU":
+            notes = "匈牙利单仓代收订单全部应付金额；仓储费与运输费按供应商月结账单核对"
+        elif is_cod:
+            notes = "单仓代收订单全部应付金额"
+        else:
+            notes = "非货到付款订单"
         result[warehouse_id] = {
             "payment_method": order["payment_method"] or "",
             "cod_collection_role": role,
             "cod_amount": cod_amount,
             "cod_currency": currency,
+            "merchandise_amount": _money_text(merchandise.get(warehouse_id, 0)),
+            "customer_shipping_amount": _money_text(customer_shipping),
+            "order_adjustment_amount": _money_text(order_adjustment),
+            "source_order_total": _money_text(order_total),
+            "source_shipping_total": _money_text(shipping_total),
+            "allocation_method": (
+                "woo_line_gross_residual_to_poland"
+                if split_pl_hu
+                else "woo_line_gross_residual_to_single_warehouse"
+            ),
             "settlement_mode": "monthly_statement" if country == "HU" else "internal",
             "fee_currency": currency,
             "reconciliation_status": "unbilled",
-            "notes": (
-                "匈牙利仓仓储费与运输费按供应商月结账单核对"
-                if country == "HU"
-                else "波兰仓负责客户 COD 代收" if role == "collector" else ""
-            ),
+            "notes": notes,
         }
     return result
 
@@ -634,7 +751,7 @@ def plan_order(
                 "qty": remaining, "reason": "out_of_stock",
             })
 
-    financial_terms = _financial_terms_by_warehouse(conn, order, assignments.keys())
+    financial_terms = _financial_terms_by_warehouse(conn, order, assignments, items)
     canonical_plan = {
         "order_id": order_id,
         "market": market,
@@ -728,14 +845,22 @@ def plan_order(
         conn.execute(
             '''INSERT INTO oms_fulfillment_financials
                (fulfillment_id, payment_method, cod_collection_role, cod_amount,
-                cod_currency, settlement_mode, fee_currency,
+                cod_currency, merchandise_amount, customer_shipping_amount,
+                order_adjustment_amount, source_order_total, source_shipping_total,
+                allocation_method, settlement_mode, fee_currency,
                 reconciliation_status, notes)
-               VALUES (?,?,?,?,?,?,?,?,?)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(fulfillment_id) DO UPDATE SET
                  payment_method=excluded.payment_method,
                  cod_collection_role=excluded.cod_collection_role,
                  cod_amount=excluded.cod_amount,
                  cod_currency=excluded.cod_currency,
+                 merchandise_amount=excluded.merchandise_amount,
+                 customer_shipping_amount=excluded.customer_shipping_amount,
+                 order_adjustment_amount=excluded.order_adjustment_amount,
+                 source_order_total=excluded.source_order_total,
+                 source_shipping_total=excluded.source_shipping_total,
+                 allocation_method=excluded.allocation_method,
                  settlement_mode=excluded.settlement_mode,
                  fee_currency=excluded.fee_currency,
                  reconciliation_status=excluded.reconciliation_status,
@@ -747,6 +872,12 @@ def plan_order(
                 finance["cod_collection_role"],
                 finance["cod_amount"],
                 finance["cod_currency"],
+                finance["merchandise_amount"],
+                finance["customer_shipping_amount"],
+                finance["order_adjustment_amount"],
+                finance["source_order_total"],
+                finance["source_shipping_total"],
+                finance["allocation_method"],
                 finance["settlement_mode"],
                 finance["fee_currency"],
                 finance["reconciliation_status"],
@@ -853,9 +984,11 @@ def build_wms_payload(conn: sqlite3.Connection, fulfillment_id: str) -> dict:
     fulfillment = conn.execute(
         '''SELECT f.*, wi.config_json, o.total, o.currency, o.payment_method,
                   o.billing, o.shipping, o.line_items, o.source,
-                  w.country AS warehouse_country,
-                  ff.cod_collection_role, ff.cod_amount,
-                  ff.cod_currency, ff.settlement_mode
+                   w.country AS warehouse_country,
+                   ff.cod_collection_role, ff.cod_amount,
+                   ff.cod_currency, ff.settlement_mode,
+                   ff.merchandise_amount, ff.customer_shipping_amount,
+                   ff.order_adjustment_amount, ff.allocation_method
            FROM oms_fulfillments f
            JOIN orders o ON o.id=f.order_id
            LEFT JOIN warehouses w ON w.id=f.warehouse_id
@@ -931,26 +1064,19 @@ def build_wms_payload(conn: sqlite3.Connection, fulfillment_id: str) -> dict:
     if not is_cod:
         total = "0.00"
     elif role == "collector":
+        if fulfillment["allocation_method"] == "legacy_requires_replan":
+            raise DomainError(
+                "该履约单仍使用旧 COD 金额规则，请重新分仓后再提交 WMS",
+                "cod_replan_required",
+            )
         total = _money_text(fulfillment["cod_amount"])
     elif role == "instruction_only":
         total = "0.00"
     else:
-        # Compatibility fallback for a pre-007 row: a Hungary fulfillment in
-        # a Poland+Hungary split must still fail safe to zero COD.
-        countries = {
-            (row["country"] or "").upper()
-            for row in conn.execute(
-                '''SELECT w.country
-                   FROM oms_fulfillments f
-                   LEFT JOIN warehouses w ON w.id=f.warehouse_id
-                   WHERE f.order_id=? AND f.revision=? AND f.status!='superseded' ''',
-                (fulfillment["order_id"], fulfillment["revision"]),
-            ).fetchall()
-        }
-        if (fulfillment["warehouse_country"] or "").upper() == "HU" and {"PL", "HU"}.issubset(countries):
-            total = "0.00"
-        else:
-            total = _money_text(fulfillment["total"])
+        raise DomainError(
+            "履约单缺少明确的 COD 收款责任，已阻止提交 WMS",
+            "cod_financial_terms_missing",
+        )
     address_1 = (address.get("address_1") or "").strip()
     address_2 = (address.get("address_2") or "").strip()
     if not address_1:
@@ -1060,9 +1186,9 @@ def create_shipment(
     conn.execute(
         '''INSERT INTO oms_shipment_notifications
            (shipment_id, channel, template_version, status)
-           VALUES (?, 'email', 'ast-v1', 'pending')
+           VALUES (?, 'email', ?, 'pending')
            ON CONFLICT(shipment_id, channel, template_version) DO NOTHING''',
-        (shipment_id,),
+        (shipment_id, SHIPMENT_NOTIFICATION_TEMPLATE_VERSION),
     )
     if SHIPMENT_PROGRESS.get(initial_status, 0) >= 2:
         _enqueue_shipment_side_effects(conn, fulfillment, shipment_id, "created")

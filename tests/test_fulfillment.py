@@ -12,8 +12,8 @@ from fulfillment_service import (
     recompute_order_status,
     transition_fulfillment,
 )
-from inv_migrations import up_001, up_006, up_007
-from fulfillment_woocommerce import _all_order_shipments, _ast_items
+from inv_migrations import up_001, up_006, up_007, up_008
+from fulfillment_woocommerce import _all_order_shipments, _ast_items, _customer_note_body
 
 
 class FulfillmentDomainTests(unittest.TestCase):
@@ -33,7 +33,7 @@ class FulfillmentDomainTests(unittest.TestCase):
             CREATE TABLE orders (
               id TEXT PRIMARY KEY, number TEXT, status TEXT, source TEXT,
               line_items TEXT, billing TEXT, shipping TEXT, total REAL,
-              currency TEXT, payment_method TEXT, date_created TEXT
+              shipping_total REAL, currency TEXT, payment_method TEXT, date_created TEXT
             );
             """
         )
@@ -48,6 +48,7 @@ class FulfillmentDomainTests(unittest.TestCase):
         up_001(self.db)
         up_006(self.db)
         up_007(self.db)
+        up_008(self.db)
         self.db.execute(
             "INSERT INTO inv_skus (id,sku_code,name,barcode,is_active) VALUES (1,'SKU1','Test product','BAR1',1)"
         )
@@ -86,15 +87,52 @@ class FulfillmentDomainTests(unittest.TestCase):
         )
         self.db.commit()
 
-    def add_order(self, oid, market, qty=1):
+    def add_order(
+        self,
+        oid,
+        market,
+        qty=1,
+        *,
+        shipping_total=0,
+        currency="EUR",
+        line_total=None,
+        line_tax=0,
+        order_total=None,
+        payment_method="cod",
+    ):
         site = {"PL": "https://pl.test", "HU": "https://hu.test", "CZ": "https://cz.test"}[market]
-        item = {"id": 501, "product_id": 101, "variation_id": 0, "sku": "SKU1", "name": "Test product", "quantity": qty, "total": str(qty * 10)}
+        if line_total is None:
+            line_total = qty * 10
+        if order_total is None:
+            order_total = Decimal(str(line_total)) + Decimal(str(line_tax)) + Decimal(str(shipping_total))
+        item = {
+            "id": 501,
+            "product_id": 101,
+            "variation_id": 0,
+            "sku": "SKU1",
+            "name": "Test product",
+            "quantity": qty,
+            "total": str(line_total),
+            "total_tax": str(line_tax),
+        }
         address = {"first_name": "Test", "last_name": "Buyer", "email": "buyer@example.test", "phone": "123456", "address_1": "Main 1", "address_2": "", "city": "Budapest", "state": "", "postcode": "1000", "country": market}
         self.db.execute(
             """INSERT INTO orders
-               (id,number,status,source,line_items,billing,shipping,total,currency,payment_method,date_created)
-               VALUES (?,?, 'processing', ?,?,?,?,?, 'EUR','cod','2026-07-18T10:00:00')""",
-            (oid, oid, site, json.dumps([item]), json.dumps(address), json.dumps(address), qty * 10),
+               (id,number,status,source,line_items,billing,shipping,total,
+                shipping_total,currency,payment_method,date_created)
+               VALUES (?,?, 'processing', ?,?,?,?,?,?,?,?,'2026-07-18T10:00:00')""",
+            (
+                oid,
+                oid,
+                site,
+                json.dumps([item]),
+                json.dumps(address),
+                json.dumps(address),
+                float(order_total),
+                float(shipping_total),
+                currency,
+                payment_method,
+            ),
         )
         self.db.commit()
 
@@ -172,21 +210,30 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.assertEqual(2, self.db.execute("SELECT COUNT(*) FROM oms_tracking_events WHERE shipment_id=?", (shipments[1]["id"],)).fetchone()[0])
 
     def test_wms_payload_contract_and_cod(self):
-        self.add_order("hu-wms-1", "HU", 1)
+        self.add_order("hu-wms-1", "HU", 1, shipping_total="3.49")
         result = plan_order(self.db, "hu-wms-1")
         payload = build_wms_payload(self.db, result["fulfillment_ids"][0])
         self.assertEqual("HU01", payload["storehouseCode"])
         self.assertEqual("欧洲直发-25", payload["channelCode"])
         self.assertEqual("匈牙利", payload["contry"])
-        self.assertEqual(Decimal("10"), Decimal(payload["invoicePrice"]))
+        self.assertEqual(Decimal("13.49"), Decimal(payload["invoicePrice"]))
         self.assertEqual("测试产品", payload["invoiceDetailsCreateRequests"][0]["productName"])
+        finance = self.db.execute(
+            "SELECT * FROM oms_fulfillment_financials WHERE fulfillment_id=?",
+            (result["fulfillment_ids"][0],),
+        ).fetchone()
+        self.assertEqual(Decimal("10"), Decimal(finance["merchandise_amount"]))
+        self.assertEqual(Decimal("3.49"), Decimal(finance["customer_shipping_amount"]))
 
-    def test_split_cod_is_collected_by_poland_and_hungary_gets_zero(self):
+    def test_split_cod_allocates_shipping_to_poland_and_hungary_goods_only(self):
         self.set_stock(pl=1, hu=10)
-        self.add_order("split-cod-1", "PL", 3)
+        self.add_order("split-cod-1", "PL", 3, shipping_total="3.49")
         plan_order(self.db, "split-cod-1")
         rows = self.db.execute(
             '''SELECT f.id, w.country, ff.cod_collection_role, ff.cod_amount,
+                      ff.merchandise_amount, ff.customer_shipping_amount,
+                      ff.order_adjustment_amount, ff.source_order_total,
+                      ff.source_shipping_total, ff.allocation_method,
                       ff.settlement_mode
                FROM oms_fulfillments f
                JOIN warehouses w ON w.id=f.warehouse_id
@@ -196,17 +243,142 @@ class FulfillmentDomainTests(unittest.TestCase):
         ).fetchall()
         by_country = {row["country"]: row for row in rows}
         self.assertEqual("collector", by_country["PL"]["cod_collection_role"])
-        self.assertEqual(Decimal("30"), Decimal(by_country["PL"]["cod_amount"]))
-        self.assertEqual("instruction_only", by_country["HU"]["cod_collection_role"])
-        self.assertEqual(Decimal("0"), Decimal(by_country["HU"]["cod_amount"]))
+        self.assertEqual(Decimal("13.49"), Decimal(by_country["PL"]["cod_amount"]))
+        self.assertEqual(Decimal("10"), Decimal(by_country["PL"]["merchandise_amount"]))
+        self.assertEqual(Decimal("3.49"), Decimal(by_country["PL"]["customer_shipping_amount"]))
+        self.assertEqual("collector", by_country["HU"]["cod_collection_role"])
+        self.assertEqual(Decimal("20"), Decimal(by_country["HU"]["cod_amount"]))
+        self.assertEqual(Decimal("20"), Decimal(by_country["HU"]["merchandise_amount"]))
+        self.assertEqual(Decimal("0"), Decimal(by_country["HU"]["customer_shipping_amount"]))
+        self.assertEqual(
+            Decimal("33.49"),
+            sum(Decimal(row["cod_amount"]) for row in rows),
+        )
+        self.assertEqual(
+            "woo_line_gross_residual_to_poland",
+            by_country["HU"]["allocation_method"],
+        )
         self.assertEqual("monthly_statement", by_country["HU"]["settlement_mode"])
         payload = build_wms_payload(self.db, by_country["HU"]["id"])
-        self.assertEqual(Decimal("0"), Decimal(payload["invoicePrice"]))
+        self.assertEqual(Decimal("20"), Decimal(payload["invoicePrice"]))
+
+    def test_huf_discount_tax_and_shipping_preserve_order_total(self):
+        self.set_stock(pl=1, hu=10)
+        self.add_order(
+            "split-huf-1",
+            "PL",
+            3,
+            shipping_total="3490",
+            currency="HUF",
+            line_total="27000",
+            line_tax="3000",
+            order_total="33490",
+        )
+        plan_order(self.db, "split-huf-1")
+        rows = self.db.execute(
+            '''SELECT w.country, ff.*
+               FROM oms_fulfillments f
+               JOIN warehouses w ON w.id=f.warehouse_id
+               JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
+               WHERE f.order_id='split-huf-1' AND f.status!='superseded'
+               ORDER BY w.country'''
+        ).fetchall()
+        by_country = {row["country"]: row for row in rows}
+        self.assertEqual(Decimal("13490"), Decimal(by_country["PL"]["cod_amount"]))
+        self.assertEqual(Decimal("10000"), Decimal(by_country["PL"]["merchandise_amount"]))
+        self.assertEqual(Decimal("3490"), Decimal(by_country["PL"]["customer_shipping_amount"]))
+        self.assertEqual(Decimal("20000"), Decimal(by_country["HU"]["cod_amount"]))
+        self.assertEqual(Decimal("0"), Decimal(by_country["HU"]["customer_shipping_amount"]))
+        self.assertEqual(
+            Decimal("33490"),
+            sum(Decimal(row["cod_amount"]) for row in rows),
+        )
+        order = self.db.execute(
+            "SELECT * FROM orders WHERE id='split-huf-1'"
+        ).fetchone()
+        hu_notice = _customer_note_body(
+            self.db,
+            order,
+            {
+                "fulfillment_id": by_country["HU"]["fulfillment_id"],
+                "tracking_number": "HU-TRACK-1",
+                "carrier_name": "GLS",
+                "carrier_slug": "gls",
+            },
+        )
+        self.assertIn("货到付款金额：20000.00 HUF", hu_notice)
+        self.assertIn("不重复收取订单运费", hu_notice)
+        pl_notice = _customer_note_body(
+            self.db,
+            order,
+            {
+                "fulfillment_id": by_country["PL"]["fulfillment_id"],
+                "tracking_number": "PL-TRACK-1",
+                "carrier_name": "DPD",
+                "carrier_slug": "dpd",
+            },
+        )
+        self.assertIn("货到付款金额：13490.00 HUF", pl_notice)
+        self.assertIn("全部客户运费 3490.00 HUF", pl_notice)
+
+    def test_split_rounding_keeps_exact_cod_total(self):
+        self.set_stock(pl=1, hu=10)
+        self.add_order(
+            "split-round-1",
+            "PL",
+            3,
+            shipping_total="3.49",
+            line_total="10.00",
+            order_total="13.49",
+        )
+        plan_order(self.db, "split-round-1")
+        amounts = {
+            row["country"]: Decimal(row["cod_amount"])
+            for row in self.db.execute(
+                '''SELECT w.country, ff.cod_amount
+                   FROM oms_fulfillments f
+                   JOIN warehouses w ON w.id=f.warehouse_id
+                   JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
+                   WHERE f.order_id='split-round-1' AND f.status!='superseded' '''
+            ).fetchall()
+        }
+        self.assertEqual(Decimal("6.82"), amounts["PL"])
+        self.assertEqual(Decimal("6.67"), amounts["HU"])
+        self.assertEqual(Decimal("13.49"), sum(amounts.values()))
+
+    def test_order_level_fee_stays_with_poland_collector(self):
+        self.set_stock(pl=1, hu=10)
+        self.add_order(
+            "split-fee-1",
+            "PL",
+            3,
+            shipping_total="3.49",
+            line_total="30",
+            order_total="35.49",
+        )
+        plan_order(self.db, "split-fee-1")
+        rows = self.db.execute(
+            '''SELECT w.country, ff.cod_amount, ff.customer_shipping_amount,
+                      ff.order_adjustment_amount
+               FROM oms_fulfillments f
+               JOIN warehouses w ON w.id=f.warehouse_id
+               JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
+               WHERE f.order_id='split-fee-1' AND f.status!='superseded' '''
+        ).fetchall()
+        by_country = {row["country"]: row for row in rows}
+        self.assertEqual(Decimal("15.49"), Decimal(by_country["PL"]["cod_amount"]))
+        self.assertEqual(Decimal("3.49"), Decimal(by_country["PL"]["customer_shipping_amount"]))
+        self.assertEqual(Decimal("2.00"), Decimal(by_country["PL"]["order_adjustment_amount"]))
+        self.assertEqual(Decimal("20.00"), Decimal(by_country["HU"]["cod_amount"]))
+        self.assertEqual(Decimal("35.49"), sum(Decimal(row["cod_amount"]) for row in rows))
 
     def test_prepaid_hungary_never_receives_cod_amount(self):
-        self.add_order("hu-prepaid-1", "HU", 1)
-        self.db.execute(
-            "UPDATE orders SET payment_method='bacs' WHERE id='hu-prepaid-1'"
+        self.add_order(
+            "hu-prepaid-1",
+            "HU",
+            1,
+            shipping_total="3.49",
+            payment_method="bacs",
         )
         result = plan_order(self.db, "hu-prepaid-1")
         payload = build_wms_payload(self.db, result["fulfillment_ids"][0])
@@ -216,6 +388,8 @@ class FulfillmentDomainTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("not_applicable", finance["cod_collection_role"])
         self.assertEqual("monthly_statement", finance["settlement_mode"])
+        self.assertEqual(Decimal("10"), Decimal(finance["merchandise_amount"]))
+        self.assertEqual(Decimal("3.49"), Decimal(finance["customer_shipping_amount"]))
         self.assertEqual(Decimal("0"), Decimal(payload["invoicePrice"]))
 
     def test_ast_excludes_wms_label_until_actual_outbound(self):

@@ -1011,6 +1011,117 @@ def down_007(conn):
     conn.commit()
 
 
+# ───────────────── 008: 分仓 COD 商品与客户运费快照 ─────────────────
+
+def up_008(conn):
+    """Separate merchandise, customer shipping and order-level adjustments.
+
+    WooCommerce remains the source of truth for the order total and the
+    customer-facing shipping charge.  For a Poland+Hungary COD split, Poland
+    collects its merchandise plus the full customer shipping charge while
+    Hungary collects only its allocated merchandise amount.
+    """
+
+    columns = {
+        row['name']
+        for row in conn.execute('PRAGMA table_info(oms_fulfillment_financials)').fetchall()
+    }
+    additions = [
+        ('merchandise_amount', "TEXT NOT NULL DEFAULT '0'"),
+        ('customer_shipping_amount', "TEXT NOT NULL DEFAULT '0'"),
+        ('order_adjustment_amount', "TEXT NOT NULL DEFAULT '0'"),
+        ('source_order_total', 'TEXT'),
+        ('source_shipping_total', 'TEXT'),
+        ('allocation_method', "TEXT NOT NULL DEFAULT 'legacy_requires_replan'"),
+    ]
+    for name, definition in additions:
+        if name not in columns:
+            conn.execute(
+                f'ALTER TABLE oms_fulfillment_financials ADD COLUMN {name} {definition}'
+            )
+
+    conn.execute(
+        '''UPDATE oms_fulfillment_financials
+           SET source_order_total=(
+                 SELECT CAST(o.total AS TEXT)
+                 FROM oms_fulfillments f JOIN orders o ON o.id=f.order_id
+                 WHERE f.id=oms_fulfillment_financials.fulfillment_id
+               ),
+               source_shipping_total=(
+                 SELECT CAST(COALESCE(o.shipping_total,0) AS TEXT)
+                 FROM oms_fulfillments f JOIN orders o ON o.id=f.order_id
+                 WHERE f.id=oms_fulfillment_financials.fulfillment_id
+               )
+           WHERE source_order_total IS NULL OR source_shipping_total IS NULL'''
+    )
+
+    # Existing split COD rows were created under migration 007's old
+    # "Poland collects everything" rule.  Never silently submit those rows
+    # under the new contract: require an explicit re-plan first.
+    conn.execute(
+        '''UPDATE oms_order_fulfillment_state
+           SET aggregate_status='manual_review', manual_review=1,
+               manual_reason='COD 分仓金额规则已更新，请重新分仓后再发货',
+               updated_at=CURRENT_TIMESTAMP
+           WHERE order_id IN (
+             SELECT f.order_id
+             FROM oms_fulfillments f
+             JOIN orders o ON o.id=f.order_id
+             JOIN warehouses w ON w.id=f.warehouse_id
+             WHERE f.status NOT IN ('cancelled','superseded','delivered','returned')
+               AND LOWER(COALESCE(o.payment_method,''))='cod'
+             GROUP BY f.order_id, f.revision
+             HAVING SUM(CASE WHEN UPPER(COALESCE(w.country,''))='PL' THEN 1 ELSE 0 END)>0
+                AND SUM(CASE WHEN UPPER(COALESCE(w.country,''))='HU' THEN 1 ELSE 0 END)>0
+           )'''
+    )
+    conn.commit()
+
+
+def down_008(conn):
+    """Restore the migration-007 financial table while preserving its rows."""
+
+    conn.executescript('''
+        DROP INDEX IF EXISTS idx_oms_ff_statement;
+        ALTER TABLE oms_fulfillment_financials
+            RENAME TO oms_fulfillment_financials_pre008;
+
+        CREATE TABLE oms_fulfillment_financials (
+            fulfillment_id          TEXT PRIMARY KEY,
+            payment_method          TEXT,
+            cod_collection_role     TEXT NOT NULL DEFAULT 'not_applicable',
+            cod_amount              TEXT NOT NULL DEFAULT '0',
+            cod_currency            TEXT,
+            settlement_mode         TEXT NOT NULL DEFAULT 'internal',
+            statement_month         TEXT,
+            warehouse_storage_fee   TEXT,
+            warehouse_shipping_fee  TEXT,
+            fee_currency            TEXT,
+            reconciliation_status   TEXT NOT NULL DEFAULT 'unbilled',
+            notes                   TEXT,
+            created_at              TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at              TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (fulfillment_id) REFERENCES oms_fulfillments(id) ON DELETE RESTRICT
+        );
+
+        INSERT INTO oms_fulfillment_financials
+            (fulfillment_id, payment_method, cod_collection_role, cod_amount,
+             cod_currency, settlement_mode, statement_month,
+             warehouse_storage_fee, warehouse_shipping_fee, fee_currency,
+             reconciliation_status, notes, created_at, updated_at)
+        SELECT fulfillment_id, payment_method, cod_collection_role, cod_amount,
+               cod_currency, settlement_mode, statement_month,
+               warehouse_storage_fee, warehouse_shipping_fee, fee_currency,
+               reconciliation_status, notes, created_at, updated_at
+        FROM oms_fulfillment_financials_pre008;
+
+        DROP TABLE oms_fulfillment_financials_pre008;
+        CREATE INDEX idx_oms_ff_statement
+            ON oms_fulfillment_financials(settlement_mode, statement_month, reconciliation_status);
+    ''')
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -1019,6 +1130,7 @@ MIGRATIONS = [
     ('005', 'notifications', up_005, down_005),
     ('006', 'multi_warehouse_fulfillment_v2', up_006, down_006),
     ('007', 'fulfillment_cod_and_monthly_settlement', up_007, down_007),
+    ('008', 'split_cod_shipping_allocation', up_008, down_008),
 ]
 
 
