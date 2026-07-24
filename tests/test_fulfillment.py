@@ -12,7 +12,7 @@ from fulfillment_service import (
     recompute_order_status,
     transition_fulfillment,
 )
-from inv_migrations import up_001, up_006
+from inv_migrations import up_001, up_006, up_007
 from fulfillment_woocommerce import _all_order_shipments, _ast_items
 
 
@@ -47,6 +47,7 @@ class FulfillmentDomainTests(unittest.TestCase):
         )
         up_001(self.db)
         up_006(self.db)
+        up_007(self.db)
         self.db.execute(
             "INSERT INTO inv_skus (id,sku_code,name,barcode,is_active) VALUES (1,'SKU1','Test product','BAR1',1)"
         )
@@ -179,6 +180,43 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.assertEqual("匈牙利", payload["contry"])
         self.assertEqual(Decimal("10"), Decimal(payload["invoicePrice"]))
         self.assertEqual("测试产品", payload["invoiceDetailsCreateRequests"][0]["productName"])
+
+    def test_split_cod_is_collected_by_poland_and_hungary_gets_zero(self):
+        self.set_stock(pl=1, hu=10)
+        self.add_order("split-cod-1", "PL", 3)
+        plan_order(self.db, "split-cod-1")
+        rows = self.db.execute(
+            '''SELECT f.id, w.country, ff.cod_collection_role, ff.cod_amount,
+                      ff.settlement_mode
+               FROM oms_fulfillments f
+               JOIN warehouses w ON w.id=f.warehouse_id
+               JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
+               WHERE f.order_id='split-cod-1' AND f.status!='superseded'
+               ORDER BY w.country'''
+        ).fetchall()
+        by_country = {row["country"]: row for row in rows}
+        self.assertEqual("collector", by_country["PL"]["cod_collection_role"])
+        self.assertEqual(Decimal("30"), Decimal(by_country["PL"]["cod_amount"]))
+        self.assertEqual("instruction_only", by_country["HU"]["cod_collection_role"])
+        self.assertEqual(Decimal("0"), Decimal(by_country["HU"]["cod_amount"]))
+        self.assertEqual("monthly_statement", by_country["HU"]["settlement_mode"])
+        payload = build_wms_payload(self.db, by_country["HU"]["id"])
+        self.assertEqual(Decimal("0"), Decimal(payload["invoicePrice"]))
+
+    def test_prepaid_hungary_never_receives_cod_amount(self):
+        self.add_order("hu-prepaid-1", "HU", 1)
+        self.db.execute(
+            "UPDATE orders SET payment_method='bacs' WHERE id='hu-prepaid-1'"
+        )
+        result = plan_order(self.db, "hu-prepaid-1")
+        payload = build_wms_payload(self.db, result["fulfillment_ids"][0])
+        finance = self.db.execute(
+            "SELECT * FROM oms_fulfillment_financials WHERE fulfillment_id=?",
+            (result["fulfillment_ids"][0],),
+        ).fetchone()
+        self.assertEqual("not_applicable", finance["cod_collection_role"])
+        self.assertEqual("monthly_statement", finance["settlement_mode"])
+        self.assertEqual(Decimal("0"), Decimal(payload["invoicePrice"]))
 
     def test_ast_excludes_wms_label_until_actual_outbound(self):
         self.set_stock(pl=1, hu=5)

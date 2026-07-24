@@ -927,6 +927,90 @@ def down_006(conn):
     conn.commit()
 
 
+# ───────────────── 007: 履约资金责任与月结费用底座 ─────────────────
+
+def up_007(conn):
+    """Persist COD collection ownership separately from warehouse fees.
+
+    A split COD order can have both Poland and Hungary fulfillments.  Poland
+    collects the customer's full COD amount; the Hungary parcel is submitted
+    with zero COD and its storage/transport fees are reconciled from the
+    supplier's month-end statement.
+    """
+
+    conn.executescript('''
+        CREATE TABLE IF NOT EXISTS oms_fulfillment_financials (
+            fulfillment_id          TEXT PRIMARY KEY,
+            payment_method          TEXT,
+            cod_collection_role     TEXT NOT NULL DEFAULT 'not_applicable',
+            cod_amount              TEXT NOT NULL DEFAULT '0',
+            cod_currency            TEXT,
+            settlement_mode         TEXT NOT NULL DEFAULT 'internal',
+            statement_month         TEXT,
+            warehouse_storage_fee   TEXT,
+            warehouse_shipping_fee  TEXT,
+            fee_currency            TEXT,
+            reconciliation_status   TEXT NOT NULL DEFAULT 'unbilled',
+            notes                   TEXT,
+            created_at              TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at              TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (fulfillment_id) REFERENCES oms_fulfillments(id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_ff_statement
+            ON oms_fulfillment_financials(settlement_mode, statement_month, reconciliation_status);
+    ''')
+
+    # Backfill safely if a previous release already created fulfillments.
+    groups = conn.execute(
+        '''SELECT f.order_id, f.revision, o.payment_method, o.total, o.currency
+           FROM oms_fulfillments f
+           JOIN orders o ON o.id=f.order_id
+           WHERE f.status!='superseded'
+           GROUP BY f.order_id, f.revision'''
+    ).fetchall()
+    for group in groups:
+        fulfillments = conn.execute(
+            '''SELECT f.id, UPPER(COALESCE(w.country,'')) AS warehouse_country
+               FROM oms_fulfillments f
+               LEFT JOIN warehouses w ON w.id=f.warehouse_id
+               WHERE f.order_id=? AND f.revision=? AND f.status!='superseded' ''',
+            (group['order_id'], group['revision']),
+        ).fetchall()
+        countries = {row['warehouse_country'] for row in fulfillments}
+        is_cod = str(group['payment_method'] or '').lower() == 'cod'
+        split_pl_hu = {'PL', 'HU'}.issubset(countries)
+        for fulfillment in fulfillments:
+            country = fulfillment['warehouse_country']
+            if not is_cod:
+                role, amount = 'not_applicable', '0'
+            elif split_pl_hu:
+                role = 'collector' if country == 'PL' else 'instruction_only'
+                amount = str(group['total'] or '0') if country == 'PL' else '0'
+            else:
+                role, amount = 'collector', str(group['total'] or '0')
+            settlement = 'monthly_statement' if country == 'HU' else 'internal'
+            conn.execute(
+                '''INSERT OR IGNORE INTO oms_fulfillment_financials
+                   (fulfillment_id, payment_method, cod_collection_role,
+                    cod_amount, cod_currency, settlement_mode, fee_currency,
+                    reconciliation_status, notes)
+                   VALUES (?,?,?,?,?,?,?,?,?)''',
+                (
+                    fulfillment['id'], group['payment_method'], role, amount,
+                    group['currency'], settlement, group['currency'], 'unbilled',
+                    '迁移 007 自动回填',
+                ),
+            )
+    conn.commit()
+
+
+def down_007(conn):
+    """Remove only the new financial responsibility table."""
+
+    conn.execute('DROP TABLE IF EXISTS oms_fulfillment_financials')
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -934,6 +1018,7 @@ MIGRATIONS = [
     ('004', 'inv_push_logs', up_004, down_004),
     ('005', 'notifications', up_005, down_005),
     ('006', 'multi_warehouse_fulfillment_v2', up_006, down_006),
+    ('007', 'fulfillment_cod_and_monthly_settlement', up_007, down_007),
 ]
 
 
