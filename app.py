@@ -6,6 +6,7 @@ import sqlite3
 import json
 import html
 import os
+import uuid
 from datetime import datetime
 from functools import wraps
 
@@ -16,6 +17,14 @@ import blocklist  # customer blocklist: auto-cancel COD orders from blacklisted 
 from shipping_export import build_australia_shipping_workbook
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
+from product_manager_service import (
+    PRODUCT_EDIT_FIELDS as PRODUCT_EDIT_WHITELIST,
+    parse_wc_response as _parse_wc_response,
+    product_operation_action as _product_operation_action,
+    product_state_snapshot as _product_state_snapshot,
+    verify_product_child_sync as _verify_product_child_sync,
+    wc_product_update_verified as _wc_product_update_verified,
+)
 
 app = Flask(__name__)
 app.secret_key = 'woocommerce-order-analysis-secret-key-2024'
@@ -5872,6 +5881,62 @@ def init_product_masters_table():
     conn.close()
 
 
+def init_product_operation_logs_table():
+    """Durable audit trail for product-manager writes.
+
+    Product changes happen on remote WooCommerce sites, so a local HTTP 200 is
+    not enough evidence that the requested state actually persisted.  This log
+    stores the requested fields, the state read back from WooCommerce, and (for
+    multistore-routed sites) the child-site verification result.
+    """
+    conn = get_db_connection()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS product_operation_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT,
+            site_id INTEGER NOT NULL,
+            site_url TEXT,
+            effective_url TEXT,
+            product_id INTEGER,
+            parent_id INTEGER,
+            item_type TEXT,
+            action TEXT,
+            requested_payload TEXT,
+            final_state TEXT,
+            response_trace TEXT,
+            status TEXT NOT NULL,
+            error TEXT,
+            routed_to_master INTEGER DEFAULT 0,
+            child_verification_status TEXT,
+            child_verification_detail TEXT,
+            child_final_state TEXT,
+            operator_id INTEGER,
+            operator_name TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # Forward-compatible with an interrupted/partial rollout that created the
+    # first audit-table version before request traces were added.
+    for column_sql in (
+        'ALTER TABLE product_operation_logs ADD COLUMN response_trace TEXT',
+        'ALTER TABLE product_operation_logs ADD COLUMN child_final_state TEXT',
+    ):
+        try:
+            conn.execute(column_sql)
+        except sqlite3.OperationalError:
+            pass
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_product_operation_logs_batch
+        ON product_operation_logs(batch_id, id)
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_product_operation_logs_site_time
+        ON product_operation_logs(site_id, created_at)
+    ''')
+    conn.commit()
+    conn.close()
+
+
 def init_sync_logs_table():
     """Initialize sync_logs table for storing synchronization history"""
     conn = get_db_connection()
@@ -6961,6 +7026,7 @@ def init_blocklist_tables():
 with app.app_context():
     init_sites_table()
     init_product_masters_table()
+    init_product_operation_logs_table()
     init_sync_logs_table()
     init_settings_table()
     init_users_table()
@@ -7372,12 +7438,6 @@ def test_product_master(master_id):
 
 # Whitelist of fields editable through this UI. WC product schema has many more,
 # but we deliberately restrict to avoid accidental clobbering of unrelated fields.
-PRODUCT_EDIT_WHITELIST = {
-    'manage_stock', 'stock_quantity', 'stock_status',
-    'regular_price', 'sale_price',
-}
-
-
 def _resolve_site_for_product_edit(conn, site_id):
     """Return (site_row, api_url, ck, cs) or raise ValueError with user-friendly message.
     Routes multistore-managed sites to their master automatically.
@@ -7411,40 +7471,49 @@ def _resolve_site_for_product_edit(conn, site_id):
     return site, api_url, ck, cs
 
 
-def _parse_wc_response(resp):
-    """Parse a WC REST API response defensively. Returns (data, error_message).
-
-    Handles all the ways the call can go wrong without exceptions:
-      - non-2xx status: extracts WC's error message (or HTML preview if not JSON)
-      - 200 OK with HTML body: surfaces a hint about CF/cache/PHP-error
-      - empty / malformed JSON: returns None data with explanation
-
-    Either `data` is the parsed JSON (could be {} or [] for empty), or
-    `error_message` is a Chinese string ready to put in the API response.
-    Both will not be set; one will be None."""
-    body_preview = ((resp.text or '')[:300]).replace('\n', ' ')
-    looks_like_html = body_preview.lstrip().lower().startswith(('<!doctype', '<html', '<?xml'))
-
-    if resp.status_code not in (200, 201):
-        try:
-            j = resp.json()
-            msg = j.get('message') or body_preview or '(无响应内容)'
-        except Exception:
-            msg = body_preview or '(无响应内容)'
-        return None, f'WC API 错误 HTTP {resp.status_code}: {msg}'
-
+def _write_product_operation_audit(
+        *, batch_id, site, effective_url, product_id, parent_id, payload,
+        final_state, status, error=None, child_verification=None, trace=None):
+    """Persist one product write outcome; audit failures never mask API results."""
+    conn = None
     try:
-        return resp.json(), None
+        conn = get_db_connection()
+        child_verification = child_verification or {}
+        conn.execute('''
+            INSERT INTO product_operation_logs (
+                batch_id, site_id, site_url, effective_url,
+                product_id, parent_id, item_type, action,
+                requested_payload, final_state, response_trace, status, error,
+                routed_to_master, child_verification_status,
+                child_verification_detail, child_final_state,
+                operator_id, operator_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            (batch_id or '')[:100],
+            site['id'], site['url'], effective_url,
+            product_id, parent_id, 'variation' if parent_id else 'product',
+            _product_operation_action(payload),
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            json.dumps(final_state or {}, ensure_ascii=False, sort_keys=True),
+            json.dumps(trace or {}, ensure_ascii=False, sort_keys=True),
+            status, error,
+            1 if site['product_master_id'] else 0,
+            child_verification.get('status'),
+            child_verification.get('detail'),
+            json.dumps(
+                child_verification.get('state') or {},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            int(current_user.id) if str(current_user.id).isdigit() else None,
+            current_user.name,
+        ))
+        conn.commit()
     except Exception:
-        if looks_like_html:
-            hint = (
-                f'WC API 返回了 HTML 而不是 JSON（HTTP {resp.status_code}）。'
-                f'常见原因：CloudFlare 拦截、缓存插件命中、PHP 致命错误页。'
-                f'响应开头: {body_preview}'
-            )
-        else:
-            hint = f'WC API 响应解析失败（HTTP {resp.status_code}）：{body_preview}'
-        return None, hint
+        app.logger.exception('Failed to write product operation audit log')
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @app.route('/api/product-manager/products')
@@ -7688,6 +7757,7 @@ def product_manager_update_variation(site_id, parent_id, variation_id):
     import requests as req
 
     data = request.get_json(silent=True) or {}
+    batch_id = str(data.get('batch_id') or uuid.uuid4())
     payload, err = _build_product_update_payload(data)
     if err:
         return jsonify({'success': False, 'error': err}), 400
@@ -7700,25 +7770,50 @@ def product_manager_update_variation(site_id, parent_id, variation_id):
         return jsonify({'success': False, 'error': str(e)}), 400
     conn.close()
 
-    try:
-        resp = req.put(
-            f'{api_url}/wp-json/wc/v3/products/{parent_id}/variations/{variation_id}',
-            auth=(ck, cs),
-            json=payload,
-            timeout=90,  # WooMultistore can take 30-60s to sync to child stores
-            headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0',
-                     'Content-Type': 'application/json',
-                     'Accept': 'application/json'},
-        )
-    except req.RequestException as e:
-        return jsonify({'success': False, 'error': f'连接失败: {e}'}), 502
-
-    v, err = _parse_wc_response(resp)
+    resource_url = (
+        f'{api_url}/wp-json/wc/v3/products/{parent_id}/variations/{variation_id}'
+    )
+    v, err, trace = _wc_product_update_verified(
+        req, resource_url, (ck, cs), payload
+    )
     if err:
-        app.logger.warning(f'PUT variation {parent_id}/{variation_id} on {api_url} failed: {err}')
-        return jsonify({'success': False, 'error': err}), 502
+        app.logger.warning(
+            f'PUT variation {parent_id}/{variation_id} on {api_url} failed: {err}'
+        )
+        _write_product_operation_audit(
+            batch_id=batch_id, site=site, effective_url=api_url,
+            product_id=variation_id, parent_id=parent_id, payload=payload,
+            final_state=trace.get('final_state'), status='failed', error=err,
+            trace=trace,
+        )
+        return jsonify({'success': False, 'error': err}), 409
 
     v = v or {}
+    child_verification = _verify_product_child_sync(req, site, v, payload)
+    if child_verification['status'] not in ('not_applicable', 'verified'):
+        sync_error = (
+            f'商品主站写入成功，但 {site["url"]} 同步未验证：'
+            f'{child_verification["detail"]}'
+        )
+        _write_product_operation_audit(
+            batch_id=batch_id, site=site, effective_url=api_url,
+            product_id=variation_id, parent_id=parent_id, payload=payload,
+            final_state=_product_state_snapshot(v), status='sync_pending',
+            error=sync_error, child_verification=child_verification,
+            trace=trace,
+        )
+        return jsonify({
+            'success': False,
+            'error': sync_error,
+            'master_updated': True,
+            'verification': child_verification,
+        }), 409
+    _write_product_operation_audit(
+        batch_id=batch_id, site=site, effective_url=api_url,
+        product_id=variation_id, parent_id=parent_id, payload=payload,
+        final_state=_product_state_snapshot(v), status='verified',
+        child_verification=child_verification, trace=trace,
+    )
     return jsonify({
         'success': True,
         'variation': {
@@ -7730,6 +7825,7 @@ def product_manager_update_variation(site_id, parent_id, variation_id):
             'sale_price': v.get('sale_price', ''),
             'price': v.get('price', ''),
         },
+        'verification': child_verification,
     })
 
 
@@ -7741,6 +7837,7 @@ def product_manager_update(site_id, product_id):
     import requests as req
 
     data = request.get_json(silent=True) or {}
+    batch_id = str(data.get('batch_id') or uuid.uuid4())
     payload, err = _build_product_update_payload(data)
     if err:
         return jsonify({'success': False, 'error': err}), 400
@@ -7761,25 +7858,48 @@ def product_manager_update(site_id, product_id):
         routing_label = m['label'] if m else None
     conn.close()
 
-    try:
-        resp = req.put(
-            f'{api_url}/wp-json/wc/v3/products/{product_id}',
-            auth=(ck, cs),
-            json=payload,
-            timeout=90,  # WooMultistore can take 30-60s to sync to child stores
-            headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0',
-                     'Content-Type': 'application/json',
-                     'Accept': 'application/json'},
-        )
-    except req.RequestException as e:
-        return jsonify({'success': False, 'error': f'连接失败: {e}'}), 502
-
-    p, err = _parse_wc_response(resp)
+    resource_url = f'{api_url}/wp-json/wc/v3/products/{product_id}'
+    p, err, trace = _wc_product_update_verified(
+        req, resource_url, (ck, cs), payload
+    )
     if err:
-        app.logger.warning(f'PUT product {product_id} on {api_url} failed: {err}')
-        return jsonify({'success': False, 'error': err}), 502
+        app.logger.warning(
+            f'PUT product {product_id} on {api_url} failed: {err}'
+        )
+        _write_product_operation_audit(
+            batch_id=batch_id, site=site, effective_url=api_url,
+            product_id=product_id, parent_id=None, payload=payload,
+            final_state=trace.get('final_state'), status='failed', error=err,
+            trace=trace,
+        )
+        return jsonify({'success': False, 'error': err}), 409
 
     p = p or {}
+    child_verification = _verify_product_child_sync(req, site, p, payload)
+    if child_verification['status'] not in ('not_applicable', 'verified'):
+        sync_error = (
+            f'商品主站写入成功，但 {site["url"]} 同步未验证：'
+            f'{child_verification["detail"]}'
+        )
+        _write_product_operation_audit(
+            batch_id=batch_id, site=site, effective_url=api_url,
+            product_id=product_id, parent_id=None, payload=payload,
+            final_state=_product_state_snapshot(p), status='sync_pending',
+            error=sync_error, child_verification=child_verification,
+            trace=trace,
+        )
+        return jsonify({
+            'success': False,
+            'error': sync_error,
+            'master_updated': True,
+            'verification': child_verification,
+        }), 409
+    _write_product_operation_audit(
+        batch_id=batch_id, site=site, effective_url=api_url,
+        product_id=product_id, parent_id=None, payload=payload,
+        final_state=_product_state_snapshot(p), status='verified',
+        child_verification=child_verification, trace=trace,
+    )
     return jsonify({
         'success': True,
         'product': {
@@ -7792,6 +7912,7 @@ def product_manager_update(site_id, product_id):
             'price': p.get('price', ''),
         },
         'routing_label': routing_label,
+        'verification': child_verification,
     })
 
 
@@ -7825,6 +7946,7 @@ def product_manager_bulk():
         return jsonify({'error': '请提供 site_id 和非空 items 列表'}), 400
     if len(items) > 200:
         return jsonify({'error': '单次最多处理 200 个产品，请分批'}), 400
+    batch_id = str(data.get('batch_id') or uuid.uuid4())
 
     conn = get_db_connection()
     try:
@@ -7833,12 +7955,6 @@ def product_manager_bulk():
         conn.close()
         return jsonify({'error': str(e)}), 400
     conn.close()
-
-    headers = {
-        'User-Agent': 'WooCommerce API Client-Python/3.0.0',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-    }
 
     results = {'success': [], 'failed': []}
     for item in items:
@@ -7859,23 +7975,46 @@ def product_manager_bulk():
         else:
             url = f'{api_url}/wp-json/wc/v3/products/{pid}'
 
-        try:
-            resp = req.put(url, auth=(ck, cs), json=payload, timeout=90, headers=headers)
-        except req.RequestException as e:
-            results['failed'].append({
-                'product_id': pid, 'parent_id': parent_id,
-                'error': f'连接失败: {e}'
-            })
-            continue
-
-        p, err = _parse_wc_response(resp)
+        p, err, trace = _wc_product_update_verified(
+            req, url, (ck, cs), payload
+        )
         if err:
+            _write_product_operation_audit(
+                batch_id=batch_id, site=site, effective_url=api_url,
+                product_id=pid, parent_id=parent_id, payload=payload,
+                final_state=trace.get('final_state'), status='failed',
+                error=err, trace=trace,
+            )
             results['failed'].append({
                 'product_id': pid, 'parent_id': parent_id,
                 'error': err,
             })
             continue
         p = p or {}
+        child_verification = _verify_product_child_sync(req, site, p, payload)
+        if child_verification['status'] not in ('not_applicable', 'verified'):
+            sync_error = (
+                f'商品主站写入成功，但 {site["url"]} 同步未验证：'
+                f'{child_verification["detail"]}'
+            )
+            _write_product_operation_audit(
+                batch_id=batch_id, site=site, effective_url=api_url,
+                product_id=pid, parent_id=parent_id, payload=payload,
+                final_state=_product_state_snapshot(p),
+                status='sync_pending', error=sync_error,
+                child_verification=child_verification, trace=trace,
+            )
+            results['failed'].append({
+                'product_id': pid, 'parent_id': parent_id,
+                'error': sync_error,
+            })
+            continue
+        _write_product_operation_audit(
+            batch_id=batch_id, site=site, effective_url=api_url,
+            product_id=pid, parent_id=parent_id, payload=payload,
+            final_state=_product_state_snapshot(p), status='verified',
+            child_verification=child_verification, trace=trace,
+        )
         results['success'].append({
             'product_id': pid,
             'parent_id': parent_id,

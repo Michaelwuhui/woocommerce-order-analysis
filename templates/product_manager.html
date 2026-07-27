@@ -1188,7 +1188,7 @@
             headers: {'Content-Type':'application/json'},
             body: JSON.stringify(payload),
         })
-            .then(r => r.json())
+            .then(r => parseProductManagerJson(r))
             .then(result => {
                 row?.classList.remove('pm-row-saving');
                 if (btn) btn.innerHTML = originalIcon;
@@ -1426,10 +1426,11 @@
         } else if (type === 'soldout') {
             body = `
                 <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 small">
-                    将对 ${count} 个产品执行：<br>
+                    将对 ${count} 个已选商品执行；可变商品会自动包含全部变体，无需提前展开：<br>
                     <code class="text-warning">manage_stock = false</code>（关闭库存管理）<br>
                     <code class="text-warning">stock_status = outofstock</code>（强制售完）<br>
-                    这样订单取消时不会自动加回库存，产品会一直保持售完状态直到你手动恢复。
+                    完成后会重新读取 WooCommerce 状态；商品主站路由还会验证实际子站，
+                    只有验证一致才计为成功。
                 </div>`;
         } else if (type === 'restore') {
             body = `
@@ -1477,7 +1478,7 @@
         return data;
     }
 
-    async function updateOneBatchItem(item) {
+    async function updateOneBatchItem(item, batchId) {
         const isVariation = Boolean(item.parent_id);
         const url = isVariation
             ? `/api/product-manager/products/${currentSiteId}/${item.parent_id}/variations/${item.product_id}`
@@ -1485,6 +1486,7 @@
         const payload = {...item};
         delete payload.product_id;
         delete payload.parent_id;
+        payload.batch_id = batchId;
 
         try {
             const response = await fetch(url, {
@@ -1545,37 +1547,85 @@
             baseChange = { manage_stock: true, stock_quantity: parseInt(q, 10) };
         }
 
-        // Build items list: each rowKey → either {product_id} (simple) or {product_id, parent_id} (variation)
-        // For price ops, skip variable parent products (they have no direct price; use variations instead)
-        const items = [];
+        const applyBtn = $('pmBatchApplyBtn');
+        applyBtn.disabled = true;
+        applyBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>正在加载全部变体...';
+
+        // Build an idempotent item map. For inventory operations, selecting a
+        // variable parent means ALL of its variations, including variants that
+        // were never expanded/rendered in the DOM.
+        const itemMap = new Map();
+        const addItem = item => {
+            const key = item.parent_id
+                ? `variation-${item.parent_id}-${item.product_id}`
+                : `product-${item.product_id}`;
+            itemMap.set(key, item);
+        };
         let skippedVariableParents = 0;
-        rowKeys.forEach(rowKey => {
-            const ids = rowKeyToIds(rowKey);
-            if (!ids) return;
-            if (ids.type === 'product') {
-                const p = products.find(x => x.id === ids.product_id);
-                if (!p) return;
-                if (type === 'price' && p.type === 'variable') {
-                    skippedVariableParents++;
-                    return;
+        let expandedVariableParents = 0;
+        try {
+            for (const rowKey of rowKeys) {
+                const ids = rowKeyToIds(rowKey);
+                if (!ids) continue;
+                if (ids.type === 'product') {
+                    const p = products.find(x => x.id === ids.product_id);
+                    if (!p) continue;
+                    if (type === 'price' && p.type === 'variable') {
+                        skippedVariableParents++;
+                        continue;
+                    }
+                    if (p.type === 'variable' && ['stock', 'soldout', 'restore'].includes(type)) {
+                        let variations = variationsCache[p.id];
+                        if (!variations) {
+                            const response = await fetch(
+                                `/api/product-manager/variations/${currentSiteId}/${p.id}`
+                            );
+                            const data = await parseProductManagerJson(response);
+                            if (data.error) throw new Error(data.error);
+                            variations = data.variations || [];
+                            variationsCache[p.id] = variations;
+                        }
+                        if (variations.length === 0) {
+                            throw new Error(`可变商品 #${p.id} 没有可处理的变体`);
+                        }
+                        variations.forEach(v => addItem({
+                            product_id: v.id,
+                            parent_id: p.id,
+                            ...baseChange,
+                        }));
+                        // A hard-sold-out also writes the parent last. Quantity
+                        // operations leave variable-parent stock derived from
+                        // its children (variable parents do not own a quantity).
+                        if (type === 'soldout') {
+                            addItem({ product_id: p.id, ...baseChange });
+                        }
+                        expandedVariableParents++;
+                        continue;
+                    }
+                    addItem({ product_id: ids.product_id, ...baseChange });
+                } else if (ids.type === 'variation') {
+                    addItem({
+                        product_id: ids.variation_id,
+                        parent_id: ids.parent_id,
+                        ...baseChange,
+                    });
                 }
-                items.push({ product_id: ids.product_id, ...baseChange });
-            } else if (ids.type === 'variation') {
-                items.push({
-                    product_id: ids.variation_id,
-                    parent_id: ids.parent_id,
-                    ...baseChange,
-                });
             }
-        });
+        } catch (err) {
+            alert('准备批量任务失败: ' + (err.message || String(err)));
+            applyBtn.disabled = false;
+            applyBtn.innerHTML = '应用';
+            return;
+        }
+        const items = Array.from(itemMap.values());
 
         if (items.length === 0) {
             alert('没有可应用的项目（可变产品的父行不能直接改价/库存，请展开变体后选择）');
+            applyBtn.disabled = false;
+            applyBtn.innerHTML = '应用';
             return;
         }
 
-        const applyBtn = $('pmBatchApplyBtn');
-        applyBtn.disabled = true;
         applyBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>处理中...';
 
         // A single server request used to update every row serially. On sites
@@ -1584,28 +1634,37 @@
         // write in its own request and use a small concurrency so one slow item
         // cannot kill the entire batch. Variations go first so the variable
         // parent's final stock status is applied last.
-        const orderedItems = [
-            ...items.filter(item => item.parent_id),
-            ...items.filter(item => !item.parent_id),
-        ];
+        const variationItems = items.filter(item => item.parent_id);
+        const productItems = items.filter(item => !item.parent_id);
         const results = {success: [], failed: []};
-        let cursor = 0;
         let completed = 0;
-        const workerCount = Math.min(2, orderedItems.length);
 
-        async function worker() {
-            while (cursor < orderedItems.length) {
-                const item = orderedItems[cursor++];
-                const result = await updateOneBatchItem(item);
-                if (result.ok) results.success.push(result.item);
-                else results.failed.push(result.item);
-                completed++;
-                applyBtn.innerHTML = `<span class="spinner-border spinner-border-sm me-2"></span>处理中 ${completed}/${orderedItems.length}...`;
+        async function runPhase(phaseItems) {
+            let phaseCursor = 0;
+            const workerCount = Math.min(2, phaseItems.length);
+            async function worker() {
+                while (phaseCursor < phaseItems.length) {
+                    const item = phaseItems[phaseCursor++];
+                    const result = await updateOneBatchItem(item, batchId);
+                    if (result.ok) results.success.push(result.item);
+                    else results.failed.push(result.item);
+                    completed++;
+                    applyBtn.innerHTML = `<span class="spinner-border spinner-border-sm me-2"></span>处理中 ${completed}/${items.length}...`;
+                }
             }
+            await Promise.all(Array.from({length: workerCount}, () => worker()));
         }
 
+        const batchId = (window.crypto && typeof window.crypto.randomUUID === 'function')
+            ? window.crypto.randomUUID()
+            : `pm-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
         try {
-            await Promise.all(Array.from({length: workerCount}, () => worker()));
+            // Strict phase barrier: every variation must finish before a
+            // variable parent is written, otherwise WooCommerce can aggregate
+            // the parent while a final variation is still in stock.
+            await runPhase(variationItems);
+            await runPhase(productItems);
             const data = {
                 success_count: results.success.length,
                 failed_count: results.failed.length,
@@ -1614,6 +1673,10 @@
             bootstrap.Modal.getInstance($('pmBatchModal'))?.hide();
             if (skippedVariableParents > 0) {
                 data.skip_note = `跳过 ${skippedVariableParents} 个可变产品父行（请展开变体后选择具体变体）`;
+            }
+            if (expandedVariableParents > 0) {
+                const note = `已自动加载 ${expandedVariableParents} 个可变商品的全部变体，并逐项验证最终状态。`;
+                data.skip_note = data.skip_note ? `${data.skip_note} ${note}` : note;
             }
             showBatchResult(data);
             // Refresh table to reflect canonical state. Variation cache is invalidated.
@@ -1634,7 +1697,7 @@
                 <div class="col">
                     <div class="text-center p-3 rounded" style="background:rgba(34,197,94,0.15);">
                         <div class="h3 text-success mb-0">${succ}</div>
-                        <small class="text-secondary">成功</small>
+                        <small class="text-secondary">已验证成功</small>
                     </div>
                 </div>
                 <div class="col">
