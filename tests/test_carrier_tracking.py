@@ -87,6 +87,10 @@ class PacketaTrack718Tests(unittest.TestCase):
 
         self.assertIn("https://tracking.packeta.com/en/", base)
         self.assertIn("PACKETA_EVENT_PHRASES", base)
+        self.assertIn(
+            "we are aware of your parcel and are waiting for the sender",
+            base,
+        )
         self.assertIn("rejected by recipient", base)
 
 
