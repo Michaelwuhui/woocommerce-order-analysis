@@ -5,6 +5,7 @@ Flask application with user authentication and data visualization
 import sqlite3
 import json
 import html
+import os
 from datetime import datetime
 from functools import wraps
 
@@ -12,6 +13,7 @@ from flask import Flask, render_template, render_template_string, request, redir
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from oid_utils import woo_post_id  # cross-site-safe WC post id for REST calls
 import blocklist  # customer blocklist: auto-cancel COD orders from blacklisted phones
+from shipping_export import build_australia_shipping_workbook
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 
@@ -17206,9 +17208,12 @@ def ship_order():
             trig_resp = req.post(
                 trig_url,
                 json={'tracking_number': tracking_number, 'carrier_slug': carrier_slug},
-                params={'consumer_key': site['consumer_key'], 'consumer_secret': site['consumer_secret']},
                 timeout=30,
-                headers=api_headers,
+                headers={
+                    **api_headers,
+                    'X-Woo-Tracking-Key': site['consumer_key'],
+                    'X-Woo-Tracking-Secret': site['consumer_secret'],
+                },
             )
             if trig_resp.status_code == 200:
                 td = trig_resp.json() if trig_resp.text else {}
@@ -17737,14 +17742,19 @@ def get_order_emails(order_id):
     # the site actually has.
     debug = '1' if request.args.get('debug') else None
     try:
-        params = {'consumer_key': site['consumer_key'], 'consumer_secret': site['consumer_secret']}
+        params = {}
         if debug:
             params['debug'] = '1'
         r = req.get(
             url,
             params=params,
             timeout=15,
-            headers={"User-Agent": "WooCommerce API Client-Python/3.0.0", "Accept": "application/json"},
+            headers={
+                "User-Agent": "WooCommerce API Client-Python/3.0.0",
+                "Accept": "application/json",
+                "X-Woo-Tracking-Key": site['consumer_key'],
+                "X-Woo-Tracking-Secret": site['consumer_secret'],
+            },
         )
         if r.status_code == 200:
             data = r.json() if r.text else {}
@@ -17798,11 +17808,14 @@ def get_customer_emails():
         try:
             r = req.get(
                 url,
-                params={'email': email, 'limit': 50,
-                        'consumer_key': site['consumer_key'],
-                        'consumer_secret': site['consumer_secret']},
+                params={'email': email, 'limit': 50},
                 timeout=15,
-                headers={"User-Agent": "WooCommerce API Client-Python/3.0.0", "Accept": "application/json"},
+                headers={
+                    "User-Agent": "WooCommerce API Client-Python/3.0.0",
+                    "Accept": "application/json",
+                    "X-Woo-Tracking-Key": site['consumer_key'],
+                    "X-Woo-Tracking-Secret": site['consumer_secret'],
+                },
             )
             if r.status_code != 200:
                 return {'site_id': site['site_id'], 'site_url': site['site_url'], 'logs': [],
@@ -17860,9 +17873,13 @@ def get_site_email_detail(site_id, log_id):
     try:
         r = req.get(
             url,
-            params={'consumer_key': site['consumer_key'], 'consumer_secret': site['consumer_secret']},
             timeout=20,
-            headers={"User-Agent": "WooCommerce API Client-Python/3.0.0", "Accept": "application/json"},
+            headers={
+                "User-Agent": "WooCommerce API Client-Python/3.0.0",
+                "Accept": "application/json",
+                "X-Woo-Tracking-Key": site['consumer_key'],
+                "X-Woo-Tracking-Secret": site['consumer_secret'],
+            },
         )
         if r.status_code == 200:
             return jsonify(r.json())
@@ -17895,9 +17912,13 @@ def get_order_email_detail(order_id, log_id):
     try:
         r = req.get(
             url,
-            params={'consumer_key': site['consumer_key'], 'consumer_secret': site['consumer_secret']},
             timeout=20,
-            headers={"User-Agent": "WooCommerce API Client-Python/3.0.0", "Accept": "application/json"},
+            headers={
+                "User-Agent": "WooCommerce API Client-Python/3.0.0",
+                "Accept": "application/json",
+                "X-Woo-Tracking-Key": site['consumer_key'],
+                "X-Woo-Tracking-Secret": site['consumer_secret'],
+            },
         )
         if r.status_code == 200:
             return jsonify(r.json())
@@ -18966,6 +18987,208 @@ def export_shipping_list():
     output.headers["Content-Disposition"] = f"attachment; filename=shipping_today_{now.strftime('%Y%m%d')}.csv"
     output.headers["Content-type"] = "text/csv"
     return output
+
+
+def _australia_shipping_export_rows(status_kind='shipped'):
+    """Return AU orders in the partner's physical-dispatch layout.
+
+    A split shipment becomes one row per parcel.  A re-shipment is different:
+    earlier tracking numbers are superseded, so only the newest parcel is
+    exported.  When a site's tracking plugin stores the number only in order
+    metadata, process_shipped_order() supplies the same fallback used by the UI.
+    Pending orders are exported once per order with a blank tracking number.
+    """
+    conn = get_db_connection()
+    if status_kind == 'pending':
+        status_condition = "o.status IN ('processing', 'offline')"
+    elif status_kind == 'shipped':
+        status_condition = "o.status IN ('on-hold', 'shipped', 'partial-shipped')"
+    else:
+        conn.close()
+        raise ValueError(f'Unsupported Australia export status: {status_kind}')
+    conditions = [
+        status_condition,
+        "EXISTS (SELECT 1 FROM sites sx WHERE sx.url=o.source AND sx.country='AU')",
+    ]
+    params = []
+
+    allowed_sources = get_user_allowed_sources(
+        current_user.id, current_user.is_admin(), current_user.is_viewer()
+    )
+    if allowed_sources is not None:
+        if not allowed_sources:
+            conn.close()
+            return []
+        placeholders = ','.join('?' for _ in allowed_sources)
+        conditions.append(f'o.source IN ({placeholders})')
+        params.extend(allowed_sources)
+
+    source_filter = (request.args.get('source') or '').strip()
+    manager_filter = (request.args.get('manager') or '').strip()
+    start_date = (request.args.get('start_date') or '').strip()
+    end_date = (request.args.get('end_date') or '').strip()
+    search = (request.args.get('search') or '').strip()
+
+    if source_filter:
+        conditions.append('o.source = ?')
+        params.append(source_filter)
+    if manager_filter:
+        conditions.append(
+            "EXISTS (SELECT 1 FROM sites sm WHERE sm.url=o.source AND sm.country='AU' AND sm.manager=?)"
+        )
+        params.append(manager_filter)
+    if start_date:
+        conditions.append('o.date_created >= ?')
+        params.append(start_date + ' 00:00:00')
+    if end_date:
+        conditions.append('o.date_created <= ?')
+        params.append(end_date + ' 23:59:59')
+    if search:
+        search_term = f'%{search}%'
+        conditions.append('''(
+            o.number LIKE ? OR o.billing LIKE ? OR o.shipping LIKE ?
+            OR EXISTS (SELECT 1 FROM shipping_logs slx WHERE slx.order_id=o.id AND slx.tracking_number LIKE ?)
+            OR o.meta_data LIKE ? OR o.shipping_lines LIKE ? OR o.line_items LIKE ?
+        )''')
+        params.extend([search_term] * 7)
+
+    query = f'''
+        SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, o.date_modified,
+               o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_lines,
+               o.shipping_total, o.customer_note, o.warehouse_id,
+               o.is_undelivered, o.shipping_loss_amount, o.undelivered_at, o.undelivered_note,
+               o.is_problem_return,
+               COALESCE((SELECT MIN(sm.manager) FROM sites sm WHERE sm.url=o.source AND sm.country='AU'), '') AS manager,
+               COALESCE(w.name, '') AS warehouse_name,
+               sl.tracking_number, sl.carrier_slug, sl.shipped_at,
+               COALESCE(u.name, '') AS undelivered_by_name,
+               '' AS latest_note, '' AS latest_note_date, '' AS latest_note_author
+        FROM orders o
+        LEFT JOIN warehouses w ON o.warehouse_id=w.id
+        LEFT JOIN shipping_logs sl ON sl.id=(
+            SELECT id FROM shipping_logs WHERE order_id=o.id ORDER BY id DESC LIMIT 1
+        )
+        LEFT JOIN users u ON o.undelivered_by=u.id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY COALESCE(sl.shipped_at, o.date_modified, o.date_created) DESC, o.id
+    '''
+    orders = conn.execute(query, params).fetchall()
+    carriers = {
+        row['slug']: row for row in conn.execute('SELECT * FROM shipping_carriers').fetchall()
+    }
+    ast_provider_mapping = {
+        'inpost-paczkomaty': ('inpost', 'InPost'),
+        'inpost': ('inpost', 'InPost'),
+        'dpd': ('dpd', 'DPD'),
+        'dpd-pl': ('dpd', 'DPD'),
+    }
+
+    rows = []
+    for order in orders:
+        billing = parse_json_field(order['billing']) or {}
+        shipping_info = parse_json_field(order['shipping']) or {}
+        addr = _addr_for_order(billing, shipping_info)
+
+        # Checkout state selections are not always valid for the postcode.  The
+        # shipping page already flags this; the dispatch file makes the safe,
+        # unambiguous correction so the carrier does not route the parcel wrong.
+        corrected_addr = dict(addr)
+        expected_state = _au_state_mismatch(addr)
+        if expected_state and '/' not in expected_state:
+            corrected_addr['state'] = expected_state
+
+        try:
+            processed = process_shipped_order(order, conn, carriers, ast_provider_mapping)
+        except Exception:
+            # One malformed legacy metadata blob must not make the entire batch
+            # unusable.  The core address and local tracking fields are enough
+            # to keep that parcel visible for manual completion in Excel.
+            processed = {
+                'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
+                'customer_phone': addr.get('phone') or billing.get('phone', ''),
+                'tracking_number': order['tracking_number'] or '',
+            }
+        parcel_rows = [dict(parcel) for parcel in conn.execute(
+            '''SELECT id, tracking_number, carrier_slug, shipped_at,
+                      COALESCE(is_reship, 0) AS is_reship
+               FROM shipping_logs
+               WHERE order_id=? AND trim(COALESCE(tracking_number, ''))!=''
+               ORDER BY id''',
+            (order['id'],),
+        ).fetchall()]
+
+        if status_kind == 'pending':
+            active_parcels = [{'tracking_number': ''}]
+        elif parcel_rows and any(p['is_reship'] for p in parcel_rows):
+            active_parcels = [parcel_rows[-1]]
+        elif parcel_rows:
+            active_parcels = parcel_rows
+        else:
+            active_parcels = [{'tracking_number': processed.get('tracking_number', '')}]
+
+        order_number = str(order['number'] or '').strip()
+        if order_number and not order_number.startswith('#'):
+            order_number = '#' + order_number
+
+        for parcel in active_parcels:
+            rows.append({
+                'order_number': order_number,
+                'customer_name': processed.get('customer_name', ''),
+                'phone': processed.get('customer_phone', ''),
+                'city': (corrected_addr.get('city') or '').strip(),
+                'state': (corrected_addr.get('state') or '').strip().upper(),
+                'address': _compose_address(corrected_addr),
+                'tracking_number': str(parcel.get('tracking_number') or '').strip(),
+            })
+
+    conn.close()
+    return rows
+
+
+@app.route('/api/shipping/export/australia')
+@login_required
+@shipping_view_required
+def export_australia_shipping_list():
+    """Export filtered AU shipped parcels in the logistics partner's xlsx format."""
+    if not _has_au_access():
+        return jsonify({'error': '无澳洲发货数据权限'}), 403
+    rows = _australia_shipping_export_rows('shipped')
+    if not rows:
+        return jsonify({'error': '当前筛选条件下没有澳洲已发货订单'}), 404
+
+    output = build_australia_shipping_workbook(rows)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    response = send_file(
+        output,
+        as_attachment=True,
+        download_name=f'杭州小包_澳洲已发货_{timestamp}.xlsx',
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+    response.headers['X-Export-Row-Count'] = str(len(rows))
+    return response
+
+
+@app.route('/api/shipping/export/australia/pending')
+@login_required
+@shipping_view_required
+def export_australia_pending_list():
+    """Export filtered AU pending orders with blank tracking-number cells."""
+    if not _has_au_access():
+        return jsonify({'error': '无澳洲发货数据权限'}), 403
+    rows = _australia_shipping_export_rows('pending')
+    if not rows:
+        return jsonify({'error': '当前筛选条件下没有澳洲未发货订单'}), 404
+
+    output = build_australia_shipping_workbook(rows)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    response = send_file(
+        output,
+        as_attachment=True,
+        download_name=f'杭州小包_澳洲未发货_{timestamp}.xlsx',
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+    response.headers['X-Export-Row-Count'] = str(len(rows))
+    return response
 
 
 @app.route('/api/shipping/export/pending')

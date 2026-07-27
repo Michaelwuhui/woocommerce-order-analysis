@@ -25,6 +25,12 @@
                 <i class="bi bi-file-earmark-excel me-1"></i> 导出未发货
             </button>
             {% if has_au_access %}
+            <button class="btn btn-success" id="exportAustraliaBtn" title="按附件的地址拆分样式，导出当前筛选条件下的澳洲已发货包裹">
+                <i class="bi bi-file-earmark-excel me-1"></i> 导出澳洲已发货
+            </button>
+            <button class="btn btn-outline-success" id="exportAustraliaPendingBtn" title="按同样格式导出当前筛选条件下的澳洲未发货订单，运输单号留空">
+                <i class="bi bi-file-earmark-excel me-1"></i> 导出澳洲未发货
+            </button>
             <a href="/au-orders" target="_blank" class="btn btn-outline-info" title="按腾讯表格样式查看全部澳洲订单（只读表格）">
                 <i class="bi bi-table me-1"></i> 澳洲发货表
             </a>
@@ -714,7 +720,72 @@
             document.getElementById('exportPendingBtn').addEventListener('click', () => {
                 window.location.href = '/api/shipping/export/pending';
             });
+            const exportAustraliaBtn = document.getElementById('exportAustraliaBtn');
+            if (exportAustraliaBtn) {
+                exportAustraliaBtn.addEventListener('click', () => exportAustraliaOrders('shipped'));
+            }
+            const exportAustraliaPendingBtn = document.getElementById('exportAustraliaPendingBtn');
+            if (exportAustraliaPendingBtn) {
+                exportAustraliaPendingBtn.addEventListener('click', () => exportAustraliaOrders('pending'));
+            }
         });
+
+        async function exportAustraliaOrders(statusKind) {
+            const country = document.getElementById('countryFilter').value;
+            if (country && country !== 'AU') {
+                alert('澳洲发货导出只包含澳洲订单，请先把国家筛选切换为 AU。');
+                return;
+            }
+
+            const isPending = statusKind === 'pending';
+            const button = document.getElementById(isPending ? 'exportAustraliaPendingBtn' : 'exportAustraliaBtn');
+            const originalHtml = button.innerHTML;
+            button.disabled = true;
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>生成中…';
+
+            const params = new URLSearchParams({
+                source: document.getElementById('siteFilter').value,
+                manager: document.getElementById('managerFilter').value,
+                start_date: document.getElementById('dateFrom').value,
+                end_date: document.getElementById('dateTo').value,
+                search: document.getElementById('searchInput').value
+            });
+
+            try {
+                const endpoint = isPending
+                    ? '/api/shipping/export/australia/pending'
+                    : '/api/shipping/export/australia';
+                const response = await fetch(`${endpoint}?${params.toString()}`);
+                if (!response.ok) {
+                    const payload = await response.json().catch(() => ({}));
+                    throw new Error(payload.error || `导出失败（HTTP ${response.status}）`);
+                }
+                const blob = await response.blob();
+                const disposition = response.headers.get('Content-Disposition') || '';
+                const utf8Name = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+                const fallbackName = disposition.match(/filename="?([^";]+)"?/i);
+                const statusLabel = isPending ? '未发货' : '已发货';
+                let filename = `杭州小包_澳洲${statusLabel}_${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.xlsx`;
+                if (utf8Name) {
+                    filename = decodeURIComponent(utf8Name[1]);
+                } else if (fallbackName) {
+                    filename = fallbackName[1];
+                }
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                URL.revokeObjectURL(url);
+            } catch (error) {
+                alert(error.message || '导出失败，请稍后重试');
+            } finally {
+                button.disabled = false;
+                button.innerHTML = originalHtml;
+            }
+        }
 
         // Render a "repeat-freeloader" warning for a single order. Returns
         // a string of HTML (possibly empty). `compact=true` for inline use
