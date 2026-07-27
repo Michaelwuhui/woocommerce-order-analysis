@@ -3,10 +3,8 @@
 Carrier delivery-status lookup (Phase 2 — auto-resolve shipped-order outcomes).
 
 Scope today: InPost (Polish parcel lockers) via the public ShipX tracking API,
-which needs no credentials and was verified reachable from this server.
-DPD's public tracking page is behind an Imperva WAF (rejects non-browser
-requests), so DPD is intentionally NOT handled here yet — classify_carrier
-returns 'dpd' so the resolver can skip those rows until a DPD path is chosen.
+plus DPD Poland and Packeta through explicitly selected Track718 carrier codes.
+Other carriers can still use Track718 auto-detection in the on-demand UI path.
 
 This module does pure lookups: no DB access, no writes. The resolver
 (resolve_outcomes.py) owns all DB side effects and policy.
@@ -43,11 +41,14 @@ def classify_carrier(provider, tracking_number=None):
     tracking_provider, e.g. 'inpost-paczkomaty' / 'dpd-pl') because the
     human-facing shipping-method label is sometimes wrong. Fall back to the
     tracking-number shape: InPost numbers are 24 digits (often '6055…'),
-    DPD-PL numbers are ~14 digits.
+    Packeta packet IDs are ``Z`` plus 10 digits, and DPD-PL numbers are
+    approximately 14 digits.
     """
     p = (provider or '').lower()
     if 'inpost' in p or 'paczko' in p:
         return 'inpost'
+    if 'packeta' in p or 'zasilkovna' in p or 'zásilkovna' in p:
+        return 'packeta'
     if 'dpd' in p:
         return 'dpd'
     # Provider names some OTHER real carrier (australia-post, ems, gls, …):
@@ -56,6 +57,8 @@ def classify_carrier(provider, tracking_number=None):
         return 'unknown'
     # No useful provider → guess by number FORMAT.
     raw = (tracking_number or '').strip()
+    if len(raw) == 11 and raw[:1].upper() == 'Z' and raw[1:].isdigit():
+        return 'packeta'
     digits = ''.join(ch for ch in raw if ch.isdigit())
     if raw.isdigit() and len(raw) >= 20:   # InPost = a PURE 24-digit number
         return 'inpost'                    # (AusPost 'R…' / others have letters → not InPost)
@@ -118,13 +121,11 @@ def inpost_status(tracking_number, timeout=12, session=None):
     }
 
 
-# ───────────────────────── DPD via Track718 aggregator ─────────────────────
-# DPD-PL's public page is behind an F5/TSPD JS challenge (un-scrapable from a
-# plain HTTP client), so DPD goes through Track718. Track718 is async, like
-# most aggregators: you ADD a number (POST /v2/tracks), it crawls the carrier
-# in the background, then you QUERY (POST /v2/tracking/query). A just-added
-# number returns result 0 (NotFound) / 10 (NotOnline) until the crawl lands,
-# so it resolves over subsequent (cron) runs. Auth is a plain header, no sign.
+# ───────────────────────── Track718 aggregator ─────────────────────────────
+# Track718 is async: ADD a number (POST /v2/tracks), let it crawl the selected
+# carrier, then QUERY (POST /v2/tracking/query). A just-added number can return
+# result 0 (NotFound) / 10 (NotOnline) until the crawl lands. Auth is a plain
+# header, no signature.
 TRACK718_ADD_URL = "https://apigetway.track718.net/v2/tracks"
 TRACK718_QUERY_URL = "https://apigetway.track718.net/v2/tracking/query"
 TRACK718_DPD_PL = "dpd-pl"          # Track718 courier code for DPD Poland
@@ -133,6 +134,7 @@ TRACK718_INPOST_PL = "in-post"      # Track718 courier code for InPost Poland (�
                                     # Paczkomat self-service parcels that aren't in ShipX at all.
                                     # (NB: 'paczkomaty'/id 1101 exists too but returned no data in
                                     # testing; 'in-post' is what the consumer site/website uses.)
+TRACK718_PACKETA = "packeta"        # Explicit code avoids ambiguous auto-detection for Z packet IDs.
 TRACK718_ADD_BATCH = 100            # API max per /v2/tracks call
 TRACK718_QUERY_BATCH = 20           # API max per /v2/tracking/query call
 
@@ -157,8 +159,16 @@ def _t718_headers(key):
     return {'Content-Type': 'application/json', 'Track718-API-Key': key}
 
 
+def track718_code_for(carrier):
+    """Return the explicit Track718 code for carriers we integrate directly."""
+    return {
+        'dpd': TRACK718_DPD_PL,
+        'packeta': TRACK718_PACKETA,
+    }.get((carrier or '').lower())
+
+
 def track718_add(items, key, timeout=25, session=None):
-    """Register DPD shipments so Track718 starts crawling them.
+    """Register shipments so Track718 starts crawling them.
     items: list of dicts, each at least {'trackNum': ...}; we also pass
     code/innerNum/country/zip/ondate when available. Returns count added."""
     getter = session or requests
@@ -261,15 +271,16 @@ def track718_detail(number, key, code=None, timeout=25, session=None, poll=3, po
 
 
 def lookup(carrier, tracking_number, key=None, **kw):
-    """Single-number dispatch. InPost is synchronous. DPD via Track718 needs
-    add → crawl → query, so a first lookup right after add may return
-    error='no_info' (retry shortly)."""
+    """Single-number dispatch. InPost is synchronous. Explicit Track718
+    carriers need add → crawl → query, so a first lookup right after add may
+    return error='no_info' (retry shortly)."""
     if carrier == 'inpost':
         return inpost_status(tracking_number, **kw)
-    if carrier == 'dpd':
+    code = track718_code_for(carrier)
+    if code:
         if not key:
             return {'ok': False, 'error': 'no_track718_key'}
-        track718_add([{'trackNum': tracking_number, 'code': TRACK718_DPD_PL}], key)
-        res = track718_query([tracking_number], key)
+        track718_add([{'trackNum': tracking_number, 'code': code}], key)
+        res = track718_query([tracking_number], key, code=code)
         return res.get(tracking_number, {'ok': False, 'error': 'no_info'})
     return {'ok': False, 'error': 'unknown_carrier'}

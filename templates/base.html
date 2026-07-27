@@ -736,6 +736,46 @@
             ['being returned', '↩ 退回中'],
             ['Delivered,', '✅ 已签收/送达'],
         ];
+        // Packeta's official status API exposes stable English codeText values
+        // and Czech statusText. Track718 can return either representation, so
+        // keep both here and translate every documented operational/exception
+        // state without hiding the original carrier text in the next column.
+        const PACKETA_EVENT_PHRASES = [
+            ['internetový obchod předal informace o zásilce', '已提交包裹信息'],
+            ['zásilka byla přijata na cílovém výdejním místě', '到达目的取件点，等待客户领取'],
+            ['zásilka byla přijata na pobočce', 'Packeta 网点已接收'],
+            ['zásilka byla připravena k odeslání', '已准备从网点/仓库发出'],
+            ['zásilka byla odeslána', '运输途中'],
+            ['zásilka byla vydána', '✅ 客户已领取/签收'],
+            ['received data', '已提交包裹信息'],
+            ['prepared for departure', '已准备从网点/仓库发出'],
+            ['ready for pickup', '到达目的取件点，等待客户领取'],
+            ['handed to carrier', '已交给末端承运商'],
+            ['posted back', '↩ 退回寄件人途中'],
+            ['reverse packet arrived', '已接收退件包裹'],
+            ['delivery attempt', '⚠ 投递尝试未成功'],
+            ['rejected by recipient', '🔴 收件人拒收'],
+            ['return from hd no branch nearby', '↩ 投递失败，附近无可转寄网点，准备退回'],
+            ['storage time expired', '⚠ 保管期已过，准备退回'],
+            ['packet cancelled but consigned', '↩ 已取消但仍交寄，准备退回'],
+            ['return overlimit', '↩ 包裹超限，准备退回'],
+            ['zbox last delivery attempt', '⚠ Z-BOX 最后一次投递失败，需更改配送方式'],
+            ['zbox delivery attempt', '⚠ Z-BOX 投递失败'],
+            ['carrier first delivery attempt', '⚠ 末端承运商首次投递未成功'],
+            ['packet under investigation', '⚠ 包裹调查中'],
+            ['packet investigation resolved', '包裹调查已完成'],
+            ['favourite point redirect', '已改送至客户常用取件点'],
+            ['no favourite point available redirect', '常用取件点已满，已改送其他取件点'],
+            ['no favourite point set redirect', '已改送其他取件点'],
+            ['courier tracking code added', '已生成末端承运商运单号'],
+            ['customs', '清关处理中'],
+            ['collected', '已揽收，运往分拨仓'],
+            ['cancelled', '已取消'],
+            ['returned', '↩ 已退回寄件人'],
+            ['delivered', '✅ 客户已领取/签收'],
+            ['departed', '运输途中'],
+            ['arrived', '已到达 Packeta 网点'],
+        ];
         function carrierEventLabel(s) {
             const stripped = (s || '').replace(/^WA\d+(\/PL\d+)?,\s*/i, '').trim();
             if (INPOST_EVENT_LABELS[stripped]) return INPOST_EVENT_LABELS[stripped];
@@ -744,6 +784,10 @@
             }
             for (const [en, zh] of INPOST_EN_PHRASES) {
                 if (stripped.indexOf(en) !== -1) return zh;
+            }
+            const normalized = stripped.toLowerCase();
+            for (const [phrase, zh] of PACKETA_EVENT_PHRASES) {
+                if (normalized.indexOf(phrase) !== -1) return zh;
             }
             return stripped || (s || '');
         }
@@ -754,6 +798,7 @@
             num = encodeURIComponent(num || '');
             if (c.indexOf('inpost') !== -1) return 'https://inpost.pl/sledzenie-przesylek?number=' + num;
             if (c.indexOf('dpd') !== -1) return 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + num;
+            if (c.indexOf('packeta') !== -1 || c.indexOf('zasilkovna') !== -1 || c.indexOf('zásilkovna') !== -1) return 'https://tracking.packeta.com/en/' + num;
             if (c.indexOf('australia') !== -1 || c.indexOf('auspost') !== -1) return 'https://auspost.com.au/mypost/track/details/' + num;
             return 'https://www.17track.net/zh-CN/track#nums=' + num;
         }
