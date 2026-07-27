@@ -18454,7 +18454,8 @@ def order_carrier_status(order_id):
     """On-demand 查物流: live carrier lookup for ONE order. Read-only w.r.t.
     delivery confirmation / WooCommerce, but it DOES cache the detected
     carrier_status (like the resolver) so the queue badge updates immediately.
-    InPost = ShipX (+ Track718 'in-post' fallback). DPD/others = Track718."""
+    InPost = ShipX (+ Track718 'in-post' fallback). DPD and Packeta use
+    explicit Track718 carrier codes; other carriers use auto-detection."""
     import requests as req
     import carrier_tracking as ct
     conn = get_db_connection()
@@ -18544,16 +18545,25 @@ def order_carrier_status(order_id):
                         key=lambda e: e['time'], reverse=True)
         return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
                         'raw': raw, 'outcome': outcome, 'events': events})
-    # Everything that isn't InPost goes through Track718: DPD with its code,
-    # any other carrier (EMS/中国邮政, Australia Post, GLS, …) via auto-detect.
+    # Everything that isn't InPost goes through Track718. DPD and Packeta use
+    # explicit carrier codes; EMS/中国邮政, Australia Post, GLS, etc. retain
+    # auto-detection.
     if not key718:
         return jsonify({'success': False, 'error': '未配置 Track718 key'}), 400
-    res = ct.track718_detail(number, key718, code=('dpd-pl' if carrier == 'dpd' else None), poll=8, poll_wait=3)
+    res = ct.track718_detail(
+        number,
+        key718,
+        code=ct.track718_code_for(carrier),
+        poll=8,
+        poll_wait=3,
+    )
     _persist_carrier_status(order_id, res.get('outcome'))
     name_map = {'dpd-pl': 'DPD', 'china-post': '中国邮政/EMS', 'australia-post': 'Australia Post',
-                'inpost-paczkomaty': 'InPost', 'gls': 'GLS', 'poczta-polska': 'Poczta Polska'}
-    cname = 'DPD' if carrier == 'dpd' else name_map.get((res.get('carrier') or '').lower(),
-                                                         (res.get('carrier') or '物流').upper())
+                'inpost-paczkomaty': 'InPost', 'gls': 'GLS', 'packeta': 'Packeta',
+                'poczta-polska': 'Poczta Polska'}
+    explicit_name = {'dpd': 'DPD', 'packeta': 'Packeta'}.get(carrier)
+    cname = explicit_name or name_map.get((res.get('carrier') or '').lower(),
+                                           (res.get('carrier') or '物流').upper())
     if res.get('events'):
         return jsonify({'success': True, 'carrier': cname, 'tracking_number': number,
                         'outcome': res.get('outcome', 'unknown'), 'events': res['events']})
