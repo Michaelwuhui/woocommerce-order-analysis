@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce Orders Tracking REST API
  * Description: Provides REST API endpoints for woo-orders-tracking functionality (Adapted for custom implementation)
  * Author: Custom Development
- * Version: 1.1.0
+ * Version: 1.2.0
  */
 
 if (!defined('ABSPATH')) {
@@ -89,27 +89,37 @@ class WOT_REST_API {
             return true;
         }
         
-        // 2. Check WooCommerce REST API authentication (for external API calls)
-        // This allows using WooCommerce consumer_key/consumer_secret for authentication
+        // 2. Check WooCommerce REST API credentials for external server-to-server
+        // calls. Prefer dedicated HTTPS headers so credentials never appear in
+        // URLs / access logs. Query/body credentials remain temporarily
+        // supported for backwards compatibility, but receive the exact same
+        // strict key + secret validation.
         $consumer_key = '';
         $consumer_secret = '';
-        
-        // Priority 1: Try URL query parameters (recommended for avoiding WordPress Basic Auth interception)
-        if (isset($_GET['consumer_key']) && isset($_GET['consumer_secret'])) {
+
+        // Priority 1: Dedicated headers (recommended).
+        $header_key = $request->get_header('x-woo-tracking-key');
+        $header_secret = $request->get_header('x-woo-tracking-secret');
+        if ($header_key && $header_secret) {
+            $consumer_key = sanitize_text_field($header_key);
+            $consumer_secret = sanitize_text_field($header_secret);
+        }
+        // Priority 2: Legacy URL query parameters.
+        elseif (isset($_GET['consumer_key']) && isset($_GET['consumer_secret'])) {
             $consumer_key = sanitize_text_field($_GET['consumer_key']);
             $consumer_secret = sanitize_text_field($_GET['consumer_secret']);
         }
-        // Priority 2: Try request body parameters
+        // Priority 3: Legacy request body parameters.
         elseif ($request->get_param('consumer_key') && $request->get_param('consumer_secret')) {
             $consumer_key = sanitize_text_field($request->get_param('consumer_key'));
             $consumer_secret = sanitize_text_field($request->get_param('consumer_secret'));
         }
-        // Priority 3: Try Basic Auth header (may be intercepted by WordPress)
+        // Priority 4: Basic Auth (some WordPress stacks intercept this first).
         elseif (isset($_SERVER['PHP_AUTH_USER']) && isset($_SERVER['PHP_AUTH_PW'])) {
             $consumer_key = sanitize_text_field($_SERVER['PHP_AUTH_USER']);
             $consumer_secret = sanitize_text_field($_SERVER['PHP_AUTH_PW']);
         }
-        // Priority 4: Try Authorization header (for some server configurations)
+        // Priority 5: Raw Authorization header fallback.
         elseif (isset($_SERVER['HTTP_AUTHORIZATION'])) {
             $auth_header = $_SERVER['HTTP_AUTHORIZATION'];
             if (strpos($auth_header, 'Basic ') === 0) {
@@ -122,46 +132,48 @@ class WOT_REST_API {
             }
         }
         
-        // Validate WooCommerce API key
-        if (!empty($consumer_key) && !empty($consumer_secret)) {
-            global $wpdb;
-            $key = $wpdb->get_row(
-                $wpdb->prepare(
-                    "SELECT key_id, user_id, permissions FROM {$wpdb->prefix}woocommerce_api_keys WHERE consumer_key = %s",
-                    wc_api_hash($consumer_key)
-                )
+        if (empty($consumer_key) || empty($consumer_secret)) {
+            return new WP_Error(
+                'rest_forbidden',
+                __('You do not have permission to access this endpoint.', 'woo-orders-tracking'),
+                array('status' => 403)
             );
-            
-            if ($key && hash_equals($key->consumer_secret ?? '', $consumer_secret) === false) {
-                // For WooCommerce, we need to verify differently - check if key exists and has write permission
-                $key_check = $wpdb->get_row(
-                    $wpdb->prepare(
-                        "SELECT key_id, user_id, permissions, consumer_secret FROM {$wpdb->prefix}woocommerce_api_keys WHERE consumer_key = %s",
-                        wc_api_hash($consumer_key)
-                    )
-                );
-                
-                if ($key_check && in_array($key_check->permissions, array('read_write', 'write'))) {
-                    return true;
-                }
-            }
-            
-            // Simplified check: if consumer_key exists in WooCommerce API keys table with write permission
-            $valid_key = $wpdb->get_var(
-                $wpdb->prepare(
-                    "SELECT key_id FROM {$wpdb->prefix}woocommerce_api_keys 
-                     WHERE consumer_key = %s 
-                     AND permissions IN ('read_write', 'write')",
-                    wc_api_hash($consumer_key)
-                )
-            );
-            
-            if ($valid_key) {
-                return true;
-            }
         }
-        
-        return new WP_Error('rest_forbidden', __('You do not have permission to access this endpoint.', 'woo-orders-tracking'), array('status' => 403));
+
+        global $wpdb;
+        $key = $wpdb->get_row(
+            $wpdb->prepare(
+                "SELECT key_id, user_id, permissions, consumer_secret
+                 FROM {$wpdb->prefix}woocommerce_api_keys
+                 WHERE consumer_key = %s",
+                wc_api_hash($consumer_key)
+            )
+        );
+
+        // Both values are required. Never authorize from consumer_key alone.
+        if (!$key || !hash_equals((string)$key->consumer_secret, (string)$consumer_secret)) {
+            return new WP_Error(
+                'rest_forbidden',
+                __('Invalid API credentials.', 'woo-orders-tracking'),
+                array('status' => 403)
+            );
+        }
+
+        // GET/HEAD endpoints only need read access; the shipment-email POST
+        // endpoint requires write access.
+        $method = strtoupper($request->get_method());
+        $allowed_permissions = in_array($method, array('GET', 'HEAD'), true)
+            ? array('read', 'read_write')
+            : array('write', 'read_write');
+        if (!in_array($key->permissions, $allowed_permissions, true)) {
+            return new WP_Error(
+                'rest_forbidden',
+                __('API key does not have permission for this request.', 'woo-orders-tracking'),
+                array('status' => 403)
+            );
+        }
+
+        return true;
     }
     
     /**
@@ -790,4 +802,3 @@ WOT_REST_API::get_instance();
 // any more. Likewise, the woocommerce_email_before_order_table hook for
 // poland.php tracking has been removed — VillaTheme's send_mail and the
 // site's own WC emails handle the formatting now.
-

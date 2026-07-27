@@ -47,6 +47,7 @@ Thumbs.db
 # Project specific
 # Excel files
 *.xlsx
+!assets/export_templates/australia_shipping_template.xlsx
 *.xls
 *.csv
 
