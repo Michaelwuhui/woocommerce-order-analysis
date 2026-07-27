@@ -20,6 +20,7 @@ from fulfillment_common import json_dump, json_load, utcnow
 
 
 ACTIVE_ORDER_STATUSES = {"processing", "offline", "on-hold", "partial-shipped", "shipped"}
+MANUAL_PARTNER_AVAILABLE = 2_147_483_647
 PLANNABLE_FULFILLMENT_STATUSES = {
     "planned",
     "ready_to_pick",
@@ -327,6 +328,106 @@ def _resolve_sku(conn: sqlite3.Connection, site_id: int, item: dict) -> int | No
     return row["sku_id"] if row else None
 
 
+def _ensure_manual_partner_sku(
+    conn: sqlite3.Connection,
+    site_id: int,
+    market: str,
+    item: dict,
+) -> int | None:
+    """Create a lightweight identity for Poland-partner fulfillment.
+
+    PL/CZ operators do not maintain stock quantities in this OMS.  We still
+    need a durable internal item identity because fulfillment items reference
+    ``inv_skus``.  These auto-created records are deliberately *not*
+    WMS-ready: barcode and WMS names stay empty, so they can never leak into a
+    Hungary WMS submission without an explicit product mapping.
+    """
+
+    if market not in {"PL", "CZ"}:
+        return None
+    product_id = item.get("product_id")
+    variation_id = item.get("variation_id") or 0
+    if product_id in (None, ""):
+        return None
+
+    # Respect an intentionally disabled mapping instead of silently
+    # reactivating it as a manual-partner item.
+    existing_map = conn.execute(
+        """SELECT sku_id, is_active FROM inv_site_sku_map
+           WHERE site_id=? AND wc_product_id=? AND wc_variation_id=?""",
+        (site_id, product_id, variation_id),
+    ).fetchone()
+    if existing_map:
+        return existing_map["sku_id"] if existing_map["is_active"] else None
+
+    warehouse = conn.execute(
+        """SELECT w.id
+           FROM warehouses w
+           JOIN oms_warehouse_integrations wi ON wi.warehouse_id=w.id
+           JOIN inv_market_warehouses mw
+             ON mw.warehouse_id=w.id AND mw.market_code=? AND mw.is_active=1
+           WHERE w.is_active=1 AND w.country='PL'
+             AND wi.is_enabled=1 AND wi.inventory_authority='manual_partner'
+           ORDER BY mw.priority, w.id LIMIT 1""",
+        (market,),
+    ).fetchone()
+    if not warehouse:
+        return None
+
+    sku_code = f"MANUAL-PL-{site_id}-{product_id}-{variation_id}"
+    name = item.get("name") or item.get("parent_name") or sku_code
+    conn.execute(
+        """INSERT OR IGNORE INTO inv_skus
+           (sku_code, name, barcode, is_active, notes)
+           VALUES (?, ?, NULL, 1, ?)""",
+        (
+            sku_code,
+            name,
+            "系统自动建立：仅用于波兰合作仓人工履约，不代表库存数量，也不可直接提交匈牙利 WMS",
+        ),
+    )
+    sku = conn.execute(
+        "SELECT id FROM inv_skus WHERE sku_code=? AND is_active=1",
+        (sku_code,),
+    ).fetchone()
+    if not sku:
+        return None
+    sku_id = sku["id"]
+    conn.execute(
+        """INSERT OR IGNORE INTO inv_site_sku_map
+           (site_id, wc_product_id, wc_variation_id, wc_sku, raw_name,
+            sku_id, qty_per_item, is_active)
+           VALUES (?, ?, ?, ?, ?, ?, 1, 1)""",
+        (
+            site_id,
+            product_id,
+            variation_id,
+            item.get("sku") or "",
+            name,
+            sku_id,
+        ),
+    )
+    mapped = conn.execute(
+        """SELECT sku_id, is_active FROM inv_site_sku_map
+           WHERE site_id=? AND wc_product_id=? AND wc_variation_id=?""",
+        (site_id, product_id, variation_id),
+    ).fetchone()
+    if not mapped or not mapped["is_active"]:
+        return None
+    sku_id = mapped["sku_id"]
+    conn.execute(
+        """INSERT OR IGNORE INTO oms_sku_warehouses
+           (sku_id, warehouse_id, is_primary, is_enabled, product_type, notes)
+           VALUES (?, ?, 1, 1, 'P', ?)""",
+        (
+            sku_id,
+            warehouse["id"],
+            "系统自动归属波兰合作仓；库存与缺货由合作方人工反馈",
+        ),
+    )
+    return sku_id
+
+
 def sync_order_items(conn: sqlite3.Connection, order_id: str) -> list[dict]:
     order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
     if not order:
@@ -341,6 +442,13 @@ def sync_order_items(conn: sqlite3.Connection, order_id: str) -> list[dict]:
         active_keys.append(line_id)
         qty = int(item.get("quantity") or 0)
         sku_id = _resolve_sku(conn, site["id"], item)
+        if not sku_id:
+            sku_id = _ensure_manual_partner_sku(
+                conn,
+                site["id"],
+                (site["country"] or "").upper(),
+                item,
+            )
         conn.execute(
             '''INSERT INTO oms_order_items
                (order_id, woo_line_item_id, line_index, wc_product_id,
@@ -418,7 +526,11 @@ def _candidate_warehouses(conn: sqlite3.Connection, market: str, sku_id: int) ->
                 "SELECT 1 FROM oms_external_stock WHERE warehouse_id=? AND sku_id=?",
                 (d["warehouse_id"], sku_id),
             ).fetchone()
-            if not stock_exists and not ext_exists:
+            manual_partner_default = (
+                market in {"PL", "CZ"}
+                and d["inventory_authority"] == "manual_partner"
+            )
+            if not stock_exists and not ext_exists and not manual_partner_default:
                 continue
         if d["inventory_authority"] == "external_wms":
             stock = conn.execute(
@@ -426,13 +538,22 @@ def _candidate_warehouses(conn: sqlite3.Connection, market: str, sku_id: int) ->
                    FROM oms_external_stock WHERE warehouse_id=? AND sku_id=?''',
                 (d["warehouse_id"], sku_id),
             ).fetchone()
+            d["available"] = max(0, int(stock["available"] if stock else 0))
+            d["availability_mode"] = "external_wms"
+        elif d["inventory_authority"] == "manual_partner":
+            # The partner confirms shortages outside the OMS.  Treat the
+            # mapped product as allocatable and surface later exceptions as a
+            # manual hold instead of inventing quantity-level stock.
+            d["available"] = MANUAL_PARTNER_AVAILABLE
+            d["availability_mode"] = "partner_reported"
         else:
             stock = conn.execute(
                 '''SELECT COALESCE(on_hand-reserved,0) AS available
                    FROM inv_stock WHERE warehouse_id=? AND sku_id=?''',
                 (d["warehouse_id"], sku_id),
             ).fetchone()
-        d["available"] = max(0, int(stock["available"] if stock else 0))
+            d["available"] = max(0, int(stock["available"] if stock else 0))
+            d["availability_mode"] = "local_stock"
         result.append(d)
 
     def rank(c: dict):
@@ -727,6 +848,8 @@ def plan_order(
             plan_reasons.add("shipping_cost" if candidates[0].get("shipping_cost") is not None else "route_priority_fallback")
         else:
             plan_reasons.add("site_preference")
+        if candidates[0].get("availability_mode") == "partner_reported":
+            plan_reasons.add("partner_reported_availability")
         remaining = qty
         for candidate in candidates:
             key = (candidate["warehouse_id"], item["sku_id"])

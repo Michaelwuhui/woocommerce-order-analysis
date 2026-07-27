@@ -23,6 +23,7 @@ inv_migrations.py — 进销存模块的可回滚数据库迁移。
 import sys
 import shutil
 import datetime
+import json
 import sqlite3
 
 from inv_common import DB_FILE, get_conn
@@ -1122,6 +1123,143 @@ def down_008(conn):
     conn.commit()
 
 
+# ───────────────── 009: 人工合作仓 + Packeta 承运商 ─────────────────
+
+def up_009(conn):
+    """Model Poland as partner-reported stock and seed Packeta tracking.
+
+    The Poland partner does not maintain quantity-level inventory in this OMS.
+    Product shortages are reported operationally, so the allocator must not
+    treat a missing ``inv_stock`` row as zero stock.  Hungary remains
+    ``external_wms`` and still requires explicit WMS product data and stock.
+    """
+
+    pl = conn.execute(
+        "SELECT id FROM warehouses WHERE country='PL' OR code='PL' ORDER BY id LIMIT 1"
+    ).fetchone()
+    if pl:
+        previous = conn.execute(
+            "SELECT inventory_authority, config_json FROM oms_warehouse_integrations WHERE warehouse_id=?",
+            (pl["id"],),
+        ).fetchone()
+        if previous:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (
+                    "migration_009_pl_integration_previous",
+                    json.dumps(
+                        {
+                            "inventory_authority": previous["inventory_authority"],
+                            "config_json": previous["config_json"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+            try:
+                config = json.loads(previous["config_json"] or "{}")
+            except (TypeError, ValueError):
+                config = {}
+            config.update(
+                {
+                    "stock_policy": "partner_reported",
+                    "shortage_policy": "manual_notification",
+                    "requires_quantity_inventory": False,
+                }
+            )
+            conn.execute(
+                """UPDATE oms_warehouse_integrations
+                   SET inventory_authority='manual_partner', config_json=?,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE warehouse_id=?""",
+                (json.dumps(config, ensure_ascii=False, separators=(",", ":")), pl["id"]),
+            )
+
+    carrier_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shipping_carriers'"
+    ).fetchone()
+    if carrier_table:
+        previous = conn.execute(
+            "SELECT slug, name, tracking_url, is_active FROM shipping_carriers WHERE slug='packeta'"
+        ).fetchone()
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (
+                "migration_009_packeta_previous",
+                json.dumps(dict(previous), ensure_ascii=False) if previous else "__absent__",
+            ),
+        )
+        conn.execute(
+            """INSERT INTO shipping_carriers (slug, name, tracking_url, is_active)
+               VALUES ('packeta', 'Packeta', 'https://tracking.packeta.com/en/{tracking}', 1)
+               ON CONFLICT(slug) DO UPDATE SET
+                   name=excluded.name,
+                   tracking_url=excluded.tracking_url,
+                   is_active=1"""
+        )
+    conn.commit()
+
+
+def down_009(conn):
+    """Restore pre-009 carrier/inventory settings without touching shipments."""
+
+    pl = conn.execute(
+        "SELECT id FROM warehouses WHERE country='PL' OR code='PL' ORDER BY id LIMIT 1"
+    ).fetchone()
+    saved_pl = conn.execute(
+        "SELECT value FROM settings WHERE key='migration_009_pl_integration_previous'"
+    ).fetchone()
+    if pl and saved_pl:
+        try:
+            previous = json.loads(saved_pl["value"])
+        except (TypeError, ValueError):
+            previous = {}
+        conn.execute(
+            """UPDATE oms_warehouse_integrations
+               SET inventory_authority=?, config_json=?, updated_at=CURRENT_TIMESTAMP
+               WHERE warehouse_id=? AND inventory_authority='manual_partner'""",
+            (
+                previous.get("inventory_authority") or "local",
+                previous.get("config_json"),
+                pl["id"],
+            ),
+        )
+
+    carrier_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shipping_carriers'"
+    ).fetchone()
+    saved_carrier = conn.execute(
+        "SELECT value FROM settings WHERE key='migration_009_packeta_previous'"
+    ).fetchone()
+    if carrier_table and saved_carrier:
+        if saved_carrier["value"] == "__absent__":
+            conn.execute("DELETE FROM shipping_carriers WHERE slug='packeta'")
+        else:
+            try:
+                previous = json.loads(saved_carrier["value"])
+            except (TypeError, ValueError):
+                previous = None
+            if previous:
+                conn.execute(
+                    """INSERT INTO shipping_carriers (slug, name, tracking_url, is_active)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(slug) DO UPDATE SET
+                           name=excluded.name,
+                           tracking_url=excluded.tracking_url,
+                           is_active=excluded.is_active""",
+                    (
+                        previous["slug"],
+                        previous["name"],
+                        previous.get("tracking_url"),
+                        previous.get("is_active", 1),
+                    ),
+                )
+    conn.execute(
+        "DELETE FROM settings WHERE key IN ('migration_009_pl_integration_previous','migration_009_packeta_previous')"
+    )
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -1131,6 +1269,7 @@ MIGRATIONS = [
     ('006', 'multi_warehouse_fulfillment_v2', up_006, down_006),
     ('007', 'fulfillment_cod_and_monthly_settlement', up_007, down_007),
     ('008', 'split_cod_shipping_allocation', up_008, down_008),
+    ('009', 'manual_partner_pl_and_packeta', up_009, down_009),
 ]
 
 

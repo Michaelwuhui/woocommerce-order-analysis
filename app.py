@@ -16647,32 +16647,9 @@ def find_orders_by_tracking():
 # ============================================================================
 
 def detect_site_tracking_format(conn, site_url):
-    """Look at recent shipped orders for this site to figure out which plugin
-    holds the tracking. Returns 'ast' | 'villatheme' | 'custom_lineitem' | 'unknown'."""
-    rows = conn.execute("""
-        SELECT meta_data, line_items FROM orders
-        WHERE source = ? AND status IN ('on-hold','shipped','completed')
-        ORDER BY date_modified DESC LIMIT 10
-    """, (site_url,)).fetchall()
+    from tracking_format import detect_site_tracking_format as _detect
 
-    ast = villa = custom = 0
-    for r in rows:
-        md = r['meta_data'] or ''
-        li = r['line_items'] or ''
-        if '_wc_shipment_tracking_items' in md:
-            ast += 1
-        if '_vi_wot_order_item_tracking_data' in li:
-            villa += 1
-        elif '"key":"tracking_number"' in li or '"key": "tracking_number"' in li:
-            custom += 1
-
-    if ast and ast >= max(villa, custom):
-        return 'ast'
-    if villa and villa >= custom:
-        return 'villatheme'
-    if custom:
-        return 'custom_lineitem'
-    return 'unknown'
+    return _detect(conn, site_url)
 
 
 def _ast_provider_for_carrier(carrier_slug):
@@ -17196,13 +17173,34 @@ def ship_order():
     #     Setting meta via REST never triggers send_mail(), so VillaTheme
     #     sites stopped emailing customers after the ship_order rewrite.
     #     The trigger endpoint replicates the admin call.
-    # The endpoint itself decides which path applies; we just always call it
-    # and let it self-detect.
+    # AST is handled locally below to avoid a duplicate fallback note when the
+    # optional helper endpoint is not installed. Other formats still use the
+    # helper endpoint and let it self-detect the available plugin.
     email_trigger_info = None
     # Did a customer-facing notification actually go out? Only consumed by the
     # reship fallback below; harmless for normal ships.
     customer_notified = False
-    if send_email:
+    if send_email and fmt == 'ast':
+        if not more_batches and not is_reship:
+            # AST sends its native shipment email from the transition to the
+            # custom "shipped" status.  Calling a missing helper endpoint and
+            # posting a second customer note would duplicate that email.
+            email_trigger_info = {
+                'plugin': 'AST',
+                'email_sent': None,
+                'note': '由 shipped 状态转换触发 AST 原生邮件',
+            }
+            customer_notified = True
+        else:
+            # Partial batches do not change status, and a re-shipment is
+            # already in shipped status.  Neither causes AST's transition
+            # hook, so send exactly one WooCommerce customer-note email.
+            _post_fallback_customer_note(
+                req, site, order, carrier_name, tracking_number,
+                tracking_url, api_headers, warnings,
+            )
+            customer_notified = True
+    elif send_email:
         try:
             trig_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/trigger-shipment-email"
             trig_resp = req.post(

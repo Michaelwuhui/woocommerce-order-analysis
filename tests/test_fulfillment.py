@@ -12,7 +12,7 @@ from fulfillment_service import (
     recompute_order_status,
     transition_fulfillment,
 )
-from inv_migrations import up_001, up_006, up_007, up_008
+from inv_migrations import down_009, up_001, up_006, up_007, up_008, up_009
 from fulfillment_woocommerce import _all_order_shipments, _ast_items, _customer_note_body
 
 
@@ -99,6 +99,9 @@ class FulfillmentDomainTests(unittest.TestCase):
         line_tax=0,
         order_total=None,
         payment_method="cod",
+        product_id=101,
+        sku="SKU1",
+        name="Test product",
     ):
         site = {"PL": "https://pl.test", "HU": "https://hu.test", "CZ": "https://cz.test"}[market]
         if line_total is None:
@@ -107,10 +110,10 @@ class FulfillmentDomainTests(unittest.TestCase):
             order_total = Decimal(str(line_total)) + Decimal(str(line_tax)) + Decimal(str(shipping_total))
         item = {
             "id": 501,
-            "product_id": 101,
+            "product_id": product_id,
             "variation_id": 0,
-            "sku": "SKU1",
-            "name": "Test product",
+            "sku": sku,
+            "name": name,
             "quantity": qty,
             "total": str(line_total),
             "total_tax": str(line_tax),
@@ -180,6 +183,95 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.assertEqual(1, state["has_shortage"])
         self.assertEqual(1, state["manual_review"])
         self.assertFalse(completion_guard(self.db, "short-1")[0])
+
+    def test_manual_partner_autoprovisions_czech_without_stock_quantity(self):
+        self.db.execute(
+            """UPDATE oms_warehouse_integrations
+               SET inventory_authority='manual_partner' WHERE warehouse_id=1"""
+        )
+        self.set_stock(pl=0, hu=0)
+        self.add_order(
+            "cz-manual-1",
+            "CZ",
+            2,
+            product_id=202,
+            sku="",
+            name="Partner-managed product",
+        )
+
+        result = plan_order(self.db, "cz-manual-1")
+
+        self.assertFalse(result["shortages"])
+        self.assertEqual([{"warehouse_id": 1, "qty": 2}], self.allocations("cz-manual-1"))
+        self.assertIn("partner_reported_availability", result["reason"])
+        created = self.db.execute(
+            """SELECT s.sku_code, s.barcode, sw.warehouse_id
+               FROM inv_site_sku_map sm
+               JOIN inv_skus s ON s.id=sm.sku_id
+               JOIN oms_sku_warehouses sw ON sw.sku_id=s.id
+               WHERE sm.site_id=3 AND sm.wc_product_id=202"""
+        ).fetchone()
+        self.assertTrue(created["sku_code"].startswith("MANUAL-PL-3-202-"))
+        self.assertIsNone(created["barcode"])
+        self.assertEqual(1, created["warehouse_id"])
+
+    def test_manual_partner_fallback_never_autoprovisions_hungary_wms_item(self):
+        self.db.execute(
+            """UPDATE oms_warehouse_integrations
+               SET inventory_authority='manual_partner' WHERE warehouse_id=1"""
+        )
+        self.add_order(
+            "hu-unmapped-1",
+            "HU",
+            1,
+            product_id=202,
+            sku="",
+            name="Unmapped WMS product",
+        )
+
+        result = plan_order(self.db, "hu-unmapped-1")
+
+        self.assertEqual([], self.allocations("hu-unmapped-1"))
+        self.assertEqual("sku_unmapped", result["shortages"][0]["reason"])
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT id FROM inv_skus WHERE sku_code LIKE 'MANUAL-PL-2-202-%'"
+            ).fetchone()
+        )
+
+    def test_packeta_and_manual_partner_migration_roundtrip(self):
+        self.db.execute(
+            """CREATE TABLE shipping_carriers (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 slug TEXT NOT NULL UNIQUE,
+                 name TEXT NOT NULL,
+                 tracking_url TEXT,
+                 is_active INTEGER DEFAULT 1
+               )"""
+        )
+
+        up_009(self.db)
+
+        carrier = self.db.execute(
+            "SELECT * FROM shipping_carriers WHERE slug='packeta'"
+        ).fetchone()
+        authority = self.db.execute(
+            "SELECT inventory_authority FROM oms_warehouse_integrations WHERE warehouse_id=1"
+        ).fetchone()[0]
+        self.assertEqual("https://tracking.packeta.com/en/{tracking}", carrier["tracking_url"])
+        self.assertEqual("manual_partner", authority)
+
+        down_009(self.db)
+
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT id FROM shipping_carriers WHERE slug='packeta'"
+            ).fetchone()
+        )
+        authority = self.db.execute(
+            "SELECT inventory_authority FROM oms_warehouse_integrations WHERE warehouse_id=1"
+        ).fetchone()[0]
+        self.assertEqual("local", authority)
 
     def test_two_parcels_complete_only_after_both_delivered_and_ignore_late_event(self):
         self.set_stock(pl=1, hu=5)

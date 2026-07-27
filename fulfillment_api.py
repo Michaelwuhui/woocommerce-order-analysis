@@ -225,32 +225,65 @@ def _rollout_readiness(conn) -> dict:
                WHERE wi.provider='hungary_wms' AND wi.is_enabled=1
                  AND es.sku_id IS NOT NULL AND es.available_quantity>0'''
         ).fetchone()["n"],
+        "manual_partner_warehouse_count": conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM oms_warehouse_integrations wi
+               JOIN warehouses w ON w.id=wi.warehouse_id
+               WHERE wi.is_enabled=1
+                 AND wi.inventory_authority='manual_partner'
+                 AND w.is_active=1 AND w.country='PL'"""
+        ).fetchone()["n"],
+        "manual_partner_route_count": conn.execute(
+            """SELECT COUNT(DISTINCT mw.market_code) AS n
+               FROM inv_market_warehouses mw
+               JOIN warehouses w ON w.id=mw.warehouse_id
+               JOIN oms_warehouse_integrations wi ON wi.warehouse_id=w.id
+               WHERE mw.is_active=1 AND mw.market_code IN ('PL','CZ')
+                 AND w.is_active=1 AND w.country='PL'
+                 AND wi.is_enabled=1
+                 AND wi.inventory_authority='manual_partner'"""
+        ).fetchone()["n"],
     }
-    can_auto_plan = all(
+    master_data_can_plan = all(
         counts[key] > 0
         for key in ("sku_count", "site_sku_map_count", "warehouse_sku_map_count")
     )
+    manual_partner_ready = (
+        counts["manual_partner_warehouse_count"] > 0
+        and counts["manual_partner_route_count"] >= 2
+    )
+    can_auto_plan = manual_partner_ready or master_data_can_plan
     can_auto_submit = (
-        can_auto_plan
+        master_data_can_plan
         and counts["wms_ready_sku_count"] > 0
         and counts["wms_stocked_sku_count"] > 0
     )
-    blockers = []
+    manual_partner_blockers = []
+    if counts["manual_partner_warehouse_count"] <= 0:
+        manual_partner_blockers.append("波兰仓尚未设置为合作方人工库存模式")
+    if counts["manual_partner_route_count"] < 2:
+        manual_partner_blockers.append("波兰/捷克市场的波兰合作仓路由未完整配置")
+
+    wms_blockers = []
     if counts["sku_count"] <= 0:
-        blockers.append("SKU 主档为空")
+        wms_blockers.append("SKU 主档为空")
     if counts["site_sku_map_count"] <= 0:
-        blockers.append("站点商品与 SKU 映射为空")
+        wms_blockers.append("站点商品与 SKU 映射为空")
     if counts["warehouse_sku_map_count"] <= 0:
-        blockers.append("SKU 仓库归属为空")
+        wms_blockers.append("SKU 仓库归属为空")
     if counts["wms_ready_sku_count"] <= 0:
-        blockers.append("没有同时具备条码、中英文品名的匈牙利 WMS SKU")
+        wms_blockers.append("没有同时具备条码、中英文品名的匈牙利 WMS SKU")
     if counts["wms_stocked_sku_count"] <= 0:
-        blockers.append("HU01 当前没有可识别的可用库存")
+        wms_blockers.append("HU01 当前没有可识别的可用库存")
     return {
         **counts,
+        "manual_partner_ready": manual_partner_ready,
         "can_auto_plan": can_auto_plan,
         "can_auto_submit": can_auto_submit,
-        "blockers": blockers,
+        "manual_partner_blockers": manual_partner_blockers,
+        "wms_blockers": wms_blockers,
+        # Backward-compatible key used by the current configuration UI.
+        "blockers": wms_blockers,
     }
 
 
