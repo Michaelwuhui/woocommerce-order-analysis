@@ -40,7 +40,7 @@ $remotePycache = "/tmp/company-profit-pycache-$token"
 $localJson = Join-Path $resolvedTempRoot "snapshot-$Month.json"
 $localBuilder = Join-Path $resolvedTempRoot 'build_company_profit_workbook.mjs'
 $localNodeModules = Join-Path $resolvedTempRoot 'node_modules'
-$outputFile = Join-Path $outputRoot "公司经营月报-$Month.xlsx"
+$outputFile = Join-Path $outputRoot "company-profit-monthly-$Month.xlsx"
 
 try {
     Copy-Item -LiteralPath (Join-Path $repoRoot 'tools\build_company_profit_workbook.mjs') -Destination $localBuilder

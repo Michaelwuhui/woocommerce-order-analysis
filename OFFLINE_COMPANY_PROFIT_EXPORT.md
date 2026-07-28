@@ -10,7 +10,7 @@
 powershell -ExecutionPolicy Bypass -File .\scripts\export_company_profit_month.ps1 -Month 2026-07
 ```
 
-默认输出到代码仓库同级的 `outputs\company-profit\公司经营月报-2026-07.xlsx`。
+默认输出到代码仓库同级的 `outputs\company-profit\company-profit-monthly-2026-07.xlsx`。使用 ASCII 文件名是为了兼容 Windows PowerShell 5.1 的脚本编码行为；工作簿内部仍使用完整中文标题。
 
 导出流程：
 
