@@ -193,14 +193,6 @@
                         </a>
                     </li>
                     {% endif %}
-                    {% if can_view_company_profit %}
-                    <li class="nav-item">
-                        <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('company_profit.') else '' }}"
-                            href="{{ url_for('company_profit.company_profit_page') }}">
-                            <i class="bi bi-graph-up-arrow me-1"></i>公司盈利
-                        </a>
-                    </li>
-                    {% endif %}
                     {% if current_user.can_view_costs() %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint == 'product_costs_page' else '' }}"
