@@ -669,6 +669,7 @@ async function main() {
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
   const output = await SpreadsheetFile.exportXlsx(workbook);
   await output.save(outputPath);
+  await fs.rm(`${outputPath}.inspect.ndjson`, { force: true });
   try {
     await fs.chmod(outputPath, 0o600);
   } catch {

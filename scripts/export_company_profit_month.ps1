@@ -36,6 +36,7 @@ New-Item -ItemType Directory -Path $resolvedTempRoot | Out-Null
 
 $token = [guid]::NewGuid().ToString('N')
 $remoteJson = "/tmp/company-profit-$Month-$token.json"
+$remotePycache = "/tmp/company-profit-pycache-$token"
 $localJson = Join-Path $resolvedTempRoot "snapshot-$Month.json"
 $localBuilder = Join-Path $resolvedTempRoot 'build_company_profit_workbook.mjs'
 $localNodeModules = Join-Path $resolvedTempRoot 'node_modules'
@@ -52,7 +53,7 @@ if [ -x venv/bin/python ]; then PY=venv/bin/python
 elif [ -x .venv/bin/python ]; then PY=.venv/bin/python
 else PY=python3
 fi
-PYTHONPYCACHEPREFIX=/tmp/company-profit-pycache-`$`$ "`$PY" offline_company_profit_snapshot.py --month '$Month' --output '$remoteJson'
+PYTHONPYCACHEPREFIX='$remotePycache' "`$PY" offline_company_profit_snapshot.py --month '$Month' --output '$remoteJson'
 "@
     & ssh $SshAlias $remoteCommand
     if ($LASTEXITCODE -ne 0) {
@@ -74,7 +75,7 @@ PYTHONPYCACHEPREFIX=/tmp/company-profit-pycache-`$`$ "`$PY" offline_company_prof
     Write-Output $outputFile
 }
 finally {
-    & ssh $SshAlias "rm -f '$remoteJson'" 2>$null
+    & ssh $SshAlias "set -eu; rm -f '$remoteJson'; case '$remotePycache' in /tmp/company-profit-pycache-*) rm -rf -- '$remotePycache' ;; *) exit 2 ;; esac" 2>$null
     if (Test-Path -LiteralPath $resolvedTempRoot) {
         $verifiedTemp = [System.IO.Path]::GetFullPath($resolvedTempRoot)
         if ($verifiedTemp.StartsWith($resolvedTempParent, [System.StringComparison]::OrdinalIgnoreCase)) {
