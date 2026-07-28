@@ -121,7 +121,7 @@
 
 <!-- Edit User Modal -->
 <div class="modal fade" id="editUserModal" tabindex="-1">
-    <div class="modal-dialog">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
         <div class="modal-content bg-dark border border-secondary border-opacity-25">
             <div class="modal-header border-bottom border-secondary border-opacity-25">
                 <h5 class="modal-title text-white">编辑用户</h5>
@@ -213,6 +213,32 @@
                                 <i class="bi bi-pencil-square me-1"></i>合伙人对账 · 编辑 <small class="text-muted">（可生成对账单、录入收款、改合伙人设置。内部财务/admin 需勾上）</small>
                             </label>
                         </div>
+                        <div class="ms-4 mt-2 p-3 rounded border border-secondary border-opacity-25"
+                             id="wrapReconciliationScope">
+                            <div class="small text-white-50 mb-2">
+                                <i class="bi bi-funnel me-1"></i>对账查看范围
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input" type="radio" name="reconciliationScope"
+                                       id="reconciliationScopeAll" value="all" checked>
+                                <label class="form-check-label text-white-50" for="reconciliationScopeAll">
+                                    全部对账 <small class="text-muted">（仅限内部财务）</small>
+                                </label>
+                            </div>
+                            <div class="form-check mt-1">
+                                <input class="form-check-input" type="radio" name="reconciliationScope"
+                                       id="reconciliationScopeSelected" value="selected">
+                                <label class="form-check-label text-white-50" for="reconciliationScopeSelected">
+                                    仅指定对账主体
+                                </label>
+                            </div>
+                            <div class="mt-2 ms-4" id="reconciliationPartnerOptions">
+                                <span class="text-muted small">正在加载对账主体…</span>
+                            </div>
+                            <div class="form-text text-warning">
+                                指定后，页面列表和接口都只能读取所选范围。
+                            </div>
+                        </div>
                         <div class="form-check mt-2">
                             <input class="form-check-input" type="checkbox" id="editCanViewCosts">
                             <label class="form-check-label text-white-50" for="editCanViewCosts">
@@ -223,6 +249,20 @@
                             <input class="form-check-input" type="checkbox" id="editCanEditCosts">
                             <label class="form-check-label text-white-50" for="editCanEditCosts">
                                 <i class="bi bi-pencil-square me-1"></i>成本管理 · 编辑 <small class="text-muted">（可新增/修改/删除产品成本及历史价格版本）</small>
+                            </label>
+                        </div>
+                        <div class="form-check mt-2">
+                            <input class="form-check-input" type="checkbox" id="editCanViewCompanyProfit">
+                            <label class="form-check-label text-warning" for="editCanViewCompanyProfit">
+                                <i class="bi bi-building-gear me-1"></i>公司盈利 · 查看
+                                <small class="text-muted">（可查看公司分润、工资支出、经营利润与预测）</small>
+                            </label>
+                        </div>
+                        <div class="form-check mt-1 ms-4">
+                            <input class="form-check-input" type="checkbox" id="editCanEditCompanyProfit">
+                            <label class="form-check-label text-warning" for="editCanEditCompanyProfit">
+                                <i class="bi bi-pencil-square me-1"></i>公司盈利 · 修改
+                                <small class="text-muted">（可修改分润比例、实际工资、预测与支出；自动含查看）</small>
                             </label>
                         </div>
                         <div class="form-check mt-2">
@@ -250,7 +290,7 @@
                             </label>
                         </div>
                         {% endif %}
-                        <small class="text-muted">允许该用户访问发货管理、数据报告和销售看板功能</small>
+                        <small class="text-muted">按用户独立授予业务与财务模块权限；角色本身不自动获得公司盈利数据。</small>
                     </div>
                 </div>
                 <div class="modal-footer border-top border-secondary border-opacity-25">
@@ -308,6 +348,7 @@
 <script>
     document.addEventListener('DOMContentLoaded', function () {
         loadUsers();
+        loadReconciliationOptions();
 
         // Use event delegation on tbody for all button clicks - this is more robust
         const tbody = document.getElementById('usersTableBody');
@@ -324,7 +365,7 @@
             } else if (btn.classList.contains('btn-edit')) {
                 const user = window._usersData && window._usersData[userId];
                 if (user) {
-                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_manage_own_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0, user.can_view_own_sales_board || 0, user.site_count || 0, user.can_view_shipping || 0, user.can_manage_blocklist || 0, user.can_view_inventory || 0, user.can_manage_inventory || 0);
+                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_manage_own_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0, user.can_view_own_sales_board || 0, user.site_count || 0, user.can_view_shipping || 0, user.can_manage_blocklist || 0, user.can_view_inventory || 0, user.can_manage_inventory || 0, user.can_view_company_profit || 0, user.can_edit_company_profit || 0, user.reconciliation_scope || 'none', user.reconciliation_partner_ids || []);
                 }
             } else if (btn.classList.contains('btn-delete')) {
                 deleteUser(userId);
@@ -395,6 +436,51 @@
                 });
         }
 
+        let reconciliationOptions = [];
+        let currentReconciliationSelectedIds = [];
+        function loadReconciliationOptions() {
+            const container = document.getElementById('reconciliationPartnerOptions');
+            if (!container) return;
+            fetch('/api/users/reconciliation-options')
+                .then(res => res.ok ? res.json() : Promise.reject(new Error('加载失败')))
+                .then(partners => {
+                    reconciliationOptions = partners;
+                    renderReconciliationOptions(currentReconciliationSelectedIds);
+                })
+                .catch(() => {
+                    container.innerHTML = '<span class="text-danger small">对账主体加载失败，请刷新后重试</span>';
+                });
+        }
+
+        function renderReconciliationOptions(selectedIds) {
+            const container = document.getElementById('reconciliationPartnerOptions');
+            if (!container) return;
+            currentReconciliationSelectedIds = (selectedIds || []).map(Number);
+            const selected = new Set(currentReconciliationSelectedIds);
+            if (!reconciliationOptions.length) {
+                container.innerHTML = '<span class="text-muted small">暂无对账主体，请先到“合伙人对账 → 设置”中创建。</span>';
+                return;
+            }
+            container.innerHTML = reconciliationOptions.map(p => `
+                <div class="form-check">
+                    <input class="form-check-input reconciliation-partner-option" type="checkbox"
+                           value="${p.id}" id="reconPartner_${p.id}" ${selected.has(p.id) ? 'checked' : ''}>
+                    <label class="form-check-label text-white-50" for="reconPartner_${p.id}">
+                        ${escapeHtmlText(p.name)}
+                        <small class="text-muted">（${escapeHtmlText(p.countries || '未绑定站点')} · ${p.site_count || 0} 个站点）</small>
+                    </label>
+                </div>
+            `).join('');
+            updateReconciliationScopeState();
+        }
+
+        function escapeHtmlText(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
         // Add User
         document.getElementById('addUserForm').addEventListener('submit', function (e) {
             e.preventDefault();
@@ -421,7 +507,7 @@
         });
 
         // Edit User
-        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, site_count, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory) {
+        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, site_count, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, can_view_company_profit, can_edit_company_profit, reconciliation_scope, reconciliation_partner_ids) {
             document.getElementById('editUserId').value = id;
             document.getElementById('editUsername').value = username;
             document.getElementById('editName').value = name;
@@ -456,6 +542,13 @@
             if (rcEl) rcEl.checked = can_view_reconciliation == 1;
             var recEl = document.getElementById('editCanEditReconciliation');
             if (recEl) recEl.checked = can_edit_reconciliation == 1;
+            var selectedScopeEl = document.getElementById('reconciliationScopeSelected');
+            var allScopeEl = document.getElementById('reconciliationScopeAll');
+            if (selectedScopeEl && allScopeEl) {
+                selectedScopeEl.checked = reconciliation_scope === 'selected';
+                allScopeEl.checked = reconciliation_scope !== 'selected';
+                renderReconciliationOptions(reconciliation_partner_ids || []);
+            }
             var costsEl = document.getElementById('editCanViewCosts');
             if (costsEl) costsEl.checked = can_view_costs == 1;
             var costsEditEl = document.getElementById('editCanEditCosts');
@@ -468,11 +561,17 @@
             if (ivEl) ivEl.checked = can_view_inventory == 1;
             var imEl = document.getElementById('editCanManageInventory');
             if (imEl) imEl.checked = can_manage_inventory == 1;
+            var cpvEl = document.getElementById('editCanViewCompanyProfit');
+            if (cpvEl) cpvEl.checked = can_view_company_profit == 1;
+            var cpeEl = document.getElementById('editCanEditCompanyProfit');
+            if (cpeEl) cpeEl.checked = can_edit_company_profit == 1;
             document.getElementById('editPassword').value = '';
             // Enforce: edit implies view. If view is unchecked, disable edit.
             updateReconEditState();
+            updateReconciliationScopeState();
             updateCostsEditState();
             updateInventoryEditState();
+            updateCompanyProfitEditState();
             bootstrap.Modal.getOrCreateInstance(document.getElementById('editUserModal')).show();
         };
 
@@ -498,6 +597,20 @@
             } else {
                 eEl.disabled = false;
             }
+            updateReconciliationScopeState();
+        }
+        function updateReconciliationScopeState() {
+            var viewEl = document.getElementById('editCanViewReconciliation');
+            var selectedEl = document.getElementById('reconciliationScopeSelected');
+            var wrap = document.getElementById('wrapReconciliationScope');
+            var enabled = !!(viewEl && viewEl.checked);
+            if (wrap) wrap.style.opacity = enabled ? '1' : '0.5';
+            document.querySelectorAll('input[name="reconciliationScope"]').forEach(el => {
+                el.disabled = !enabled;
+            });
+            document.querySelectorAll('.reconciliation-partner-option').forEach(el => {
+                el.disabled = !enabled || !(selectedEl && selectedEl.checked);
+            });
         }
         // Same gate for costs: editing requires viewing
         function updateCostsEditState() {
@@ -515,6 +628,18 @@
         function updateInventoryEditState() {
             var vEl = document.getElementById('editCanViewInventory');
             var eEl = document.getElementById('editCanManageInventory');
+            if (!vEl || !eEl) return;
+            if (!vEl.checked) {
+                eEl.checked = false;
+                eEl.disabled = true;
+            } else {
+                eEl.disabled = false;
+            }
+        }
+        // 公司盈利：修改权限自动包含查看；查看取消时禁用修改。
+        function updateCompanyProfitEditState() {
+            var vEl = document.getElementById('editCanViewCompanyProfit');
+            var eEl = document.getElementById('editCanEditCompanyProfit');
             if (!vEl || !eEl) return;
             if (!vEl.checked) {
                 eEl.checked = false;
@@ -565,6 +690,9 @@
             var vEl = document.getElementById('editCanViewReconciliation');
             var eEl = document.getElementById('editCanEditReconciliation');
             if (vEl) vEl.addEventListener('change', updateReconEditState);
+            document.querySelectorAll('input[name="reconciliationScope"]').forEach(el => {
+                el.addEventListener('change', updateReconciliationScopeState);
+            });
             if (eEl) eEl.addEventListener('change', function () {
                 // If enabling edit, auto-enable view
                 if (eEl.checked && vEl && !vEl.checked) vEl.checked = true;
@@ -583,11 +711,29 @@
             if (imEl) imEl.addEventListener('change', function () {
                 if (imEl.checked && ivEl && !ivEl.checked) ivEl.checked = true;
             });
+            var cpvEl = document.getElementById('editCanViewCompanyProfit');
+            var cpeEl = document.getElementById('editCanEditCompanyProfit');
+            if (cpvEl) cpvEl.addEventListener('change', updateCompanyProfitEditState);
+            if (cpeEl) cpeEl.addEventListener('change', function () {
+                if (cpeEl.checked && cpvEl && !cpvEl.checked) {
+                    cpvEl.checked = true;
+                    updateCompanyProfitEditState();
+                }
+            });
         })();
 
         document.getElementById('editUserForm').addEventListener('submit', function (e) {
             e.preventDefault();
             const id = document.getElementById('editUserId').value;
+            const canViewReconciliation = (document.getElementById('editCanViewReconciliation') || {}).checked;
+            const reconciliationScope = (document.querySelector('input[name="reconciliationScope"]:checked') || {}).value || 'all';
+            const reconciliationPartnerIds = Array.from(
+                document.querySelectorAll('.reconciliation-partner-option:checked')
+            ).map(el => parseInt(el.value));
+            if (canViewReconciliation && reconciliationScope === 'selected' && reconciliationPartnerIds.length === 0) {
+                alert('请选择至少一个对账主体');
+                return;
+            }
             fetch(`/api/users/${id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
@@ -602,14 +748,18 @@
                     can_manage_own_products: (document.getElementById('editCanManageOwnProducts') || {}).checked ? 1 : 0,
                     can_view_sales_board: (document.getElementById('editCanViewSalesBoard') || {}).checked ? 1 : 0,
                     can_view_own_sales_board: (document.getElementById('editCanViewOwnSalesBoard') || {}).checked ? 1 : 0,
-                    can_view_reconciliation: (document.getElementById('editCanViewReconciliation') || {}).checked ? 1 : 0,
+                    can_view_reconciliation: canViewReconciliation ? 1 : 0,
                     can_edit_reconciliation: (document.getElementById('editCanEditReconciliation') || {}).checked ? 1 : 0,
+                    reconciliation_scope: reconciliationScope,
+                    reconciliation_partner_ids: reconciliationPartnerIds,
                     can_view_costs: (document.getElementById('editCanViewCosts') || {}).checked ? 1 : 0,
                     can_edit_costs: (document.getElementById('editCanEditCosts') || {}).checked ? 1 : 0,
                     can_manage_users: (document.getElementById('editCanManageUsers') || {}).checked ? 1 : 0,
                     can_manage_blocklist: (document.getElementById('editCanManageBlocklist') || {}).checked ? 1 : 0,
                     can_view_inventory: (document.getElementById('editCanViewInventory') || {}).checked ? 1 : 0,
-                    can_manage_inventory: (document.getElementById('editCanManageInventory') || {}).checked ? 1 : 0
+                    can_manage_inventory: (document.getElementById('editCanManageInventory') || {}).checked ? 1 : 0,
+                    can_view_company_profit: (document.getElementById('editCanViewCompanyProfit') || {}).checked ? 1 : 0,
+                    can_edit_company_profit: (document.getElementById('editCanEditCompanyProfit') || {}).checked ? 1 : 0
                 })
             })
                 .then(res => res.json())
@@ -658,7 +808,12 @@
         // (auto-inherits future sites); within a granted country an individual site
         // can be excluded by unchecking it. Sites in non-granted countries are
         // permitted only when explicitly checked.
-        const COUNTRY_NAMES = { PL: '波兰', AU: '澳大利亚', AE: '阿联酋', US: '美国', GB: '英国' };
+        const COUNTRY_NAMES = {
+            PL: '波兰', AU: '澳大利亚', AE: '阿联酋',
+            HU: '匈牙利', CZ: '捷克',
+            DE: '德国', FR: '法国', UK: '英国', GB: '英国',
+            US: '美国', CN: '中国'
+        };
         const HINT_ON = '整国授权 · 新增站点自动继承（取消勾选某站 = 排除该站）';
         const HINT_OFF = '未整国授权 · 仅勾选的站点可见';
 

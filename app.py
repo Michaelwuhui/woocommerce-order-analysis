@@ -15,6 +15,14 @@ from flask_login import LoginManager, UserMixin, login_user, logout_user, login_
 from oid_utils import woo_post_id  # cross-site-safe WC post id for REST calls
 import blocklist  # customer blocklist: auto-cancel COD orders from blacklisted phones
 from shipping_export import build_australia_shipping_workbook
+from sales_board_rates import load_monthly_receipt_rates, resolve_sales_board_rate
+from sales_target_inheritance import load_sales_targets_for_month
+from partner_site_scope import (
+    EFFECTIVE_PARTNER_SITES,
+    get_partner_site_scope,
+    init_partner_site_scope,
+    replace_partner_site_scope,
+)
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 from product_manager_service import (
@@ -1355,7 +1363,7 @@ def _user_allowed_warehouse_ids(for_view=False):
             return None if for_view else []
         placeholders = ','.join(['?'] * len(partner_ids))
         countries = [r['country'] for r in conn.execute(f'''
-            SELECT DISTINCT s.country FROM partner_sites ps
+            SELECT DISTINCT s.country FROM effective_partner_sites ps
             JOIN sites s ON s.id = ps.site_id
             WHERE ps.partner_id IN ({placeholders})
               AND s.country IS NOT NULL AND s.country != ''
@@ -2850,7 +2858,7 @@ def monthly():
         total_amount = gdf['total'].sum()
 
         success_mask = (
-            ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat'])
+            ~gdf['status'].isin(['failed', 'cancelled', 'checkout-draft', 'trash', 'cheat', 'refunded'])
             & ~((gdf['status'] == 'pending') & (gdf['payment_method'].fillna('cod') != 'cod'))
             & ~((gdf['status'] == 'on-hold') & (gdf['payment_method'] == 'bacs'))
             & ~((gdf['status'] == 'on-hold') & ~gdf['source'].isin(on_hold_shipped_sources))
@@ -6648,6 +6656,7 @@ def init_partner_reconciliation_tables():
             FOREIGN KEY (partner_id) REFERENCES partners(id) ON DELETE CASCADE
         )
     ''')
+    init_partner_site_scope(conn)
 
     # Partner-user bindings (which users can see which partner's data)
     conn.execute('''
@@ -6836,6 +6845,14 @@ def init_partner_reconciliation_tables():
         for site in pl_sites:
             conn.execute('INSERT OR IGNORE INTO partner_sites (partner_id, site_id) VALUES (?, ?)',
                         (partner_id, site['id']))
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO partner_country_permissions
+                (partner_id, country)
+            VALUES (?, 'PL')
+            """,
+            (partner_id,),
+        )
 
     conn.commit()
     conn.close()
@@ -7049,6 +7066,11 @@ def settings():
     """Settings page for site management - Admin only"""
     conn = get_db_connection()
     sites = conn.execute('SELECT * FROM sites').fetchall()
+    site_managers = sorted({
+        (site['manager'] or '').strip()
+        for site in sites
+        if (site['manager'] or '').strip()
+    }, key=str.casefold)
 
     # Get exchange rates
     exchange_rates = conn.execute('''
@@ -7087,6 +7109,7 @@ def settings():
     conn.close()
     return render_template('settings.html',
                           sites=sites,
+                          site_managers=site_managers,
                           exchange_rates=exchange_rates,
                           currencies=currency_list,
                           product_masters=product_masters_list,
@@ -10611,7 +10634,7 @@ def get_users():
     # them on startup, so in practice the first SELECT succeeds.
     SCHEMAS = [
         # 0: latest — incl. 库存权限 can_view_inventory / can_manage_inventory
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, can_view_company_profit, can_edit_company_profit, created_at FROM users',
         # 0a: missing product own-scope column
         'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, 0 as can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, created_at FROM users',
         # 0b: 库存列尚未迁移时回退(其余同上)
@@ -10645,6 +10668,17 @@ def get_users():
     site_counts = {r['manager']: r['c'] for r in conn.execute(
         "SELECT manager, COUNT(*) c FROM sites WHERE manager IS NOT NULL AND manager != '' GROUP BY manager"
     ).fetchall()}
+    # Reconciliation scope is stored in partner_users:
+    # no rows = all partners (internal finance); one or more rows = only those
+    # partners.  Return the bindings with each user so the super-admin can manage
+    # the scope from the same dialog as the view/edit permission.
+    reconciliation_partner_ids = {}
+    try:
+        for binding in conn.execute(
+                'SELECT user_id, partner_id FROM partner_users ORDER BY user_id, partner_id').fetchall():
+            reconciliation_partner_ids.setdefault(binding['user_id'], []).append(binding['partner_id'])
+    except sqlite3.OperationalError:
+        pass
     conn.close()
     is_super_admin = (current_user.username == 'admin')
     result = []
@@ -10656,12 +10690,45 @@ def get_users():
         u.setdefault('can_view_inventory', 0)
         u.setdefault('can_manage_inventory', 0)
         u.setdefault('can_manage_own_products', 0)
+        u.setdefault('can_view_company_profit', 0)
+        u.setdefault('can_edit_company_profit', 0)
         u['site_count'] = site_counts.get(u.get('name') or '', 0)
+        u['reconciliation_partner_ids'] = reconciliation_partner_ids.get(u['id'], [])
+        if not u.get('can_view_reconciliation'):
+            u['reconciliation_scope'] = 'none'
+        elif u['reconciliation_partner_ids']:
+            u['reconciliation_scope'] = 'selected'
+        else:
+            u['reconciliation_scope'] = 'all'
         # Mark users that the current operator cannot modify
         u['is_super_admin'] = (u['username'] == 'admin')
         u['is_protected'] = u['is_super_admin'] or (u['role'] == 'admin' and not is_super_admin)
         result.append(u)
     return jsonify(result)
+
+
+@app.route('/api/users/reconciliation-options')
+@login_required
+@user_manager_required
+def get_user_reconciliation_options():
+    """List reconciliation subjects available for per-user scope assignment."""
+    if current_user.username != 'admin':
+        return jsonify({'error': '只有超级管理员可以设置对账范围'}), 403
+    conn = get_db_connection()
+    try:
+        partners = conn.execute('''
+            SELECT p.id, p.name, p.code, p.currency,
+                   GROUP_CONCAT(DISTINCT s.country) AS countries,
+                   COUNT(DISTINCT ps.site_id) AS site_count
+            FROM partners p
+            LEFT JOIN effective_partner_sites ps ON ps.partner_id = p.id
+            LEFT JOIN sites s ON s.id = ps.site_id
+            GROUP BY p.id, p.name, p.code, p.currency
+            ORDER BY p.id
+        ''').fetchall()
+        return jsonify([dict(p) for p in partners])
+    finally:
+        conn.close()
 
 
 @app.route('/api/users', methods=['POST'])
@@ -10755,6 +10822,29 @@ def update_user(user_id):
             can_manage_users_val = 1 if data.get('can_manage_users') else 0
             can_view_reconciliation_val = 1 if data.get('can_view_reconciliation') else 0
             can_edit_reconciliation_val = 1 if data.get('can_edit_reconciliation') else 0
+            reconciliation_scope = data.get('reconciliation_scope', 'all')
+            raw_reconciliation_partner_ids = data.get('reconciliation_partner_ids', []) or []
+            try:
+                selected_reconciliation_partner_ids = sorted({
+                    int(partner_id) for partner_id in raw_reconciliation_partner_ids
+                })
+            except (TypeError, ValueError):
+                return jsonify({'error': '对账范围参数无效'}), 400
+            if reconciliation_scope not in ('all', 'selected'):
+                return jsonify({'error': '对账范围参数无效'}), 400
+            if (can_view_reconciliation_val and reconciliation_scope == 'selected'
+                    and not selected_reconciliation_partner_ids):
+                return jsonify({'error': '指定对账范围时，至少选择一个对账主体'}), 400
+            if selected_reconciliation_partner_ids:
+                placeholders = ','.join(['?'] * len(selected_reconciliation_partner_ids))
+                existing_partner_ids = {
+                    r['id'] for r in conn.execute(
+                        f'SELECT id FROM partners WHERE id IN ({placeholders})',
+                        selected_reconciliation_partner_ids
+                    ).fetchall()
+                }
+                if existing_partner_ids != set(selected_reconciliation_partner_ids):
+                    return jsonify({'error': '所选对账主体不存在或已被删除'}), 400
             can_view_costs_val = 1 if data.get('can_view_costs') else 0
             can_edit_costs_val = 1 if data.get('can_edit_costs') else 0
             # Edit permission requires view permission (can't edit what you can't see)
@@ -10774,12 +10864,27 @@ def update_user(user_id):
             can_manage_inventory_val = 1 if data.get('can_manage_inventory') else 0
             if can_manage_inventory_val and not can_view_inventory_val:
                 can_view_inventory_val = 1
+            # 公司盈利权限严格按用户授予；角色本身不自动获得财务数据。
+            can_view_company_profit_val = 1 if data.get('can_view_company_profit') else 0
+            can_edit_company_profit_val = 1 if data.get('can_edit_company_profit') else 0
+            if can_edit_company_profit_val and not can_view_company_profit_val:
+                can_view_company_profit_val = 1
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, can_view_company_profit=?, can_edit_company_profit=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, can_view_company_profit_val, can_edit_company_profit_val, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, can_view_company_profit=?, can_edit_company_profit=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, can_view_company_profit_val, can_edit_company_profit_val, user_id))
+            # Keep the view flag and its data scope in the same transaction.
+            # No bindings intentionally means "all partners"; selected mode
+            # always has at least one validated binding.
+            conn.execute('DELETE FROM partner_users WHERE user_id = ?', (user_id,))
+            if can_view_reconciliation_val and reconciliation_scope == 'selected':
+                for partner_id in selected_reconciliation_partner_ids:
+                    conn.execute(
+                        'INSERT INTO partner_users (partner_id, user_id) VALUES (?, ?)',
+                        (partner_id, user_id)
+                    )
         else:
             # Non-superadmin: cannot change can_manage_users, can_view_sales_board, or set role to admin
             # but CAN grant can_manage_products (a regular operator-level permission)
@@ -11071,7 +11176,14 @@ def _cost_at_date(idx, brand_id, series_id, puff_count, flavor, warehouse_id, or
     return None
 
 
-def _resolve_product_to_brand(product_name, source, brands_cache, product_mappings_cache):
+def _resolve_product_to_brand(
+    product_name,
+    source,
+    brands_cache,
+    product_mappings_cache,
+    series_cache=None,
+    parsed_cache=None,
+):
     """Resolve a product line item to (brand_id, series_id, puff_count, flavor).
 
     First tries product_mappings (manual override), then falls back to
@@ -11082,7 +11194,12 @@ def _resolve_product_to_brand(product_name, source, brands_cache, product_mappin
           or product_mappings_cache.get((pn_key, None)))
     if pm:
         return pm['brand_id'], pm['series_id'], pm['puff_count'], pm['flavor']
-    parsed = parse_product_name(product_name, brands_cache)
+    parsed_cache_key = pn_key or product_name
+    parsed = parsed_cache.get(parsed_cache_key) if parsed_cache is not None else None
+    if parsed is None:
+        parsed = parse_product_name(product_name, brands_cache, series_cache)
+        if parsed_cache is not None:
+            parsed_cache[parsed_cache_key] = parsed
     b_id = None
     if parsed.get('brand'):
         for bc in brands_cache:
@@ -11105,7 +11222,7 @@ def _calc_partner_net_sales(partner_id, year, month):
 
     # Get bound site URLs
     sites = conn.execute('''
-        SELECT s.url FROM partner_sites ps
+        SELECT s.url FROM effective_partner_sites ps
         JOIN sites s ON s.id = ps.site_id
         WHERE ps.partner_id = ?
     ''', (partner_id,)).fetchall()
@@ -11178,7 +11295,7 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
         # Bound site URLs (and ids -> for warehouse mapping)
         sites = conn.execute('''
             SELECT s.id, s.url, s.country, s.manager
-            FROM partner_sites ps
+            FROM effective_partner_sites ps
             JOIN sites s ON s.id = ps.site_id
             WHERE ps.partner_id = ?
         ''', (partner_id,)).fetchall()
@@ -11635,6 +11752,170 @@ def _empty_recon_detail(partner, currency, year, month):
     }
 
 
+def _aggregate_partner_recon_details(details, year, month):
+    """Combine multiple partner previews without mixing native currencies.
+
+    Every partner is calculated independently first (including its own ratios
+    and exchange rate). Native amounts are retained in ``by_currency`` while
+    the top-level display amounts are unified to CNY. The historical ``*_pln``
+    field names are kept because the single-partner API already uses those
+    suffixes for "partner native currency", not literally PLN.
+    """
+    count_fields = (
+        'total_count', 'success_orders', 'failed_orders', 'cancelled_orders',
+        'undelivered_orders', 'pending_orders', 'total_orders',
+        'cost_unmapped_qty',
+    )
+    money_fields = (
+        'total_gross_pln', 'total_shipping_pln', 'shipping_loss',
+        'total_net_pln', 'cost_amount_pln', 'actual_cost_pln',
+        'cost_mapped_pln', 'cost_estimated_pln',
+        'cost_unmapped_revenue_pln', 'actual_margin_pln',
+        'partner_profit_pln', 'our_receivable_pln',
+        'actual_partner_profit_pln', 'actual_our_receivable_pln',
+    )
+
+    counts = {field: 0 for field in count_fields}
+    cny_totals = {field: 0.0 for field in money_fields}
+    by_currency = {}
+    partner_rows = []
+    missing_rate_currencies = set()
+
+    for original in details:
+        detail = dict(original)
+        currency = detail.get('currency') or 'PLN'
+        rate = detail.get('effective_rate_cny')
+
+        # Actual-cost mode splits each partner's own remaining margin using that
+        # partner's ratios. These values cannot be recomputed from one aggregate
+        # ratio because partners may have different contracts.
+        ppr = float(detail.get('partner_profit_ratio') or 0)
+        opr = float(detail.get('our_profit_ratio') or 0)
+        remaining_ratio = ppr + opr
+        partner_share = (ppr / remaining_ratio) if remaining_ratio > 0 else 0.5
+        our_share = (opr / remaining_ratio) if remaining_ratio > 0 else 0.5
+        remainder = (
+            float(detail.get('total_net_pln') or 0)
+            - float(detail.get('actual_cost_pln') or 0)
+        )
+        detail['actual_partner_profit_pln'] = round(remainder * partner_share, 2)
+        detail['actual_our_receivable_pln'] = round(remainder * our_share, 2)
+
+        for field in count_fields:
+            counts[field] += int(detail.get(field) or 0)
+
+        bucket = by_currency.setdefault(currency, {
+            'currency': currency,
+            'partner_count': 0,
+            'effective_rate_cny': rate,
+            'rate_source': detail.get('rate_source'),
+            **{field: 0.0 for field in money_fields},
+        })
+        bucket['partner_count'] += 1
+        # Rates are system-wide per currency/month. Keep the first one, but do
+        # not conceal a missing rate if one is encountered.
+        if not rate:
+            bucket['effective_rate_cny'] = None
+            bucket['rate_source'] = 'none'
+
+        has_nonzero_money = False
+        row_money = {}
+        row_cny = {}
+        for field in money_fields:
+            value = float(detail.get(field) or 0)
+            row_money[field] = round(value, 2)
+            bucket[field] += value
+            if abs(value) > 0.0001:
+                has_nonzero_money = True
+            if rate:
+                converted = value * float(rate)
+                cny_totals[field] += converted
+                row_cny[field] = round(converted, 2)
+            else:
+                row_cny[field] = None
+
+        if not rate and has_nonzero_money:
+            missing_rate_currencies.add(currency)
+
+        partner_rows.append({
+            'partner_id': detail.get('partner_id'),
+            'partner_name': detail.get('partner_name'),
+            'currency': currency,
+            'effective_rate_cny': rate,
+            'rate_source': detail.get('rate_source'),
+            'cost_ratio': detail.get('cost_ratio'),
+            'partner_profit_ratio': detail.get('partner_profit_ratio'),
+            'our_profit_ratio': detail.get('our_profit_ratio'),
+            **{field: row_money[field] for field in money_fields},
+            **{field.replace('_pln', '_cny') if field.endswith('_pln')
+               else f'{field}_cny': row_cny[field] for field in money_fields},
+        })
+
+    currency_rows = list(by_currency.values())
+    currency_rows.sort(key=lambda row: (row['currency'] != 'PLN', row['currency']))
+    for row in currency_rows:
+        for field in money_fields:
+            row[field] = round(row[field], 2)
+
+    result = {
+        'is_aggregate': True,
+        'partner_id': None,
+        'partner_name': '全部合伙人',
+        'partner_count': len(details),
+        'period_year': year,
+        'period_month': month,
+        'currency': 'CNY',
+        'effective_rate_cny': 1.0,
+        'rate_source': 'aggregate',
+        'missing_rate_currencies': sorted(missing_rate_currencies),
+        'cny_total_complete': not missing_rate_currencies,
+        'by_currency': currency_rows,
+        'partner_breakdown': partner_rows,
+        **counts,
+    }
+
+    # Top-level values are the unified CNY display totals. Add the normal CNY
+    # aliases as well so existing card rendering remains backward compatible.
+    cny_aliases = {
+        'total_gross_pln': 'total_gross_cny',
+        'total_net_pln': 'total_net_cny',
+        'cost_amount_pln': 'cost_amount_cny',
+        'actual_cost_pln': 'actual_cost_cny',
+        'cost_mapped_pln': 'cost_mapped_cny',
+        'cost_estimated_pln': 'cost_estimated_cny',
+        'actual_margin_pln': 'actual_margin_cny',
+        'partner_profit_pln': 'partner_profit_cny',
+        'our_receivable_pln': 'our_receivable_cny',
+        'actual_partner_profit_pln': 'actual_partner_profit_cny',
+        'actual_our_receivable_pln': 'actual_our_receivable_cny',
+    }
+    for field, value in cny_totals.items():
+        rounded = round(value, 2)
+        result[field] = rounded
+        alias = cny_aliases.get(field)
+        if alias:
+            result[alias] = rounded
+
+    net_cny = result.get('total_net_pln', 0)
+    actual_cost_cny = result.get('actual_cost_pln', 0)
+    result['actual_margin_pct'] = (
+        round((net_cny - actual_cost_cny) / net_cny * 100, 2)
+        if net_cny > 0 and result['cny_total_complete'] else None
+    )
+    result['estimated_ratio_pct'] = (
+        round(result.get('cost_estimated_pln', 0) / actual_cost_cny * 100, 1)
+        if actual_cost_cny > 0 and result['cny_total_complete'] else None
+    )
+    # There is intentionally no single ratio in all-partners mode.
+    result['cost_ratio'] = None
+    result['partner_profit_ratio'] = None
+    result['our_profit_ratio'] = None
+    result['by_status'] = {}
+    result['by_site'] = []
+    result['by_product'] = []
+    return result
+
+
 # ============================================================================
 # P2: AUDIT LOG + ORDER SNAPSHOT helpers
 # ============================================================================
@@ -11696,7 +11977,7 @@ def _snapshot_statement_orders(statement_id, partner_id, year, month, conn):
     # Use partner's currency + bound sites to identify the orders
     p = conn.execute('SELECT currency FROM partners WHERE id = ?', (partner_id,)).fetchone()
     currency = (p['currency'] if p else 'PLN') or 'PLN'
-    sites = conn.execute('''SELECT s.url FROM partner_sites ps
+    sites = conn.execute('''SELECT s.url FROM effective_partner_sites ps
         JOIN sites s ON s.id = ps.site_id WHERE ps.partner_id = ?''', (partner_id,)).fetchall()
     if not sites:
         return 0
@@ -11817,6 +12098,8 @@ def api_create_partner():
     """Create a new partner (admin only)"""
     if not _is_reconciliation_admin():
         return jsonify({'error': '无权创建合伙人'}), 403
+    if current_user.get_accessible_partner_ids() is not None:
+        return jsonify({'error': '指定范围的对账账号不能创建新合伙人'}), 403
     data = request.json
     name = (data.get('name') or '').strip()
     code = (data.get('code') or '').strip()
@@ -11847,6 +12130,8 @@ def api_update_partner(partner_id):
     """Update partner info and ratios (admin only)"""
     if not _is_reconciliation_admin():
         return jsonify({'error': '无权修改合伙人'}), 403
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权修改此合伙人'}), 403
     data = request.json
     conn = get_db_connection()
     try:
@@ -11887,14 +12172,39 @@ def api_delete_partner(partner_id):
 @login_required
 @reconciliation_api_required
 def api_get_partner_sites(partner_id):
-    """Get sites bound to a partner + all available sites"""
+    """Get effective sites plus explicit/country/exclusion binding rules."""
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权查看此合伙人'}), 403
     conn = get_db_connection()
-    bound = conn.execute('SELECT site_id FROM partner_sites WHERE partner_id = ?', (partner_id,)).fetchall()
-    all_sites = conn.execute('SELECT id, url, country, manager FROM sites ORDER BY country, url').fetchall()
+    scope = get_partner_site_scope(conn, partner_id)
+    if _is_reconciliation_admin():
+        all_sites = conn.execute(
+            'SELECT id, url, country, manager FROM sites ORDER BY country, url').fetchall()
+        binding_rows = conn.execute(f'''
+            SELECT eps.site_id, p.id AS partner_id, p.name AS partner_name
+            FROM {EFFECTIVE_PARTNER_SITES} eps
+            JOIN partners p ON p.id = eps.partner_id
+            ORDER BY eps.site_id, p.id
+        ''').fetchall()
+    else:
+        # Read-only scoped users need the bound-site labels for drill-down, but
+        # must not be able to enumerate unrelated sites by calling this API.
+        all_sites = conn.execute(f'''
+            SELECT s.id, s.url, s.country, s.manager
+            FROM sites s
+            JOIN {EFFECTIVE_PARTNER_SITES} ps ON ps.site_id = s.id
+            WHERE ps.partner_id = ?
+            ORDER BY s.country, s.url
+        ''', (partner_id,)).fetchall()
+        binding_rows = []
     conn.close()
     return jsonify({
-        'bound_site_ids': [b['site_id'] for b in bound],
-        'all_sites': [dict(s) for s in all_sites]
+        'bound_site_ids': sorted(scope['effective_site_ids']),
+        'explicit_site_ids': sorted(scope['explicit_site_ids']),
+        'granted_countries': sorted(scope['granted_countries']),
+        'excluded_site_ids': sorted(scope['excluded_site_ids']),
+        'all_sites': [dict(s) for s in all_sites],
+        'site_bindings': [dict(row) for row in binding_rows],
     })
 
 
@@ -11902,19 +12212,27 @@ def api_get_partner_sites(partner_id):
 @login_required
 @reconciliation_api_required
 def api_update_partner_sites(partner_id):
-    """Update sites bound to a partner (admin only)"""
+    """Update explicit sites, inherited countries, and exclusions."""
     if not _is_reconciliation_admin():
         return jsonify({'error': '无权修改站点绑定'}), 403
-    data = request.json
-    site_ids = data.get('site_ids', [])
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权修改此合伙人的站点绑定'}), 403
+    data = request.get_json(silent=True) or {}
     conn = get_db_connection()
     try:
-        conn.execute('DELETE FROM partner_sites WHERE partner_id = ?', (partner_id,))
-        for sid in site_ids:
-            conn.execute('INSERT OR IGNORE INTO partner_sites (partner_id, site_id) VALUES (?, ?)',
-                        (partner_id, sid))
+        try:
+            scope = replace_partner_site_scope(
+                conn,
+                partner_id,
+                site_ids=data.get('site_ids', []),
+                country_grants=data.get('country_grants', []),
+                site_exclusions=data.get('site_exclusions', []),
+            )
+        except ValueError as exc:
+            conn.rollback()
+            return jsonify({'error': str(exc)}), 409
         conn.commit()
-        return jsonify({'success': True})
+        return jsonify({'success': True, **scope})
     finally:
         conn.close()
 
@@ -11925,6 +12243,8 @@ def api_update_partner_sites(partner_id):
 def api_get_partner_users(partner_id):
     """Get users bound to a partner + eligible users (those with can_view_reconciliation).
     Super admin 'admin' is excluded — it already sees everything."""
+    if current_user.username != 'admin':
+        return jsonify({'error': '只有超级管理员可以查看对账用户绑定'}), 403
     conn = get_db_connection()
     bound = conn.execute('SELECT user_id FROM partner_users WHERE partner_id = ?', (partner_id,)).fetchall()
     try:
@@ -12030,15 +12350,42 @@ def api_preview_statement():
     partner_id = request.args.get('partner_id', type=int)
     year = request.args.get('year', type=int)
     month = request.args.get('month', type=int)
-    if not all([partner_id, year, month]):
-        return jsonify({'error': '缺少参数'}), 400
-    if not _check_partner_access(partner_id):
-        return jsonify({'error': '无权查看此合伙人'}), 403
+    if not year or not month:
+        return jsonify({'error': '缺少 year/month 参数'}), 400
 
-    detail = _calc_partner_recon_detail(partner_id, year, month)
-    if detail is None:
-        return jsonify({'error': '合伙人不存在'}), 404
-    return jsonify(detail)
+    if partner_id:
+        if not _check_partner_access(partner_id):
+            return jsonify({'error': '无权查看此合伙人'}), 403
+        detail = _calc_partner_recon_detail(partner_id, year, month)
+        if detail is None:
+            return jsonify({'error': '合伙人不存在'}), 404
+        return jsonify(detail)
+
+    # No partner_id means "全部合伙人". Resolve the current user's allowed
+    # partner IDs server-side so a scoped account can never aggregate data from
+    # partners outside its bindings.
+    allowed_ids = current_user.get_accessible_partner_ids()
+    conn = get_db_connection()
+    try:
+        if allowed_ids is None:
+            partner_rows = conn.execute('SELECT id FROM partners ORDER BY id').fetchall()
+        elif allowed_ids:
+            placeholders = ','.join(['?'] * len(allowed_ids))
+            partner_rows = conn.execute(
+                f'SELECT id FROM partners WHERE id IN ({placeholders}) ORDER BY id',
+                allowed_ids
+            ).fetchall()
+        else:
+            partner_rows = []
+    finally:
+        conn.close()
+
+    details = []
+    for partner_row in partner_rows:
+        detail = _calc_partner_recon_detail(partner_row['id'], year, month)
+        if detail is not None:
+            details.append(detail)
+    return jsonify(_aggregate_partner_recon_details(details, year, month))
 
 
 @app.route('/api/reconciliation/orders')
@@ -12078,7 +12425,7 @@ def api_recon_orders():
         currency = partner['currency'] or 'PLN'
 
         sites = conn.execute('''
-            SELECT s.url FROM partner_sites ps
+            SELECT s.url FROM effective_partner_sites ps
             JOIN sites s ON s.id = ps.site_id
             WHERE ps.partner_id = ?
         ''', (partner_id,)).fetchall()
@@ -12440,7 +12787,7 @@ def api_recon_summary_stats():
 
         sites = conn.execute('''
             SELECT s.url, s.country, s.manager
-            FROM partner_sites ps
+            FROM effective_partner_sites ps
             JOIN sites s ON s.id = ps.site_id
             WHERE ps.partner_id = ?
         ''', (partner_id,)).fetchall()
@@ -12613,7 +12960,7 @@ def api_recon_unmapped_products():
 
         sites = conn.execute('''
             SELECT s.url, s.country, s.manager
-            FROM partner_sites ps
+            FROM effective_partner_sites ps
             JOIN sites s ON s.id = ps.site_id
             WHERE ps.partner_id = ?
         ''', (partner_id,)).fetchall()
@@ -12777,7 +13124,7 @@ def api_recon_dashboard_monthly_trend():
             return jsonify({'error': '合伙人不存在'}), 404
         currency = partner['currency'] or 'PLN'
 
-        sites = conn.execute('''SELECT s.url FROM partner_sites ps
+        sites = conn.execute('''SELECT s.url FROM effective_partner_sites ps
             JOIN sites s ON s.id = ps.site_id WHERE ps.partner_id = ?''', (partner_id,)).fetchall()
         if not sites:
             return jsonify({'partner_id': partner_id, 'currency': currency, 'months': []})
@@ -13113,6 +13460,8 @@ def api_generate_statement():
         return jsonify({'error': '无权生成对账单'}), 403
     data = request.json
     partner_id = int(data.get('partner_id'))
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权生成此合伙人的对账单'}), 403
     year = int(data.get('year'))
     month = int(data.get('month'))
 
@@ -13217,6 +13566,8 @@ def api_manual_statement():
         return jsonify({'error': '无权录入对账单'}), 403
     data = request.json
     partner_id = int(data.get('partner_id'))
+    if not _check_partner_access(partner_id):
+        return jsonify({'error': '无权录入此合伙人的对账单'}), 403
     year = int(data.get('year'))
     month = int(data.get('month'))
     net = float(data.get('total_net_pln', 0))
@@ -13771,6 +14122,9 @@ def api_resolve_dispute(stmt_id):
     if not stmt:
         conn.close()
         return jsonify({'error': '对账单不存在'}), 404
+    if not _check_partner_access(stmt['partner_id']):
+        conn.close()
+        return jsonify({'error': '无权处理此对账单'}), 403
     if stmt['status'] != 'disputed':
         conn.close()
         return jsonify({'error': '对账单当前不是异议中状态'}), 400
@@ -13897,10 +14251,16 @@ def api_delete_statement(stmt_id):
     if not _is_reconciliation_admin():
         return jsonify({'error': '无权删除'}), 403
     conn = get_db_connection()
-    stmt = conn.execute('SELECT status FROM reconciliation_statements WHERE id = ?', (stmt_id,)).fetchone()
+    stmt = conn.execute(
+        'SELECT status, partner_id FROM reconciliation_statements WHERE id = ?',
+        (stmt_id,)
+    ).fetchone()
     if not stmt:
         conn.close()
         return jsonify({'error': '对账单不存在'}), 404
+    if not _check_partner_access(stmt['partner_id']):
+        conn.close()
+        return jsonify({'error': '无权删除此对账单'}), 403
     if stmt['status'] in ('locked', 'settled'):
         conn.close()
         return jsonify({'error': '已锁定的对账单不能删除'}), 400
@@ -14078,7 +14438,14 @@ def api_delete_receipt(receipt_id):
     conn = get_db_connection()
     try:
         # P2 audit: log deletion on linked statement before deleting
-        receipt = conn.execute('SELECT statement_id, amount_pln FROM partner_receipts WHERE id = ?', (receipt_id,)).fetchone()
+        receipt = conn.execute(
+            'SELECT statement_id, amount_pln, partner_id FROM partner_receipts WHERE id = ?',
+            (receipt_id,)
+        ).fetchone()
+        if not receipt:
+            return jsonify({'error': '收款记录不存在'}), 404
+        if not _check_partner_access(receipt['partner_id']):
+            return jsonify({'error': '无权删除此收款记录'}), 403
         if receipt and receipt['statement_id']:
             _audit_log(int(receipt['statement_id']), 'delete_receipt', field='receipt',
                        old=f'#{receipt_id} {receipt["amount_pln"]}',
@@ -15073,7 +15440,6 @@ def get_product_stats():
             'aliases': aliases,
             'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
         })
-    
     conn.close()
     
     # Aggregate
@@ -16786,9 +17152,32 @@ def find_orders_by_tracking():
 # ============================================================================
 
 def detect_site_tracking_format(conn, site_url):
-    from tracking_format import detect_site_tracking_format as _detect
+    """Look at recent shipped orders for this site to figure out which plugin
+    holds the tracking. Returns 'ast' | 'villatheme' | 'custom_lineitem' | 'unknown'."""
+    rows = conn.execute("""
+        SELECT meta_data, line_items FROM orders
+        WHERE source = ? AND status IN ('on-hold','shipped','completed')
+        ORDER BY date_modified DESC LIMIT 10
+    """, (site_url,)).fetchall()
 
-    return _detect(conn, site_url)
+    ast = villa = custom = 0
+    for r in rows:
+        md = r['meta_data'] or ''
+        li = r['line_items'] or ''
+        if '_wc_shipment_tracking_items' in md:
+            ast += 1
+        if '_vi_wot_order_item_tracking_data' in li:
+            villa += 1
+        elif '"key":"tracking_number"' in li or '"key": "tracking_number"' in li:
+            custom += 1
+
+    if ast and ast >= max(villa, custom):
+        return 'ast'
+    if villa and villa >= custom:
+        return 'villatheme'
+    if custom:
+        return 'custom_lineitem'
+    return 'unknown'
 
 
 def _ast_provider_for_carrier(carrier_slug):
@@ -17312,34 +17701,13 @@ def ship_order():
     #     Setting meta via REST never triggers send_mail(), so VillaTheme
     #     sites stopped emailing customers after the ship_order rewrite.
     #     The trigger endpoint replicates the admin call.
-    # AST is handled locally below to avoid a duplicate fallback note when the
-    # optional helper endpoint is not installed. Other formats still use the
-    # helper endpoint and let it self-detect the available plugin.
+    # The endpoint itself decides which path applies; we just always call it
+    # and let it self-detect.
     email_trigger_info = None
     # Did a customer-facing notification actually go out? Only consumed by the
     # reship fallback below; harmless for normal ships.
     customer_notified = False
-    if send_email and fmt == 'ast':
-        if not more_batches and not is_reship:
-            # AST sends its native shipment email from the transition to the
-            # custom "shipped" status.  Calling a missing helper endpoint and
-            # posting a second customer note would duplicate that email.
-            email_trigger_info = {
-                'plugin': 'AST',
-                'email_sent': None,
-                'note': '由 shipped 状态转换触发 AST 原生邮件',
-            }
-            customer_notified = True
-        else:
-            # Partial batches do not change status, and a re-shipment is
-            # already in shipped status.  Neither causes AST's transition
-            # hook, so send exactly one WooCommerce customer-note email.
-            _post_fallback_customer_note(
-                req, site, order, carrier_name, tracking_number,
-                tracking_url, api_headers, warnings,
-            )
-            customer_notified = True
-    elif send_email:
+    if send_email:
         try:
             trig_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/trigger-shipment-email"
             trig_resp = req.post(
@@ -18593,8 +18961,7 @@ def order_carrier_status(order_id):
     """On-demand 查物流: live carrier lookup for ONE order. Read-only w.r.t.
     delivery confirmation / WooCommerce, but it DOES cache the detected
     carrier_status (like the resolver) so the queue badge updates immediately.
-    InPost = ShipX (+ Track718 'in-post' fallback). DPD and Packeta use
-    explicit Track718 carrier codes; other carriers use auto-detection."""
+    InPost = ShipX (+ Track718 'in-post' fallback). DPD/others = Track718."""
     import requests as req
     import carrier_tracking as ct
     conn = get_db_connection()
@@ -18684,25 +19051,16 @@ def order_carrier_status(order_id):
                         key=lambda e: e['time'], reverse=True)
         return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
                         'raw': raw, 'outcome': outcome, 'events': events})
-    # Everything that isn't InPost goes through Track718. DPD and Packeta use
-    # explicit carrier codes; EMS/中国邮政, Australia Post, GLS, etc. retain
-    # auto-detection.
+    # Everything that isn't InPost goes through Track718: DPD with its code,
+    # any other carrier (EMS/中国邮政, Australia Post, GLS, …) via auto-detect.
     if not key718:
         return jsonify({'success': False, 'error': '未配置 Track718 key'}), 400
-    res = ct.track718_detail(
-        number,
-        key718,
-        code=ct.track718_code_for(carrier),
-        poll=8,
-        poll_wait=3,
-    )
+    res = ct.track718_detail(number, key718, code=('dpd-pl' if carrier == 'dpd' else None), poll=8, poll_wait=3)
     _persist_carrier_status(order_id, res.get('outcome'))
     name_map = {'dpd-pl': 'DPD', 'china-post': '中国邮政/EMS', 'australia-post': 'Australia Post',
-                'inpost-paczkomaty': 'InPost', 'gls': 'GLS', 'packeta': 'Packeta',
-                'poczta-polska': 'Poczta Polska'}
-    explicit_name = {'dpd': 'DPD', 'packeta': 'Packeta'}.get(carrier)
-    cname = explicit_name or name_map.get((res.get('carrier') or '').lower(),
-                                           (res.get('carrier') or '物流').upper())
+                'inpost-paczkomaty': 'InPost', 'gls': 'GLS', 'poczta-polska': 'Poczta Polska'}
+    cname = 'DPD' if carrier == 'dpd' else name_map.get((res.get('carrier') or '').lower(),
+                                                         (res.get('carrier') or '物流').upper())
     if res.get('events'):
         return jsonify({'success': True, 'carrier': cname, 'tracking_number': number,
                         'outcome': res.get('outcome', 'unknown'), 'events': res['events']})
@@ -20326,21 +20684,40 @@ def _get_sales_board_rate_overrides(year_month):
         conn.close()
 
 
-def _get_board_cny_rate(currency, year_month, overrides=None):
+def _get_sales_board_receipt_rates(year_month):
+    """Return receipt-weighted rates for one month, keyed by currency."""
+    conn = get_db_connection()
+    try:
+        return load_monthly_receipt_rates(conn, year_month)
+    finally:
+        conn.close()
+
+
+def _get_board_cny_rate(
+    currency,
+    year_month,
+    overrides=None,
+    receipt_rates=None,
+):
     """CNY rate for sales-board calculations only.
 
     overrides: optional pre-fetched dict for the month, to avoid repeated DB hits.
-    Falls back to the global get_cny_rate when no override is set.
+    Priority: receipt-weighted rate, custom override, then global system rate.
     """
     if not currency or currency.upper() == 'CNY':
-        return 1.0, 'override' if overrides and 'CNY' in overrides else 'system'
+        return 1.0, 'system'
     cur_u = currency.upper()
     if overrides is None:
         overrides = _get_sales_board_rate_overrides(year_month)
-    if cur_u in overrides:
-        return overrides[cur_u], 'override'
+    if receipt_rates is None:
+        receipt_rates = _get_sales_board_receipt_rates(year_month)
     rate, _ = get_cny_rate(currency, year_month)
-    return (rate or 0), 'system'
+    return resolve_sales_board_rate(
+        cur_u,
+        receipt_rates=receipt_rates,
+        custom_overrides=overrides,
+        system_rate=rate,
+    )
 
 
 def _compute_sales_board_data(selected_month, restrict_manager=None):
@@ -20368,6 +20745,8 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
     # Sales-board-only exchange rate overrides
     _board_overrides_cur = _get_sales_board_rate_overrides(selected_month)
     _board_overrides_prev = _get_sales_board_rate_overrides(prev_month)
+    _board_receipt_rates_cur = _get_sales_board_receipt_rates(selected_month)
+    _board_receipt_rates_prev = _get_sales_board_receipt_rates(prev_month)
 
     # Get all managers and their sites
     sites = conn.execute('SELECT url, manager FROM sites WHERE manager IS NOT NULL AND manager != ""').fetchall()
@@ -20381,11 +20760,9 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
 
     managers = sorted(manager_sites.keys())
 
-    # Get sales targets for selected month
-    targets = {}
-    target_rows = conn.execute('SELECT * FROM sales_targets WHERE year_month = ?', (selected_month,)).fetchall()
-    for t in target_rows:
-        targets[t['manager']] = dict(t)
+    # Sales goals remain month-specific, while salary and commission rules
+    # inherit from the latest prior month until this month is explicitly saved.
+    targets = load_sales_targets_for_month(conn, selected_month)
 
     # Get no-commission brand names
     no_comm_rows = conn.execute('SELECT brand_name FROM no_commission_brands').fetchall()
@@ -20396,7 +20773,8 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
     all_brands_rows = conn.execute('SELECT name FROM brands ORDER BY name').fetchall()
     all_brands_list = [r['name'] for r in all_brands_rows]
 
-    # Get brands cache for product name parsing
+    # Get brand/series caches for product name parsing. Passing brands without
+    # series makes parse_product_name reload the series table per line item.
     brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
     brands_cache = []
     for row in brands_rows:
@@ -20411,6 +20789,30 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
             'aliases': aliases,
             'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
         })
+    series_rows = conn.execute(
+        'SELECT id, brand_id, name FROM series'
+    ).fetchall()
+    series_cache = [
+        {
+            'id': row['id'],
+            'brand_id': row['brand_id'],
+            'name': row['name'],
+        }
+        for row in series_rows
+    ]
+    parsed_product_cache = {}
+
+    def _parse_sales_board_product(product_name):
+        cache_key = normalize_raw_name(product_name) or product_name
+        parsed = parsed_product_cache.get(cache_key)
+        if parsed is None:
+            parsed = parse_product_name(
+                product_name,
+                brands_cache,
+                series_cache,
+            )
+            parsed_product_cache[cache_key] = parsed
+        return parsed
 
     # Load profit settings for this month
     profit_row = conn.execute(
@@ -20539,7 +20941,12 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
         _month_rate_sources = {}  # 'override' or 'system'
         def _rate_for(cur):
             if cur not in _month_rates:
-                r, src = _get_board_cny_rate(cur, selected_month, _board_overrides_cur)
+                r, src = _get_board_cny_rate(
+                    cur,
+                    selected_month,
+                    _board_overrides_cur,
+                    _board_receipt_rates_cur,
+                )
                 _month_rates[cur] = r or 0
                 _month_rate_sources[cur] = src
             return _month_rates[cur]
@@ -20574,7 +20981,7 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
                             break
                     # Also check against brands_cache for better matching
                     if not excluded_brand:
-                        parsed = parse_product_name(product_name_raw, brands_cache)
+                        parsed = _parse_sales_board_product(product_name_raw)
                         if parsed.get('brand') and parsed['brand'].upper() in no_commission_brands:
                             excluded_brand = parsed['brand'].upper()
 
@@ -20598,7 +21005,12 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
                         order_date = (order['date_created'] or '')[:10]  # YYYY-MM-DD
                         wh_id = order_wh_id
                         b_id, s_id, p_cnt, flav = _resolve_product_to_brand(
-                            product_name_raw, source, brands_cache, product_mappings_cache
+                            product_name_raw,
+                            source,
+                            brands_cache,
+                            product_mappings_cache,
+                            series_cache=series_cache,
+                            parsed_cache=parsed_product_cache,
                         )
                         # Find cost entry matching this warehouse (priority fallback).
                         # If the order has no warehouse_id, fall back to country
@@ -20635,7 +21047,12 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
         _prev_rate_cache = {}
         def _prev_rate(cur):
             if cur not in _prev_rate_cache:
-                r, _src = _get_board_cny_rate(cur, prev_month, _board_overrides_prev)
+                r, _src = _get_board_cny_rate(
+                    cur,
+                    prev_month,
+                    _board_overrides_prev,
+                    _board_receipt_rates_prev,
+                )
                 _prev_rate_cache[cur] = r or 0
             return _prev_rate_cache[cur]
 
@@ -20773,6 +21190,7 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
             'units_met': units_met,
             'salary_protected': salary_protected,
             'base_salary': base_salary,
+            'salary_inherited_from_month': target.get('salary_inherited_from_month'),
             'salary_deduction': salary_deduction,
             'actual_salary': actual_salary,
             'commission_rate': commission_rate,
@@ -20965,6 +21383,7 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
         'all_brands_list': all_brands_list,
         'rates_in_use': rates_in_use,
         'rate_overrides': _board_overrides_cur,
+        'receipt_rates': _board_receipt_rates_cur,
         'profit_mode': profit_mode,
         'profit_percentage': profit_percentage,
         'country_percentages': country_percentages,
@@ -21007,7 +21426,9 @@ def get_sales_targets():
     year_month = request.args.get('month', '')
     conn = get_db_connection()
     if year_month:
-        rows = conn.execute('SELECT * FROM sales_targets WHERE year_month = ?', (year_month,)).fetchall()
+        rows = list(
+            load_sales_targets_for_month(conn, year_month).values()
+        )
     else:
         rows = conn.execute('SELECT * FROM sales_targets ORDER BY year_month DESC').fetchall()
     conn.close()
@@ -21215,9 +21636,9 @@ def delete_sales_group(group_id):
 @login_required
 @admin_required
 def get_sales_board_exchange_rates():
-    """List custom rates + applicable system rates for a given month.
+    """List receipt, custom and system rates for a given month.
 
-    For each currency, returns {currency, system_rate, override_rate, in_use, source}.
+    Receipt-weighted rates take precedence over custom and system rates.
     """
     month = (request.args.get('month') or '').strip()
     if not month:
@@ -21225,6 +21646,7 @@ def get_sales_board_exchange_rates():
         month = datetime.date.today().strftime('%Y-%m')
 
     overrides = _get_sales_board_rate_overrides(month)
+    receipt_rates = _get_sales_board_receipt_rates(month)
 
     # Determine which currencies are in use this month
     conn = get_db_connection()
@@ -21242,6 +21664,9 @@ def get_sales_board_exchange_rates():
         for c in overrides.keys():
             if c not in currencies:
                 currencies.append(c)
+        for c in receipt_rates.keys():
+            if c not in currencies:
+                currencies.append(c)
         currencies = sorted(set(currencies))
 
         result = []
@@ -21250,12 +21675,34 @@ def get_sales_board_exchange_rates():
                 continue
             sys_rate, _ = get_cny_rate(cur, month)
             override = overrides.get(cur)
+            receipt = receipt_rates.get(cur)
+            in_use, source = resolve_sales_board_rate(
+                cur,
+                receipt_rates=receipt_rates,
+                custom_overrides=overrides,
+                system_rate=sys_rate,
+            )
             result.append({
                 'currency': cur,
                 'system_rate': round(sys_rate, 6) if sys_rate else None,
                 'override_rate': override,
-                'in_use': override if override is not None else (sys_rate or 0),
-                'source': 'override' if override is not None else 'system',
+                'receipt_rate': (
+                    round(receipt['rate'], 6) if receipt else None
+                ),
+                'receipt_count': (
+                    receipt['receipt_count'] if receipt else 0
+                ),
+                'receipt_native_amount': (
+                    round(receipt['native_amount'], 2) if receipt else None
+                ),
+                'receipt_cny_amount': (
+                    round(receipt['cny_amount'], 2) if receipt else None
+                ),
+                'receipt_partner_names': (
+                    receipt['partner_names'] if receipt else []
+                ),
+                'in_use': in_use,
+                'source': source,
             })
         return jsonify({'month': month, 'rates': result})
     finally:
@@ -21266,10 +21713,11 @@ def get_sales_board_exchange_rates():
 @login_required
 @admin_required
 def save_sales_board_exchange_rates():
-    """Save custom exchange rate overrides for a month.
+    """Save custom fallback exchange-rate overrides for a month.
 
     Payload: { "month": "YYYY-MM", "rates": [{"currency": "PLN", "rate": 1.95}, ...] }
-    A rate of null/empty/0 means "remove override (use system rate)".
+    A rate of null/empty/0 removes the override. Receipt rates still take
+    precedence whenever the selected month has valid partner receipts.
     """
     data = request.get_json(silent=True) or {}
     month = (data.get('month') or '').strip()
@@ -21909,7 +22357,7 @@ def _generate_sales_board_excel(data, hide_leader=False):
         ("", False, 10),
         ("【本月使用汇率】", True, 12),
         *([(line, False, 10) for line in rate_lines] if rate_lines else [("• （无）", False, 10)]),
-        ("• 自定义汇率仅作用于销售看板和本导出文件，不影响系统其它模块。", False, 10),
+        ("• 汇率优先级：当月回款加权汇率 → 自定义汇率 → 系统汇率；仅作用于销售看板和本导出文件。", False, 10),
         ("", False, 10),
         ("【底薪保护（满足其一即可）】", True, 12),
         ("• 环比增长 ≥ 20%", False, 10),
@@ -22785,11 +23233,17 @@ def get_sales_board_unmapped():
         ).fetchall()
         for ov in override_rows:
             _board_overrides[ov['currency']] = ov['rate_to_cny']
+        _board_receipt_rates = load_monthly_receipt_rates(conn, year_month)
 
         rate_cache = {}
         def _rate_for(cur):
             if cur not in rate_cache:
-                r, _ = _get_board_cny_rate(cur, year_month, _board_overrides)
+                r, _ = _get_board_cny_rate(
+                    cur,
+                    year_month,
+                    _board_overrides,
+                    _board_receipt_rates,
+                )
                 rate_cache[cur] = r or 0
             return rate_cache[cur]
 
@@ -22962,6 +23416,26 @@ try:
     app.register_blueprint(fulfillment_bp)
 except Exception as _e:
     app.logger.warning('多仓履约模块未加载: %s', _e)
+
+try:
+    from company_profit import (
+        create_company_profit_blueprint,
+        init_company_profit_tables,
+    )
+    with app.app_context():
+        init_company_profit_tables(get_db_connection)
+    app.register_blueprint(
+        create_company_profit_blueprint(
+            get_db_connection,
+            _compute_sales_board_data,
+            _revenue_status_cond,
+            _calc_partner_recon_detail,
+            _compute_statement_split,
+            True,
+        )
+    )
+except Exception as _e:
+    app.logger.warning('公司盈利模块未加载: %s', _e)
 
 
 @app.context_processor

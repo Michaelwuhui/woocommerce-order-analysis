@@ -32,8 +32,8 @@
             <button class="btn btn-sm btn-outline-success" onclick="openGroupSettings()">
                 <i class="bi bi-people me-1"></i>小组管理
             </button>
-            <button class="btn btn-sm btn-outline-warning" onclick="openRateSettings()" title="自定义本销售看板使用的汇率（不影响其它系统模块）">
-                <i class="bi bi-currency-exchange me-1"></i>自定义汇率
+            <button class="btn btn-sm btn-outline-warning" onclick="openRateSettings()" title="查看当月回款汇率，并设置无回款时的备用汇率">
+                <i class="bi bi-currency-exchange me-1"></i>汇率来源
             </button>
             {% if current_user.username == 'admin' %}
             <div class="btn-group btn-group-sm" role="group">
@@ -442,7 +442,8 @@
                 <div class="d-flex align-items-center justify-content-between mb-3">
                     <p class="text-white-50 small mb-0">
                         <i class="bi bi-info-circle me-1"></i>
-                        「上月销售」为系统自动计算的 <strong class="text-white">{{ prev_month }}</strong> 实际净销售额(¥)
+                        「上月销售」为系统自动计算的 <strong class="text-white">{{ prev_month }}</strong> 实际净销售额(¥)；
+                        新月份自动继承最近设置的底薪和提成比例，月/周销售目标仍需单独设置
                     </p>
                     <button type="button" class="btn btn-sm btn-outline-success" onclick="autoFillAll()">
                         <i class="bi bi-magic me-1"></i>一键自动填充全部目标(上月×120%)
@@ -483,7 +484,12 @@
                                 <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w3" value="{{ d.weekly_targets.get('w3', 0)|int }}" step="1" style="width:100%;"></td>
                                 <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w4" value="{{ d.weekly_targets.get('w4', 0)|int }}" step="1" style="width:100%;"></td>
                                 <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-w5" value="{{ d.weekly_targets.get('w5', 0)|int }}" step="1" style="width:100%;"></td>
-                                <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-salary" value="{{ d.base_salary|int }}" step="100" min="0" style="width:100%;"></td>
+                                <td>
+                                    <input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-salary" value="{{ d.base_salary|int }}" step="100" min="0" style="width:100%;">
+                                    {% if d.salary_inherited_from_month %}
+                                    <div class="small text-info mt-1">继承 {{ d.salary_inherited_from_month }}</div>
+                                    {% endif %}
+                                </td>
                                 <td><input type="number" class="form-control form-control-sm bg-dark text-white border-secondary target-commission" value="{{ (d.commission_rate * 100)|round(1) }}" step="0.5" min="0" max="100" style="width:100%;"></td>
                                 <td><input type="text" class="form-control form-control-sm bg-dark text-white border-secondary target-notes" value="{{ d.notes }}" style="width:100%;"></td>
                             </tr>
@@ -541,28 +547,29 @@
     <div class="modal-dialog modal-lg">
         <div class="modal-content bg-dark border border-secondary border-opacity-25">
             <div class="modal-header border-bottom border-secondary border-opacity-25">
-                <h5 class="modal-title text-white"><i class="bi bi-currency-exchange me-2"></i>自定义汇率 - <span id="rateModalMonth">{{ selected_month }}</span></h5>
+                <h5 class="modal-title text-white"><i class="bi bi-currency-exchange me-2"></i>销售看板汇率来源 - <span id="rateModalMonth">{{ selected_month }}</span></h5>
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
                 <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 text-info small">
                     <i class="bi bi-info-circle me-1"></i>
-                    本汇率<strong>仅用于销售看板</strong>，不会影响订单列表/月度统计/产品分析等其它模块。<br>
-                    留空（或填 0）会回退到系统汇率。
+                    销售看板按<strong>当月回款加权汇率 → 自定义备用汇率 → 系统汇率</strong>的顺序取值。<br>
+                    有多笔回款时按回款本币金额加权；有有效回款时，自定义值会保留但不生效。
                 </div>
                 <div class="table-responsive">
                     <table class="table table-dark table-sm align-middle mb-0">
                         <thead>
                             <tr>
                                 <th style="min-width:70px;">币种</th>
+                                <th style="min-width:145px;" class="text-end">当月回款加权(¥)</th>
                                 <th style="min-width:120px;" class="text-end">系统汇率(¥)</th>
-                                <th style="min-width:160px;">自定义汇率(¥)</th>
+                                <th style="min-width:180px;">自定义备用汇率(¥)</th>
                                 <th style="min-width:120px;">当前生效</th>
                                 <th style="min-width:100px;">来源</th>
                             </tr>
                         </thead>
                         <tbody id="rateModalBody">
-                            <tr><td colspan="5" class="text-center text-white-50 py-4">加载中...</td></tr>
+                            <tr><td colspan="6" class="text-center text-white-50 py-4">加载中...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -788,7 +795,7 @@ function openRateSettings() {
     var monthLabel = document.getElementById('rateModalMonth');
     if (monthLabel) monthLabel.textContent = '{{ selected_month }}';
     var body = document.getElementById('rateModalBody');
-    body.innerHTML = '<tr><td colspan="5" class="text-center text-white-50 py-4">加载中...</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="text-center text-white-50 py-4">加载中...</td></tr>';
     bootstrap.Modal.getOrCreateInstance(document.getElementById('rateModal')).show();
 
     fetch('/api/sales-board/exchange-rates?month={{ selected_month }}')
@@ -796,25 +803,31 @@ function openRateSettings() {
     .then(function(data) {
         var rates = data.rates || [];
         if (rates.length === 0) {
-            body.innerHTML = '<tr><td colspan="5" class="text-center text-white-50 py-4">本月暂无订单使用的币种</td></tr>';
+            body.innerHTML = '<tr><td colspan="6" class="text-center text-white-50 py-4">本月暂无订单或回款使用的币种</td></tr>';
             return;
         }
         var html = '';
         rates.forEach(function(r) {
             var sysRate = r.system_rate != null ? Number(r.system_rate).toFixed(4) : '<span class="text-warning">无</span>';
+            var receiptRate = r.receipt_rate != null
+                ? Number(r.receipt_rate).toFixed(4) + '<div class="small text-white-50">' + r.receipt_count + ' 笔 · ' + Number(r.receipt_native_amount).toLocaleString('zh-CN') + ' ' + r.currency + '</div>'
+                : '<span class="text-white-50">无回款</span>';
             var override = r.override_rate != null ? Number(r.override_rate) : '';
             var inUse = r.in_use ? Number(r.in_use).toFixed(4) : '-';
-            var srcBadge = r.source === 'override'
-                ? '<span class="badge bg-warning text-dark">自定义</span>'
-                : '<span class="badge bg-secondary">系统</span>';
+            var srcBadge = r.source === 'receipt'
+                ? '<span class="badge bg-success">回款加权</span>'
+                : (r.source === 'override'
+                    ? '<span class="badge bg-warning text-dark">自定义备用</span>'
+                    : '<span class="badge bg-secondary">系统</span>');
             html += '<tr data-currency="' + r.currency + '">' +
                 '<td class="text-white fw-bold">' + r.currency + '</td>' +
+                '<td class="text-end text-success">' + receiptRate + '</td>' +
                 '<td class="text-end text-white-50">' + sysRate + '</td>' +
                 '<td>' +
                     '<div class="input-group input-group-sm">' +
                         '<input type="number" step="0.0001" min="0" class="form-control bg-dark text-white border-secondary rate-input" ' +
-                            'value="' + override + '" placeholder="留空使用系统汇率">' +
-                        '<button class="btn btn-outline-secondary" type="button" onclick="resetRate(this)" title="清空回退到系统汇率">' +
+                            'value="' + override + '" placeholder="无回款时使用">' +
+                        '<button class="btn btn-outline-secondary" type="button" onclick="resetRate(this)" title="清空备用汇率">' +
                             '<i class="bi bi-arrow-counterclockwise"></i></button>' +
                     '</div>' +
                 '</td>' +
@@ -825,7 +838,7 @@ function openRateSettings() {
         body.innerHTML = html;
     })
     .catch(function(err) {
-        body.innerHTML = '<tr><td colspan="5" class="text-center text-danger py-4">加载失败：' + err.message + '</td></tr>';
+        body.innerHTML = '<tr><td colspan="6" class="text-center text-danger py-4">加载失败：' + err.message + '</td></tr>';
     });
 }
 

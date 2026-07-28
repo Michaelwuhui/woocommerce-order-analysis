@@ -1330,7 +1330,14 @@
                     <div class="mb-3">
                         <label class="form-label text-white-50">负责人</label>
                         <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
-                            name="manager" placeholder="输入负责人姓名">
+                            name="manager" list="siteManagerOptions" autocomplete="off"
+                            placeholder="请选择或输入负责人姓名">
+                        <datalist id="siteManagerOptions">
+                            {% for manager in site_managers %}
+                            <option value="{{ manager }}"></option>
+                            {% endfor %}
+                        </datalist>
+                        <div class="form-text text-muted">可从现有负责人中选择，也可直接输入新姓名</div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">51.la Mask ID</label>
@@ -1346,6 +1353,8 @@
                             <option value="PL">波兰 (Poland)</option>
                             <option value="AU">澳大利亚 (Australia)</option>
                             <option value="AE">阿联酋 (UAE)</option>
+                            <option value="HU">匈牙利 (Hungary)</option>
+                            <option value="CZ">捷克 (Czechia)</option>
                             <option value="DE">德国 (Germany)</option>
                             <option value="FR">法国 (France)</option>
                             <option value="UK">英国 (UK)</option>
@@ -1394,7 +1403,8 @@
                     <div class="mb-3">
                         <label class="form-label text-white-50">负责人</label>
                         <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
-                            name="manager" id="editSiteManager" placeholder="输入负责人姓名">
+                            name="manager" id="editSiteManager" list="siteManagerOptions" autocomplete="off"
+                            placeholder="请选择或输入负责人姓名">
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">51.la Mask ID</label>
@@ -1409,6 +1419,8 @@
                             <option value="PL">波兰 (Poland)</option>
                             <option value="AU">澳大利亚 (Australia)</option>
                             <option value="AE">阿联酋 (UAE)</option>
+                            <option value="HU">匈牙利 (Hungary)</option>
+                            <option value="CZ">捷克 (Czechia)</option>
                             <option value="DE">德国 (Germany)</option>
                             <option value="FR">法国 (France)</option>
                             <option value="UK">英国 (UK)</option>
