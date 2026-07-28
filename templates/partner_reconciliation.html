@@ -1973,6 +1973,12 @@ function rateSourceText(src) {
     return src;
 }
 
+function formatExchangeRate(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '—';
+    return n.toFixed(5).replace(/0+$/, '').replace(/\.$/, '');
+}
+
 // ========== Load partners ==========
 async function loadPartners() {
     try {
@@ -2110,13 +2116,30 @@ let _lastPreviewData = null;
 async function refreshPreview() {
     const y = document.getElementById('previewYear').value;
     const m = document.getElementById('previewMonth').value;
-    const partnerId = document.getElementById('partnerSelector').value || (partnersCache[0] && partnersCache[0].id);
-    if (!y || !m || !partnerId) return;
+    const partnerId = document.getElementById('partnerSelector').value;
+    if (!y || !m || partnersCache.length === 0) return;
     try {
-        const data = await api(`/api/reconciliation/statements/preview?partner_id=${partnerId}&year=${y}&month=${parseInt(m)}`);
+        const partnerParam = partnerId ? `&partner_id=${parseInt(partnerId)}` : '';
+        const data = await api(`/api/reconciliation/statements/preview?year=${y}&month=${parseInt(m)}${partnerParam}`);
         _lastPreviewData = data;
         renderPreviewCards(data);
     } catch (e) { console.error(e); }
+}
+
+function aggregatePreviewAmount(data, field) {
+    const total = data[field] ?? 0;
+    const nativeLines = (data.by_currency || [])
+        .filter(row => Math.abs(row[field] || 0) > 0.001)
+        .map(row => `${fmt(row[field])} ${row.currency}`);
+    const sub = nativeLines.length
+        ? `<div class="cny-sub">${nativeLines.join(' · ')}</div>`
+        : '';
+    return `${fmt(total)} CNY${sub}`;
+}
+
+function previewAmount(data, field, cnyField) {
+    if (data.is_aggregate) return aggregatePreviewAmount(data, field);
+    return dual(data[field] ?? 0, cnyField ? data[cnyField] : null, data.currency || 'PLN');
 }
 
 // Render the "本月实时预估" card AND the formula breakdown from data.
@@ -2127,7 +2150,15 @@ function renderPreviewCards(data) {
     try {
         const curr = data.currency || 'PLN';
         const rateBadge = document.getElementById('pvRateBadge');
-        if (data.effective_rate_cny) {
+        if (data.is_aggregate) {
+            const rateParts = (data.by_currency || [])
+                .filter(row => row.effective_rate_cny)
+                .map(row => `1 ${row.currency} = ${formatExchangeRate(row.effective_rate_cny)} CNY`);
+            const missing = data.missing_rate_currencies || [];
+            rateBadge.innerHTML = missing.length
+                ? `<span class="text-warning"><i class="bi bi-exclamation-triangle me-1"></i>全部合伙人 · ${data.partner_count || 0} 个主体 · 缺少 ${missing.join('、')} 汇率，CNY 合计不完整</span>`
+                : `<i class="bi bi-layers me-1"></i>全部合伙人 · ${data.partner_count || 0} 个主体 · 按各主体汇率折算 CNY${rateParts.length ? ` · <span class="text-white-50">${rateParts.join('；')}</span>` : ''}`;
+        } else if (data.effective_rate_cny) {
             rateBadge.innerHTML = `<i class="bi bi-currency-exchange me-1"></i>系统汇率 1 ${curr} = ${data.effective_rate_cny} CNY · <span class="text-white-50">${rateSourceText(data.rate_source)}</span>`;
         } else {
             rateBadge.innerHTML = `<span class="text-warning"><i class="bi bi-exclamation-triangle me-1"></i>系统未配置 ${curr} 汇率 — 请到系统设置中添加</span>`;
@@ -2141,16 +2172,18 @@ function renderPreviewCards(data) {
         document.getElementById('pvTotalCount').innerHTML = data.total_count ?? 0;
 
         // Row 2 — sales composition
-        document.getElementById('pvGross').innerHTML = dual(data.total_gross_pln, data.total_gross_cny, curr);
+        document.getElementById('pvGross').innerHTML = previewAmount(data, 'total_gross_pln', 'total_gross_cny');
         const shippingPLN = data.total_shipping_pln ?? 0;
         const shippingCNY = data.effective_rate_cny ? shippingPLN * data.effective_rate_cny : null;
-        document.getElementById('pvShipping').innerHTML = dual(shippingPLN, shippingCNY, curr);
+        document.getElementById('pvShipping').innerHTML = data.is_aggregate
+            ? aggregatePreviewAmount(data, 'total_shipping_pln')
+            : dual(shippingPLN, shippingCNY, curr);
         const lossPLN = data.shipping_loss ?? 0;
         const lossCNY = data.effective_rate_cny ? lossPLN * data.effective_rate_cny : null;
         document.getElementById('pvShipLoss').innerHTML = lossPLN > 0
-            ? dual(lossPLN, lossCNY, curr)
+            ? (data.is_aggregate ? aggregatePreviewAmount(data, 'shipping_loss') : dual(lossPLN, lossCNY, curr))
             : `<span class="text-muted">0</span>`;
-        document.getElementById('pvNet').innerHTML = dual(data.total_net_pln, data.total_net_cny, curr);
+        document.getElementById('pvNet').innerHTML = previewAmount(data, 'total_net_pln', 'total_net_cny');
 
         // Row 3 — cost & profit (dual track, mode-aware)
         // Compute both contract-based and actual-based values; show pp/our
@@ -2166,18 +2199,23 @@ function renderPreviewCards(data) {
         const actualCostPln = data.actual_cost_pln ?? 0;
         const actualCostCny = data.effective_rate_cny ? actualCostPln * data.effective_rate_cny : null;
         const remainder = netPln - actualCostPln;
-        const ppActual = remainder * ppShare;
-        const ourActual = remainder * opShare;
+        const ppActual = data.is_aggregate
+            ? (data.actual_partner_profit_pln ?? 0)
+            : remainder * ppShare;
+        const ourActual = data.is_aggregate
+            ? (data.actual_our_receivable_pln ?? 0)
+            : remainder * opShare;
         const rate = data.effective_rate_cny;
 
         // Card 1 (约定成本): always shows ratio-based number, label changes to indicate active/reference
-        document.getElementById('pvCostRatioLabel').textContent =
-            mode === 'actual' ? `(参考 — ${pct(cr)})` : `(${pct(cr)})`;
-        document.getElementById('pvCost').innerHTML = dual(data.cost_amount_pln, data.cost_amount_cny, curr);
+        document.getElementById('pvCostRatioLabel').textContent = data.is_aggregate
+            ? (mode === 'actual' ? '(参考 · 按各主体约定)' : '(按各主体约定)')
+            : (mode === 'actual' ? `(参考 — ${pct(cr)})` : `(${pct(cr)})`);
+        document.getElementById('pvCost').innerHTML = previewAmount(data, 'cost_amount_pln', 'cost_amount_cny');
 
         // Card 2 (实际产品成本): same number, label changes to show "active" in actual mode
         document.getElementById('pvActualCost').innerHTML = actualCostPln > 0
-            ? dual(actualCostPln, actualCostCny, curr)
+            ? (data.is_aggregate ? aggregatePreviewAmount(data, 'actual_cost_pln') : dual(actualCostPln, actualCostCny, curr))
             : `<span class="text-muted">未配置成本</span>`;
 
         // Card 3 (实际毛利) — net − actual cost. Unmapped lines contribute 0
@@ -2188,7 +2226,9 @@ function renderPreviewCards(data) {
         const marginCny = data.actual_margin_cny ?? (rate ? marginPln * rate : null);
         const pvMarginEl = document.getElementById('pvMargin');
         if (pvMarginEl) {
-            pvMarginEl.innerHTML = dual(marginPln, marginCny, curr);
+            pvMarginEl.innerHTML = data.is_aggregate
+                ? aggregatePreviewAmount(data, 'actual_margin_pln')
+                : dual(marginPln, marginCny, curr);
         }
 
         // Card 4 (实际毛利率) — margin / net × 100. When there are unmapped
@@ -2224,15 +2264,19 @@ function renderPreviewCards(data) {
         // Card 5 (合伙人利润) — value depends on mode
         // Card 6 (我方应收) — value depends on mode
         if (mode === 'actual') {
-            document.getElementById('pvPpRatioLabel').textContent = `(剩余 ${pct1(ppShare)})`;
-            document.getElementById('pvOpRatioLabel').textContent = `(剩余 ${pct1(opShare)})`;
-            document.getElementById('pvPartnerProfit').innerHTML = dual(ppActual, rate ? ppActual * rate : null, curr);
-            document.getElementById('pvOurRecv').innerHTML = dual(ourActual, rate ? ourActual * rate : null, curr);
+            document.getElementById('pvPpRatioLabel').textContent = data.is_aggregate ? '(按各主体剩余比例)' : `(剩余 ${pct1(ppShare)})`;
+            document.getElementById('pvOpRatioLabel').textContent = data.is_aggregate ? '(按各主体剩余比例)' : `(剩余 ${pct1(opShare)})`;
+            document.getElementById('pvPartnerProfit').innerHTML = data.is_aggregate
+                ? aggregatePreviewAmount(data, 'actual_partner_profit_pln')
+                : dual(ppActual, rate ? ppActual * rate : null, curr);
+            document.getElementById('pvOurRecv').innerHTML = data.is_aggregate
+                ? aggregatePreviewAmount(data, 'actual_our_receivable_pln')
+                : dual(ourActual, rate ? ourActual * rate : null, curr);
         } else {
-            document.getElementById('pvPpRatioLabel').textContent = `(${pct(ppr)})`;
-            document.getElementById('pvOpRatioLabel').textContent = `(${pct(opr)})`;
-            document.getElementById('pvPartnerProfit').innerHTML = dual(data.partner_profit_pln, data.partner_profit_cny, curr);
-            document.getElementById('pvOurRecv').innerHTML = dual(data.our_receivable_pln, data.our_receivable_cny, curr);
+            document.getElementById('pvPpRatioLabel').textContent = data.is_aggregate ? '(按各主体约定)' : `(${pct(ppr)})`;
+            document.getElementById('pvOpRatioLabel').textContent = data.is_aggregate ? '(按各主体约定)' : `(${pct(opr)})`;
+            document.getElementById('pvPartnerProfit').innerHTML = previewAmount(data, 'partner_profit_pln', 'partner_profit_cny');
+            document.getElementById('pvOurRecv').innerHTML = previewAmount(data, 'our_receivable_pln', 'our_receivable_cny');
         }
 
         // Visual highlight: the "active" cost tile pops with a glow + ACTIVE
@@ -2268,7 +2312,9 @@ function renderPreviewCards(data) {
         const unmappedQty = data.cost_unmapped_qty ?? 0;
         const unmappedHint = document.getElementById('pvCostUnmapped');
         if (unmappedQty > 0) {
-            unmappedHint.innerHTML = `<a href="javascript:void(0)" onclick="showReconUnmappedDetail()" style="color:#fbbf24;text-decoration:underline dotted;cursor:pointer;" title="点击查看未匹配成本的产品明细"><i class="bi bi-exclamation-triangle me-1"></i>${unmappedQty} 件未匹配成本，涉及 ${fmt(unmappedRev)} ${curr}</a>`;
+            unmappedHint.innerHTML = data.is_aggregate
+                ? `<span style="color:#fbbf24;"><i class="bi bi-exclamation-triangle me-1"></i>${unmappedQty} 件未匹配成本，涉及 ${fmt(unmappedRev)} CNY；请选择单个合伙人查看明细</span>`
+                : `<a href="javascript:void(0)" onclick="showReconUnmappedDetail()" style="color:#fbbf24;text-decoration:underline dotted;cursor:pointer;" title="点击查看未匹配成本的产品明细"><i class="bi bi-exclamation-triangle me-1"></i>${unmappedQty} 件未匹配成本，涉及 ${fmt(unmappedRev)} ${curr}</a>`;
         } else {
             unmappedHint.innerHTML = '';
         }
@@ -2303,9 +2349,69 @@ function getFormulaMode() {
     return el ? el.value : 'contract';
 }
 
+function renderAggregateFormulaBreakdown(d) {
+    const mode = getFormulaMode();
+    const rows = d.partner_breakdown || [];
+    const nativeAndCny = (row, field) => {
+        const local = row[field] ?? 0;
+        const cnyField = field.endsWith('_pln')
+            ? field.replace('_pln', '_cny')
+            : `${field}_cny`;
+        const cny = row[cnyField];
+        return `${fmt(local)} ${row.currency}${cny == null ? '<div class="text-warning small">缺少汇率</div>' : `<div class="cny-sub">≈ ${fmt(cny)} CNY</div>`}`;
+    };
+    const costField = mode === 'actual' ? 'actual_cost_pln' : 'cost_amount_pln';
+    const ppField = mode === 'actual' ? 'actual_partner_profit_pln' : 'partner_profit_pln';
+    const ourField = mode === 'actual' ? 'actual_our_receivable_pln' : 'our_receivable_pln';
+    const missing = d.missing_rate_currencies || [];
+    const html = `
+        <div class="formula-list">
+            <div class="formula-item fi-net">
+                <div class="formula-num"><i class="bi bi-layers"></i></div>
+                <div class="formula-body">
+                    <div class="formula-name">全部合伙人汇总口径</div>
+                    <div class="formula-note">
+                        每个主体先按自己的币种、约定比例和实际产品成本独立计算，再按该月份系统汇率折算为 CNY 后求和；不会直接相加 PLN、AUD、CZK。
+                    </div>
+                    ${missing.length ? `<div class="formula-note" style="color:#fbbf24;">缺少 ${missing.join('、')} 汇率，CNY 合计暂不完整。</div>` : ''}
+                </div>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-dark table-sm align-middle mb-0">
+                    <thead><tr>
+                        <th>对账主体</th><th class="text-end">净销售额</th>
+                        <th class="text-end">${mode === 'actual' ? '实际产品成本' : '约定成本'}</th>
+                        <th class="text-end">合伙人利润</th><th class="text-end">我方应收</th>
+                    </tr></thead>
+                    <tbody>
+                        ${rows.map(row => `<tr>
+                            <td>${escapeHtml(row.partner_name || '')}<div class="text-muted small">${row.currency} · ${rateSourceText(row.rate_source)}</div></td>
+                            <td class="text-end">${nativeAndCny(row, 'total_net_pln')}</td>
+                            <td class="text-end">${nativeAndCny(row, costField)}</td>
+                            <td class="text-end">${nativeAndCny(row, ppField)}</td>
+                            <td class="text-end">${nativeAndCny(row, ourField)}</td>
+                        </tr>`).join('')}
+                    </tbody>
+                    <tfoot><tr class="fw-bold">
+                        <td>CNY 合计</td>
+                        <td class="text-end">${fmt(d.total_net_pln)} CNY</td>
+                        <td class="text-end">${fmt(d[costField] || 0)} CNY</td>
+                        <td class="text-end">${fmt(d[ppField] || 0)} CNY</td>
+                        <td class="text-end">${fmt(d[ourField] || 0)} CNY</td>
+                    </tr></tfoot>
+                </table>
+            </div>
+        </div>`;
+    document.getElementById('formulaBoxBody').innerHTML = html;
+}
+
 function renderFormulaBreakdown(d) {
     if (!d) return;
     _lastFormulaData = d;  // cache for mode-toggle re-render
+    if (d.is_aggregate) {
+        renderAggregateFormulaBreakdown(d);
+        return;
+    }
     const mode = getFormulaMode();
     const curr = d.currency || 'PLN';
     const r = d.effective_rate_cny;
@@ -4697,10 +4803,12 @@ async function loadPartnerSettings() {
                 ]);
                 const boundSites = sites.all_sites.filter(s => sites.bound_site_ids.includes(s.id));
                 const boundUsers = users.all_users.filter(u => users.bound_user_ids.includes(u.id));
+                const inheritedCountries = sites.granted_countries || [];
                 const el = document.getElementById(`bound-${p.id}`);
                 if (el) el.innerHTML = `
                     <div class="text-white-50 small">
                         <span class="me-3"><i class="bi bi-globe me-1"></i>已绑定 ${boundSites.length} 个站点: ${boundSites.slice(0,5).map(s => s.url.replace(/https?:\/\//,'')).join(', ')}${boundSites.length>5?'...':''}</span>
+                        ${inheritedCountries.length ? `<span class="badge bg-info bg-opacity-25 text-info me-3">整国继承：${inheritedCountries.join('、')}</span>` : ''}
                         ${IS_SUPER_ADMIN ? `<span><i class="bi bi-people me-1"></i>已绑定 ${boundUsers.length} 个用户: ${boundUsers.map(u => u.username).join(', ') || '无'}</span>` : ''}
                     </div>
                 `;
@@ -4730,21 +4838,120 @@ async function savePartnerRatio(id) {
 async function editPartnerSites(id) {
     try {
         const data = await api(`/api/partners/${id}/sites`);
-        const checked = new Set(data.bound_site_ids);
-        const html = data.all_sites.map(s => `
-            <div class="form-check">
-                <input class="form-check-input" type="checkbox" value="${s.id}" id="ps_${s.id}" ${checked.has(s.id)?'checked':''}>
-                <label class="form-check-label text-white" for="ps_${s.id}">
-                    <span class="badge bg-secondary me-1">${s.country||'-'}</span>${s.url.replace(/https?:\/\//,'')}
-                    <span class="text-muted small">(${s.manager||'-'})</span>
-                </label>
-            </div>
-        `).join('');
+        const countryNames = {
+            PL:'波兰', AU:'澳大利亚', AE:'阿联酋', HU:'匈牙利',
+            CZ:'捷克', DE:'德国', FR:'法国', UK:'英国', GB:'英国',
+            US:'美国', CN:'中国'
+        };
+        const granted = new Set(data.granted_countries || []);
+        const excluded = new Set(data.excluded_site_ids || []);
+        const explicit = new Set(data.explicit_site_ids || []);
+        const bindings = {};
+        (data.site_bindings || []).forEach(row => {
+            (bindings[row.site_id] = bindings[row.site_id] || []).push(row);
+        });
+        const groups = {};
+        data.all_sites.forEach(site => {
+            const country = site.country || '';
+            (groups[country] = groups[country] || []).push(site);
+        });
+        const hintOn = '整国绑定 · 以后新增站点自动继承（取消某站 = 排除该站）';
+        const hintOff = '未整国绑定 · 仅勾选的站点计入对账';
+        const tip = `
+            <div class="alert alert-info bg-info bg-opacity-10 text-info border-info border-opacity-25 small mb-3">
+                <i class="bi bi-info-circle me-1"></i>
+                勾选国家后，该国现有及以后新增的站点都会自动计入合伙人对账。
+                如需排除个别站点，可在整国绑定下取消该站。
+            </div>`;
+        const html = tip + Object.keys(groups).sort().map(country => {
+            const sites = groups[country];
+            const countryGranted = granted.has(country);
+            const countryHead = country ? `
+                <div class="form-check">
+                    <input class="form-check-input partner-country-grant"
+                           type="checkbox" data-country="${country}"
+                           id="partner_country_${id}_${country}"
+                           ${countryGranted ? 'checked' : ''}>
+                    <label class="form-check-label text-white fw-bold"
+                           for="partner_country_${id}_${country}">
+                        ${countryNames[country] || country}
+                        <span class="text-white-50 small">${country} · ${sites.length} 个站点</span>
+                    </label>
+                    <div class="small ms-4 ${countryGranted ? 'text-info' : 'text-muted'}"
+                         id="partner_country_hint_${id}_${country}">
+                        ${countryGranted ? hintOn : hintOff}
+                    </div>
+                </div>` :
+                '<div class="text-white-50 small">未分配国家的站点（仅可单独绑定）</div>';
+            const siteRows = sites.map(site => {
+                const otherOwners = (bindings[site.id] || [])
+                    .filter(row => Number(row.partner_id) !== Number(id));
+                const occupied = otherOwners.length > 0;
+                const isChecked = occupied ? false : (
+                    countryGranted ? !excluded.has(site.id) : explicit.has(site.id)
+                );
+                const ownerNote = occupied
+                    ? `<span class="badge bg-danger bg-opacity-25 text-danger ms-2">已属于 ${otherOwners.map(row => row.partner_name).join('、')}</span>`
+                    : '';
+                return `
+                    <div class="form-check ms-4">
+                        <input class="form-check-input partner-site-check"
+                               type="checkbox" data-country="${country}"
+                               value="${site.id}" id="ps_${id}_${site.id}"
+                               ${isChecked ? 'checked' : ''}
+                               ${occupied ? 'disabled' : ''}>
+                        <label class="form-check-label text-white" for="ps_${id}_${site.id}">
+                            ${site.url.replace(/https?:\/\//,'')}
+                            <span class="text-muted small">(${site.manager || '-'})</span>
+                            ${ownerNote}
+                        </label>
+                    </div>`;
+            }).join('');
+            return `<div class="partner-country-group mb-3 pb-2 border-bottom border-secondary border-opacity-10">${countryHead}${siteRows}</div>`;
+        }).join('');
         showPromptModal('绑定站点', html, async () => {
-            const ids = Array.from(document.querySelectorAll('#promptBody input[type=checkbox]:checked')).map(x => parseInt(x.value));
-            await api(`/api/partners/${id}/sites`, {method:'PUT', body: JSON.stringify({site_ids: ids})});
+            const body = document.getElementById('promptBody');
+            const countryGrants = [];
+            const grantedSet = new Set();
+            body.querySelectorAll('.partner-country-grant:checked').forEach(input => {
+                countryGrants.push(input.dataset.country);
+                grantedSet.add(input.dataset.country);
+            });
+            const siteIds = [];
+            const siteExclusions = [];
+            body.querySelectorAll('.partner-site-check').forEach(input => {
+                const siteId = parseInt(input.value);
+                if (grantedSet.has(input.dataset.country)) {
+                    if (!input.checked) siteExclusions.push(siteId);
+                } else if (input.checked) {
+                    siteIds.push(siteId);
+                }
+            });
+            await api(`/api/partners/${id}/sites`, {
+                method:'PUT',
+                body: JSON.stringify({
+                    site_ids: siteIds,
+                    country_grants: countryGrants,
+                    site_exclusions: siteExclusions
+                })
+            });
             showToast('站点绑定已更新', 'success');
             loadPartnerSettings();
+        });
+        const body = document.getElementById('promptBody');
+        body.querySelectorAll('.partner-country-grant').forEach(input => {
+            input.addEventListener('change', function() {
+                const country = this.dataset.country;
+                const enabled = this.checked;
+                body.querySelectorAll(`.partner-site-check[data-country="${country}"]`).forEach(site => {
+                    if (!site.disabled) site.checked = enabled;
+                });
+                const hint = document.getElementById(`partner_country_hint_${id}_${country}`);
+                if (hint) {
+                    hint.textContent = enabled ? hintOn : hintOff;
+                    hint.className = `small ms-4 ${enabled ? 'text-info' : 'text-muted'}`;
+                }
+            });
         });
     } catch (e) { showToast('加载失败: ' + e.message, 'danger'); }
 }

@@ -1,0 +1,693 @@
+{% extends "base.html" %}
+{% block title %}公司盈利 - 苍赋管理系统{% endblock %}
+
+{% block content %}
+<style>
+    .profit-card {
+        border: 1px solid rgba(148, 163, 184, .18);
+        background: linear-gradient(145deg, rgba(15, 23, 42, .96), rgba(30, 41, 59, .92));
+        border-radius: 14px;
+        height: 100%;
+    }
+    .profit-card .label { color: #94a3b8; font-size: .82rem; }
+    .profit-card .value { font-size: 1.45rem; font-weight: 700; color: #f8fafc; }
+    .profit-card .note { color: #64748b; font-size: .76rem; }
+    .profit-positive { color: #34d399 !important; }
+    .profit-negative { color: #fb7185 !important; }
+    .scenario-title {
+        font-size: .95rem;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+        color: #94a3b8;
+    }
+    .data-badge {
+        font-size: .72rem;
+        border-radius: 999px;
+        padding: .22rem .55rem;
+    }
+    .market-table input, .market-table textarea {
+        min-width: 110px;
+    }
+    .scenario-table th, .scenario-table td {
+        white-space: nowrap;
+    }
+    .scenario-table tbody tr:hover {
+        background: rgba(56, 189, 248, .06);
+    }
+    .chart-wrap { min-height: 320px; }
+</style>
+
+<div class="container-fluid">
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
+    <div>
+        <h4 class="mb-1"><i class="bi bi-building-gear me-2"></i>公司盈利</h4>
+        <p class="text-white-50 mb-0">把公司可得收入、工资提成和经营支出放到同一口径。</p>
+    </div>
+    <div class="d-flex flex-wrap align-items-center justify-content-end gap-2">
+        <div class="btn-group btn-group-sm" role="group" aria-label="公司收入核算口径">
+            <button type="button"
+                    class="btn {{ 'btn-info' if profit_data.calculation_mode == 'percentage' else 'btn-outline-info' }}"
+                    {% if can_edit_company_profit %}onclick="switchCalculationMode('percentage')"{% else %}disabled{% endif %}>
+                按分润比例
+            </button>
+            <button type="button"
+                    class="btn {{ 'btn-info' if profit_data.calculation_mode == 'actual_cost' else 'btn-outline-info' }}"
+                    {% if can_edit_company_profit %}onclick="switchCalculationMode('actual_cost')"{% else %}disabled{% endif %}>
+                按实际成本
+            </button>
+        </div>
+        <label class="text-white-50 small" for="profitMonth">月份</label>
+        <input id="profitMonth" type="month" class="form-control form-control-sm bg-dark text-white border-secondary"
+               value="{{ profit_data.year_month }}" style="width:150px;">
+        {% if can_edit_company_profit %}
+        <button class="btn btn-sm btn-outline-info" data-bs-toggle="modal" data-bs-target="#monthSettingsModal">
+            <i class="bi bi-sliders me-1"></i>月度确认
+        </button>
+        <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#expenseModal" onclick="newExpense()">
+            <i class="bi bi-plus-lg me-1"></i>录入支出
+        </button>
+        {% endif %}
+    </div>
+</div>
+
+<div id="dataGapAlert" class="alert alert-warning border-warning bg-warning bg-opacity-10 text-warning {% if not profit_data.data_gaps %}d-none{% endif %}">
+    <div class="fw-semibold mb-1"><i class="bi bi-exclamation-triangle me-1"></i>当前是暂估利润，不是已确认财务结论</div>
+    <ul class="mb-0 ps-3">
+        {% for gap in profit_data.data_gaps %}<li>{{ gap }}</li>{% endfor %}
+    </ul>
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-6 col-lg-4 col-xl">
+        <div class="profit-card p-3">
+            <div class="label">GMV（需求规模）</div>
+            <div class="value" id="gmvValue"></div>
+            <div class="note">含失败/取消，不等于公司收入</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-4 col-xl">
+        <div class="profit-card p-3">
+            <div class="label">合伙人结算净销售</div>
+            <div class="value" id="netSalesValue"></div>
+            <div class="note">财务口径；优先引用冻结对账单</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-4 col-xl">
+        <div class="profit-card p-3">
+            <div class="label">团队业绩净销售</div>
+            <div class="value" id="teamNetSalesValue"></div>
+            <div class="note">销售看板口径；用于提成和绩效</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-4 col-xl">
+        <div class="profit-card p-3">
+            <div class="label">公司可得收入</div>
+            <div class="value" id="companyRevenueValue"></div>
+            <div class="note">{{ profit_data.calculation_mode_label }} · 引用合伙人对账</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-4 col-xl">
+        <div class="profit-card p-3">
+            <div class="label">实际/暂估经营利润</div>
+            <div class="value" id="actualProfitValue"></div>
+            <div class="note" id="actualProfitNote"></div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-4 mb-4">
+    <div class="col-xl-6">
+        <div class="card bg-dark border-secondary h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span class="scenario-title">实际口径</span>
+                <span class="data-badge {{ 'bg-success text-white' if profit_data.actual.complete else 'bg-warning text-dark' }}">
+                    {{ '已确认完整' if profit_data.actual.complete else '暂估/待补数据' }}
+                </span>
+            </div>
+            <div class="card-body">
+                <div class="row g-3">
+                    <div class="col-6"><div class="text-white-50 small">公司可得收入</div><div class="h5" id="actualRevenue"></div></div>
+                    <div class="col-6"><div class="text-white-50 small">工资提成</div><div class="h5" id="actualPayroll"></div><div class="small text-white-50">{{ profit_data.actual.payroll_source }}</div></div>
+                    <div class="col-6"><div class="text-white-50 small">其他实际支出</div><div class="h5" id="actualExpenses"></div></div>
+                    <div class="col-6"><div class="text-white-50 small">利润率</div><div class="h5" id="actualMargin"></div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-xl-6">
+        <div class="card bg-dark border-info h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span class="scenario-title text-info">预测口径</span>
+                <span class="data-badge {{ 'bg-info text-dark' if profit_data.forecast.complete else 'bg-warning text-dark' }}">
+                    {{ '系统口径完整' if profit_data.forecast.complete else '仍有预测缺口' }}
+                </span>
+            </div>
+            <div class="card-body">
+                <div class="row g-3">
+                    <div class="col-6"><div class="text-white-50 small">预测公司收入</div><div class="h5" id="forecastRevenue"></div></div>
+                    <div class="col-6"><div class="text-white-50 small">预测工资提成</div><div class="h5" id="forecastPayroll"></div><div class="small text-white-50">{{ profit_data.forecast.payroll_source }}</div></div>
+                    <div class="col-6"><div class="text-white-50 small">预测其他支出</div><div class="h5" id="forecastExpenses"></div></div>
+                    <div class="col-6"><div class="text-white-50 small">预测利润</div><div class="h5" id="forecastProfit"></div></div>
+                </div>
+                <div class="small text-white-50 mt-3">{{ profit_data.forecast.method_note }}</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card bg-dark border-secondary mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <div>
+            <i class="bi bi-globe2 me-2"></i>市场核算与销售预测
+            <div class="small text-white-50 mt-1">
+                当前：{{ profit_data.calculation_mode_label }}。
+                {% if profit_data.calculation_mode == 'actual_cost' %}
+                合伙人先收回真实产品成本，剩余毛利再按对账比例分配。
+                {% else %}
+                已绑定合伙人的市场直接引用对账约定比例；其他市场使用月度设置。
+                {% endif %}
+            </div>
+        </div>
+        {% if can_edit_company_profit %}
+        <button class="btn btn-sm btn-outline-success" onclick="saveMarketRules()">
+            <i class="bi bi-save me-1"></i>保存口径
+        </button>
+        {% endif %}
+    </div>
+    <div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0 market-table">
+            <thead>
+                <tr>
+                    <th>市场</th>
+                    <th class="text-end">GMV</th>
+                    <th class="text-end">团队业绩净销售</th>
+                    <th class="text-end">合伙人结算净销售</th>
+                    <th class="text-end">实际产品成本</th>
+                    <th style="width:150px;">{{ '剩余毛利我方比例' if profit_data.calculation_mode == 'actual_cost' else '公司有效分润' }}</th>
+                    <th class="text-end">公司可得收入</th>
+                    <th style="width:180px;">预测净销售</th>
+                    <th class="text-end">预测公司收入</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for market in profit_data.countries %}
+                <tr data-country="{{ market.country }}" data-share-locked="{{ 'true' if market.share_locked else 'false' }}">
+                    <td>
+                        <strong>{{ market.country }}</strong>
+                        <div class="small text-white-50">{{ market.share_source }}</div>
+                        {% if market.partner_names %}
+                        <div class="small text-info">{{ market.partner_names|join('、') }}</div>
+                        {% endif %}
+                        {% if market.reconciliation_sources %}
+                        <div class="small text-white-50">{{ market.reconciliation_sources|join('、') }}</div>
+                        {% endif %}
+                        {% if market.statement_updated_at %}
+                        <div class="small text-white-50">快照更新 {{ market.statement_updated_at|join('、') }}</div>
+                        {% endif %}
+                    </td>
+                    <td class="text-end">{{ "¥{:,.2f}".format(market.gmv_cny) }}</td>
+                    <td class="text-end">{{ "¥{:,.2f}".format(market.net_sales_cny) }}</td>
+                    <td class="text-end">
+                        {{ "¥{:,.2f}".format(market.settlement_net_sales_cny) }}
+                        {% if market.reconciliation_net_cny is none %}
+                        <div class="small text-white-50">未绑定对账，暂用团队口径</div>
+                        {% endif %}
+                    </td>
+                    <td class="text-end">
+                        {{ "¥{:,.2f}".format(market.actual_product_cost_cny) if market.actual_product_cost_cny is not none else "—" }}
+                        {% if market.actual_cost_rate is not none %}
+                        <div class="small text-white-50">成本率 {{ "{:.2f}%".format(market.actual_cost_rate * 100) }}</div>
+                        {% endif %}
+                        {% if market.unmapped_cost_qty %}
+                        <div class="small text-warning">{{ market.unmapped_cost_qty }} 件缺少进价</div>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <div class="input-group input-group-sm">
+                            <input class="form-control bg-dark text-white border-secondary share-rate"
+                                   type="number" min="0" max="100" step="0.01"
+                                   value="{{ '{:.2f}'.format(market.share_rate * 100) if market.share_rate is not none else '' }}"
+                                   {{ 'disabled' if (not can_edit_company_profit or market.share_locked) else '' }}>
+                            <span class="input-group-text bg-secondary border-secondary text-white">%</span>
+                        </div>
+                        {% if market.share_locked %}
+                        <div class="small text-white-50 mt-1">由合伙人对账锁定</div>
+                        {% endif %}
+                    </td>
+                    <td class="text-end">{{ "¥{:,.2f}".format(market.company_revenue_cny) if market.company_revenue_cny is not none else "—" }}</td>
+                    <td>
+                        <input class="form-control form-control-sm bg-dark text-white border-secondary forecast-net"
+                               type="number" min="0" step="0.01"
+                               placeholder="{{ '系统 ¥{:,.0f}'.format(market.forecast_net_sales_cny) }}"
+                               value="{{ market.manual_forecast_net_sales_cny if market.manual_forecast_net_sales_cny is not none else '' }}"
+                               {{ 'disabled' if not can_edit_company_profit else '' }}>
+                        <div class="small text-white-50 mt-1">{{ market.forecast_source }}</div>
+                    </td>
+                    <td class="text-end">
+                        {{ "¥{:,.2f}".format(market.forecast_company_revenue_cny) if market.forecast_company_revenue_cny is not none else "—" }}
+                        <div class="small text-white-50">{{ market.forecast_revenue_source }}</div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card bg-dark border-info mb-4" id="revenueLadderCard">
+    <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <div>
+            <i class="bi bi-calculator me-2"></i>销售额阶梯预测
+            <div class="small text-white-50 mt-1">
+                先看当月和增长20%的结果，再按5万元/10万元整数档比较公司收入、工资、日常运营和利润。
+            </div>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+            <span class="small text-white-50">公司收入率</span>
+            <div class="input-group input-group-sm" style="width:145px;">
+                <input id="ladderRevenueRate" class="form-control bg-dark text-white border-secondary"
+                       type="number" min="0" max="100" step="0.0001"
+                       value="{{ '{:.4f}'.format(profit_data.revenue_ladder.company_revenue_rate * 100) }}"
+                       {{ 'disabled' if not can_edit_company_profit else '' }}>
+                <span class="input-group-text bg-secondary border-secondary text-white">%</span>
+            </div>
+            {% if can_edit_company_profit %}
+            <button class="btn btn-sm btn-outline-success" onclick="saveLadderRevenueRate()">
+                <i class="bi bi-save me-1"></i>保存收入率
+            </button>
+            {% endif %}
+        </div>
+    </div>
+    <div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0 scenario-table">
+            <thead>
+                <tr>
+                    <th>预测销售额</th>
+                    <th class="text-end">公司收入</th>
+                    <th class="text-end">工资支出</th>
+                    <th class="text-end">日常运营</th>
+                    <th class="text-end">预计总支出</th>
+                    <th class="text-end">预计利润</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in profit_data.revenue_ladder.rows %}
+                <tr class="revenue-ladder-row"
+                    data-target-net-sales="{{ row.target_net_sales_cny }}"
+                    data-total-expenses="{{ row.total_expenses_cny }}">
+                    <td>
+                        <strong>{{ row.label }}</strong>
+                        <div class="small text-info">{{ "¥{:,.2f}".format(row.target_net_sales_cny) }}</div>
+                    </td>
+                    <td class="text-end fw-semibold ladder-company-revenue">{{ "¥{:,.2f}".format(row.company_revenue_cny) }}</td>
+                    <td class="text-end">{{ "¥{:,.2f}".format(row.payroll_cny) }}</td>
+                    <td class="text-end">{{ "¥{:,.2f}".format(row.daily_operations_cny) }}</td>
+                    <td class="text-end">{{ "¥{:,.2f}".format(row.total_expenses_cny) }}</td>
+                    <td class="text-end fw-bold ladder-profit {{ 'profit-positive' if row.profit_cny > 0 else 'profit-negative' if row.profit_cny < 0 else '' }}">{{ "¥{:,.2f}".format(row.profit_cny) }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    <div class="card-footer small text-white-50">
+        基数：{{ profit_data.revenue_ladder.base_source }} {{ "¥{:,.2f}".format(profit_data.revenue_ladder.base_net_sales_cny) }}；
+        工资：{{ profit_data.revenue_ladder.payroll_method }}；
+        日常运营：{{ profit_data.revenue_ladder.daily_operations_source }}，合并服务器、域名、办公物资、CDN、AI 及其他费用，共 {{ "¥{:,.2f}".format(profit_data.revenue_ladder.daily_operations_cny) }}。
+        盈亏平衡销售额：{{ "¥{:,.2f}".format(profit_data.revenue_ladder.breakeven_net_sales_cny) if profit_data.revenue_ladder.breakeven_net_sales_cny is not none else "—" }}。
+        {% if profit_data.scenario.updated_at %}最后保存：{{ profit_data.scenario.updated_at }}{% endif %}
+    </div>
+</div>
+
+<div class="row g-4 mb-4">
+    <div class="col-xl-7">
+        <div class="card bg-dark border-secondary h-100">
+            <div class="card-header"><i class="bi bi-graph-up me-2"></i>近一年经营趋势</div>
+            <div class="card-body chart-wrap"><canvas id="profitTrendChart"></canvas></div>
+        </div>
+    </div>
+    <div class="col-xl-5">
+        <div class="card bg-dark border-secondary h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-receipt me-2"></i>实际与预测支出</span>
+                <span class="small text-white-50">人民币</span>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-dark table-sm align-middle mb-0">
+                    <thead><tr><th>类型</th><th>项目</th><th class="text-end">金额</th>{% if can_edit_company_profit %}<th></th>{% endif %}</tr></thead>
+                    <tbody>
+                        {% for expense in profit_data.expenses %}
+                        <tr>
+                            <td><span class="badge {{ 'bg-success' if expense.scenario == 'actual' else 'bg-info text-dark' }}">{{ '实际' if expense.scenario == 'actual' else '预测' }}</span></td>
+                            <td>
+                                <div>{{ expense.category }} · {{ expense.name }}</div>
+                                {% if expense.is_recurring %}<span class="small text-white-50">周期性</span>{% endif %}
+                            </td>
+                            <td class="text-end">{{ "¥{:,.2f}".format(expense.amount_cny) }}</td>
+                            {% if can_edit_company_profit %}
+                            <td class="text-end">
+                                <button class="btn btn-sm btn-outline-secondary" onclick='editExpense({{ expense|tojson }})'><i class="bi bi-pencil"></i></button>
+                                <button class="btn btn-sm btn-outline-danger" onclick="askDeleteExpense({{ expense.id }})"><i class="bi bi-trash"></i></button>
+                            </td>
+                            {% endif %}
+                        </tr>
+                        {% endfor %}
+                        {% if not profit_data.expenses %}
+                        <tr><td colspan="{{ 4 if can_edit_company_profit else 3 }}" class="text-center text-white-50 py-4">尚未录入支出</td></tr>
+                        {% endif %}
+                        {% for expense in profit_data.recurring_forecast_expenses %}
+                        <tr>
+                            <td><span class="badge bg-secondary">系统带入</span></td>
+                            <td>{{ expense.category }} · {{ expense.name }}<div class="small text-white-50">来自 {{ expense.source_month }}</div></td>
+                            <td class="text-end">{{ "¥{:,.2f}".format(expense.amount_cny) }}</td>
+                            {% if can_edit_company_profit %}
+                            <td class="text-end">
+                                <button class="btn btn-sm btn-outline-info"
+                                        onclick='editInheritedExpense({{ expense|tojson }})'>
+                                    编辑本月
+                                </button>
+                            </td>
+                            {% endif %}
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card bg-dark border-secondary mb-4">
+    <div class="card-header"><i class="bi bi-journal-check me-2"></i>核算口径</div>
+    <div class="card-body">
+        <dl class="row mb-0 small">
+            {% for key, definition in profit_data.definitions.items() %}
+            <dt class="col-md-2 text-info">{{ key }}</dt><dd class="col-md-10 text-white-50">{{ definition }}</dd>
+            {% endfor %}
+        </dl>
+    </div>
+</div>
+</div>
+
+{% if can_edit_company_profit %}
+<div class="modal fade" id="monthSettingsModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark text-white border-secondary">
+            <div class="modal-header border-secondary"><h5 class="modal-title">月度实际与预测确认</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+            <div class="modal-body">
+                <div class="alert alert-info py-2 small">空白表示继续使用系统暂估。实际工资建议按工资表的最终实发总额填写。</div>
+                <div class="mb-3">
+                    <label class="form-label">公司收入核算口径</label>
+                    <select id="calculationMode" class="form-select bg-dark text-white border-secondary">
+                        <option value="percentage" {{ 'selected' if profit_data.calculation_mode == 'percentage' else '' }}>按分润比例</option>
+                        <option value="actual_cost" {{ 'selected' if profit_data.calculation_mode == 'actual_cost' else '' }}>按实际成本</option>
+                    </select>
+                    <div class="form-text text-white-50">按月份保存；真实进价和拆分比例来自“合伙人对账”。</div>
+                </div>
+                <div class="mb-3"><label class="form-label">实际已发工资总额（¥）</label><input id="payrollActual" type="number" min="0" step="0.01" class="form-control bg-dark text-white border-secondary" value="{{ profit_data.settings.payroll_actual_override if profit_data.settings.payroll_actual_override is not none else '' }}"></div>
+                <div class="mb-3"><label class="form-label">预测工资总额覆盖（¥）</label><input id="payrollForecast" type="number" min="0" step="0.01" class="form-control bg-dark text-white border-secondary" value="{{ profit_data.settings.payroll_forecast_override if profit_data.settings.payroll_forecast_override is not none else '' }}"></div>
+                <div class="form-check mb-3"><input id="expensesComplete" class="form-check-input" type="checkbox" {{ 'checked' if profit_data.settings.actual_expenses_complete else '' }}><label class="form-check-label" for="expensesComplete">本月其他实际支出已经录完</label></div>
+                <div><label class="form-label">月度备注</label><textarea id="monthNotes" class="form-control bg-dark text-white border-secondary" rows="3">{{ profit_data.settings.notes or '' }}</textarea></div>
+            </div>
+            <div class="modal-footer border-secondary"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" onclick="saveMonthSettings()">保存</button></div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="expenseModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark text-white border-secondary">
+            <div class="modal-header border-secondary"><h5 class="modal-title" id="expenseModalTitle">录入支出</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+            <div class="modal-body">
+                <input id="expenseId" type="hidden">
+                <div id="expenseOverrideNotice" class="alert alert-info py-2 small d-none">
+                    这里保存的是当前月份的预测覆盖值，不会修改来源月份，也不会影响其他月份。
+                </div>
+                <div class="row g-3">
+                    <div class="col-6"><label class="form-label">口径</label><select id="expenseScenario" class="form-select bg-dark text-white border-secondary"><option value="actual">实际</option><option value="forecast">预测</option></select></div>
+                    <div class="col-6"><label class="form-label">分类</label><select id="expenseCategory" class="form-select bg-dark text-white border-secondary"><option>工资调整</option><option>服务器/域名</option><option>软件/插件</option><option>办公/房租</option><option>税费/支付手续费</option><option>售后/退款</option><option>其他</option></select></div>
+                    <div class="col-12"><label class="form-label">项目名称</label><input id="expenseName" class="form-control bg-dark text-white border-secondary" maxlength="120"></div>
+                    <div class="col-6"><label class="form-label">金额（¥）</label><input id="expenseAmount" type="number" min="0" step="0.01" class="form-control bg-dark text-white border-secondary"></div>
+                    <div class="col-6 d-flex align-items-end"><div class="form-check mb-2"><input id="expenseRecurring" class="form-check-input" type="checkbox"><label class="form-check-label" for="expenseRecurring">每月周期性支出</label></div></div>
+                    <div class="col-12"><label class="form-label">备注</label><textarea id="expenseNotes" class="form-control bg-dark text-white border-secondary" rows="2"></textarea></div>
+                </div>
+            </div>
+            <div class="modal-footer border-secondary"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" onclick="saveExpense()">保存</button></div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="deleteExpenseModal" tabindex="-1">
+    <div class="modal-dialog modal-sm">
+        <div class="modal-content bg-dark text-white border-danger">
+            <div class="modal-header border-secondary"><h5 class="modal-title">删除支出记录</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+            <div class="modal-body">确定删除这条支出吗？删除后利润会立即重算。</div>
+            <div class="modal-footer border-secondary"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-danger" onclick="deleteExpense()">删除</button></div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<script>
+const profitData = {{ profit_data|tojson }};
+const canEditProfit = {{ 'true' if can_edit_company_profit else 'false' }};
+let deleteExpenseId = null;
+
+function money(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+    return '¥' + Number(value).toLocaleString('zh-CN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+function setProfitClass(el, value) {
+    el.classList.remove('profit-positive', 'profit-negative');
+    if (Number(value) > 0) el.classList.add('profit-positive');
+    if (Number(value) < 0) el.classList.add('profit-negative');
+}
+function jsonRequest(url, options) {
+    return fetch(url, {
+        ...options,
+        headers: {'Content-Type': 'application/json', ...(options && options.headers || {})}
+    }).then(async response => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+        return data;
+    });
+}
+function reloadMonth() {
+    const month = document.getElementById('profitMonth').value;
+    window.location.href = `/company-profit?month=${encodeURIComponent(month)}`;
+}
+document.getElementById('profitMonth').addEventListener('change', reloadMonth);
+
+function monthSettingsPayload(calculationMode) {
+    return {
+        year_month: profitData.year_month,
+        calculation_mode: calculationMode || profitData.calculation_mode,
+        payroll_actual_override: profitData.settings.payroll_actual_override,
+        payroll_forecast_override: profitData.settings.payroll_forecast_override,
+        actual_expenses_complete: !!profitData.settings.actual_expenses_complete,
+        notes: profitData.settings.notes || ''
+    };
+}
+
+async function switchCalculationMode(mode) {
+    if (!canEditProfit || mode === profitData.calculation_mode) return;
+    try {
+        await jsonRequest('/api/company-profit/settings', {
+            method: 'POST',
+            body: JSON.stringify(monthSettingsPayload(mode))
+        });
+        window.location.reload();
+    } catch (error) { alert(error.message); }
+}
+
+document.getElementById('gmvValue').textContent = money(profitData.gmv_cny);
+document.getElementById('netSalesValue').textContent = money(profitData.net_sales_cny);
+document.getElementById('teamNetSalesValue').textContent = money(profitData.team_net_sales_cny);
+document.getElementById('companyRevenueValue').textContent = money(profitData.actual.company_revenue_cny);
+const actualProfitEl = document.getElementById('actualProfitValue');
+actualProfitEl.textContent = money(profitData.actual.profit_cny);
+setProfitClass(actualProfitEl, profitData.actual.profit_cny);
+document.getElementById('actualProfitNote').textContent = profitData.actual.complete ? '实际数据已确认完整' : '当前为已知口径暂估';
+document.getElementById('actualRevenue').textContent = money(profitData.actual.company_revenue_cny);
+document.getElementById('actualPayroll').textContent = money(profitData.actual.payroll_cny);
+document.getElementById('actualExpenses').textContent = money(profitData.actual.other_expenses_cny);
+document.getElementById('actualMargin').textContent = profitData.actual.margin_pct === null ? '—' : profitData.actual.margin_pct + '%';
+document.getElementById('forecastRevenue').textContent = money(profitData.forecast.company_revenue_cny);
+document.getElementById('forecastPayroll').textContent = money(profitData.forecast.payroll_cny);
+document.getElementById('forecastExpenses').textContent = money(profitData.forecast.other_expenses_cny);
+const forecastProfitEl = document.getElementById('forecastProfit');
+forecastProfitEl.textContent = money(profitData.forecast.profit_cny);
+setProfitClass(forecastProfitEl, profitData.forecast.profit_cny);
+
+const profitTrendChart = new Chart(document.getElementById('profitTrendChart'), {
+    type: 'line',
+    data: {
+        labels: profitData.trend.map(row => row.month),
+        datasets: [
+            {label: 'GMV', data: profitData.trend.map(row => row.gmv_cny), borderColor: '#64748b', backgroundColor: 'rgba(100,116,139,.12)', borderWidth: 1.5, pointRadius: 2},
+            {label: '合伙人结算净销售', data: profitData.trend.map(row => row.net_sales_cny), borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.12)', borderWidth: 2, pointRadius: 2},
+            {label: '团队业绩净销售', data: profitData.trend.map(row => row.team_net_sales_cny), borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,.08)', borderWidth: 1.5, borderDash: [4, 3], pointRadius: 2},
+            {label: '公司可得收入', data: profitData.trend.map(row => row.company_revenue_cny), borderColor: '#a78bfa', backgroundColor: 'rgba(167,139,250,.12)', borderWidth: 2, pointRadius: 2},
+            {label: '暂估/实际利润', data: profitData.trend.map(row => row.profit_cny), borderColor: '#34d399', backgroundColor: 'rgba(52,211,153,.12)', borderWidth: 2, borderDash: [6, 4], spanGaps: true, pointRadius: 3}
+        ]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {legend: {labels: {color: '#cbd5e1'}}},
+        scales: {
+            x: {ticks: {color: '#94a3b8'}, grid: {color: 'rgba(148,163,184,.08)'}},
+            y: {ticks: {color: '#94a3b8', callback: value => '¥' + Number(value).toLocaleString('zh-CN')}, grid: {color: 'rgba(148,163,184,.08)'}}
+        }
+    }
+});
+
+function recalculateRevenueLadder() {
+    const input = document.getElementById('ladderRevenueRate');
+    const revenueRate = Math.max(0, Number(input.value) || 0) / 100;
+    document.querySelectorAll('.revenue-ladder-row').forEach(row => {
+        const targetNetSales = Number(row.dataset.targetNetSales) || 0;
+        const totalExpenses = Number(row.dataset.totalExpenses) || 0;
+        const revenue = targetNetSales * revenueRate;
+        const profit = revenue - totalExpenses;
+        row.querySelector('.ladder-company-revenue').textContent = money(revenue);
+        const profitEl = row.querySelector('.ladder-profit');
+        profitEl.textContent = money(profit);
+        setProfitClass(profitEl, profit);
+    });
+    return revenueRate;
+}
+
+document.getElementById('ladderRevenueRate')
+    .addEventListener('input', recalculateRevenueLadder);
+
+async function saveLadderRevenueRate() {
+    if (!canEditProfit) return;
+    const revenueRate = recalculateRevenueLadder();
+    try {
+        await jsonRequest('/api/company-profit/forecast-scenario', {
+            method: 'POST',
+            body: JSON.stringify({
+                year_month: profitData.year_month,
+                target_net_sales_cny: profitData.scenario.target_net_sales_cny,
+                company_revenue_rate: revenueRate,
+                payroll_cny: profitData.scenario.payroll_cny,
+                fixed_cost_cny: profitData.scenario.fixed_cost_cny,
+                variable_cost_cny: profitData.scenario.variable_cost_cny
+            })
+        });
+        window.location.reload();
+    } catch (error) { alert(error.message); }
+}
+
+async function saveMarketRules() {
+    const rules = Array.from(document.querySelectorAll('.market-table tbody tr')).map(row => {
+        const shareText = row.querySelector('.share-rate').value;
+        const forecastText = row.querySelector('.forecast-net').value;
+        return {
+            country: row.dataset.country,
+            share_rate: row.dataset.shareLocked === 'true' || shareText === ''
+                ? null
+                : Number(shareText) / 100,
+            forecast_net_sales_cny: forecastText === '' ? null : Number(forecastText)
+        };
+    });
+    try {
+        await jsonRequest('/api/company-profit/market-rules', {
+            method: 'POST',
+            body: JSON.stringify({year_month: profitData.year_month, rules})
+        });
+        window.location.reload();
+    } catch (error) { alert(error.message); }
+}
+
+async function saveMonthSettings() {
+    try {
+        await jsonRequest('/api/company-profit/settings', {
+            method: 'POST',
+            body: JSON.stringify({
+                year_month: profitData.year_month,
+                calculation_mode: document.getElementById('calculationMode').value,
+                payroll_actual_override: document.getElementById('payrollActual').value || null,
+                payroll_forecast_override: document.getElementById('payrollForecast').value || null,
+                actual_expenses_complete: document.getElementById('expensesComplete').checked,
+                notes: document.getElementById('monthNotes').value
+            })
+        });
+        window.location.reload();
+    } catch (error) { alert(error.message); }
+}
+
+function newExpense() {
+    if (!canEditProfit) return;
+    setExpenseOverrideMode(false);
+    document.getElementById('expenseModalTitle').textContent = '录入支出';
+    document.getElementById('expenseId').value = '';
+    document.getElementById('expenseScenario').value = 'actual';
+    document.getElementById('expenseCategory').value = '服务器/域名';
+    document.getElementById('expenseName').value = '';
+    document.getElementById('expenseAmount').value = '';
+    document.getElementById('expenseRecurring').checked = false;
+    document.getElementById('expenseNotes').value = '';
+}
+function editExpense(expense) {
+    setExpenseOverrideMode(false);
+    document.getElementById('expenseModalTitle').textContent = '编辑支出';
+    document.getElementById('expenseId').value = expense.id;
+    document.getElementById('expenseScenario').value = expense.scenario;
+    document.getElementById('expenseCategory').value = expense.category;
+    document.getElementById('expenseName').value = expense.name;
+    document.getElementById('expenseAmount').value = expense.amount_cny;
+    document.getElementById('expenseRecurring').checked = !!expense.is_recurring;
+    document.getElementById('expenseNotes').value = expense.notes || '';
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('expenseModal')).show();
+}
+function setExpenseOverrideMode(enabled) {
+    document.getElementById('expenseOverrideNotice').classList.toggle('d-none', !enabled);
+    ['expenseScenario', 'expenseCategory', 'expenseName', 'expenseRecurring']
+        .forEach(id => { document.getElementById(id).disabled = enabled; });
+}
+function editInheritedExpense(expense) {
+    setExpenseOverrideMode(true);
+    document.getElementById('expenseModalTitle').textContent = '编辑本月费用';
+    document.getElementById('expenseId').value = '';
+    document.getElementById('expenseScenario').value = 'forecast';
+    document.getElementById('expenseCategory').value = expense.category;
+    document.getElementById('expenseName').value = expense.name;
+    document.getElementById('expenseAmount').value = expense.amount_cny;
+    document.getElementById('expenseRecurring').checked = false;
+    document.getElementById('expenseNotes').value =
+        `本月覆盖，来源 ${expense.source_month}`;
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('expenseModal')).show();
+}
+async function saveExpense() {
+    const id = document.getElementById('expenseId').value;
+    const payload = {
+        year_month: profitData.year_month,
+        scenario: document.getElementById('expenseScenario').value,
+        category: document.getElementById('expenseCategory').value,
+        name: document.getElementById('expenseName').value,
+        amount_cny: document.getElementById('expenseAmount').value,
+        is_recurring: document.getElementById('expenseRecurring').checked,
+        notes: document.getElementById('expenseNotes').value
+    };
+    try {
+        await jsonRequest(id ? `/api/company-profit/expenses/${id}` : '/api/company-profit/expenses', {
+            method: id ? 'PUT' : 'POST',
+            body: JSON.stringify(payload)
+        });
+        window.location.reload();
+    } catch (error) { alert(error.message); }
+}
+function askDeleteExpense(id) {
+    deleteExpenseId = id;
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('deleteExpenseModal')).show();
+}
+async function deleteExpense() {
+    if (!deleteExpenseId) return;
+    try {
+        await jsonRequest(`/api/company-profit/expenses/${deleteExpenseId}`, {method: 'DELETE'});
+        window.location.reload();
+    } catch (error) { alert(error.message); }
+}
+</script>
+{% endblock %}
