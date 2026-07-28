@@ -10634,7 +10634,7 @@ def get_users():
     # them on startup, so in practice the first SELECT succeeds.
     SCHEMAS = [
         # 0: latest — incl. 库存权限 can_view_inventory / can_manage_inventory
-        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, can_view_company_profit, can_edit_company_profit, created_at FROM users',
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, created_at FROM users',
         # 0a: missing product own-scope column
         'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, 0 as can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, created_at FROM users',
         # 0b: 库存列尚未迁移时回退(其余同上)
@@ -10690,8 +10690,6 @@ def get_users():
         u.setdefault('can_view_inventory', 0)
         u.setdefault('can_manage_inventory', 0)
         u.setdefault('can_manage_own_products', 0)
-        u.setdefault('can_view_company_profit', 0)
-        u.setdefault('can_edit_company_profit', 0)
         u['site_count'] = site_counts.get(u.get('name') or '', 0)
         u['reconciliation_partner_ids'] = reconciliation_partner_ids.get(u['id'], [])
         if not u.get('can_view_reconciliation'):
@@ -10864,17 +10862,12 @@ def update_user(user_id):
             can_manage_inventory_val = 1 if data.get('can_manage_inventory') else 0
             if can_manage_inventory_val and not can_view_inventory_val:
                 can_view_inventory_val = 1
-            # 公司盈利权限严格按用户授予；角色本身不自动获得财务数据。
-            can_view_company_profit_val = 1 if data.get('can_view_company_profit') else 0
-            can_edit_company_profit_val = 1 if data.get('can_edit_company_profit') else 0
-            if can_edit_company_profit_val and not can_view_company_profit_val:
-                can_view_company_profit_val = 1
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, can_view_company_profit=?, can_edit_company_profit=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, can_view_company_profit_val, can_edit_company_profit_val, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, can_view_company_profit=?, can_edit_company_profit=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, can_view_company_profit_val, can_edit_company_profit_val, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, user_id))
             # Keep the view flag and its data scope in the same transaction.
             # No bindings intentionally means "all partners"; selected mode
             # always has at least one validated binding.
@@ -23416,27 +23409,6 @@ try:
     app.register_blueprint(fulfillment_bp)
 except Exception as _e:
     app.logger.warning('多仓履约模块未加载: %s', _e)
-
-try:
-    from company_profit import (
-        create_company_profit_blueprint,
-        init_company_profit_tables,
-    )
-    with app.app_context():
-        init_company_profit_tables(get_db_connection)
-    app.register_blueprint(
-        create_company_profit_blueprint(
-            get_db_connection,
-            _compute_sales_board_data,
-            _revenue_status_cond,
-            _calc_partner_recon_detail,
-            _compute_statement_split,
-            True,
-        )
-    )
-except Exception as _e:
-    app.logger.warning('公司盈利模块未加载: %s', _e)
-
 
 @app.context_processor
 def inject_inventory_perms():

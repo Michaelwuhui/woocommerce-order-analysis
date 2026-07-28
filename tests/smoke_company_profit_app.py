@@ -1,13 +1,16 @@
-"""Isolated full-app smoke test for company-profit routes and strict permissions."""
+"""Full-app smoke test for retired Web routes and read-only offline export."""
 
+import json
 import os
+from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 
 def seed_bootstrap_database(path):
@@ -58,71 +61,116 @@ def seed_bootstrap_database(path):
 
 
 with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tempdir:
+    temp_root = Path(tempdir)
+    database = temp_root / "woocommerce_orders.db"
+    seed_bootstrap_database(database)
     original_cwd = os.getcwd()
     try:
-        os.chdir(tempdir)
-        seed_bootstrap_database("woocommerce_orders.db")
-
+        os.chdir(temp_root)
         from app import app  # noqa: E402
-
-        conn = sqlite3.connect("woocommerce_orders.db")
-        conn.row_factory = sqlite3.Row
-        michael = conn.execute(
-            """
-            SELECT id, can_view_company_profit, can_edit_company_profit
-            FROM users WHERE username = 'michael'
-            """
-        ).fetchone()
-        admin = conn.execute(
-            """
-            SELECT id, can_view_company_profit, can_edit_company_profit
-            FROM users WHERE username = 'admin'
-            """
-        ).fetchone()
-        conn.close()
-
-        assert michael and tuple(michael)[1:] == (0, 0)
-        assert admin and tuple(admin)[1:] == (1, 1)
+        import company_profit  # noqa: E402
 
         client = app.test_client()
-        with client.session_transaction() as session:
-            session["_user_id"] = str(admin["id"])
-            session["_fresh"] = True
-        page = client.get("/company-profit?month=2026-07")
-        assert page.status_code == 200, page.status_code
-        assert "公司盈利".encode("utf-8") in page.data
-
-        with client.session_transaction() as session:
-            session["_user_id"] = str(michael["id"])
-            session["_fresh"] = True
-        blocked = client.get("/company-profit?month=2026-07")
-        assert blocked.status_code == 403, blocked.status_code
-
-        with client.session_transaction() as session:
-            session["_user_id"] = str(admin["id"])
-            session["_fresh"] = True
-        users = client.get("/api/users")
-        assert users.status_code == 200, users.status_code
-        michael_json = next(
-            user for user in users.get_json() if user["username"] == "michael"
-        )
-        assert michael_json["can_view_company_profit"] == 0
-        assert michael_json["can_edit_company_profit"] == 0
-
-        required_routes = {
+        for route in (
             "/company-profit",
             "/api/company-profit/summary",
             "/api/company-profit/settings",
             "/api/company-profit/market-rules",
+            "/api/company-profit/forecast-scenario",
             "/api/company-profit/expenses",
-        }
+        ):
+            response = client.get(route)
+            assert response.status_code == 404, (route, response.status_code)
+
         rules = {rule.rule for rule in app.url_map.iter_rules()}
-        assert not (required_routes - rules)
-        app.jinja_env.get_template("company_profit.html")
-        app.jinja_env.get_template("company_profit_denied.html")
+        assert not any(
+            route == "/company-profit" or route.startswith("/api/company-profit")
+            for route in rules
+        )
+        assert "company_profit.html" not in app.jinja_env.list_templates()
+        assert "company_profit_denied.html" not in app.jinja_env.list_templates()
+
+        assert not hasattr(company_profit, "create_company_profit_blueprint")
+
+        source = sqlite3.connect(database)
+        source.row_factory = sqlite3.Row
+        admin = source.execute(
+            "SELECT id FROM users WHERE username = 'admin'"
+        ).fetchone()
+        michael = source.execute(
+            "SELECT id FROM users WHERE username = 'michael'"
+        ).fetchone()
+        source.close()
+        assert admin and michael
+        with client.session_transaction() as session:
+            session["_user_id"] = str(admin["id"])
+            session["_fresh"] = True
+        users_response = client.get("/api/users")
+        assert users_response.status_code == 200
+        michael_payload = next(
+            user
+            for user in users_response.get_json()
+            if user["username"] == "michael"
+        )
+        assert "can_view_company_profit" not in michael_payload
+        assert "can_edit_company_profit" not in michael_payload
+        update_response = client.put(
+            f"/api/users/{michael['id']}",
+            json={
+                "name": "吴辉",
+                "role": "viewer",
+                "can_view_report": 1,
+            },
+        )
+        assert update_response.status_code == 200
+        assert update_response.get_json()["success"] is True
+
+        snapshot_output = temp_root / "offline-snapshot.json"
+        command = [
+            sys.executable,
+            str(ROOT / "offline_company_profit_snapshot.py"),
+            "--month",
+            "2026-07",
+            "--database",
+            str(database),
+            "--output",
+            str(snapshot_output),
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = json.loads(completed.stdout.strip().splitlines()[-1])
+        assert result["success"] is True
+        snapshot = json.loads(snapshot_output.read_text(encoding="utf-8"))
+        assert snapshot["schema_version"] == 1
+        assert snapshot["month"] == "2026-07"
+        assert snapshot["source"]["mode"].startswith("sqlite_readonly")
+        assert snapshot["summary"]["year_month"] == "2026-07"
+
+        source = sqlite3.connect(database)
+        user_columns = {
+            row[1] for row in source.execute("PRAGMA table_info(users)")
+        }
+        finance_tables = {
+            row[0]
+            for row in source.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name LIKE 'company_profit_%'
+                """
+            )
+        }
+        source.close()
+        assert "can_view_company_profit" not in user_columns
+        assert "can_edit_company_profit" not in user_columns
+        assert not finance_tables
         print(
-            "company_profit_app_smoke=ok "
-            f"routes={len(required_routes)} admin=200 michael=403"
+            "company_profit_web_retired=ok "
+            "routes=404 snapshot=readonly source_unchanged=true"
         )
     finally:
         os.chdir(original_cwd)

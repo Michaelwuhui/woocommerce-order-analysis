@@ -224,44 +224,34 @@ class CompanyProfitTests(unittest.TestCase):
             successful_net * our_ratio - shipping_loss / 2,
         )
 
-    def test_initial_permission_grant_is_strict_and_idempotent(self):
+    def test_offline_table_init_is_idempotent_and_adds_no_web_permissions(self):
         conn = self.get_conn()
-        rows = {
-            row["username"]: (
-                row["can_view_company_profit"],
-                row["can_edit_company_profit"],
-            )
-            for row in conn.execute(
-                """
-                SELECT username, can_view_company_profit, can_edit_company_profit
-                FROM users
-                """
-            )
+        initial_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(users)")
         }
-        self.assertEqual(rows["michael"], (0, 0))
-        self.assertEqual(rows["admin"], (1, 1))
-        self.assertEqual(rows["fiona"], (0, 0))
-
-        conn.execute(
-            """
-            UPDATE users
-            SET can_view_company_profit = 1
-            WHERE username = 'fiona'
-            """
-        )
-        conn.commit()
         conn.close()
+        self.assertNotIn("can_view_company_profit", initial_columns)
+        self.assertNotIn("can_edit_company_profit", initial_columns)
 
         init_company_profit_tables(self.get_conn)
         conn = self.get_conn()
-        fiona = conn.execute(
-            """
-            SELECT can_view_company_profit, can_edit_company_profit
-            FROM users WHERE username = 'fiona'
-            """
-        ).fetchone()
+        second_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(users)")
+        }
+        finance_tables = {
+            row["name"]
+            for row in conn.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name LIKE 'company_profit_%'
+                """
+            )
+        }
         conn.close()
-        self.assertEqual(tuple(fiona), (1, 0))
+        self.assertNotIn("can_view_company_profit", second_columns)
+        self.assertNotIn("can_edit_company_profit", second_columns)
+        self.assertIn("company_profit_month_settings", finance_tables)
+        self.assertIn("company_profit_expenses", finance_tables)
 
     def test_unknown_market_is_not_guessed_and_actual_can_be_confirmed(self):
         summary = build_company_profit_summary(
