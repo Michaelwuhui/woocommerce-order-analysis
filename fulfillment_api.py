@@ -197,6 +197,13 @@ def _actor():
 
 
 def _rollout_readiness(conn) -> dict:
+    def setting_enabled(key, default=False):
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if not row:
+            return default
+        return str(row["value"] or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    hungary_paused = setting_enabled("oms_hungary_wms_development_paused", False)
     counts = {
         "sku_count": conn.execute(
             "SELECT COUNT(*) AS n FROM inv_skus WHERE is_active=1"
@@ -238,31 +245,76 @@ def _rollout_readiness(conn) -> dict:
                FROM inv_market_warehouses mw
                JOIN warehouses w ON w.id=mw.warehouse_id
                JOIN oms_warehouse_integrations wi ON wi.warehouse_id=w.id
-               WHERE mw.is_active=1 AND mw.market_code IN ('PL','CZ')
-                 AND w.is_active=1 AND w.country='PL'
-                 AND wi.is_enabled=1
-                 AND wi.inventory_authority='manual_partner'"""
+               WHERE mw.is_active=1 AND mw.market_code IN ('PL','CZ','HU')
+                  AND w.is_active=1 AND w.country='PL'
+                  AND wi.is_enabled=1
+                  AND wi.inventory_authority='manual_partner'"""
+        ).fetchone()["n"],
+        "new_pl_mapped_sku_count": conn.execute(
+            """SELECT COUNT(DISTINCT sw.sku_id) AS n
+               FROM oms_sku_warehouses sw
+               JOIN oms_warehouse_integrations wi ON wi.warehouse_id=sw.warehouse_id
+               WHERE sw.is_enabled=1 AND wi.provider='poland_wms'"""
+        ).fetchone()["n"],
+        "new_pl_ready_sku_count": conn.execute(
+            """SELECT COUNT(DISTINCT sw.sku_id) AS n
+               FROM oms_sku_warehouses sw
+               JOIN inv_skus s ON s.id=sw.sku_id
+               JOIN oms_warehouse_integrations wi ON wi.warehouse_id=sw.warehouse_id
+               WHERE sw.is_enabled=1 AND s.is_active=1
+                 AND wi.provider='poland_wms'
+                 AND trim(COALESCE(s.barcode,''))!=''
+                 AND trim(COALESCE(sw.wms_product_name_zh,''))!=''
+                 AND trim(COALESCE(sw.wms_product_name_en,''))!=''"""
+        ).fetchone()["n"],
+        "new_pl_enabled_integration_count": conn.execute(
+            """SELECT COUNT(*) AS n FROM oms_warehouse_integrations
+               WHERE provider='poland_wms' AND is_enabled=1
+                 AND trim(COALESCE(base_url,''))!=''
+                 AND trim(COALESCE(external_code,''))!=''"""
         ).fetchone()["n"],
     }
+    new_pl_integration = conn.execute(
+        """SELECT * FROM oms_warehouse_integrations
+           WHERE provider='poland_wms' LIMIT 1"""
+    ).fetchone()
+    new_pl_config = (
+        json_load(new_pl_integration["config_json"], {}) or {}
+        if new_pl_integration
+        else {}
+    )
+    if not isinstance(new_pl_config, dict):
+        new_pl_config = {}
+    new_pl_product_id_configured = bool(
+        str(
+            new_pl_config.get("product_id")
+            or (new_pl_integration["channel_code"] if new_pl_integration else "")
+            or ""
+        ).strip()
+    )
+    new_pl_print_url_configured = bool(
+        str(new_pl_config.get("print_base_url") or "").strip()
+    )
     master_data_can_plan = all(
         counts[key] > 0
         for key in ("sku_count", "site_sku_map_count", "warehouse_sku_map_count")
     )
     manual_partner_ready = (
         counts["manual_partner_warehouse_count"] > 0
-        and counts["manual_partner_route_count"] >= 2
+        and counts["manual_partner_route_count"] >= 3
     )
     can_auto_plan = manual_partner_ready or master_data_can_plan
     can_auto_submit = (
-        master_data_can_plan
+        not hungary_paused
+        and master_data_can_plan
         and counts["wms_ready_sku_count"] > 0
         and counts["wms_stocked_sku_count"] > 0
     )
     manual_partner_blockers = []
     if counts["manual_partner_warehouse_count"] <= 0:
         manual_partner_blockers.append("波兰仓尚未设置为合作方人工库存模式")
-    if counts["manual_partner_route_count"] < 2:
-        manual_partner_blockers.append("波兰/捷克市场的波兰合作仓路由未完整配置")
+    if counts["manual_partner_route_count"] < 3:
+        manual_partner_blockers.append("波兰/捷克/匈牙利市场的金毅金谷人工仓路由未完整配置")
 
     wms_blockers = []
     if counts["sku_count"] <= 0:
@@ -275,13 +327,47 @@ def _rollout_readiness(conn) -> dict:
         wms_blockers.append("没有同时具备条码、中英文品名的匈牙利 WMS SKU")
     if counts["wms_stocked_sku_count"] <= 0:
         wms_blockers.append("HU01 当前没有可识别的可用库存")
+    if hungary_paused:
+        wms_blockers.insert(0, "匈牙利 WMS 开发和自动提交已按业务要求暂停")
+
+    new_pl_blockers = []
+    if counts["new_pl_mapped_sku_count"] != 4:
+        new_pl_blockers.append(
+            f"必须准确映射 4 款商品，当前为 {counts['new_pl_mapped_sku_count']} 款"
+        )
+    if counts["new_pl_ready_sku_count"] != 4:
+        new_pl_blockers.append("4 款商品的条码、中英文品名尚未全部就绪")
+    if counts["new_pl_enabled_integration_count"] <= 0:
+        new_pl_blockers.append("新波兰仓独立适配器尚未启用")
+    if not new_pl_product_id_configured:
+        new_pl_blockers.append("尚未配置对方分配的运输方式 product_id")
+    if not new_pl_print_url_configured:
+        new_pl_blockers.append("标签打印地址尚未配置")
+    new_pl_routing_enabled = setting_enabled("oms_new_pl_wms_routing_enabled", False)
+    if not new_pl_routing_enabled:
+        new_pl_blockers.append("新波兰仓专属路由安全门保持关闭")
+    can_new_pl_submit = (
+        counts["new_pl_mapped_sku_count"] == 4
+        and counts["new_pl_ready_sku_count"] == 4
+        and counts["new_pl_enabled_integration_count"] > 0
+        and new_pl_product_id_configured
+        and new_pl_print_url_configured
+        and new_pl_routing_enabled
+    )
     return {
         **counts,
+        "hungary_wms_paused": hungary_paused,
         "manual_partner_ready": manual_partner_ready,
         "can_auto_plan": can_auto_plan,
         "can_auto_submit": can_auto_submit,
+        "new_pl_expected_sku_count": 4,
+        "new_pl_routing_enabled": new_pl_routing_enabled,
+        "new_pl_product_id_configured": new_pl_product_id_configured,
+        "new_pl_print_url_configured": new_pl_print_url_configured,
+        "can_new_pl_submit": can_new_pl_submit,
         "manual_partner_blockers": manual_partner_blockers,
         "wms_blockers": wms_blockers,
+        "new_pl_blockers": new_pl_blockers,
         # Backward-compatible key used by the current configuration UI.
         "blockers": wms_blockers,
     }
@@ -536,9 +622,29 @@ def api_submit_wms(fulfillment_id):
             return jsonify({"error": "履约单不存在"}), 404
         if fulfillment["mode"] != "external_wms":
             return jsonify({"error": "该履约单不是外部 WMS 模式"}), 409
+        job_types = {
+            "hungary_wms": "SUBMIT_HU_FULFILLMENT",
+            "poland_wms": "SUBMIT_PL_FULFILLMENT",
+        }
+        job_type = job_types.get(fulfillment["provider"])
+        if not job_type:
+            return jsonify({
+                "error": "该外部仓尚未安装独立 API 适配器",
+                "code": "external_wms_adapter_unavailable",
+            }), 409
+        integration = conn.execute(
+            """SELECT is_enabled FROM oms_warehouse_integrations
+               WHERE warehouse_id=?""",
+            (fulfillment["warehouse_id"],),
+        ).fetchone()
+        if not integration or not integration["is_enabled"]:
+            return jsonify({
+                "error": "该外部仓接口尚未启用",
+                "code": "external_wms_disabled",
+            }), 409
         job_id = enqueue_job(
             conn,
-            "SUBMIT_HU_FULFILLMENT",
+            job_type,
             "fulfillment",
             fulfillment_id,
             f"manual-submit:{fulfillment['idempotency_key']}",
@@ -579,8 +685,46 @@ def api_cancel_fulfillment(fulfillment_id):
             )
             return jsonify({"error": "WMS 提交结果尚未确认；已转人工处理"}), 409
         if fulfillment["mode"] == "external_wms" and fulfillment["submitted_at"]:
+            if (
+                fulfillment["provider"] == "poland_wms"
+                and fulfillment["status"] in {
+                    "accepted",
+                    "picking",
+                    "packed",
+                    "stock_shortage",
+                    "manual_hold",
+                    "ready_to_submit",
+                }
+            ):
+                transition_fulfillment(
+                    conn,
+                    fulfillment_id,
+                    "cancel_pending",
+                    actor=_actor(),
+                    reason=reason,
+                )
+                job_id = enqueue_job(
+                    conn,
+                    "CANCEL_PL_FULFILLMENT",
+                    "fulfillment",
+                    fulfillment_id,
+                    f"cancel-pl:{fulfillment['idempotency_key']}",
+                    {"fulfillment_id": fulfillment_id, "reason": reason},
+                )
+                conn.commit()
+                return jsonify({
+                    "queued": True,
+                    "job_id": job_id,
+                    "message": "已进入新波兰仓幂等取消队列",
+                }), 202
+            provider_name = (
+                "新波兰仓华磊系统"
+                if fulfillment["provider"] == "poland_wms"
+                else "匈牙利 WMS"
+            )
             manual_reason = (
-                "匈牙利 WMS 不支持 API 取消；请在物流群联系对方运营人工拦截。"
+                f"{provider_name}当前没有已确认可用的 API 取消接口；"
+                "请联系对方运营人工拦截。"
                 f"申请原因：{reason}"
             )
             mark_manual_review(
@@ -588,7 +732,7 @@ def api_cancel_fulfillment(fulfillment_id):
             )
             return jsonify({
                 "manual_required": True,
-                "message": "已标记人工处理；请在物流群联系对方运营拦截该出库单",
+                "message": "已标记人工处理；请联系对方运营拦截该外部单据",
             }), 202
         # Not yet sent to an external warehouse: local cancellation is final.
         transition_fulfillment(
@@ -794,19 +938,58 @@ def api_fulfillment_options():
         if request.method == "POST":
             body = request.get_json(silent=True) or {}
             readiness = _rollout_readiness(conn)
+            integration = None
+            if body.get("warehouse_id") is not None:
+                integration = conn.execute(
+                    "SELECT provider FROM oms_warehouse_integrations WHERE warehouse_id=?",
+                    (int(body["warehouse_id"]),),
+                ).fetchone()
             if body.get("oms_auto_plan_enabled") and not readiness["can_auto_plan"]:
                 return jsonify({
                     "error": "自动分仓尚未达到上线条件",
                     "code": "auto_plan_not_ready",
                     "readiness": readiness,
                 }), 409
-            if body.get("auto_submit") and not readiness["can_auto_submit"]:
+            if (
+                body.get("auto_submit")
+                and integration
+                and integration["provider"] == "hungary_wms"
+                and not readiness["can_auto_submit"]
+            ):
                 return jsonify({
                     "error": "匈牙利 WMS 自动提交尚未达到上线条件",
                     "code": "wms_auto_submit_not_ready",
                     "readiness": readiness,
                 }), 409
-            for key in ("oms_fulfillment_enabled", "oms_auto_plan_enabled"):
+            if (
+                body.get("auto_submit")
+                and integration
+                and integration["provider"] == "poland_wms"
+                and not readiness["can_new_pl_submit"]
+            ):
+                return jsonify({
+                    "error": "新波兰仓自动提交尚未达到上线条件",
+                    "code": "poland_wms_auto_submit_not_ready",
+                    "readiness": readiness,
+                }), 409
+            if (
+                body.get("oms_new_pl_wms_routing_enabled")
+                and (
+                    readiness["new_pl_mapped_sku_count"] != 4
+                    or readiness["new_pl_ready_sku_count"] != 4
+                    or not readiness["new_pl_product_id_configured"]
+                )
+            ):
+                return jsonify({
+                    "error": "新波兰仓专属路由必须先补齐 4 款 SKU 和 product_id",
+                    "code": "poland_wms_routing_not_ready",
+                    "readiness": readiness,
+                }), 409
+            for key in (
+                "oms_fulfillment_enabled",
+                "oms_auto_plan_enabled",
+                "oms_new_pl_wms_routing_enabled",
+            ):
                 if key in body:
                     value = "1" if body.get(key) else "0"
                     conn.execute(
@@ -814,8 +997,19 @@ def api_fulfillment_options():
                         (key, value),
                     )
             if body.get("warehouse_id") is not None:
+                if "auto_submit" in body and (
+                    not integration
+                    or integration["provider"] not in {"hungary_wms", "poland_wms"}
+                ):
+                    return jsonify({
+                        "error": "该仓库没有可用的外部 API 自动提交适配器",
+                        "code": "integration_provider_mismatch",
+                    }), 409
                 fields = []
                 values = []
+                if "integration_enabled" in body:
+                    fields.append("is_enabled=?")
+                    values.append(1 if body.get("integration_enabled") else 0)
                 if "auto_submit" in body:
                     fields.append("auto_submit=?")
                     values.append(1 if body.get("auto_submit") else 0)
@@ -830,7 +1024,13 @@ def api_fulfillment_options():
                     )
             conn.commit()
         setting_rows = conn.execute(
-            "SELECT key, value FROM settings WHERE key IN ('oms_fulfillment_enabled','oms_auto_plan_enabled')"
+            """SELECT key, value FROM settings
+               WHERE key IN (
+                 'oms_fulfillment_enabled','oms_auto_plan_enabled',
+                 'oms_hungary_wms_development_paused',
+                 'oms_hungary_wms_routing_enabled',
+                 'oms_new_pl_wms_routing_enabled'
+               )"""
         ).fetchall()
         settings = {r["key"]: str(r["value"]).lower() in {"1", "true", "yes", "on"} for r in setting_rows}
         readiness = _rollout_readiness(conn)

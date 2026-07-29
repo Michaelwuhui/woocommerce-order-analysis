@@ -66,12 +66,19 @@ def chunks(items: Iterable[Any], size: int):
 
 _SENSITIVE_KEYS = {
     "salt",
+    "auth",
     "authorization",
     "consumer_key",
     "consumer_secret",
     "password",
+    "username",
     "api_key",
     "token",
+    # The HuaLei legacy API uses these identifiers in every create request
+    # and does not document a second request signature.  Treat them as
+    # credentials in audit output.
+    "customer_id",
+    "customer_userid",
 }
 
 _PII_KEYS = {
@@ -85,6 +92,32 @@ _PII_KEYS = {
     "address",
     "address_1",
     "address_2",
+    "consignee_mobile",
+    "consignee_name",
+    "consignee_companyname",
+    "consignee_address",
+    "consignee_telephone",
+    "consignee_email",
+    "consignee_passportno",
+    "consignee_taxno",
+    "consignee_streetno",
+    "consignee_doorno",
+    "consignee_shortaddress",
+    "shipper_name",
+    "shipper_companyname",
+    "shipper_address1",
+    "shipper_address2",
+    "shipper_address3",
+    "shipper_telephone",
+    "shipper_email",
+    "shipper_passportno",
+    "import_name",
+    "import_companyname",
+    "import_address",
+    "import_address2",
+    "import_address3",
+    "import_telephone",
+    "import_email",
 }
 
 

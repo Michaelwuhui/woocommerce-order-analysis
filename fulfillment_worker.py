@@ -16,12 +16,15 @@ import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import unquote
 
 import carrier_tracking
 from fulfillment_common import get_conn, json_dump, json_load, redact, utcnow
 from fulfillment_service import (
     DomainError,
+    SHIPMENT_PROGRESS,
     add_tracking_event,
+    build_poland_wms_payload,
     build_wms_payload,
     create_shipment,
     enqueue_job,
@@ -39,6 +42,12 @@ from hungary_wms import (
     WmsResult,
     normalize_wms_fulfillment_status,
     normalize_wms_tracking_status,
+)
+from poland_wms import (
+    PolandWmsClient,
+    PolandWmsError,
+    PolandWmsResult,
+    normalize_poland_tracking_status,
 )
 
 
@@ -180,6 +189,71 @@ def _audit_wms_error(conn, job: dict, operation: str, error: WmsError, correlati
             "hungary_wms",
             operation,
             "POST",
+            operation,
+            error.http_status,
+            str(error.business_code or error.code),
+            json_dump(redact(error.response)) if error.response is not None else None,
+            error.duration_ms,
+            job["attempts"],
+            "unknown" if error.unknown_outcome else "error",
+            str(error)[:1000],
+        ),
+    )
+    conn.commit()
+
+
+def _audit_poland_success(
+    conn,
+    job: dict,
+    operation: str,
+    result: PolandWmsResult,
+    correlation_id: str,
+):
+    request_redacted = redact(result.request_redacted)
+    conn.execute(
+        '''INSERT INTO oms_external_api_calls
+           (correlation_id, job_id, provider, operation, method, endpoint,
+            request_hash, request_redacted, response_http_code, response_code,
+            response_redacted, duration_ms, attempt, outcome)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'success')''',
+        (
+            correlation_id,
+            job["id"],
+            "poland_wms",
+            operation,
+            result.method,
+            result.endpoint,
+            hashlib.sha256(json_dump(request_redacted).encode()).hexdigest(),
+            json_dump(request_redacted),
+            result.http_status,
+            str(result.business_code),
+            json_dump(redact(result.raw)),
+            result.duration_ms,
+            job["attempts"],
+        ),
+    )
+    conn.commit()
+
+
+def _audit_poland_error(
+    conn,
+    job: dict,
+    operation: str,
+    error: PolandWmsError,
+    correlation_id: str,
+):
+    conn.execute(
+        '''INSERT INTO oms_external_api_calls
+           (correlation_id, job_id, provider, operation, method, endpoint,
+            response_http_code, response_code, response_redacted, duration_ms,
+            attempt, outcome, error)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+        (
+            correlation_id,
+            job["id"],
+            "poland_wms",
+            operation,
+            "POST" if operation in {"authenticate", "create_order", "cancel_order"} else "GET",
             operation,
             error.http_status,
             str(error.business_code or error.code),
@@ -386,6 +460,561 @@ def handle_submit_wms(conn, job: dict, payload: dict):
     }
 
 
+def _poland_integration(conn, warehouse_id: int):
+    row = conn.execute(
+        """SELECT * FROM oms_warehouse_integrations
+           WHERE warehouse_id=? AND provider='poland_wms'""",
+        (warehouse_id,),
+    ).fetchone()
+    if not row or not row["is_enabled"]:
+        raise DomainError("新波兰仓接口尚未启用", "poland_wms_disabled")
+    return row
+
+
+def _poland_client(integration) -> tuple[PolandWmsClient, dict]:
+    if not integration:
+        raise PolandWmsError(
+            "新波兰仓接口配置不存在",
+            code="integration_missing",
+        )
+    config = json_load(integration["config_json"], {}) or {}
+    if not isinstance(config, dict):
+        config = {}
+    client = PolandWmsClient(
+        order_base_url=integration["base_url"],
+        print_base_url=config.get("print_base_url"),
+    )
+    return client, config
+
+
+def _poland_result_row(data: Any) -> dict:
+    if isinstance(data, dict):
+        nested = data.get("data")
+        if isinstance(nested, list):
+            return next((row for row in nested if isinstance(row, dict)), {})
+        if isinstance(nested, dict):
+            return nested
+        return data
+    if isinstance(data, list):
+        return next((row for row in data if isinstance(row, dict)), {})
+    return {}
+
+
+def _poland_external_fields(data: Any) -> dict:
+    row = _poland_result_row(data)
+    return {
+        "order_id": row.get("order_id") or row.get("orderId"),
+        "document_code": (
+            row.get("order_customerinvoicecode")
+            or row.get("documentCode")
+            or row.get("reference_number")
+        ),
+        "tracking_number": (
+            row.get("tracking_number")
+            or row.get("trackingNumber")
+            or row.get("order_serveinvoicecode")
+            or row.get("order_transfercode")
+        ),
+        "carrier_name": (
+            row.get("post_customername")
+            or row.get("carrier_name")
+            or row.get("carrierName")
+            or "新波兰仓物流"
+        ),
+        "message": unquote(str(row.get("message") or row.get("msg") or "")),
+        "row": row,
+    }
+
+
+def _create_poland_shipment(
+    conn,
+    fulfillment,
+    *,
+    tracking_number: str,
+    carrier_name: str,
+    label_url: str | None,
+):
+    shipment = create_shipment(
+        conn,
+        fulfillment["id"],
+        str(tracking_number),
+        carrier_slug="poland-wms",
+        carrier_name=carrier_name or "新波兰仓物流",
+        label_url=label_url,
+        external_shipment_id=str(tracking_number),
+        tracking_source="poland_wms",
+        initial_status="label_ready" if label_url else "label_pending",
+        commit=False,
+    )
+    enqueue_job(
+        conn,
+        "POLL_SHIPMENT_TRACKING",
+        "shipment",
+        shipment["id"],
+        f"track:{shipment['id']}:provider-created",
+        {"shipment_id": shipment["id"]},
+        available_at=_future(120),
+    )
+    return shipment
+
+
+def handle_submit_poland_wms(conn, job: dict, payload: dict):
+    fid = payload.get("fulfillment_id") or job["aggregate_id"]
+    fulfillment = conn.execute(
+        "SELECT * FROM oms_fulfillments WHERE id=?", (fid,)
+    ).fetchone()
+    if not fulfillment:
+        raise DomainError("履约单不存在", "fulfillment_not_found")
+    if fulfillment["provider"] != "poland_wms":
+        raise DomainError("该履约单不属于新波兰仓", "provider_mismatch")
+    if fulfillment["status"] in {"accepted", "picking", "packed", "shipped", "delivered"}:
+        return {"noop": fulfillment["status"]}
+    if fulfillment["status"] == "submission_unknown":
+        enqueue_job(
+            conn,
+            "VERIFY_PL_SUBMISSION",
+            "fulfillment",
+            fid,
+            f"verify-pl:{fulfillment['idempotency_key']}:{job['attempts']}",
+            {"fulfillment_id": fid},
+            available_at=_future(30),
+        )
+        conn.commit()
+        return {"verify": True}
+    if fulfillment["status"] not in {"ready_to_submit", "failed_retryable"}:
+        raise DomainError(
+            f"履约状态 {fulfillment['status']} 不能提交新波兰仓",
+            "not_submittable",
+        )
+
+    integration = _poland_integration(conn, fulfillment["warehouse_id"])
+    client, config = _poland_client(integration)
+    auth_correlation = uuid.uuid4().hex
+    try:
+        auth = client.authenticate()
+    except PolandWmsError as exc:
+        _audit_poland_error(conn, job, "authenticate", exc, auth_correlation)
+        raise
+    _audit_poland_success(conn, job, "authenticate", auth, auth_correlation)
+    auth_data = auth.data if isinstance(auth.data, dict) else {}
+    request_payload = build_poland_wms_payload(
+        conn,
+        fid,
+        customer_id=str(auth_data["customer_id"]),
+        customer_userid=str(auth_data["customer_userid"]),
+    )
+    payload_hash = hashlib.sha256(json_dump(request_payload).encode()).hexdigest()
+    transition_fulfillment(
+        conn,
+        fid,
+        "submitting",
+        reason="开始提交新波兰仓华磊接口",
+        extra_updates={"submitted_at": utcnow(), "payload_hash": payload_hash},
+    )
+    conn.commit()
+
+    correlation = uuid.uuid4().hex
+    try:
+        result = client.create_order(request_payload)
+    except PolandWmsError as exc:
+        _audit_poland_error(conn, job, "create_order", exc, correlation)
+        current = conn.execute(
+            "SELECT status FROM oms_fulfillments WHERE id=?", (fid,)
+        ).fetchone()["status"]
+        if exc.unknown_outcome and current == "submitting":
+            transition_fulfillment(
+                conn,
+                fid,
+                "submission_unknown",
+                reason=str(exc),
+                correlation_id=correlation,
+                extra_updates={
+                    "last_error_code": exc.code,
+                    "last_error_message": str(exc),
+                },
+            )
+            enqueue_job(
+                conn,
+                "VERIFY_PL_SUBMISSION",
+                "fulfillment",
+                fid,
+                f"verify-pl:{fulfillment['idempotency_key']}:{job['attempts']}",
+                {"fulfillment_id": fid},
+                available_at=_future(30),
+            )
+            conn.commit()
+            return {"unknown": True}
+        if exc.retryable and current == "submitting":
+            transition_fulfillment(
+                conn,
+                fid,
+                "failed_retryable",
+                reason=str(exc),
+                correlation_id=correlation,
+                extra_updates={
+                    "last_error_code": exc.code,
+                    "last_error_message": str(exc),
+                },
+            )
+            conn.commit()
+        elif current == "submitting":
+            transition_fulfillment(
+                conn,
+                fid,
+                "rejected",
+                reason=str(exc),
+                correlation_id=correlation,
+                extra_updates={
+                    "last_error_code": exc.code,
+                    "last_error_message": str(exc),
+                },
+            )
+            mark_manual_review(
+                conn,
+                fulfillment["order_id"],
+                f"新波兰仓拒绝履约: {str(exc)[:300]}",
+                commit=False,
+            )
+            conn.commit()
+        raise
+
+    _audit_poland_success(conn, job, "create_order", result, correlation)
+    fields = _poland_external_fields(result.data)
+    external_order_id = fields["order_id"]
+    tracking_number = fields["tracking_number"]
+    if not external_order_id:
+        transition_fulfillment(
+            conn,
+            fid,
+            "rejected",
+            reason="新波兰仓返回成功但缺少 order_id，无法生成标签",
+            correlation_id=correlation,
+        )
+        mark_manual_review(
+            conn,
+            fulfillment["order_id"],
+            "新波兰仓返回成功但缺少 order_id，需人工核对外部系统",
+            commit=False,
+        )
+        conn.commit()
+        return {"accepted": False, "manual_review": True}
+
+    label_url = client.label_url(
+        str(external_order_id),
+        print_type=str(config.get("print_type") or "lab10_10"),
+        label_format=config.get("label_format"),
+        print_goods=bool(config.get("print_goods")),
+    )
+    transition_fulfillment(
+        conn,
+        fid,
+        "accepted",
+        reason="新波兰仓已接单",
+        correlation_id=correlation,
+        extra_updates={
+            # The legacy schema's generic external reference field stores the
+            # HuaLei order_id; it is required for label printing.
+            "external_pick_code": str(external_order_id),
+            "external_label_url": label_url,
+            "last_error_code": None,
+            "last_error_message": None,
+        },
+    )
+    fulfillment = conn.execute(
+        "SELECT * FROM oms_fulfillments WHERE id=?", (fid,)
+    ).fetchone()
+    if tracking_number:
+        _create_poland_shipment(
+            conn,
+            fulfillment,
+            tracking_number=str(tracking_number),
+            carrier_name=str(fields["carrier_name"]),
+            label_url=label_url,
+        )
+    else:
+        enqueue_job(
+            conn,
+            "POLL_PL_TRACKING_NUMBER",
+            "fulfillment",
+            fid,
+            f"pl-tracking-number:{fid}",
+            {"fulfillment_id": fid},
+            available_at=_future(120),
+        )
+    conn.commit()
+    return {
+        "accepted": True,
+        "external_order_id": bool(external_order_id),
+        "tracking_number": bool(tracking_number),
+        "label": True,
+    }
+
+
+def _query_poland_order(conn, job: dict, fulfillment, operation: str):
+    integration = _poland_integration(conn, fulfillment["warehouse_id"])
+    client, config = _poland_client(integration)
+    correlation = uuid.uuid4().hex
+    try:
+        result = client.tracking_number(
+            document_code=fulfillment["external_invoice_code"]
+        )
+    except PolandWmsError as exc:
+        _audit_poland_error(conn, job, operation, exc, correlation)
+        raise
+    _audit_poland_success(conn, job, operation, result, correlation)
+    return client, config, _poland_external_fields(result.data), correlation
+
+
+def handle_verify_poland_submission(conn, job: dict, payload: dict):
+    fid = payload.get("fulfillment_id") or job["aggregate_id"]
+    fulfillment = conn.execute(
+        "SELECT * FROM oms_fulfillments WHERE id=?", (fid,)
+    ).fetchone()
+    if not fulfillment:
+        raise DomainError("履约单不存在", "fulfillment_not_found")
+    if fulfillment["status"] != "submission_unknown":
+        return {"noop": fulfillment["status"]}
+    client, config, fields, correlation = _query_poland_order(
+        conn, job, fulfillment, "verify_submission"
+    )
+    found = bool(
+        fields["order_id"]
+        or fields["tracking_number"]
+        or fields["document_code"] == fulfillment["external_invoice_code"]
+    )
+    if not found:
+        if int(job["attempts"]) < 3:
+            raise RetryTask(
+                "新波兰仓暂未查到原单号，继续核验",
+                code="not_found_yet",
+                delay_seconds=60,
+            )
+        reason = (
+            "新波兰仓创建请求结果连续无法确认；为避免重复出库，"
+            "系统已停止自动重提并转人工核对"
+        )
+        transition_fulfillment(
+            conn,
+            fid,
+            "manual_review",
+            reason=reason,
+            correlation_id=correlation,
+        )
+        mark_manual_review(conn, fulfillment["order_id"], reason, commit=False)
+        conn.commit()
+        return {"not_found": True, "manual_review": True, "resubmit": False}
+
+    external_order_id = fields["order_id"]
+    label_url = (
+        client.label_url(
+            str(external_order_id),
+            print_type=str(config.get("print_type") or "lab10_10"),
+            label_format=config.get("label_format"),
+            print_goods=bool(config.get("print_goods")),
+        )
+        if external_order_id
+        else fulfillment["external_label_url"]
+    )
+    transition_fulfillment(
+        conn,
+        fid,
+        "accepted",
+        reason="超时后按原单号确认新波兰仓已接单",
+        correlation_id=correlation,
+        extra_updates={
+            "external_pick_code": (
+                str(external_order_id)
+                if external_order_id
+                else fulfillment["external_pick_code"]
+            ),
+            "external_label_url": label_url,
+            "last_error_code": None,
+            "last_error_message": None,
+        },
+    )
+    fulfillment = conn.execute(
+        "SELECT * FROM oms_fulfillments WHERE id=?", (fid,)
+    ).fetchone()
+    if fields["tracking_number"]:
+        _create_poland_shipment(
+            conn,
+            fulfillment,
+            tracking_number=str(fields["tracking_number"]),
+            carrier_name=str(fields["carrier_name"]),
+            label_url=label_url,
+        )
+    else:
+        enqueue_job(
+            conn,
+            "POLL_PL_TRACKING_NUMBER",
+            "fulfillment",
+            fid,
+            f"pl-tracking-number:{fid}",
+            {"fulfillment_id": fid},
+            available_at=_future(120),
+        )
+    conn.commit()
+    return {"confirmed": True}
+
+
+def handle_poll_poland_tracking_number(conn, job: dict, payload: dict):
+    fid = payload.get("fulfillment_id") or job["aggregate_id"]
+    fulfillment = conn.execute(
+        "SELECT * FROM oms_fulfillments WHERE id=?", (fid,)
+    ).fetchone()
+    if not fulfillment or fulfillment["status"] in {
+        "shipped", "delivered", "cancelled", "returned", "superseded"
+    }:
+        return {"noop": True}
+    existing = conn.execute(
+        "SELECT * FROM oms_shipments WHERE fulfillment_id=? ORDER BY created_at LIMIT 1",
+        (fid,),
+    ).fetchone()
+    if existing and existing["tracking_number"]:
+        return {"noop": "tracking_exists"}
+
+    client, config, fields, correlation = _query_poland_order(
+        conn, job, fulfillment, "tracking_number"
+    )
+    if not fields["tracking_number"]:
+        if int(job["attempts"]) >= 8:
+            reason = "新波兰仓长时间未返回运单号，已转人工核对"
+            transition_fulfillment(
+                conn,
+                fid,
+                "manual_hold",
+                reason=reason,
+                correlation_id=correlation,
+            )
+            mark_manual_review(conn, fulfillment["order_id"], reason, commit=False)
+            conn.commit()
+            return {"manual_review": True}
+        raise RetryTask(
+            "新波兰仓运单号尚未生成",
+            code="tracking_number_not_ready",
+            delay_seconds=300,
+        )
+
+    external_order_id = fields["order_id"] or fulfillment["external_pick_code"]
+    label_url = fulfillment["external_label_url"]
+    if not label_url and external_order_id:
+        label_url = client.label_url(
+            str(external_order_id),
+            print_type=str(config.get("print_type") or "lab10_10"),
+            label_format=config.get("label_format"),
+            print_goods=bool(config.get("print_goods")),
+        )
+        conn.execute(
+            """UPDATE oms_fulfillments
+               SET external_pick_code=COALESCE(external_pick_code, ?),
+                   external_label_url=?, updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (str(external_order_id), label_url, fid),
+        )
+    fulfillment = conn.execute(
+        "SELECT * FROM oms_fulfillments WHERE id=?", (fid,)
+    ).fetchone()
+    shipment = _create_poland_shipment(
+        conn,
+        fulfillment,
+        tracking_number=str(fields["tracking_number"]),
+        carrier_name=str(fields["carrier_name"]),
+        label_url=label_url,
+    )
+    conn.commit()
+    return {"tracking_number": True, "shipment_id": shipment["id"]}
+
+
+def handle_cancel_poland_wms(conn, job: dict, payload: dict):
+    fid = payload.get("fulfillment_id") or job["aggregate_id"]
+    fulfillment = conn.execute(
+        "SELECT * FROM oms_fulfillments WHERE id=?", (fid,)
+    ).fetchone()
+    if not fulfillment:
+        raise DomainError("履约单不存在", "fulfillment_not_found")
+    if fulfillment["status"] == "cancelled":
+        return {"noop": "cancelled"}
+    if fulfillment["provider"] != "poland_wms":
+        raise DomainError("该履约单不属于新波兰仓", "provider_mismatch")
+    if fulfillment["status"] != "cancel_pending":
+        raise DomainError(
+            f"履约状态 {fulfillment['status']} 不能执行新波兰仓取消",
+            "not_cancellable",
+        )
+    external_order_id = fulfillment["external_pick_code"]
+    if not external_order_id:
+        reason = "新波兰仓缺少外部 order_id，无法调用取消接口"
+        transition_fulfillment(conn, fid, "manual_review", reason=reason)
+        mark_manual_review(conn, fulfillment["order_id"], reason, commit=False)
+        conn.commit()
+        return {"manual_required": True}
+
+    integration = _poland_integration(conn, fulfillment["warehouse_id"])
+    client, _ = _poland_client(integration)
+    auth_correlation = uuid.uuid4().hex
+    try:
+        auth = client.authenticate()
+    except PolandWmsError as exc:
+        _audit_poland_error(conn, job, "authenticate", exc, auth_correlation)
+        if exc.retryable:
+            raise
+        reason = f"新波兰仓取消前认证失败: {str(exc)[:300]}"
+        transition_fulfillment(conn, fid, "manual_review", reason=reason)
+        mark_manual_review(conn, fulfillment["order_id"], reason, commit=False)
+        conn.commit()
+        return {"manual_required": True, "reason": exc.code}
+    _audit_poland_success(conn, job, "authenticate", auth, auth_correlation)
+    auth_data = auth.data if isinstance(auth.data, dict) else {}
+
+    correlation = uuid.uuid4().hex
+    try:
+        result = client.cancel_order(
+            order_id=str(external_order_id),
+            customer_id=str(auth_data["customer_id"]),
+            reason=str(payload.get("reason") or "客户取消/人工调整"),
+        )
+    except PolandWmsError as exc:
+        _audit_poland_error(conn, job, "cancel_order", exc, correlation)
+        if exc.unknown_outcome:
+            reason = (
+                "新波兰仓取消请求结果未知；已停止自动重试，"
+                "请在对方系统按外部 order_id 人工核验"
+            )
+            transition_fulfillment(
+                conn,
+                fid,
+                "manual_review",
+                reason=reason,
+                correlation_id=correlation,
+            )
+            mark_manual_review(conn, fulfillment["order_id"], reason, commit=False)
+            conn.commit()
+            return {"manual_required": True, "unknown": True}
+        reason = f"新波兰仓取消被拒绝: {str(exc)[:300]}"
+        transition_fulfillment(
+            conn,
+            fid,
+            "cancel_rejected",
+            reason=reason,
+            correlation_id=correlation,
+        )
+        mark_manual_review(conn, fulfillment["order_id"], reason, commit=False)
+        conn.commit()
+        return {"cancelled": False, "rejected": True, "reason": exc.code}
+
+    _audit_poland_success(conn, job, "cancel_order", result, correlation)
+    transition_fulfillment(
+        conn,
+        fid,
+        "cancelled",
+        reason="新波兰仓取消接口已确认成功",
+        correlation_id=correlation,
+    )
+    recompute_order_status(conn, fulfillment["order_id"], commit=False)
+    conn.commit()
+    return {"cancelled": True}
+
+
 def _single_status_row(result: WmsResult) -> dict | None:
     data = result.data
     if isinstance(data, list):
@@ -568,6 +1197,70 @@ def _extract_wms_tracking(data: Any) -> list[dict]:
     return events
 
 
+def _extract_poland_tracking(data: Any) -> list[dict]:
+    events = []
+
+    def visit(value: Any, inherited_status: str | None = None):
+        if isinstance(value, list):
+            for item in value:
+                visit(item, inherited_status)
+            return
+        if not isinstance(value, dict):
+            return
+        raw_status = str(
+            value.get("trackStatus")
+            or value.get("businessStatus")
+            or value.get("status")
+            or inherited_status
+            or ""
+        ).strip()
+        nested_keys = (
+            "trackDetails",
+            "trackList",
+            "track_list",
+            "details",
+            "events",
+            "tracks",
+            "data",
+        )
+        nested_found = False
+        for key in nested_keys:
+            nested = value.get(key)
+            if isinstance(nested, (list, dict)):
+                nested_found = True
+                visit(nested, raw_status)
+        description = (
+            value.get("track_content")
+            or value.get("trackContent")
+            or value.get("description")
+            or value.get("content")
+        )
+        event_at = (
+            value.get("track_date")
+            or value.get("trackDate")
+            or value.get("eventTime")
+            or value.get("time")
+        )
+        if description or event_at or (raw_status and not nested_found):
+            events.append(
+                {
+                    "raw_status": raw_status or str(description or ""),
+                    "event_at": event_at,
+                    "location": (
+                        value.get("location")
+                        or value.get("track_location")
+                        or value.get("trackLocation")
+                    ),
+                    "description": description,
+                    "raw": value,
+                }
+            )
+
+    visit(data)
+    events.sort(key=lambda item: str(item.get("event_at") or ""))
+    return events
+
+
 def handle_poll_tracking(conn, job: dict, payload: dict):
     sid = payload.get("shipment_id") or job["aggregate_id"]
     shipment = conn.execute(
@@ -603,6 +1296,47 @@ def handle_poll_tracking(conn, job: dict, payload: dict):
             official_ok = bool(events)
         except WmsError as exc:
             _audit_wms_error(conn, job, "tracking", exc, correlation)
+    elif shipment["provider"] == "poland_wms":
+        integration = conn.execute(
+            "SELECT * FROM oms_warehouse_integrations WHERE warehouse_id=?",
+            (shipment["warehouse_id"],),
+        ).fetchone()
+        correlation = uuid.uuid4().hex
+        try:
+            client, _ = _poland_client(integration)
+            result = client.track(tracking)
+            _audit_poland_success(conn, job, "tracking", result, correlation)
+            events = _extract_poland_tracking(result.data)
+            for event in events:
+                normalized = normalize_poland_tracking_status(event["raw_status"])
+                current = conn.execute(
+                    "SELECT status FROM oms_shipments WHERE id=?", (sid,)
+                ).fetchone()["status"]
+                if SHIPMENT_PROGRESS.get(current, 0) < 2 and SHIPMENT_PROGRESS.get(
+                    normalized, 0
+                ) >= 2:
+                    mark_shipment_shipped(
+                        conn,
+                        sid,
+                        reason=f"新波兰仓官方轨迹: {event['raw_status']}",
+                        commit=False,
+                    )
+                add_tracking_event(
+                    conn,
+                    sid,
+                    "poland_wms",
+                    normalized,
+                    raw_status=event["raw_status"],
+                    event_at=event.get("event_at"),
+                    location=event.get("location"),
+                    description=event.get("description"),
+                    raw_payload=event.get("raw"),
+                    correlation_id=correlation,
+                    commit=False,
+                )
+            official_ok = bool(events)
+        except PolandWmsError as exc:
+            _audit_poland_error(conn, job, "tracking", exc, correlation)
 
     key_row = conn.execute("SELECT value FROM settings WHERE key='track718_api_key'").fetchone()
     key = key_row["value"] if key_row else None
@@ -679,7 +1413,11 @@ HANDLERS = {
     "PLAN_ORDER": lambda c, j, p: plan_order(c, p.get("order_id") or j["aggregate_id"]),
     "REFRESH_HU_STOCK": handle_refresh_stock,
     "SUBMIT_HU_FULFILLMENT": handle_submit_wms,
+    "SUBMIT_PL_FULFILLMENT": handle_submit_poland_wms,
     "VERIFY_WMS_SUBMISSION": handle_verify_submission,
+    "VERIFY_PL_SUBMISSION": handle_verify_poland_submission,
+    "POLL_PL_TRACKING_NUMBER": handle_poll_poland_tracking_number,
+    "CANCEL_PL_FULFILLMENT": handle_cancel_poland_wms,
     "FETCH_WMS_LABEL": handle_fetch_label,
     "CANCEL_HU_FULFILLMENT": handle_cancel_wms,
     "POLL_WMS_STATUS": handle_poll_wms_status,
@@ -720,6 +1458,23 @@ def seed_periodic_jobs(conn):
             f"wms-status:{row['id']}:{_bucket(10)}", {"fulfillment_id": row["id"]},
         )
     for row in conn.execute(
+        '''SELECT id FROM oms_fulfillments
+           WHERE provider='poland_wms' AND status='accepted'
+             AND NOT EXISTS (
+               SELECT 1 FROM oms_shipments s
+               WHERE s.fulfillment_id=oms_fulfillments.id
+                 AND s.tracking_number IS NOT NULL
+             )'''
+    ).fetchall():
+        enqueue_job(
+            conn,
+            "POLL_PL_TRACKING_NUMBER",
+            "fulfillment",
+            row["id"],
+            f"pl-tracking-number:{row['id']}",
+            {"fulfillment_id": row["id"]},
+        )
+    for row in conn.execute(
         "SELECT id FROM oms_shipments WHERE status NOT IN ('delivered','returned','cancelled') AND tracking_number IS NOT NULL"
     ).fetchall():
         enqueue_job(
@@ -738,7 +1493,7 @@ def run_one(conn) -> bool:
         finish_job(conn, job["id"], result)
     except RetryTask as exc:
         retry_job(conn, job, exc, delay_seconds=exc.delay_seconds, code=exc.code)
-    except WmsError as exc:
+    except (WmsError, PolandWmsError) as exc:
         if exc.retryable:
             retry_job(conn, job, exc, code=exc.code)
         else:

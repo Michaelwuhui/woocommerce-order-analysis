@@ -21,6 +21,8 @@ from fulfillment_common import json_dump, json_load, utcnow
 
 ACTIVE_ORDER_STATUSES = {"processing", "offline", "on-hold", "partial-shipped", "shipped"}
 MANUAL_PARTNER_AVAILABLE = 2_147_483_647
+TRUE_VALUES = {"1", "true", "yes", "on"}
+EXCLUSIVE_SKU_ROUTING = "exclusive_mapped_skus"
 PLANNABLE_FULFILLMENT_STATUSES = {
     "planned",
     "ready_to_pick",
@@ -116,6 +118,23 @@ def _hash(value: Any) -> str:
 
 def _uuid() -> str:
     return str(uuid.uuid4())
+
+
+def _setting_enabled(
+    conn: sqlite3.Connection,
+    key: str,
+    *,
+    default: bool = False,
+) -> bool:
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    if not row:
+        return default
+    return str(row["value"] or "").strip().lower() in TRUE_VALUES
+
+
+def _integration_config(value: Any) -> dict:
+    config = json_load(value, {}) or {}
+    return config if isinstance(config, dict) else {}
 
 
 def _actor(actor: dict | None) -> tuple[str, str | None, str | None]:
@@ -336,14 +355,14 @@ def _ensure_manual_partner_sku(
 ) -> int | None:
     """Create a lightweight identity for Poland-partner fulfillment.
 
-    PL/CZ operators do not maintain stock quantities in this OMS.  We still
+    PL/CZ/HU operators do not maintain stock quantities in this OMS.  We still
     need a durable internal item identity because fulfillment items reference
     ``inv_skus``.  These auto-created records are deliberately *not*
     WMS-ready: barcode and WMS names stay empty, so they can never leak into a
     Hungary WMS submission without an explicit product mapping.
     """
 
-    if market not in {"PL", "CZ"}:
+    if market not in {"PL", "CZ", "HU"}:
         return None
     product_id = item.get("product_id")
     variation_id = item.get("variation_id") or 0
@@ -486,17 +505,43 @@ def sync_order_items(conn: sqlite3.Connection, order_id: str) -> list[dict]:
 
 def _candidate_warehouses(conn: sqlite3.Connection, market: str, sku_id: int) -> list[dict]:
     explicit = conn.execute(
-        "SELECT warehouse_id FROM oms_sku_warehouses WHERE sku_id=? AND is_enabled=1",
+        '''SELECT sw.warehouse_id, wi.provider, wi.is_enabled, wi.config_json
+           FROM oms_sku_warehouses sw
+           LEFT JOIN oms_warehouse_integrations wi ON wi.warehouse_id=sw.warehouse_id
+           WHERE sw.sku_id=? AND sw.is_enabled=1''',
         (sku_id,),
     ).fetchall()
     explicit_ids = {r["warehouse_id"] for r in explicit}
+    hungary_routing_enabled = _setting_enabled(
+        conn, "oms_hungary_wms_routing_enabled", default=True
+    )
+    exclusive_ids = {
+        r["warehouse_id"]
+        for r in explicit
+        if r["provider"] == "poland_wms"
+        and _integration_config(r["config_json"]).get("routing_policy") == EXCLUSIVE_SKU_ROUTING
+    }
+    if exclusive_ids:
+        # An explicitly assigned new-Poland-WMS SKU must never silently leak
+        # to the manual partner or Hungary.  Before go-live it remains a
+        # visible shortage instead.
+        if not _setting_enabled(conn, "oms_new_pl_wms_routing_enabled", default=False):
+            return []
+        explicit_ids = exclusive_ids
+    elif not hungary_routing_enabled:
+        # Pausing Hungary routing also releases legacy Hungary-only mappings
+        # so ordinary products can follow the current manual-partner fallback.
+        explicit_ids = {
+            r["warehouse_id"] for r in explicit if r["provider"] != "hungary_wms"
+        }
 
     rows = conn.execute(
         '''SELECT mw.warehouse_id, mw.priority, w.name, w.code, w.country,
-                  COALESCE(wi.provider, 'internal') AS provider,
-                  COALESCE(wi.inventory_authority, 'local') AS inventory_authority,
-                  sw.is_primary, sw.wms_product_name_zh, sw.wms_product_name_en,
-                  sw.wms_product_image, sw.product_type,
+                   COALESCE(wi.provider, 'internal') AS provider,
+                   COALESCE(wi.inventory_authority, 'local') AS inventory_authority,
+                   wi.config_json,
+                   sw.is_primary, sw.wms_product_name_zh, sw.wms_product_name_en,
+                   sw.wms_product_image, sw.product_type,
                   (SELECT MIN(sc.amount) FROM oms_shipping_costs sc
                    WHERE sc.market_code=? AND sc.warehouse_id=mw.warehouse_id
                      AND sc.is_active=1
@@ -514,6 +559,13 @@ def _candidate_warehouses(conn: sqlite3.Connection, market: str, sku_id: int) ->
     result = []
     for row in rows:
         d = dict(row)
+        if d["provider"] == "hungary_wms" and not hungary_routing_enabled:
+            continue
+        config = _integration_config(d.get("config_json"))
+        d["routing_policy"] = config.get("routing_policy")
+        if d["provider"] == "poland_wms":
+            if not _setting_enabled(conn, "oms_new_pl_wms_routing_enabled", default=False):
+                continue
         if explicit_ids and d["warehouse_id"] not in explicit_ids:
             continue
         if not explicit_ids:
@@ -527,7 +579,7 @@ def _candidate_warehouses(conn: sqlite3.Connection, market: str, sku_id: int) ->
                 (d["warehouse_id"], sku_id),
             ).fetchone()
             manual_partner_default = (
-                market in {"PL", "CZ"}
+                market in {"PL", "CZ", "HU"}
                 and d["inventory_authority"] == "manual_partner"
             )
             if not stock_exists and not ext_exists and not manual_partner_default:
@@ -558,6 +610,8 @@ def _candidate_warehouses(conn: sqlite3.Connection, market: str, sku_id: int) ->
 
     def rank(c: dict):
         country = (c.get("country") or "").upper()
+        if c.get("routing_policy") == EXCLUSIVE_SKU_ROUTING:
+            return (-1, c["priority"], c["warehouse_id"])
         if market == "PL":
             site_preference = 0 if country == "PL" else 1
             return (site_preference, c["priority"], c["warehouse_id"])
@@ -844,7 +898,9 @@ def plan_order(
                 "qty": qty, "reason": "warehouse_mapping_missing",
             })
             continue
-        if market == "CZ":
+        if candidates[0].get("routing_policy") == EXCLUSIVE_SKU_ROUTING:
+            plan_reasons.add("exclusive_sku_route")
+        elif market == "CZ":
             plan_reasons.add("shipping_cost" if candidates[0].get("shipping_cost") is not None else "route_priority_fallback")
         else:
             plan_reasons.add("site_preference")
@@ -935,7 +991,15 @@ def plan_order(
             "SELECT * FROM oms_warehouse_integrations WHERE warehouse_id=?", (warehouse_id,)
         ).fetchone()
         provider = integration["provider"] if integration else "internal"
-        mode = "external_wms" if provider == "hungary_wms" else "internal"
+        mode = (
+            "external_wms"
+            if integration
+            and (
+                integration["inventory_authority"] == "external_wms"
+                or provider in {"hungary_wms", "poland_wms"}
+            )
+            else "internal"
+        )
         status = "stock_shortage" if has_shortage else ("ready_to_submit" if mode == "external_wms" else "ready_to_pick")
         fid = _uuid()
         invoice_code = build_invoice_code(order, integration, revision) if mode == "external_wms" else None
@@ -1050,10 +1114,21 @@ def plan_order(
             },
         )
         created.append(fid)
-        if mode == "external_wms" and not has_shortage and integration and integration["auto_submit"]:
+        if (
+            provider in {"hungary_wms", "poland_wms"}
+            and mode == "external_wms"
+            and not has_shortage
+            and integration
+            and integration["auto_submit"]
+        ):
+            job_type = (
+                "SUBMIT_HU_FULFILLMENT"
+                if provider == "hungary_wms"
+                else "SUBMIT_PL_FULFILLMENT"
+            )
             enqueue_job(
                 conn,
-                "SUBMIT_HU_FULFILLMENT",
+                job_type,
                 "fulfillment",
                 fid,
                 f"submit:{idem}",
@@ -1124,6 +1199,11 @@ def build_wms_payload(conn: sqlite3.Connection, fulfillment_id: str) -> dict:
         raise DomainError("履约单不存在", "fulfillment_not_found")
     if fulfillment["mode"] != "external_wms":
         raise DomainError("该履约单不是外部 WMS 模式", "not_external_wms")
+    if fulfillment["provider"] != "hungary_wms":
+        raise DomainError(
+            "该外部仓尚未安装独立 API 适配器，禁止套用匈牙利 WMS 协议",
+            "external_wms_adapter_unavailable",
+        )
     config = json_load(fulfillment["config_json"], {}) or {}
     shipping = json_load(fulfillment["shipping"], {}) or {}
     billing = json_load(fulfillment["billing"], {}) or {}
@@ -1231,6 +1311,198 @@ def build_wms_payload(conn: sqlite3.Connection, fulfillment_id: str) -> dict:
         "ordersDeclaredValue": format(declared_value.quantize(Decimal("0.01")), "f"),
         "invoiceDetailsCreateRequests": details,
     }
+
+
+def build_poland_wms_payload(
+    conn: sqlite3.Connection,
+    fulfillment_id: str,
+    *,
+    customer_id: str,
+    customer_userid: str,
+) -> dict:
+    """Build the form payload for the new Poland warehouse's HuaLei API.
+
+    HuaLei's ``orderInvoiceParam`` is both the customs declaration and the
+    only documented per-SKU picking information.  Consequently every routed
+    SKU must have an explicit warehouse mapping; guessed names or codes are
+    rejected before any external request is made.
+    """
+
+    fulfillment = conn.execute(
+        '''SELECT f.*, wi.config_json, wi.channel_code,
+                  o.total, o.currency, o.payment_method, o.billing, o.shipping,
+                  o.source,
+                  ff.cod_collection_role, ff.cod_amount, ff.cod_currency,
+                  ff.merchandise_amount, ff.allocation_method
+           FROM oms_fulfillments f
+           JOIN orders o ON o.id=f.order_id
+           JOIN oms_warehouse_integrations wi ON wi.warehouse_id=f.warehouse_id
+           LEFT JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
+           WHERE f.id=?''',
+        (fulfillment_id,),
+    ).fetchone()
+    if not fulfillment:
+        raise DomainError("履约单不存在", "fulfillment_not_found")
+    if fulfillment["mode"] != "external_wms" or fulfillment["provider"] != "poland_wms":
+        raise DomainError("该履约单不是新波兰仓外部履约单", "not_poland_wms")
+    if not customer_id or not customer_userid:
+        raise DomainError("新波兰仓认证标识缺失", "poland_wms_auth_ids_missing")
+
+    config = _integration_config(fulfillment["config_json"])
+    product_id = str(
+        config.get("product_id") or fulfillment["channel_code"] or ""
+    ).strip()
+    if not product_id:
+        raise DomainError(
+            "新波兰仓运输方式 product_id 尚未配置",
+            "poland_wms_product_id_missing",
+        )
+
+    shipping = json_load(fulfillment["shipping"], {}) or {}
+    billing = json_load(fulfillment["billing"], {}) or {}
+    address = shipping if shipping.get("address_1") else billing
+    country = str(address.get("country") or "").strip().upper()
+    if country not in {"PL", "CZ", "HU"}:
+        raise DomainError(
+            f"新波兰仓专属路由当前仅支持 PL/CZ/HU，订单国家为 {country or '空'}",
+            "poland_wms_country_not_supported",
+        )
+    consignee = " ".join(
+        filter(None, [address.get("first_name"), address.get("last_name")])
+    ).strip()
+    phone = str(address.get("phone") or billing.get("phone") or "").strip()
+    address_text = " ".join(
+        filter(None, [address.get("address_1"), address.get("address_2")])
+    ).strip()
+    postcode = str(address.get("postcode") or "").strip()
+    if not consignee:
+        raise DomainError("新波兰仓要求收件人姓名", "consignee_missing")
+    if not phone:
+        raise DomainError("新波兰仓要求收件电话", "phone_missing")
+    if not address_text:
+        raise DomainError("新波兰仓要求收件地址", "address_missing")
+    if not postcode:
+        raise DomainError("新波兰仓要求邮编", "postcode_missing")
+
+    rows = conn.execute(
+        '''SELECT fi.*, sw.wms_product_name_zh, sw.wms_product_name_en,
+                  sw.wms_product_image, sw.product_type, oi.raw_json
+           FROM oms_fulfillment_items fi
+           JOIN oms_order_items oi ON oi.id=fi.order_item_id
+           LEFT JOIN oms_sku_warehouses sw
+             ON sw.sku_id=fi.sku_id AND sw.warehouse_id=?
+           WHERE fi.fulfillment_id=? ORDER BY fi.id''',
+        (fulfillment["warehouse_id"], fulfillment_id),
+    ).fetchall()
+    if not rows:
+        raise DomainError("新波兰仓履约单没有商品", "fulfillment_items_missing")
+
+    declarations = []
+    images = []
+    for row in rows:
+        raw = json_load(row["raw_json"], {}) or {}
+        name_zh = str(row["wms_product_name_zh"] or "").strip()
+        name_en = str(row["wms_product_name_en"] or "").strip()
+        sku_code = str(row["barcode_snapshot"] or row["sku_code_snapshot"] or "").strip()
+        if not name_zh:
+            raise DomainError(
+                f"SKU {row['sku_code_snapshot'] or row['sku_id']} 缺少新波兰仓中文品名",
+                "poland_wms_product_name_zh_missing",
+            )
+        if not name_en:
+            raise DomainError(
+                f"SKU {row['sku_code_snapshot'] or row['sku_id']} 缺少新波兰仓英文品名",
+                "poland_wms_product_name_en_missing",
+            )
+        if not sku_code:
+            raise DomainError(
+                f"SKU {row['sku_id']} 缺少新波兰仓配货编码/条码",
+                "poland_wms_sku_code_missing",
+            )
+        allocated = int(row["allocated_qty"])
+        try:
+            ordered_qty = max(1, int(raw.get("quantity") or 1))
+            line_gross = _money_decimal(raw.get("total")) + _money_decimal(raw.get("total_tax"))
+            declared_amount = (line_gross / ordered_qty * allocated).quantize(MONEY_QUANTUM)
+        except (TypeError, ValueError, InvalidOperation, ZeroDivisionError):
+            declared_amount = Decimal("0.00")
+        image = (
+            row["wms_product_image"]
+            or (raw.get("image") or {}).get("src")
+            or ""
+        )
+        if image:
+            images.append(str(image))
+        declaration = {
+            "invoice_amount": _money_text(declared_amount),
+            "invoice_pcs": allocated,
+            "invoice_title": name_en,
+            "sku": name_zh,
+            "sku_code": sku_code,
+            "invoice_imgurl": str(image),
+            "invoice_currency": fulfillment["currency"] or "EUR",
+        }
+        if config.get("invoice_unit_code"):
+            declaration["invoiceunit_code"] = str(config["invoice_unit_code"])
+        if config.get("origin_country"):
+            declaration["origin_country"] = str(config["origin_country"])
+        declarations.append(declaration)
+
+    is_cod = str(fulfillment["payment_method"] or "").lower() == "cod"
+    if not is_cod:
+        cod_amount = "0.00"
+    elif fulfillment["cod_collection_role"] == "collector":
+        if fulfillment["allocation_method"] == "legacy_requires_replan":
+            raise DomainError(
+                "该履约单仍使用旧 COD 分配规则，请重新分仓",
+                "cod_replan_required",
+            )
+        cod_amount = _money_text(fulfillment["cod_amount"])
+    elif fulfillment["cod_collection_role"] == "instruction_only":
+        cod_amount = "0.00"
+    else:
+        raise DomainError(
+            "新波兰仓履约单缺少明确的 COD 收款责任",
+            "cod_financial_terms_missing",
+        )
+
+    payload = {
+        "buyerid": "",
+        "order_piece": int(config.get("order_piece") or 1),
+        "order_returnsign": str(config.get("order_returnsign") or "N"),
+        "trade_type": str(config.get("trade_type") or "ZYXT"),
+        "duty_type": str(config.get("duty_type") or "Other"),
+        "consignee_name": consignee,
+        "consignee_companyname": address.get("company") or "",
+        "consignee_address": address_text,
+        "consignee_telephone": phone,
+        "consignee_mobile": phone,
+        "country": country,
+        "consignee_state": address.get("state") or "",
+        "consignee_city": address.get("city") or "",
+        "consignee_suburb": "",
+        "consignee_postcode": postcode,
+        "consignee_email": address.get("email") or billing.get("email") or "",
+        "consignee_type": str(config.get("consignee_type") or "02"),
+        "customer_id": str(customer_id),
+        "customer_userid": str(customer_userid),
+        "order_customerinvoicecode": fulfillment["external_invoice_code"],
+        "product_id": product_id,
+        "product_imagepath": ";".join(dict.fromkeys(images)),
+        "order_transactionurl": fulfillment["source"] or "",
+        "order_cargoamount": _money_text(fulfillment["merchandise_amount"]),
+        "order_codamount": cod_amount,
+        "order_codcurrency": fulfillment["cod_currency"] or fulfillment["currency"] or "EUR",
+        "cargo_type": str(config.get("cargo_type") or "P"),
+        "store_name": fulfillment["source"] or "",
+        "ecommerce_platform_name": "WooCommerce",
+        "orderInvoiceParam": declarations,
+    }
+    if config.get("battery_type"):
+        payload["battery_type"] = str(config["battery_type"])
+    if config.get("customs_declaration"):
+        payload["customs_declaration"] = str(config["customs_declaration"])
+    return payload
 
 
 def create_shipment(

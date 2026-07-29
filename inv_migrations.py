@@ -1260,6 +1260,285 @@ def down_009(conn):
     conn.commit()
 
 
+# ───────────────── 010: 新波兰 WMS 隔离路由底座 ─────────────────
+
+NEW_PL_WMS_CODE = "PL-NEW-WMS"
+MIGRATION_010_STATE_KEY = "migration_010_previous_state"
+
+
+def _migration_010_row(conn, sql, args=()):
+    row = conn.execute(sql, args).fetchone()
+    return dict(row) if row else None
+
+
+def up_010(conn):
+    """Create a fail-closed Poland WMS profile and pause Hungary routing.
+
+    The HuaLei API endpoints are known, but production credentials, the
+    shipping product_id and the four exact SKUs are not available yet.
+    Therefore the integration remains disabled and no SKU is seeded.  The
+    API does not expose inventory, so availability is partner-confirmed; a
+    mapped SKU is still exclusive and never silently falls back elsewhere.
+    """
+
+    warehouse = _migration_010_row(
+        conn, "SELECT * FROM warehouses WHERE code=? ORDER BY id LIMIT 1",
+        (NEW_PL_WMS_CODE,),
+    )
+    hu_integrations = [
+        dict(row) for row in conn.execute(
+            "SELECT warehouse_id, auto_submit FROM oms_warehouse_integrations WHERE provider='hungary_wms'"
+        ).fetchall()
+    ]
+    hu_routes = [
+        dict(row) for row in conn.execute(
+            """SELECT mw.id, mw.is_active
+               FROM inv_market_warehouses mw
+               JOIN oms_warehouse_integrations wi ON wi.warehouse_id=mw.warehouse_id
+               WHERE wi.provider='hungary_wms'"""
+        ).fetchall()
+    ]
+    tracked_settings = (
+        "oms_hungary_wms_development_paused",
+        "oms_hungary_wms_routing_enabled",
+        "oms_new_pl_wms_routing_enabled",
+    )
+    previous_settings = {}
+    for key in tracked_settings:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        previous_settings[key] = row["value"] if row else None
+    state = {
+        "warehouse": warehouse,
+        "hu_integrations": hu_integrations,
+        "hu_routes": hu_routes,
+        "settings": previous_settings,
+    }
+
+    if not warehouse:
+        conn.execute(
+            """INSERT INTO warehouses (name, code, country, is_active)
+               VALUES ('新波兰仓（API）', ?, 'PL', 1)""",
+            (NEW_PL_WMS_CODE,),
+        )
+        warehouse = _migration_010_row(
+            conn, "SELECT * FROM warehouses WHERE id=last_insert_rowid()"
+        )
+    warehouse_id = warehouse["id"]
+    state["warehouse_id"] = warehouse_id
+    state["integration"] = _migration_010_row(
+        conn, "SELECT * FROM oms_warehouse_integrations WHERE warehouse_id=?",
+        (warehouse_id,),
+    )
+    state["warehouse_ext"] = _migration_010_row(
+        conn, "SELECT * FROM inv_warehouse_ext WHERE warehouse_id=?",
+        (warehouse_id,),
+    )
+    state["routes"] = [
+        dict(row) for row in conn.execute(
+            "SELECT * FROM inv_market_warehouses WHERE warehouse_id=? ORDER BY market_code",
+            (warehouse_id,),
+        ).fetchall()
+    ]
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (MIGRATION_010_STATE_KEY, json.dumps(state, ensure_ascii=False)),
+    )
+
+    config = json.dumps(
+        {
+            "routing_policy": "exclusive_mapped_skus",
+            "api_family": "sz56t_hualei_legacy",
+            "integration_status": "awaiting_credentials_product_id_and_skus",
+            "required_sku_count": 4,
+            "stock_policy": "partner_reported",
+            "print_base_url": "http://175.178.192.240:8089",
+            "product_id": None,
+            "trade_type": "ZYXT",
+            "order_returnsign": "N",
+            "duty_type": "Other",
+            "consignee_type": "02",
+            "cargo_type": "P",
+            "print_type": "lab10_10",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    conn.execute(
+        """INSERT INTO oms_warehouse_integrations
+             (warehouse_id, provider, external_code, channel_code, base_url,
+              is_enabled, auto_submit, inventory_authority, tracking_mode,
+              config_json)
+           VALUES (?, 'poland_wms', 'SZ56T', NULL,
+                   'http://175.178.192.240:8082', 0, 0, 'manual_partner',
+                   'official_and_third_party', ?)
+           ON CONFLICT(warehouse_id) DO UPDATE SET
+             provider='poland_wms', external_code='SZ56T', channel_code=NULL,
+             base_url='http://175.178.192.240:8082', is_enabled=0, auto_submit=0,
+             inventory_authority='manual_partner',
+             tracking_mode='official_and_third_party', config_json=excluded.config_json,
+             updated_at=CURRENT_TIMESTAMP""",
+        (warehouse_id, config),
+    )
+    conn.execute(
+        """INSERT INTO inv_warehouse_ext
+             (warehouse_id, ownership_type, partner_name, region,
+              is_fulfillment, notes)
+           VALUES (?, 'partner', '新波兰仓', 'PL', 1,
+                   '仅履约明确映射的四款商品；API 联调完成前禁止外发')
+           ON CONFLICT(warehouse_id) DO UPDATE SET
+             ownership_type='partner', partner_name='新波兰仓', region='PL',
+             is_fulfillment=1, notes=excluded.notes,
+             updated_at=CURRENT_TIMESTAMP""",
+        (warehouse_id,),
+    )
+    for market in ("PL", "CZ", "HU"):
+        conn.execute(
+            """INSERT INTO inv_market_warehouses
+                 (market_code, warehouse_id, priority, is_active, notes)
+               VALUES (?, ?, 5, 1, '仅限明确映射的四款商品；不参与普通商品兜底')
+               ON CONFLICT(market_code, warehouse_id) DO UPDATE SET
+                 priority=5, is_active=1, notes=excluded.notes,
+                 updated_at=CURRENT_TIMESTAMP""",
+            (market, warehouse_id),
+        )
+
+    conn.execute(
+        "UPDATE oms_warehouse_integrations SET auto_submit=0, updated_at=CURRENT_TIMESTAMP WHERE provider='hungary_wms'"
+    )
+    conn.execute(
+        """UPDATE inv_market_warehouses SET is_active=0, updated_at=CURRENT_TIMESTAMP
+           WHERE warehouse_id IN (
+             SELECT warehouse_id FROM oms_warehouse_integrations
+             WHERE provider='hungary_wms'
+           )"""
+    )
+    for key, value in (
+        ("oms_hungary_wms_development_paused", "1"),
+        ("oms_hungary_wms_routing_enabled", "0"),
+        ("oms_new_pl_wms_routing_enabled", "0"),
+    ):
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+    conn.commit()
+
+
+def down_010(conn):
+    """Restore pre-010 routing; preserve any later warehouse audit data."""
+
+    saved = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (MIGRATION_010_STATE_KEY,)
+    ).fetchone()
+    if not saved:
+        return
+    state = json.loads(saved["value"])
+    warehouse_id = int(state["warehouse_id"])
+
+    for row in state.get("hu_integrations") or []:
+        conn.execute(
+            """UPDATE oms_warehouse_integrations
+               SET auto_submit=?, updated_at=CURRENT_TIMESTAMP
+               WHERE warehouse_id=?""",
+            (row["auto_submit"], row["warehouse_id"]),
+        )
+    for row in state.get("hu_routes") or []:
+        conn.execute(
+            """UPDATE inv_market_warehouses
+               SET is_active=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (row["is_active"], row["id"]),
+        )
+    for key, value in (state.get("settings") or {}).items():
+        if value is None:
+            conn.execute("DELETE FROM settings WHERE key=?", (key,))
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+
+    references = 0
+    for table in (
+        "oms_fulfillments",
+        "oms_sku_warehouses",
+        "oms_external_stock",
+        "inv_stock",
+        "inv_movements",
+        "inv_market_warehouses",
+    ):
+        if table == "inv_market_warehouses":
+            continue
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone():
+            references += conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE warehouse_id=?", (warehouse_id,)
+            ).fetchone()[0]
+
+    conn.execute("DELETE FROM inv_market_warehouses WHERE warehouse_id=?", (warehouse_id,))
+    previous_routes = state.get("routes") or []
+    for row in previous_routes:
+        conn.execute(
+            """INSERT INTO inv_market_warehouses
+                 (id, market_code, warehouse_id, priority, is_active, notes,
+                  created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                row["id"], row["market_code"], row["warehouse_id"],
+                row["priority"], row["is_active"], row.get("notes"),
+                row.get("created_at"), row.get("updated_at"),
+            ),
+        )
+
+    previous_integration = state.get("integration")
+    previous_ext = state.get("warehouse_ext")
+    if state.get("warehouse") is None and references:
+        conn.execute(
+            """UPDATE oms_warehouse_integrations
+               SET is_enabled=0, auto_submit=0, updated_at=CURRENT_TIMESTAMP
+               WHERE warehouse_id=?""",
+            (warehouse_id,),
+        )
+        conn.execute(
+            "UPDATE warehouses SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (warehouse_id,),
+        )
+    else:
+        conn.execute(
+            "DELETE FROM oms_warehouse_integrations WHERE warehouse_id=?", (warehouse_id,)
+        )
+        if previous_integration:
+            conn.execute(
+                """INSERT INTO oms_warehouse_integrations
+                     (warehouse_id, provider, external_code, channel_code, base_url,
+                      is_enabled, auto_submit, inventory_authority, tracking_mode,
+                      config_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(previous_integration.get(key) for key in (
+                    "warehouse_id", "provider", "external_code", "channel_code",
+                    "base_url", "is_enabled", "auto_submit", "inventory_authority",
+                    "tracking_mode", "config_json", "created_at", "updated_at",
+                )),
+            )
+        conn.execute("DELETE FROM inv_warehouse_ext WHERE warehouse_id=?", (warehouse_id,))
+        if previous_ext:
+            conn.execute(
+                """INSERT INTO inv_warehouse_ext
+                     (warehouse_id, ownership_type, partner_name, partner_id, region,
+                      is_fulfillment, notes, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(previous_ext.get(key) for key in (
+                    "warehouse_id", "ownership_type", "partner_name", "partner_id",
+                    "region", "is_fulfillment", "notes", "created_at", "updated_at",
+                )),
+            )
+        if state.get("warehouse") is None:
+            conn.execute("DELETE FROM warehouses WHERE id=?", (warehouse_id,))
+
+    conn.execute("DELETE FROM settings WHERE key=?", (MIGRATION_010_STATE_KEY,))
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -1270,6 +1549,7 @@ MIGRATIONS = [
     ('007', 'fulfillment_cod_and_monthly_settlement', up_007, down_007),
     ('008', 'split_cod_shipping_allocation', up_008, down_008),
     ('009', 'manual_partner_pl_and_packeta', up_009, down_009),
+    ('010', 'new_poland_wms_isolated_routing', up_010, down_010),
 ]
 
 

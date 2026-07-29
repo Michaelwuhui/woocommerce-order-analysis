@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from fulfillment_service import (
     add_tracking_event,
+    build_poland_wms_payload,
     build_wms_payload,
     completion_guard,
     create_shipment,
@@ -12,7 +13,16 @@ from fulfillment_service import (
     recompute_order_status,
     transition_fulfillment,
 )
-from inv_migrations import down_009, up_001, up_006, up_007, up_008, up_009
+from inv_migrations import (
+    down_009,
+    down_010,
+    up_001,
+    up_006,
+    up_007,
+    up_008,
+    up_009,
+    up_010,
+)
 from fulfillment_woocommerce import _all_order_shipments, _ast_items, _customer_note_body
 
 
@@ -215,7 +225,7 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.assertIsNone(created["barcode"])
         self.assertEqual(1, created["warehouse_id"])
 
-    def test_manual_partner_fallback_never_autoprovisions_hungary_wms_item(self):
+    def test_manual_partner_autoprovisions_hungary_market_fallback(self):
         self.db.execute(
             """UPDATE oms_warehouse_integrations
                SET inventory_authority='manual_partner' WHERE warehouse_id=1"""
@@ -226,18 +236,18 @@ class FulfillmentDomainTests(unittest.TestCase):
             1,
             product_id=202,
             sku="",
-            name="Unmapped WMS product",
+            name="Partner-managed Hungary product",
         )
 
         result = plan_order(self.db, "hu-unmapped-1")
 
-        self.assertEqual([], self.allocations("hu-unmapped-1"))
-        self.assertEqual("sku_unmapped", result["shortages"][0]["reason"])
-        self.assertIsNone(
-            self.db.execute(
-                "SELECT id FROM inv_skus WHERE sku_code LIKE 'MANUAL-PL-2-202-%'"
-            ).fetchone()
-        )
+        self.assertFalse(result["shortages"])
+        self.assertEqual([{"warehouse_id": 1, "qty": 1}], self.allocations("hu-unmapped-1"))
+        created = self.db.execute(
+            "SELECT id, barcode FROM inv_skus WHERE sku_code LIKE 'MANUAL-PL-2-202-%'"
+        ).fetchone()
+        self.assertIsNotNone(created)
+        self.assertIsNone(created["barcode"])
 
     def test_packeta_and_manual_partner_migration_roundtrip(self):
         self.db.execute(
@@ -272,6 +282,170 @@ class FulfillmentDomainTests(unittest.TestCase):
             "SELECT inventory_authority FROM oms_warehouse_integrations WHERE warehouse_id=1"
         ).fetchone()[0]
         self.assertEqual("local", authority)
+
+    def test_new_poland_wms_migration_is_fail_closed_and_reversible(self):
+        up_009(self.db)
+        up_010(self.db)
+
+        new_pl = self.db.execute(
+            "SELECT id, name, is_active FROM warehouses WHERE code='PL-NEW-WMS'"
+        ).fetchone()
+        integration = self.db.execute(
+            "SELECT * FROM oms_warehouse_integrations WHERE warehouse_id=?",
+            (new_pl["id"],),
+        ).fetchone()
+        self.assertEqual("新波兰仓（API）", new_pl["name"])
+        self.assertEqual("poland_wms", integration["provider"])
+        self.assertEqual(0, integration["is_enabled"])
+        self.assertEqual(0, integration["auto_submit"])
+        self.assertEqual("manual_partner", integration["inventory_authority"])
+        self.assertEqual("http://175.178.192.240:8082", integration["base_url"])
+        self.assertEqual(
+            3,
+            self.db.execute(
+                "SELECT COUNT(*) FROM inv_market_warehouses WHERE warehouse_id=? AND is_active=1",
+                (new_pl["id"],),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.db.execute(
+                """SELECT COUNT(*) FROM inv_market_warehouses mw
+                   JOIN oms_warehouse_integrations wi ON wi.warehouse_id=mw.warehouse_id
+                   WHERE wi.provider='hungary_wms' AND mw.is_active=1"""
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            "0",
+            self.db.execute(
+                "SELECT value FROM settings WHERE key='oms_new_pl_wms_routing_enabled'"
+            ).fetchone()[0],
+        )
+
+        down_010(self.db)
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT id FROM warehouses WHERE code='PL-NEW-WMS'"
+            ).fetchone()
+        )
+        self.assertGreater(
+            self.db.execute(
+                """SELECT COUNT(*) FROM inv_market_warehouses mw
+                   JOIN oms_warehouse_integrations wi ON wi.warehouse_id=mw.warehouse_id
+                   WHERE wi.provider='hungary_wms' AND mw.is_active=1"""
+            ).fetchone()[0],
+            0,
+        )
+        down_009(self.db)
+
+    def test_new_poland_wms_mapping_is_exclusive_and_never_falls_back(self):
+        up_009(self.db)
+        up_010(self.db)
+        new_pl_id = self.db.execute(
+            "SELECT id FROM warehouses WHERE code='PL-NEW-WMS'"
+        ).fetchone()[0]
+        self.db.execute(
+            """UPDATE oms_warehouse_integrations
+               SET is_enabled=1, base_url='https://pl-wms.example.test',
+                   external_code='PL01', channel_code='777'
+               WHERE warehouse_id=?""",
+            (new_pl_id,),
+        )
+        self.db.execute(
+            "UPDATE settings SET value='1' WHERE key='oms_new_pl_wms_routing_enabled'"
+        )
+        self.db.execute(
+            """INSERT INTO oms_sku_warehouses
+               (sku_id, warehouse_id, is_primary, is_enabled,
+                wms_product_name_zh, wms_product_name_en, product_type)
+               VALUES (1, ?, 1, 1, '测试产品', 'Test product', 'P')""",
+            (new_pl_id,),
+        )
+        self.db.execute(
+            """INSERT INTO oms_external_stock
+               (warehouse_id, sku_barcode, sku_id, quantity,
+                lock_quantity, available_quantity)
+               VALUES (?, 'BAR1', 1, 10, 0, 10)""",
+            (new_pl_id,),
+        )
+        self.add_order("new-pl-special-1", "CZ", 2)
+
+        result = plan_order(self.db, "new-pl-special-1")
+
+        self.assertEqual(
+            [{"warehouse_id": new_pl_id, "qty": 2}],
+            self.allocations("new-pl-special-1"),
+        )
+        self.assertIn("exclusive_sku_route", result["reason"])
+        fulfillment = self.db.execute(
+            "SELECT * FROM oms_fulfillments WHERE order_id='new-pl-special-1'"
+        ).fetchone()
+        self.assertEqual("poland_wms", fulfillment["provider"])
+        self.assertEqual("external_wms", fulfillment["mode"])
+        with self.assertRaisesRegex(Exception, "独立 API 适配器"):
+            build_wms_payload(self.db, fulfillment["id"])
+        payload = build_poland_wms_payload(
+            self.db,
+            fulfillment["id"],
+            customer_id="C1",
+            customer_userid="U1",
+        )
+        self.assertEqual("777", payload["product_id"])
+        self.assertEqual("CZ", payload["country"])
+        self.assertEqual("OMSnewplspecial1PL01R1", payload["order_customerinvoicecode"])
+        self.assertEqual("BAR1", payload["orderInvoiceParam"][0]["sku_code"])
+        self.assertEqual(Decimal("20"), Decimal(payload["order_codamount"]))
+
+    def test_new_poland_wms_special_sku_uses_partner_reported_stock_only(self):
+        up_009(self.db)
+        up_010(self.db)
+        new_pl_id = self.db.execute(
+            "SELECT id FROM warehouses WHERE code='PL-NEW-WMS'"
+        ).fetchone()[0]
+        self.db.execute(
+            """UPDATE oms_warehouse_integrations
+               SET is_enabled=1, base_url='https://pl-wms.example.test',
+                   external_code='PL01'
+               WHERE warehouse_id=?""",
+            (new_pl_id,),
+        )
+        self.db.execute(
+            "UPDATE settings SET value='1' WHERE key='oms_new_pl_wms_routing_enabled'"
+        )
+        self.db.execute(
+            """INSERT INTO oms_sku_warehouses
+               (sku_id, warehouse_id, is_primary, is_enabled,
+                wms_product_name_zh, wms_product_name_en, product_type)
+               VALUES (1, ?, 1, 1, '测试产品', 'Test product', 'P')""",
+            (new_pl_id,),
+        )
+        self.add_order("new-pl-shortage-1", "HU", 1)
+
+        result = plan_order(self.db, "new-pl-shortage-1")
+
+        self.assertEqual(
+            [{"warehouse_id": new_pl_id, "qty": 1}],
+            self.allocations("new-pl-shortage-1"),
+        )
+        self.assertFalse(result["shortages"])
+        self.assertIn("partner_reported_availability", result["reason"])
+
+    def test_paused_hungary_only_mapping_falls_back_to_manual_poland(self):
+        self.db.execute(
+            "DELETE FROM oms_sku_warehouses WHERE sku_id=1 AND warehouse_id=1"
+        )
+        up_009(self.db)
+        up_010(self.db)
+        self.add_order("hu-legacy-map-1", "HU", 1)
+
+        result = plan_order(self.db, "hu-legacy-map-1")
+
+        self.assertFalse(result["shortages"])
+        self.assertEqual(
+            [{"warehouse_id": 1, "qty": 1}],
+            self.allocations("hu-legacy-map-1"),
+        )
+        self.assertIn("partner_reported_availability", result["reason"])
 
     def test_two_parcels_complete_only_after_both_delivered_and_ignore_late_event(self):
         self.set_stock(pl=1, hu=5)

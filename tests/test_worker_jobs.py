@@ -6,10 +6,13 @@ from fulfillment_service import enqueue_job
 from fulfillment_worker import (
     claim_job,
     finish_job,
+    handle_cancel_poland_wms,
+    handle_verify_poland_submission,
     handle_verify_submission,
     retry_job,
     run_iteration,
 )
+from poland_wms import PolandWmsError
 
 
 class DurableJobTests(unittest.TestCase):
@@ -108,6 +111,127 @@ class DurableJobTests(unittest.TestCase):
         self.assertEqual("manual_review", transition.call_args.args[2])
         manual.assert_called_once()
         enqueue.assert_not_called()
+        self.assertTrue(conn.committed)
+
+    def test_unknown_poland_submission_never_auto_resubmits(self):
+        fulfillment = {
+            "id": "F-PL-1",
+            "order_id": "O-PL-1",
+            "status": "submission_unknown",
+            "external_invoice_code": "OMS-PL-1",
+        }
+
+        class Result:
+            def fetchone(self):
+                return fulfillment
+
+        class Conn:
+            committed = False
+
+            def execute(self, _sql, _params=()):
+                return Result()
+
+            def commit(self):
+                self.committed = True
+
+        conn = Conn()
+        job = {"id": 10, "aggregate_id": "F-PL-1", "attempts": 3}
+        empty_fields = {
+            "order_id": None,
+            "tracking_number": None,
+            "document_code": None,
+        }
+        with patch(
+            "fulfillment_worker._query_poland_order",
+            return_value=(None, {}, empty_fields, "corr-pl"),
+        ), patch(
+            "fulfillment_worker.transition_fulfillment"
+        ) as transition, patch(
+            "fulfillment_worker.mark_manual_review"
+        ) as manual, patch(
+            "fulfillment_worker.enqueue_job"
+        ) as enqueue:
+            result = handle_verify_poland_submission(
+                conn,
+                job,
+                {"fulfillment_id": "F-PL-1"},
+            )
+
+        self.assertEqual(
+            {"not_found": True, "manual_review": True, "resubmit": False},
+            result,
+        )
+        self.assertEqual("manual_review", transition.call_args.args[2])
+        manual.assert_called_once()
+        enqueue.assert_not_called()
+        self.assertTrue(conn.committed)
+
+    def test_unknown_poland_cancel_stops_retry_and_requires_manual_check(self):
+        fulfillment = {
+            "id": "F-PL-2",
+            "order_id": "O-PL-2",
+            "warehouse_id": 3,
+            "provider": "poland_wms",
+            "status": "cancel_pending",
+            "external_pick_code": "ORDER-7788",
+        }
+
+        class Result:
+            def fetchone(self):
+                return fulfillment
+
+        class Conn:
+            committed = False
+
+            def execute(self, _sql, _params=()):
+                return Result()
+
+            def commit(self):
+                self.committed = True
+
+        class AuthResult:
+            data = {"customer_id": "C1", "customer_userid": "U1"}
+
+        class Client:
+            def authenticate(self):
+                return AuthResult()
+
+            def cancel_order(self, **_kwargs):
+                raise PolandWmsError(
+                    "cancel timeout",
+                    code="cancel_timeout",
+                    unknown_outcome=True,
+                )
+
+        conn = Conn()
+        job = {"id": 11, "aggregate_id": "F-PL-2", "attempts": 1}
+        with patch(
+            "fulfillment_worker._poland_integration",
+            return_value={"warehouse_id": 3},
+        ), patch(
+            "fulfillment_worker._poland_client",
+            return_value=(Client(), {}),
+        ), patch(
+            "fulfillment_worker._audit_poland_success"
+        ), patch(
+            "fulfillment_worker._audit_poland_error"
+        ), patch(
+            "fulfillment_worker.transition_fulfillment"
+        ) as transition, patch(
+            "fulfillment_worker.mark_manual_review"
+        ) as manual:
+            result = handle_cancel_poland_wms(
+                conn,
+                job,
+                {"fulfillment_id": "F-PL-2", "reason": "customer cancelled"},
+            )
+
+        self.assertEqual(
+            {"manual_required": True, "unknown": True},
+            result,
+        )
+        self.assertEqual("manual_review", transition.call_args.args[2])
+        manual.assert_called_once()
         self.assertTrue(conn.committed)
 
 
