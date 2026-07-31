@@ -22,6 +22,7 @@ MAX_SITE_CONCURRENCY = 1
 INTER_SITE_DELAY_SECONDS = 1
 INCREMENTAL_OVERLAP_MINUTES = 10
 NOTES_ACTIVE_LIMIT = 25
+NOTES_REFRESH_INTERVAL_HOURS = 24
 NOTE_WORKERS = 1
 LOCK_FILE = '/tmp/woo-analysis-auto-sync.lock'
 
@@ -73,6 +74,7 @@ def sync_one_site(site):
             sync_days=0,
             incremental_overlap_minutes=INCREMENTAL_OVERLAP_MINUTES,
             notes_active_limit=NOTES_ACTIVE_LIMIT,
+            notes_refresh_interval_hours=NOTES_REFRESH_INTERVAL_HOURS,
             note_workers=NOTE_WORKERS,
         )
         

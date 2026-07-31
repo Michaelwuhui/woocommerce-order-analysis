@@ -16,6 +16,7 @@ PROXY_CONFIG = {}
 
 DEFAULT_INCREMENTAL_OVERLAP_MINUTES = 10
 DEFAULT_NOTES_ACTIVE_LIMIT = 25
+DEFAULT_NOTES_REFRESH_INTERVAL_HOURS = 24
 DEFAULT_NOTE_WORKERS = 1
 
 
@@ -390,6 +391,7 @@ def sync_order_notes(
     connection=None,
     changed_woo_ids=None,
     active_limit=DEFAULT_NOTES_ACTIVE_LIMIT,
+    active_refresh_interval_hours=DEFAULT_NOTES_REFRESH_INTERVAL_HOURS,
     max_workers=DEFAULT_NOTE_WORKERS,
     progress_callback=None,
 ):
@@ -438,12 +440,17 @@ def sync_order_notes(
             for oid, woo_id in cursor.fetchall():
                 candidates[str(oid)] = (oid, woo_id)
 
+        stale_before = (
+            datetime.now()
+            - timedelta(hours=max(0, int(active_refresh_interval_hours or 0)))
+        ).isoformat(timespec="seconds")
+
         if active_limit is None:
             limit_clause = ""
-            params = (site_url,)
+            params = (site_url, stale_before)
         else:
             limit_clause = "LIMIT ?"
-            params = (site_url, max(0, int(active_limit)))
+            params = (site_url, stale_before, max(0, int(active_limit)))
 
         if active_limit is None or int(active_limit) > 0:
             cursor.execute(
@@ -454,6 +461,10 @@ def sync_order_notes(
                   ON s.order_id = CAST(o.id AS TEXT)
                 WHERE o.source = ?
                   AND o.status IN ('processing', 'offline', 'on-hold')
+                  AND (
+                    s.last_synced_at IS NULL
+                    OR s.last_synced_at <= ?
+                  )
                 ORDER BY
                   CASE WHEN s.last_synced_at IS NULL THEN 0 ELSE 1 END,
                   COALESCE(s.last_synced_at, '') ASC,
@@ -582,6 +593,7 @@ def sync_site(
     full_history=False,
     incremental_overlap_minutes=DEFAULT_INCREMENTAL_OVERLAP_MINUTES,
     notes_active_limit=DEFAULT_NOTES_ACTIVE_LIMIT,
+    notes_refresh_interval_hours=DEFAULT_NOTES_REFRESH_INTERVAL_HOURS,
     note_workers=DEFAULT_NOTE_WORKERS,
 ):
     """Sync a single site
@@ -596,6 +608,8 @@ def sync_site(
                                      stored modification timestamp.
         notes_active_limit: Maximum stale active orders to rotate per run, in
                             addition to orders changed in the current run.
+        notes_refresh_interval_hours: Minimum age before an unchanged active
+                                      order is eligible for note rotation.
         note_workers: Per-site order-note request concurrency.
     """
     if progress_callback: progress_callback(f"Connecting to {url}...")
@@ -666,6 +680,7 @@ def sync_site(
             connection=conn,
             changed_woo_ids=changed_woo_ids,
             active_limit=notes_active_limit,
+            active_refresh_interval_hours=notes_refresh_interval_hours,
             max_workers=note_workers,
             progress_callback=progress_callback,
         )

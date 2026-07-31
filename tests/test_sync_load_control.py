@@ -128,6 +128,33 @@ def test_note_state_table_is_committed_when_no_orders_are_selected():
     assert result["candidates"] == 0
 
 
+def test_recently_refreshed_active_orders_wait_for_stale_interval():
+    conn = make_note_db()
+    conn.executescript(
+        """
+        CREATE TABLE order_note_sync_state (
+            order_id TEXT PRIMARY KEY,
+            last_synced_at TEXT NOT NULL
+        );
+        INSERT INTO order_note_sync_state
+        SELECT id, datetime('now') FROM orders;
+        """
+    )
+    wcapi = FakeWCAPI()
+
+    result = sync_utils.sync_order_notes(
+        wcapi,
+        "https://store.example",
+        connection=conn,
+        changed_woo_ids=[104],
+        active_limit=25,
+        active_refresh_interval_hours=24,
+    )
+
+    assert result["candidates"] == 1
+    assert [path for path, _ in wcapi.paths] == ["orders/104/notes"]
+
+
 def test_sync_site_defaults_to_checkpoint_with_overlap(monkeypatch):
     conn = sqlite3.connect(":memory:")
     wcapi = object()
@@ -159,6 +186,7 @@ def test_sync_site_defaults_to_checkpoint_with_overlap(monkeypatch):
     assert modified_fetch.call_args.args[2] == "2026-07-31T09:50:00"
     assert note_sync.call_args.kwargs["changed_woo_ids"] == [201, 202]
     assert note_sync.call_args.kwargs["active_limit"] == 25
+    assert note_sync.call_args.kwargs["active_refresh_interval_hours"] == 24
     assert note_sync.call_args.kwargs["max_workers"] == 1
     assert result["updated_orders"] == 2
     assert result["notes_checked"] == 2
