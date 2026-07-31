@@ -2,13 +2,13 @@
 """
 Auto-sync script for cron execution.
 This script is called by cron to automatically sync all sites.
-Optimized: uses ThreadPoolExecutor for concurrent sync (max 4 workers).
+Runs sites sequentially with incremental checkpoints and bounded note refreshes.
 """
 import sqlite3
-import json
 import threading
+import fcntl
+import time
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 import os
 
@@ -18,7 +18,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sync_utils
 
 DB_FILE = 'woocommerce_orders.db'
-MAX_WORKERS = 4
+MAX_SITE_CONCURRENCY = 1
+INTER_SITE_DELAY_SECONDS = 1
+INCREMENTAL_OVERLAP_MINUTES = 10
+NOTES_ACTIVE_LIMIT = 25
+NOTE_WORKERS = 1
+LOCK_FILE = '/tmp/woo-analysis-auto-sync.lock'
 
 # 线程安全的打印锁
 _print_lock = threading.Lock()
@@ -52,7 +57,7 @@ def sync_one_site(site):
     consumer_key = site['consumer_key']
     consumer_secret = site['consumer_secret']
     
-    safe_print(f"[Thread] Syncing: {site_url}")
+    safe_print(f"[Site] Syncing: {site_url}")
     
     start_time = datetime.now()
     
@@ -64,7 +69,11 @@ def sync_one_site(site):
             site_url,
             consumer_key,
             consumer_secret,
-            progress_callback
+            progress_callback,
+            sync_days=0,
+            incremental_overlap_minutes=INCREMENTAL_OVERLAP_MINUTES,
+            notes_active_limit=NOTES_ACTIVE_LIMIT,
+            note_workers=NOTE_WORKERS,
         )
         
         duration = int((datetime.now() - start_time).total_seconds())
@@ -79,7 +88,10 @@ def sync_one_site(site):
             
             log_sync(
                 site_id, site_url, 'success',
-                f"Synced successfully: {result.get('new_orders', 0)} new, {result.get('updated_orders', 0)} updated",
+                f"Synced successfully: {result.get('new_orders', 0)} new, "
+                f"{result.get('updated_orders', 0)} updated, "
+                f"{result.get('notes_checked', 0)} notes checked, "
+                f"{result.get('note_failures', 0)} note failures",
                 result.get('new_orders', 0), result.get('updated_orders', 0), duration
             )
             safe_print(f"  [{site_url}] ✓ Success ({duration}s)")
@@ -95,8 +107,11 @@ def sync_one_site(site):
         safe_print(f"  [{site_url}] ✗ Exception: {e}")
         return {'site_url': site_url, 'status': 'error', 'duration': duration}
 
-def main():
-    safe_print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto-sync started (max {MAX_WORKERS} concurrent)")
+def run_sync_batch():
+    safe_print(
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+        f"Auto-sync started (site concurrency {MAX_SITE_CONCURRENCY})"
+    )
     
     conn = get_db_connection()
     sites = conn.execute('SELECT * FROM sites').fetchall()
@@ -109,16 +124,14 @@ def main():
     safe_print(f"Total sites: {len(sites)}")
     
     results = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(sync_one_site, site): site for site in sites}
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                site = futures[future]
-                safe_print(f"  [{site['url']}] ✗ Future exception: {e}")
-                results.append({'site_url': site['url'], 'status': 'error', 'duration': 0})
+    for index, site in enumerate(sites):
+        try:
+            results.append(sync_one_site(site))
+        except Exception as e:
+            safe_print(f"  [{site['url']}] ✗ Sync exception: {e}")
+            results.append({'site_url': site['url'], 'status': 'error', 'duration': 0})
+        if index + 1 < len(sites):
+            time.sleep(INTER_SITE_DELAY_SECONDS)
     
     # 输出汇总
     success_count = sum(1 for r in results if r['status'] == 'success')
@@ -164,6 +177,27 @@ def main():
             conn.close()
     except Exception as e:
         safe_print(f"[auto-confirm] enforcement failed: {e}")
+
+
+def main():
+    """Run one batch only; skip safely if an earlier batch is still active."""
+    lock_handle = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        safe_print(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            "Auto-sync skipped: another batch is still running"
+        )
+        lock_handle.close()
+        return
+
+    try:
+        run_sync_batch()
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
 
 if __name__ == '__main__':
     main()

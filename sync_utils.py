@@ -4,7 +4,7 @@ import time
 import sqlite3
 import threading
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 from woocommerce import API
 from oid_utils import make_oid, site_id_for_source, woo_post_id  # cross-site-safe surrogate order id
 
@@ -13,6 +13,32 @@ DB_FILE = 'woocommerce_orders.db'
 
 # Proxy configuration (optional)
 PROXY_CONFIG = {}
+
+DEFAULT_INCREMENTAL_OVERLAP_MINUTES = 10
+DEFAULT_NOTES_ACTIVE_LIMIT = 25
+DEFAULT_NOTE_WORKERS = 1
+
+
+def _subtract_minutes_from_iso(value, minutes):
+    """Return an ISO timestamp moved backwards by ``minutes``.
+
+    WooCommerce returns site-local ISO timestamps, sometimes with an explicit
+    offset and sometimes without one.  Preserve that shape so the next API
+    request is interpreted in the same site timezone.  A small overlap avoids
+    missing orders that changed at the exact checkpoint timestamp.
+    """
+    if not value:
+        return None
+    try:
+        raw = str(value).strip()
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        shifted = parsed - timedelta(minutes=max(0, int(minutes or 0)))
+        result = shifted.isoformat(timespec="seconds")
+        if raw.endswith("Z") and result.endswith("+00:00"):
+            result = result[:-6] + "Z"
+        return result
+    except (TypeError, ValueError):
+        return value
 
 
 def _flag_enabled(conn, key):
@@ -358,65 +384,144 @@ def fetch_orders_modified_after(wcapi, site_url, modified_after=None, progress_c
                 
     return orders
 
-def sync_order_notes(wcapi, site_url, connection=None):
-    """Fetch and sync order notes for active orders.
+def sync_order_notes(
+    wcapi,
+    site_url,
+    connection=None,
+    changed_woo_ids=None,
+    active_limit=DEFAULT_NOTES_ACTIVE_LIMIT,
+    max_workers=DEFAULT_NOTE_WORKERS,
+    progress_callback=None,
+):
+    """Refresh notes for changed orders plus a bounded active-order rotation.
 
-    The WC REST API requires the internal post ID (orders.id), not the
-    customer-facing order number. Sites that use the Sequential Order Numbers
-    plugin (vapeprimeau.com, vapego.pl, …) have number != id, so calling
-    /orders/{number}/notes returns 404. Always use orders.id for the API call.
+    The old hourly path fetched notes for every active order, using five note
+    workers inside each of four concurrent site workers. This bounded rotation
+    keeps changed orders fresh without flooding small WooCommerce servers.
     """
+    result = {"candidates": 0, "synced": 0, "failed": 0, "notes": 0}
     if not connection:
-        return
+        return result
 
     try:
         cursor = connection.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_note_sync_state (
+                order_id TEXT PRIMARY KEY,
+                last_synced_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
 
-        # The WC REST API needs the raw post id (woo_id); the local order_id is
-        # the cross-site surrogate. Select both: call the API with woo_id, store
-        # notes under the surrogate id.
-        cursor.execute('''
-            SELECT id, woo_id
-            FROM orders
-            WHERE source = ? AND status IN ('processing', 'offline', 'on-hold')
-        ''', (site_url,))
+        candidates = {}
+        changed_ids = []
+        for value in changed_woo_ids or []:
+            try:
+                changed_ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
 
-        active_orders = [(row[0], row[1]) for row in cursor.fetchall()]
+        # SQLite commonly limits a statement to 999 bound parameters.
+        for start in range(0, len(changed_ids), 500):
+            chunk = changed_ids[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            cursor.execute(
+                f"""
+                SELECT id, woo_id
+                FROM orders
+                WHERE source = ? AND woo_id IN ({placeholders})
+                """,
+                (site_url, *chunk),
+            )
+            for oid, woo_id in cursor.fetchall():
+                candidates[str(oid)] = (oid, woo_id)
 
-        if not active_orders:
-            return
+        if active_limit is None:
+            limit_clause = ""
+            params = (site_url,)
+        else:
+            limit_clause = "LIMIT ?"
+            params = (site_url, max(0, int(active_limit)))
+
+        if active_limit is None or int(active_limit) > 0:
+            cursor.execute(
+                f"""
+                SELECT o.id, o.woo_id
+                FROM orders AS o
+                LEFT JOIN order_note_sync_state AS s
+                  ON s.order_id = CAST(o.id AS TEXT)
+                WHERE o.source = ?
+                  AND o.status IN ('processing', 'offline', 'on-hold')
+                ORDER BY
+                  CASE WHEN s.last_synced_at IS NULL THEN 0 ELSE 1 END,
+                  COALESCE(s.last_synced_at, '') ASC,
+                  COALESCE(o.date_modified, '') DESC
+                {limit_clause}
+                """,
+                params,
+            )
+            for oid, woo_id in cursor.fetchall():
+                candidates.setdefault(str(oid), (oid, woo_id))
+
+        selected = list(candidates.values())
+        result["candidates"] = len(selected)
+        if not selected:
+            return result
+
+        if progress_callback:
+            progress_callback(
+                f"Refreshing notes for {len(selected)} orders "
+                f"(changed={len(changed_ids)}, active_cap={active_limit})..."
+            )
 
         def fetch_notes_for_order(oid, woo_id):
             wc_pid = woo_id if woo_id is not None else woo_post_id(oid)
-            try:
-                response = wcapi.get(f"orders/{wc_pid}/notes")
-                if response.status_code == 200:
-                    notes_data = response.json()
-                    for note in notes_data:
-                        note['_local_order_id'] = oid
-                    return notes_data
-            except Exception as e:
-                print(f"Error fetching notes for order {oid}: {e}")
-            return []
+            for attempt in range(3):
+                try:
+                    response = wcapi.get(f"orders/{wc_pid}/notes")
+                    if response.status_code == 200:
+                        notes_data = response.json()
+                        for note in notes_data:
+                            note["_local_order_id"] = oid
+                        return oid, notes_data, True
+                    if response.status_code not in {429, 502, 503, 504}:
+                        break
+                except Exception as exc:
+                    if attempt == 2:
+                        print(f"Error fetching notes for order {oid}: {exc}")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+            return oid, [], False
+
+        fetched = []
+        workers = max(1, int(max_workers or 1))
+        if workers == 1:
+            for oid, woo_id in selected:
+                fetched.append(fetch_notes_for_order(oid, woo_id))
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(fetch_notes_for_order, oid, woo_id)
+                    for oid, woo_id in selected
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    fetched.append(future.result())
 
         all_notes = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_order = {executor.submit(fetch_notes_for_order, oid, woo_id): oid
-                               for oid, woo_id in active_orders}
-
-            for future in concurrent.futures.as_completed(future_to_order):
-                order_id = future_to_order[future]
-                try:
-                    notes = future.result()
-                    if notes:
-                        all_notes.extend(notes)
-                except Exception as exc:
-                    print(f'{order_id} generated an exception: {exc}')
+        successful_order_ids = []
+        for oid, notes, success in fetched:
+            if success:
+                successful_order_ids.append(
+                    (str(oid), datetime.now().isoformat(timespec="seconds"))
+                )
+                result["synced"] += 1
+                all_notes.extend(notes)
+            else:
+                result["failed"] += 1
 
         if all_notes:
-            # Dedupe by (order_id, wc_note_id). WC note IDs are per-site auto-increment
-            # so they collide across sites — using them as the local PK silently
-            # overwrites notes from earlier-synced sites.
             insert_query = """
             INSERT INTO order_notes (
                 wc_note_id, order_id, note, date_created, customer_note, author, added_by_user
@@ -436,39 +541,62 @@ def sync_order_notes(wcapi, site_url, connection=None):
                     ELSE excluded.added_by_user
                 END
             """
-
             processed_notes = []
             for note in all_notes:
-                local_order_id = note['_local_order_id']
-                added_by_user = 1 if note.get('added_by_user', False) else 0
-                customer_note = 1 if note.get('customer_note', False) else 0
-
                 processed_notes.append((
-                    note.get('id'),
-                    local_order_id,
-                    note.get('note', ''),
-                    note.get('date_created', ''),
-                    customer_note,
-                    note.get('author', ''),
-                    added_by_user
+                    note.get("id"),
+                    note["_local_order_id"],
+                    note.get("note", ""),
+                    note.get("date_created", ""),
+                    1 if note.get("customer_note", False) else 0,
+                    note.get("author", ""),
+                    1 if note.get("added_by_user", False) else 0,
                 ))
+            cursor.executemany(insert_query, processed_notes)
+            result["notes"] = len(processed_notes)
 
-            if processed_notes:
-                cursor.executemany(insert_query, processed_notes)
-                connection.commit()
+        if successful_order_ids:
+            cursor.executemany(
+                """
+                INSERT INTO order_note_sync_state (order_id, last_synced_at)
+                VALUES (?, ?)
+                ON CONFLICT(order_id) DO UPDATE SET
+                    last_synced_at = excluded.last_synced_at
+                """,
+                successful_order_ids,
+            )
+        connection.commit()
+        return result
 
-    except Exception as e:
-        print(f"Error syncing order notes: {e}")
+    except Exception as exc:
+        print(f"Error syncing order notes: {exc}")
+        result["failed"] += 1
+        return result
 
-def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_days=7, full_history=False):
+def sync_site(
+    url,
+    consumer_key,
+    consumer_secret,
+    progress_callback=None,
+    sync_days=0,
+    full_history=False,
+    incremental_overlap_minutes=DEFAULT_INCREMENTAL_OVERLAP_MINUTES,
+    notes_active_limit=DEFAULT_NOTES_ACTIVE_LIMIT,
+    note_workers=DEFAULT_NOTE_WORKERS,
+):
     """Sync a single site
 
     Args:
-        sync_days: Only sync orders modified in the last N days.
-                   Set to 0 or None for sync from last known order date.
+        sync_days: Optional legacy lookback in days. The default uses the last
+                   stored modification timestamp with a small safety overlap.
         full_history: When True, ignore all local cutoffs and fetch every order
                       page from the WooCommerce API. Use this for first-time
                       sync of a site or when local DB is missing historical data.
+        incremental_overlap_minutes: Re-read this many minutes before the last
+                                     stored modification timestamp.
+        notes_active_limit: Maximum stale active orders to rotate per run, in
+                            addition to orders changed in the current run.
+        note_workers: Per-site order-note request concurrency.
     """
     if progress_callback: progress_callback(f"Connecting to {url}...")
 
@@ -480,53 +608,80 @@ def sync_site(url, consumer_key, consumer_secret, progress_callback=None, sync_d
     conn = get_thread_db_connection()
 
     try:
-        # Calculate time window for modified_after
-        modified_after = None
+        new_orders = []
+        updated_orders = []
+
         if full_history:
-            # No cutoff at all — fetch every page
-            modified_after = None
             if progress_callback:
                 progress_callback("Full history sync (no date filter)...")
+            new_orders = fetch_orders_incrementally(
+                wcapi,
+                url,
+                None,
+                progress_callback,
+                connection=conn,
+            )
         elif sync_days and sync_days > 0:
-            from datetime import timedelta
             cutoff_date = datetime.now() - timedelta(days=sync_days)
             modified_after = cutoff_date.strftime("%Y-%m-%dT00:00:00")
             if progress_callback:
                 progress_callback(f"Syncing orders modified in last {sync_days} days...")
+            updated_orders = fetch_orders_modified_after(
+                wcapi,
+                url,
+                modified_after,
+                progress_callback,
+                connection=conn,
+            )
         else:
-            # Full sync: use last modified date from DB
-            modified_after = get_last_modified_date_from_db(url)
+            checkpoint = get_last_modified_date_from_db(url)
+            modified_after = _subtract_minutes_from_iso(
+                checkpoint,
+                incremental_overlap_minutes,
+            )
             if progress_callback:
                 if modified_after:
-                    progress_callback(f"Full sync from {modified_after}...")
+                    progress_callback(
+                        f"Incremental sync from {modified_after} "
+                        f"({incremental_overlap_minutes}m overlap)..."
+                    )
                 else:
-                    progress_callback("Full sync (all history)...")
+                    progress_callback("No local checkpoint; fetching full history once...")
+            updated_orders = fetch_orders_modified_after(
+                wcapi,
+                url,
+                modified_after,
+                progress_callback,
+                connection=conn,
+            )
 
-        # 1. Fetch new orders (only for first-time sync or when no cutoff)
-        new_orders = []
-        if full_history or not sync_days or sync_days <= 0:
-            last_order_date = None if full_history else get_last_order_date_from_db(url)
-            if progress_callback:
-                if last_order_date:
-                    progress_callback(f"Fetching new orders after {last_order_date}...")
-                else:
-                    progress_callback("First time sync (full history)...")
-            new_orders = fetch_orders_incrementally(wcapi, url, last_order_date, progress_callback, connection=conn)
-        
-        # 2. Fetch updated orders (within time window)
-        updated_orders = fetch_orders_modified_after(wcapi, url, modified_after, progress_callback, connection=conn)
-        
-        # 3. Sync order notes for active orders
-        if progress_callback: progress_callback("Syncing order notes...")
-        sync_order_notes(wcapi, url, connection=conn)
-        
-        msg = f"Sync complete. New: {len(new_orders)}, Updated: {len(updated_orders)}"
+        changed_woo_ids = [
+            order.get("id")
+            for order in (new_orders + updated_orders)
+            if order.get("id") is not None
+        ]
+        note_result = sync_order_notes(
+            wcapi,
+            url,
+            connection=conn,
+            changed_woo_ids=changed_woo_ids,
+            active_limit=notes_active_limit,
+            max_workers=note_workers,
+            progress_callback=progress_callback,
+        )
+
+        msg = (
+            f"Sync complete. New: {len(new_orders)}, Updated: {len(updated_orders)}, "
+            f"Notes checked: {note_result['synced']}, note failures: {note_result['failed']}"
+        )
         if progress_callback: progress_callback(msg)
         
         return {
-            "status": "success", 
-            "new_orders": len(new_orders), 
-            "updated_orders": len(updated_orders)
+            "status": "success",
+            "new_orders": len(new_orders),
+            "updated_orders": len(updated_orders),
+            "notes_checked": note_result["synced"],
+            "note_failures": note_result["failed"],
         }
     except Exception as e:
         if progress_callback: progress_callback(f"Critical Error: {str(e)}")
