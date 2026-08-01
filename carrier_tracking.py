@@ -9,11 +9,14 @@ Other carriers can still use Track718 auto-detection in the on-demand UI path.
 This module does pure lookups: no DB access, no writes. The resolver
 (resolve_outcomes.py) owns all DB side effects and policy.
 """
+import html
+import re
 import time
 
 import requests
 
 INPOST_TRACKING_URL = "https://api-shipx-pl.easypack24.net/v1/tracking/{number}"
+EXPRESSONE_HU_TRACKING_URL = "https://tracking.expressone.hu/?plc_number={number}"
 _HEADERS = {"User-Agent": "woo-analysis-tracker/1.0", "Accept": "application/json"}
 
 # Map InPost ShipX raw status -> our outcome category.
@@ -34,7 +37,7 @@ INPOST_STATUS_MAP = {
 }
 
 
-def classify_carrier(provider, tracking_number=None):
+def classify_carrier(provider, tracking_number=None, destination_country=None):
     """Decide which carrier a shipment belongs to.
 
     Prefer the plugin-stored provider (AST '_wc_shipment_tracking_items'.
@@ -47,6 +50,8 @@ def classify_carrier(provider, tracking_number=None):
     p = (provider or '').lower()
     if 'inpost' in p or 'paczko' in p:
         return 'inpost'
+    if 'packeta-hu' in p or 'expressone' in p or 'express one' in p:
+        return 'expressone_hu'
     if 'packeta' in p or 'zasilkovna' in p or 'zásilkovna' in p:
         return 'packeta'
     if 'dpd' in p:
@@ -57,6 +62,8 @@ def classify_carrier(provider, tracking_number=None):
         return 'unknown'
     # No useful provider → guess by number FORMAT.
     raw = (tracking_number or '').strip()
+    if str(destination_country or '').strip().upper() == 'HU' and raw.isdigit() and len(raw) >= 20:
+        return 'expressone_hu'
     if len(raw) == 11 and raw[:1].upper() == 'Z' and raw[1:].isdigit():
         return 'packeta'
     digits = ''.join(ch for ch in raw if ch.isdigit())
@@ -65,6 +72,110 @@ def classify_carrier(provider, tracking_number=None):
     if 11 <= len(digits) <= 16:            # DPD-PL = ~13 digits (often + trailing letter)
         return 'dpd'
     return 'unknown'
+
+
+def _plain_html(value):
+    """Convert one small HTML cell to normalized plain text."""
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def _expressone_outcome(events):
+    combined = " ".join(
+        f"{event.get('code', '')} {event.get('status', '')}" for event in events
+    ).lower()
+    if any(value in combined for value in (
+        "sikeresen kézbesítve", "kézbesítve", "delivered", " pod ",
+    )):
+        return "delivered"
+    if any(value in combined for value in (
+        "visszaküld", "visszáru", "return", "refused", "megtagad",
+    )):
+        return "returned"
+    if any(value in combined for value in (
+        "sikertelen", "kézbesíthetetlen", "hiba", "címzett ismeretlen",
+    )):
+        return "attention"
+    return "in_transit" if events else "unknown"
+
+
+def expressone_hu_detail(tracking_number, timeout=15, session=None):
+    """Read the public Express One Hungary tracking page.
+
+    Packeta parcels delivered in Hungary can receive an Express One PLC number.
+    The public page is synchronous and does not require credentials, so it is
+    the authoritative first lookup for the ``packeta-hu`` carrier.  We parse
+    only the dated delivery-history table and never submit or mutate data.
+    """
+    number = (tracking_number or "").strip()
+    if not number:
+        return {"ok": False, "error": "empty", "events": [], "outcome": "unknown"}
+    getter = session or requests
+    try:
+        response = getter.get(
+            EXPRESSONE_HU_TRACKING_URL.format(number=number),
+            headers=_HEADERS,
+            timeout=timeout,
+        )
+    except requests.exceptions.Timeout:
+        return {"ok": False, "error": "timeout", "events": [], "outcome": "unknown"}
+    except requests.exceptions.RequestException as exc:
+        return {
+            "ok": False,
+            "error": "conn",
+            "detail": str(exc),
+            "events": [],
+            "outcome": "unknown",
+        }
+    if response.status_code == 404:
+        return {"ok": False, "error": "http_404", "events": [], "outcome": "unknown"}
+    if response.status_code != 200:
+        return {
+            "ok": False,
+            "error": f"http_{response.status_code}",
+            "events": [],
+            "outcome": "unknown",
+        }
+
+    source = response.text or ""
+    events = []
+    section_pattern = re.compile(
+        r'<div\s+class="headline"[^>]*>\s*<h5>\s*<span>(\d{4}-\d{2}-\d{2})</span>.*?</div>'
+        r'\s*<table[^>]*>(.*?)</table>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    row_pattern = re.compile(r"<tr[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
+    cell_pattern = re.compile(r"<td[^>]*>(.*?)</td>", re.IGNORECASE | re.DOTALL)
+    for date_value, table_html in section_pattern.findall(source):
+        for row_html in row_pattern.findall(table_html):
+            cells = [_plain_html(value) for value in cell_pattern.findall(row_html)]
+            if len(cells) < 3 or not re.fullmatch(r"\d{2}:\d{2}:\d{2}", cells[0]):
+                continue
+            events.append({
+                "time": f"{date_value} {cells[0]}",
+                "code": cells[1],
+                "status": cells[2],
+            })
+    events.sort(key=lambda event: event["time"], reverse=True)
+    outcome = _expressone_outcome(events)
+    if not events:
+        # A valid tracking page without a history table means the parcel is
+        # either too new or the number is unknown. Keep this non-terminal.
+        return {
+            "ok": False,
+            "error": "no_info",
+            "events": [],
+            "outcome": "unknown",
+            "official_url": EXPRESSONE_HU_TRACKING_URL.format(number=number),
+        }
+    return {
+        "ok": True,
+        "error": None,
+        "carrier": "expressone-hu",
+        "events": events,
+        "outcome": outcome,
+        "official_url": EXPRESSONE_HU_TRACKING_URL.format(number=number),
+    }
 
 
 def inpost_status(tracking_number, timeout=12, session=None):
@@ -276,6 +387,8 @@ def lookup(carrier, tracking_number, key=None, **kw):
     return error='no_info' (retry shortly)."""
     if carrier == 'inpost':
         return inpost_status(tracking_number, **kw)
+    if carrier == 'expressone_hu':
+        return expressone_hu_detail(tracking_number, **kw)
     code = track718_code_for(carrier)
     if code:
         if not key:

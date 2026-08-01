@@ -16006,6 +16006,35 @@ def user_preferences_api():
 
 # ============== SHIPPING MANAGEMENT ==============
 
+def _manual_partner_only_warehouse_scope(conn, user_id, permission='can_view'):
+    """Whether a user is explicitly limited to the legacy Poland partner.
+
+    This is used as a defence-in-depth guard while managed-family orders are
+    waiting for the asynchronous fulfillment planner. Administrators without
+    explicit warehouse rows remain unrestricted.
+    """
+    if permission not in {'can_view', 'can_ship'}:
+        raise ValueError('unsupported warehouse permission')
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='oms_warehouse_user_permissions'"
+    ).fetchone():
+        return False
+    rows = conn.execute(
+        f'''SELECT p.warehouse_id, p.{permission} AS allowed,
+                   COALESCE(wi.provider,'internal') AS provider,
+                   COALESCE(wi.inventory_authority,'local') AS inventory_authority
+            FROM oms_warehouse_user_permissions p
+            LEFT JOIN oms_warehouse_integrations wi ON wi.warehouse_id=p.warehouse_id
+            WHERE p.user_id=?''',
+        (user_id,),
+    ).fetchall()
+    allowed = [row for row in rows if row['allowed']]
+    return bool(rows) and bool(allowed) and all(
+        row['inventory_authority'] == 'manual_partner'
+        and row['provider'] not in {'poland_wms', 'hungary_wms'}
+        for row in allowed
+    )
+
 @app.route('/shipping')
 @login_required
 @shipping_view_required
@@ -16509,7 +16538,9 @@ def get_pending_orders():
     fulfillment_state_map = {}
     fulfillment_products_map = {}
     fulfillment_warehouses_map = {}
+    preplan_products_map = {}
     explicit_warehouse_scope = False
+    manual_partner_only = False
     if orders and conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='oms_order_fulfillment_state'"
     ).fetchone():
@@ -16528,6 +16559,9 @@ def get_pending_orders():
             (current_user.id,),
         ).fetchall()
         explicit_warehouse_scope = bool(permission_rows) and getattr(current_user, 'username', None) != 'admin'
+        manual_partner_only = _manual_partner_only_warehouse_scope(
+            conn, current_user.id, 'can_view'
+        )
         allowed_warehouse_ids = [r['warehouse_id'] for r in permission_rows if r['can_view']]
         fulfillment_query = f'''SELECT f.id, f.order_id, f.warehouse_id, w.name AS warehouse_name
                                 FROM oms_fulfillments f
@@ -16571,6 +16605,28 @@ def get_pending_orders():
             visible_order_ids = set(fulfillment_warehouses_map)
             orders = [o for o in orders if o['id'] not in fulfillment_state_map or o['id'] in visible_order_ids]
 
+        # A just-synced order may be visible for a few seconds before the
+        # planner creates oms_order_fulfillment_state.  Never expose one of the
+        # reserved WMS product families to operators who are scoped only to the
+        # legacy Poland partner.  Mixed orders retain only their legacy items;
+        # managed-only orders disappear until their WMS fulfillment is ready.
+        if manual_partner_only:
+            from fulfillment_service import managed_product_family
+            visible_orders = []
+            for order in orders:
+                if order['id'] in fulfillment_state_map:
+                    visible_orders.append(order)
+                    continue
+                raw_items = parse_json_field(order['line_items']) or []
+                visible_items = [
+                    item for item in raw_items
+                    if not managed_product_family(conn, item)
+                ]
+                preplan_products_map[order['id']] = visible_items
+                if visible_items:
+                    visible_orders.append(order)
+            orders = visible_orders
+
     # Parcels already shipped for these orders (split shipment / 分批发货).
     # shipping_logs is local-only and untouched by sync, so a partial order
     # keeps its 'processing' status and stays in this queue; the parcel rows
@@ -16601,7 +16657,12 @@ def get_pending_orders():
     for order in orders:
         billing = parse_json_field(order['billing'])
         shipping_info = parse_json_field(order['shipping'])
-        line_items = fulfillment_products_map.get(order['id']) or parse_json_field(order['line_items'])
+        if order['id'] in fulfillment_products_map:
+            line_items = fulfillment_products_map[order['id']]
+        elif order['id'] in preplan_products_map:
+            line_items = preplan_products_map[order['id']]
+        else:
+            line_items = parse_json_field(order['line_items'])
         shipping_lines = parse_json_field(order['shipping_lines'])
         shipping_method = shipping_lines[0].get('method_title', 'Unknown') if shipping_lines and len(shipping_lines) > 0 else ''
 
@@ -17185,6 +17246,10 @@ def _ast_provider_for_carrier(carrier_slug):
         'dpd': 'dpd-pl',  # our 'dpd' carrier row stores the PL tracking URL
         'auspost': 'australia-post',
         'australia_post': 'australia-post',
+        # AST does not have a stable Packeta -> Express One HU provider.  A
+        # custom record preserves the exact official last-mile URL instead of
+        # sending customers to Czech Packeta tracking.
+        'packeta-hu': 'custom',
     }
     return aliases.get(cs, cs or 'custom')
 
@@ -17279,11 +17344,19 @@ def build_ast_tracking_items(parcels, line_items):
         if not tn:
             continue
         ds = str(p.get('date_shipped') or int(time.time()))
+        carrier_slug = (p.get('carrier_slug') or '').lower().strip()
+        tracking_template = p.get('tracking_url_template') or ''
+        custom_link = ''
+        if carrier_slug == 'packeta-hu' and tracking_template:
+            custom_link = tracking_template.replace('{tracking}', tn).replace('{tracking_number}', tn)
         items.append({
             'tracking_number': tn,
             'shipping_note': '',
-            'tracking_provider': _ast_provider_for_carrier(p.get('carrier_slug')),
-            'custom_tracking_link': '',
+            'tracking_provider': _ast_provider_for_carrier(carrier_slug),
+            'custom_tracking_provider': (
+                p.get('carrier_name') or 'Packeta / Express One（匈牙利）'
+            ) if carrier_slug == 'packeta-hu' else '',
+            'custom_tracking_link': custom_link,
             'tracking_product_code': '',
             'date_shipped': ds,
             'products_list': products,
@@ -17429,6 +17502,21 @@ def ship_order():
     if not order:
         conn.close()
         return jsonify({'success': False, 'error': '订单不存在'}), 404
+
+    # Defence in depth for stale browser tabs or direct API calls.  The legacy
+    # partner must never ship an order containing one of the four WMS-managed
+    # product families, even during the short pre-planning window.
+    if _manual_partner_only_warehouse_scope(conn, current_user.id, 'can_ship'):
+        from fulfillment_service import managed_product_family
+        if any(
+            managed_product_family(conn, item)
+            for item in (parse_json_field(order['line_items']) or [])
+        ):
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': '订单含新波兰仓/匈牙利仓专仓商品，请在「多仓履约」处理；SKU 未映射前不可发货'
+            }), 409
 
     if conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='oms_order_fulfillment_state'"
@@ -18192,6 +18280,8 @@ def get_carriers_for_site():
     site = conn.execute('SELECT country FROM sites WHERE url = ?', (source,)).fetchone()
     required_slugs_by_country = {
         'AU': ('australia-post', 'ems'),
+        'CZ': ('packeta',),
+        'HU': ('packeta-hu',),
     }
     if site and site['country'] in required_slugs_by_country:
         present = {c['slug'] for c in carriers}
@@ -18958,8 +19048,12 @@ def order_carrier_status(order_id):
     import requests as req
     import carrier_tracking as ct
     conn = get_db_connection()
-    order = conn.execute('SELECT id, number, meta_data, line_items, shipping_lines FROM orders WHERE id=?',
-                         (order_id,)).fetchone()
+    order = conn.execute(
+        '''SELECT o.id, o.number, o.source, o.meta_data, o.line_items,
+                  o.shipping_lines, s.country AS destination_country
+           FROM orders o LEFT JOIN sites s ON s.url=o.source WHERE o.id=?''',
+        (order_id,),
+    ).fetchone()
     if not order:
         conn.close()
         return jsonify({'success': False, 'error': '订单不存在'}), 404
@@ -19003,7 +19097,29 @@ def order_carrier_status(order_id):
     if not number:
         return jsonify({'success': False, 'error': '该订单没有运单号'}), 404
 
-    carrier = ct.classify_carrier(provider, number)
+    carrier = ct.classify_carrier(provider, number, order['destination_country'])
+    if carrier == 'expressone_hu':
+        res = ct.expressone_hu_detail(number)
+        _persist_carrier_status(order_id, res.get('outcome'))
+        if res.get('events'):
+            return jsonify({
+                'success': True,
+                'carrier': 'Packeta / Express One（匈牙利）',
+                'tracking_number': number,
+                'outcome': res.get('outcome', 'unknown'),
+                'events': res['events'],
+                'official_url': res.get('official_url'),
+                'note': '来自 Express One 匈牙利官网',
+            })
+        return jsonify({
+            'success': True,
+            'carrier': 'Packeta / Express One（匈牙利）',
+            'tracking_number': number,
+            'outcome': res.get('outcome', 'unknown'),
+            'events': [],
+            'official_url': res.get('official_url'),
+            'note': 'Express One 暂无轨迹，请稍后再查或点「官网」核对',
+        })
     if carrier == 'inpost':
         try:
             r = req.get(f"https://api-shipx-pl.easypack24.net/v1/tracking/{number}",
@@ -19048,12 +19164,21 @@ def order_carrier_status(order_id):
     # any other carrier (EMS/中国邮政, Australia Post, GLS, …) via auto-detect.
     if not key718:
         return jsonify({'success': False, 'error': '未配置 Track718 key'}), 400
-    res = ct.track718_detail(number, key718, code=('dpd-pl' if carrier == 'dpd' else None), poll=8, poll_wait=3)
+    carrier_code = (
+        'dpd-pl' if carrier == 'dpd'
+        else ct.TRACK718_PACKETA if carrier == 'packeta'
+        else None
+    )
+    res = ct.track718_detail(number, key718, code=carrier_code, poll=8, poll_wait=3)
     _persist_carrier_status(order_id, res.get('outcome'))
     name_map = {'dpd-pl': 'DPD', 'china-post': '中国邮政/EMS', 'australia-post': 'Australia Post',
                 'inpost-paczkomaty': 'InPost', 'gls': 'GLS', 'poczta-polska': 'Poczta Polska'}
-    cname = 'DPD' if carrier == 'dpd' else name_map.get((res.get('carrier') or '').lower(),
-                                                         (res.get('carrier') or '物流').upper())
+    cname = (
+        'DPD' if carrier == 'dpd'
+        else 'Packeta' if carrier == 'packeta'
+        else name_map.get((res.get('carrier') or '').lower(),
+                          (res.get('carrier') or '物流').upper())
+    )
     if res.get('events'):
         return jsonify({'success': True, 'carrier': cname, 'tracking_number': number,
                         'outcome': res.get('outcome', 'unknown'), 'events': res['events']})

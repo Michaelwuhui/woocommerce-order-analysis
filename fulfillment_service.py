@@ -23,6 +23,15 @@ ACTIVE_ORDER_STATUSES = {"processing", "offline", "on-hold", "partial-shipped", 
 MANUAL_PARTNER_AVAILABLE = 2_147_483_647
 TRUE_VALUES = {"1", "true", "yes", "on"}
 EXCLUSIVE_SKU_ROUTING = "exclusive_mapped_skus"
+MANAGED_WMS_ROUTING = "managed_wms_skus"
+MANAGED_PRODUCT_ISOLATION_SETTING = "oms_managed_product_isolation_enabled"
+MANAGED_PRODUCT_FAMILIES_SETTING = "oms_managed_product_families"
+DEFAULT_MANAGED_PRODUCT_FAMILIES = (
+    "fumot-eco-4in1-80k",
+    "fumot-leopard-40k",
+    "fumot-randm-tornado-9000",
+    "fumot-randm-tornado-15000",
+)
 PLANNABLE_FULFILLMENT_STATUSES = {
     "planned",
     "ready_to_pick",
@@ -130,6 +139,73 @@ def _setting_enabled(
     if not row:
         return default
     return str(row["value"] or "").strip().lower() in TRUE_VALUES
+
+
+def _managed_family_codes(conn: sqlite3.Connection) -> set[str]:
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (MANAGED_PRODUCT_FAMILIES_SETTING,),
+    ).fetchone()
+    if not row or not row["value"]:
+        return set(DEFAULT_MANAGED_PRODUCT_FAMILIES)
+    try:
+        configured = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return set(DEFAULT_MANAGED_PRODUCT_FAMILIES)
+    if not isinstance(configured, list):
+        return set(DEFAULT_MANAGED_PRODUCT_FAMILIES)
+    return {str(value).strip().lower() for value in configured if str(value).strip()}
+
+
+def managed_product_family(conn: sqlite3.Connection, item: dict) -> str | None:
+    """Return the reserved fulfillment family for a WooCommerce order line.
+
+    These four families belong to managed WMS warehouses even before their
+    variant-level SKU/barcode mapping is complete.  A positive match prevents
+    the legacy Poland partner fallback from claiming the item.  Matching is
+    deliberately narrow: brand/family terms plus an exact puff-count token are
+    required, so Tornado 9000 cannot accidentally match Tornado 90000.
+    """
+    if not _setting_enabled(conn, MANAGED_PRODUCT_ISOLATION_SETTING, default=False):
+        return None
+    enabled = _managed_family_codes(conn)
+    raw = " ".join(
+        str(item.get(key) or "") for key in ("name", "parent_name", "sku")
+    ).upper()
+    text = re.sub(r"[^A-Z0-9]+", " ", raw).strip()
+    compact = text.replace(" ", "")
+
+    def has_number(value: str) -> bool:
+        return bool(re.search(rf"(?<!\d){re.escape(value)}(?!\d)", raw))
+
+    if "fumot-eco-4in1-80k" in enabled:
+        if "FUMOT" in text and "ECO" in text and "4IN1" in compact and (
+            has_number("80000") or "80K" in text.split()
+        ):
+            return "fumot-eco-4in1-80k"
+    if "fumot-leopard-40k" in enabled:
+        if "FUMOT" in text and "LEOPARD" in text and (
+            has_number("40000") or "40K" in text.split()
+        ):
+            return "fumot-leopard-40k"
+    if "fumot-randm-tornado-9000" in enabled:
+        if "TORNADO" in text and ("RANDM" in text or "FUMOT" in text) and has_number("9000"):
+            return "fumot-randm-tornado-9000"
+    if "fumot-randm-tornado-15000" in enabled:
+        if "TORNADO" in text and ("RANDM" in text or "FUMOT" in text) and has_number("15000"):
+            return "fumot-randm-tornado-15000"
+    return None
+
+
+def order_contains_managed_product(conn: sqlite3.Connection, order_id: str) -> bool:
+    row = conn.execute("SELECT line_items FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not row:
+        return False
+    items = json_load(row["line_items"], []) or []
+    return any(
+        isinstance(item, dict) and managed_product_family(conn, item)
+        for item in items
+    )
 
 
 def _integration_config(value: Any) -> dict:
@@ -461,7 +537,8 @@ def sync_order_items(conn: sqlite3.Connection, order_id: str) -> list[dict]:
         active_keys.append(line_id)
         qty = int(item.get("quantity") or 0)
         sku_id = _resolve_sku(conn, site["id"], item)
-        if not sku_id:
+        reserved_family = managed_product_family(conn, item) if not sku_id else None
+        if not sku_id and not reserved_family:
             sku_id = _ensure_manual_partner_sku(
                 conn,
                 site["id"],
@@ -503,7 +580,13 @@ def sync_order_items(conn: sqlite3.Connection, order_id: str) -> list[dict]:
     ).fetchall()]
 
 
-def _candidate_warehouses(conn: sqlite3.Connection, market: str, sku_id: int) -> list[dict]:
+def _candidate_warehouses(
+    conn: sqlite3.Connection,
+    market: str,
+    sku_id: int,
+    *,
+    managed_family: bool = False,
+) -> list[dict]:
     explicit = conn.execute(
         '''SELECT sw.warehouse_id, wi.provider, wi.is_enabled, wi.config_json
            FROM oms_sku_warehouses sw
@@ -521,7 +604,32 @@ def _candidate_warehouses(conn: sqlite3.Connection, market: str, sku_id: int) ->
         if r["provider"] == "poland_wms"
         and _integration_config(r["config_json"]).get("routing_policy") == EXCLUSIVE_SKU_ROUTING
     }
-    if exclusive_ids:
+    managed_wms_marker = any(
+        r["provider"] == "poland_wms"
+        and _integration_config(r["config_json"]).get("routing_policy") == MANAGED_WMS_ROUTING
+        for r in explicit
+    )
+    if managed_family or managed_wms_marker:
+        # The four managed families may be stocked by both external WMS
+        # warehouses. They are exclusive only against the legacy manual
+        # Poland partner, not against each other. Market preference/cost then
+        # chooses between the enabled PL WMS and HU WMS candidates.
+        explicit_ids = {
+            r["warehouse_id"]
+            for r in explicit
+            if r["provider"] in {"poland_wms", "hungary_wms"}
+        }
+        if not _setting_enabled(conn, "oms_new_pl_wms_routing_enabled", default=False):
+            explicit_ids -= {
+                r["warehouse_id"] for r in explicit if r["provider"] == "poland_wms"
+            }
+        if not hungary_routing_enabled:
+            explicit_ids -= {
+                r["warehouse_id"] for r in explicit if r["provider"] == "hungary_wms"
+            }
+        if not explicit_ids:
+            return []
+    elif exclusive_ids:
         # An explicitly assigned new-Poland-WMS SKU must never silently leak
         # to the manual partner or Hungary.  Before go-live it remains a
         # visible shortage instead.
@@ -562,7 +670,9 @@ def _candidate_warehouses(conn: sqlite3.Connection, market: str, sku_id: int) ->
         if d["provider"] == "hungary_wms" and not hungary_routing_enabled:
             continue
         config = _integration_config(d.get("config_json"))
-        d["routing_policy"] = config.get("routing_policy")
+        d["routing_policy"] = (
+            MANAGED_WMS_ROUTING if managed_family else config.get("routing_policy")
+        )
         if d["provider"] == "poland_wms":
             if not _setting_enabled(conn, "oms_new_pl_wms_routing_enabled", default=False):
                 continue
@@ -891,14 +1001,23 @@ def plan_order(
                 "qty": qty, "reason": "sku_unmapped",
             })
             continue
-        candidates = _candidate_warehouses(conn, market, item["sku_id"])
+        raw_item = json_load(item.get("raw_json"), {}) or {}
+        reserved_family = managed_product_family(conn, raw_item)
+        candidates = _candidate_warehouses(
+            conn,
+            market,
+            item["sku_id"],
+            managed_family=bool(reserved_family),
+        )
         if not candidates:
             shortages.append({
                 "order_item_id": item["id"], "sku_id": item["sku_id"], "name": item["name"],
                 "qty": qty, "reason": "warehouse_mapping_missing",
             })
             continue
-        if candidates[0].get("routing_policy") == EXCLUSIVE_SKU_ROUTING:
+        if candidates[0].get("routing_policy") == MANAGED_WMS_ROUTING:
+            plan_reasons.add("managed_wms_route")
+        elif candidates[0].get("routing_policy") == EXCLUSIVE_SKU_ROUTING:
             plan_reasons.add("exclusive_sku_route")
         elif market == "CZ":
             plan_reasons.add("shipping_cost" if candidates[0].get("shipping_cost") is not None else "route_priority_fallback")

@@ -68,7 +68,20 @@ def _ast_provider(slug: str | None) -> str:
         "dpd": "dpd-pl",
         "auspost": "australia-post",
         "wms-auto": "custom",
+        "packeta-hu": "custom",
     }.get(value, value)
+
+
+def _tracking_url(conn, shipment: dict) -> str:
+    carrier = conn.execute(
+        "SELECT tracking_url FROM shipping_carriers WHERE slug=?",
+        (shipment.get("carrier_slug") or "",),
+    ).fetchone()
+    template = carrier["tracking_url"] if carrier else ""
+    tracking = str(shipment.get("tracking_number") or "")
+    return (template or "").replace("{tracking}", tracking).replace(
+        "{tracking_number}", tracking
+    )
 
 
 def _shipment_products(conn, shipment_id: str) -> list[dict]:
@@ -111,7 +124,7 @@ def _all_order_shipments(conn, order_id: str, revision: int) -> list[dict]:
     return result
 
 
-def _ast_items(shipments: list[dict]) -> list[dict]:
+def _ast_items(shipments: list[dict], conn=None) -> list[dict]:
     result = []
     for shipment in shipments:
         tracking = (shipment.get("tracking_number") or "").strip()
@@ -122,11 +135,19 @@ def _ast_items(shipments: list[dict]) -> list[dict]:
             date_shipped = str(int(time.mktime(time.strptime(shipped_at[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S"))))
         except Exception:
             date_shipped = str(int(time.time()))
+        carrier_slug = (shipment.get("carrier_slug") or "").lower().strip()
+        custom_tracking_link = (
+            _tracking_url(conn, shipment)
+            if carrier_slug == "packeta-hu" and conn is not None else ""
+        )
         result.append({
             "tracking_number": tracking,
             "shipping_note": "",
             "tracking_provider": _ast_provider(shipment.get("carrier_slug")),
-            "custom_tracking_link": "",
+            "custom_tracking_provider": (
+                shipment.get("carrier_name") or "Packeta / Express One（匈牙利）"
+            ) if carrier_slug == "packeta-hu" else "",
+            "custom_tracking_link": custom_tracking_link,
             "tracking_product_code": "",
             "date_shipped": date_shipped,
             "products_list": shipment.get("products") or [],
@@ -323,6 +344,7 @@ def _notify_shipment(conn, site, order, shipment: dict, fmt: str, final: bool) -
     if notification and notification["status"] == "sent":
         return "already_sent"
     try:
+        tracking_url = _tracking_url(conn, shipment)
         finance = _shipment_financial_context(conn, shipment["fulfillment_id"])
         split_cod = (
             str(order["payment_method"] or "").lower() == "cod"
@@ -332,7 +354,7 @@ def _notify_shipment(conn, site, order, shipment: dict, fmt: str, final: bool) -
             # A single generic AST template cannot explain two different COD
             # amounts safely.  Use one idempotent customer-note email per
             # parcel; tracking metadata is still written to AST.
-            _post_customer_note(conn, site, order, shipment)
+            _post_customer_note(conn, site, order, shipment, tracking_url)
             result = "sent_split_cod_customer_note"
         else:
             trigger_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/trigger-shipment-email"
@@ -350,12 +372,12 @@ def _notify_shipment(conn, site, order, shipment: dict, fmt: str, final: bool) -
             # shipment has no status transition, so guarantee the per-parcel
             # notice with an idempotent Woo customer note.
             if fmt == "ast" and not final:
-                _post_customer_note(conn, site, order, shipment)
+                _post_customer_note(conn, site, order, shipment, tracking_url)
                 result = "sent_partial_customer_note"
             elif sent is True or (fmt == "ast" and final):
                 result = f"sent_{plugin or fmt}"
             elif response.status_code == 404 or sent is False:
-                _post_customer_note(conn, site, order, shipment)
+                _post_customer_note(conn, site, order, shipment, tracking_url)
                 result = "sent_customer_note_fallback"
             else:
                 # AST final email is queued asynchronously and returns null.
@@ -408,7 +430,7 @@ def sync_shipment(conn, shipment_id: str) -> dict:
     if final:
         payload["status"] = "shipped" if fmt == "ast" else "on-hold"
     if fmt == "ast":
-        payload["meta_data"].append({"key": "_wc_shipment_tracking_items", "value": _ast_items(shipments)})
+        payload["meta_data"].append({"key": "_wc_shipment_tracking_items", "value": _ast_items(shipments, conn=conn)})
     elif fmt == "villatheme":
         payload["line_items"] = _villatheme_lines(conn, shipments, order_lines)
     else:

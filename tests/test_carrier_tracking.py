@@ -32,6 +32,43 @@ class CarrierClassificationTests(unittest.TestCase):
             tracking.track718_code_for("packeta"),
         )
 
+    def test_hungary_expressone_number_uses_dedicated_adapter(self):
+        self.assertEqual(
+            "expressone_hu",
+            tracking.classify_carrier(
+                "packeta-hu", "671555557697000013601086", "HU"
+            ),
+        )
+        self.assertEqual(
+            "expressone_hu",
+            tracking.classify_carrier(
+                "custom", "671555557697000013601086", "HU"
+            ),
+        )
+
+
+class ExpressOneHungaryTests(unittest.TestCase):
+    def test_official_html_history_is_parsed(self):
+        response = Mock(status_code=200)
+        response.text = """
+        <div class="headline"><h5><span>2026-07-30</span></h5></div>
+        <table><tbody><tr><td>10:48:00</td><td>PRE</td>
+        <td>Szállítási adatok regisztrálva, a küldemény még nem érkezett be.</td>
+        </tr></tbody></table>
+        """
+        session = Mock()
+        session.get.return_value = response
+
+        result = tracking.expressone_hu_detail(
+            "671555557697000013601086", session=session
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("in_transit", result["outcome"])
+        self.assertEqual("PRE", result["events"][0]["code"])
+        self.assertEqual("2026-07-30 10:48:00", result["events"][0]["time"])
+        self.assertIn("plc_number=671555557697000013601086", result["official_url"])
+
 
 class PacketaTrack718Tests(unittest.TestCase):
     def test_detail_forces_packeta_code_for_add_and_query(self):
@@ -92,6 +129,8 @@ class PacketaTrack718Tests(unittest.TestCase):
             base,
         )
         self.assertIn("rejected by recipient", base)
+        self.assertIn("https://tracking.expressone.hu/?plc_number=", base)
+        self.assertIn("EXPRESSONE_HU_EVENT_PHRASES", base)
 
 
 if __name__ == "__main__":

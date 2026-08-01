@@ -1539,6 +1539,215 @@ def down_010(conn):
     conn.commit()
 
 
+# ───────────────── 011: 匈牙利 Packeta + 四款专仓商品隔离 ─────────────────
+
+MIGRATION_011_STATE_KEY = "migration_011_previous_state"
+MANAGED_PRODUCT_FAMILIES = [
+    "fumot-eco-4in1-80k",
+    "fumot-leopard-40k",
+    "fumot-randm-tornado-9000",
+    "fumot-randm-tornado-15000",
+]
+
+
+def _migration_table_exists(conn, name):
+    return bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone())
+
+
+def up_011(conn):
+    """Separate Czech Packeta from Hungary's Express One last mile.
+
+    The migration also reserves the four managed product families before their
+    variant-level SKU mapping is complete and scopes the Poland manual shippers
+    to the legacy partner warehouse.  External WMS routing/auto-submit remains
+    disabled; this migration cannot create a supplier dispatch.
+    """
+    tracked_settings = (
+        "oms_managed_product_isolation_enabled",
+        "oms_managed_product_families",
+    )
+    state = {"settings": {}, "country_permissions": [], "warehouse_permissions": []}
+    for key in tracked_settings:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        state["settings"][key] = row["value"] if row else None
+
+    if _migration_table_exists(conn, "shipping_carriers"):
+        row = conn.execute(
+            "SELECT slug,name,tracking_url,is_active FROM shipping_carriers WHERE slug='packeta-hu'"
+        ).fetchone()
+        state["packeta_hu"] = dict(row) if row else None
+
+    new_pl = conn.execute(
+        "SELECT warehouse_id,config_json FROM oms_warehouse_integrations WHERE provider='poland_wms' ORDER BY warehouse_id LIMIT 1"
+    ).fetchone()
+    state["new_pl_integration"] = dict(new_pl) if new_pl else None
+
+    manual_pl = conn.execute(
+        """SELECT w.id FROM warehouses w
+           JOIN oms_warehouse_integrations wi ON wi.warehouse_id=w.id
+           WHERE w.country='PL' AND w.is_active=1
+             AND wi.inventory_authority='manual_partner'
+             AND COALESCE(wi.provider,'internal')!='poland_wms'
+           ORDER BY w.id LIMIT 1"""
+    ).fetchone()
+    state["manual_pl_warehouse_id"] = manual_pl["id"] if manual_pl else None
+
+    users = []
+    if _migration_table_exists(conn, "users"):
+        users = conn.execute(
+            "SELECT id,username FROM users WHERE username IN ('jinyi','jingu','钱品宏') ORDER BY id"
+        ).fetchall()
+    if _migration_table_exists(conn, "user_country_permissions"):
+        for user in users:
+            if user["username"] not in {"jinyi", "jingu"}:
+                continue
+            existed = bool(conn.execute(
+                "SELECT 1 FROM user_country_permissions WHERE user_id=? AND country='HU'",
+                (user["id"],),
+            ).fetchone())
+            state["country_permissions"].append({
+                "user_id": user["id"], "country": "HU", "existed": existed,
+            })
+
+    if manual_pl and _migration_table_exists(conn, "oms_warehouse_user_permissions"):
+        for user in users:
+            previous = conn.execute(
+                "SELECT * FROM oms_warehouse_user_permissions WHERE user_id=? AND warehouse_id=?",
+                (user["id"], manual_pl["id"]),
+            ).fetchone()
+            state["warehouse_permissions"].append({
+                "user_id": user["id"],
+                "warehouse_id": manual_pl["id"],
+                "previous": dict(previous) if previous else None,
+            })
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+        (MIGRATION_011_STATE_KEY, json.dumps(state, ensure_ascii=False)),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES ('oms_managed_product_isolation_enabled','1')"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES ('oms_managed_product_families',?)",
+        (json.dumps(MANAGED_PRODUCT_FAMILIES, ensure_ascii=False, separators=(",", ":")),),
+    )
+
+    if _migration_table_exists(conn, "shipping_carriers"):
+        conn.execute(
+            """INSERT INTO shipping_carriers (slug,name,tracking_url,is_active)
+               VALUES ('packeta-hu','Packeta / Express One（匈牙利）',
+                       'https://tracking.expressone.hu/?plc_number={tracking}',1)
+               ON CONFLICT(slug) DO UPDATE SET name=excluded.name,
+                 tracking_url=excluded.tracking_url,is_active=1"""
+        )
+
+    if new_pl:
+        try:
+            config = json.loads(new_pl["config_json"] or "{}")
+        except (TypeError, ValueError):
+            config = {}
+        config["routing_policy"] = "managed_wms_skus"
+        config["managed_product_families"] = MANAGED_PRODUCT_FAMILIES
+        conn.execute(
+            "UPDATE oms_warehouse_integrations SET config_json=?,updated_at=CURRENT_TIMESTAMP WHERE warehouse_id=?",
+            (json.dumps(config, ensure_ascii=False, separators=(",", ":")), new_pl["warehouse_id"]),
+        )
+
+    if _migration_table_exists(conn, "user_country_permissions"):
+        for item in state["country_permissions"]:
+            conn.execute(
+                "INSERT OR IGNORE INTO user_country_permissions (user_id,country) VALUES (?,?)",
+                (item["user_id"], item["country"]),
+            )
+
+    if manual_pl and _migration_table_exists(conn, "oms_warehouse_user_permissions"):
+        for user in users:
+            conn.execute(
+                """INSERT INTO oms_warehouse_user_permissions
+                     (user_id,warehouse_id,can_view,can_pick,can_pack,can_ship,
+                      can_cancel,can_retry,can_reconcile)
+                   VALUES (?,?,1,1,1,1,1,0,0)
+                   ON CONFLICT(user_id,warehouse_id) DO UPDATE SET
+                     can_view=1,can_pick=1,can_pack=1,can_ship=1,can_cancel=1,
+                     updated_at=CURRENT_TIMESTAMP""",
+                (user["id"], manual_pl["id"]),
+            )
+    conn.commit()
+
+
+def down_011(conn):
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (MIGRATION_011_STATE_KEY,)
+    ).fetchone()
+    if not row:
+        return
+    state = json.loads(row["value"])
+
+    for key, value in (state.get("settings") or {}).items():
+        if value is None:
+            conn.execute("DELETE FROM settings WHERE key=?", (key,))
+        else:
+            conn.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
+
+    if _migration_table_exists(conn, "shipping_carriers"):
+        previous = state.get("packeta_hu")
+        if previous:
+            conn.execute(
+                """INSERT INTO shipping_carriers (slug,name,tracking_url,is_active)
+                   VALUES (?,?,?,?) ON CONFLICT(slug) DO UPDATE SET
+                     name=excluded.name,tracking_url=excluded.tracking_url,is_active=excluded.is_active""",
+                (previous["slug"], previous["name"], previous["tracking_url"], previous["is_active"]),
+            )
+        else:
+            conn.execute("DELETE FROM shipping_carriers WHERE slug='packeta-hu'")
+
+    new_pl = state.get("new_pl_integration")
+    if new_pl:
+        conn.execute(
+            "UPDATE oms_warehouse_integrations SET config_json=?,updated_at=CURRENT_TIMESTAMP WHERE warehouse_id=?",
+            (new_pl.get("config_json"), new_pl["warehouse_id"]),
+        )
+
+    if _migration_table_exists(conn, "user_country_permissions"):
+        for item in state.get("country_permissions") or []:
+            if not item.get("existed"):
+                conn.execute(
+                    "DELETE FROM user_country_permissions WHERE user_id=? AND country=?",
+                    (item["user_id"], item["country"]),
+                )
+
+    if _migration_table_exists(conn, "oms_warehouse_user_permissions"):
+        columns = (
+            "user_id", "warehouse_id", "can_view", "can_pick", "can_pack",
+            "can_ship", "can_cancel", "can_retry", "can_reconcile",
+        )
+        for item in state.get("warehouse_permissions") or []:
+            previous = item.get("previous")
+            if not previous:
+                conn.execute(
+                    "DELETE FROM oms_warehouse_user_permissions WHERE user_id=? AND warehouse_id=?",
+                    (item["user_id"], item["warehouse_id"]),
+                )
+                continue
+            conn.execute(
+                """INSERT INTO oms_warehouse_user_permissions
+                     (user_id,warehouse_id,can_view,can_pick,can_pack,can_ship,
+                      can_cancel,can_retry,can_reconcile)
+                   VALUES (?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(user_id,warehouse_id) DO UPDATE SET
+                     can_view=excluded.can_view,can_pick=excluded.can_pick,
+                     can_pack=excluded.can_pack,can_ship=excluded.can_ship,
+                     can_cancel=excluded.can_cancel,can_retry=excluded.can_retry,
+                     can_reconcile=excluded.can_reconcile,updated_at=CURRENT_TIMESTAMP""",
+                tuple(previous.get(column) for column in columns),
+            )
+    conn.execute("DELETE FROM settings WHERE key=?", (MIGRATION_011_STATE_KEY,))
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -1550,6 +1759,7 @@ MIGRATIONS = [
     ('008', 'split_cod_shipping_allocation', up_008, down_008),
     ('009', 'manual_partner_pl_and_packeta', up_009, down_009),
     ('010', 'new_poland_wms_isolated_routing', up_010, down_010),
+    ('011', 'packeta_hu_and_managed_product_isolation', up_011, down_011),
 ]
 
 

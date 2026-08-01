@@ -58,11 +58,16 @@ def _enqueue_fulfillment_plans(candidates):
         return
     try:
         from fulfillment_common import get_conn
-        from fulfillment_service import enqueue_job
+        from fulfillment_service import enqueue_job, order_contains_managed_product
 
         conn = get_conn()
         try:
-            if not _flag_enabled(conn, 'oms_fulfillment_enabled') or not _flag_enabled(conn, 'oms_auto_plan_enabled'):
+            fulfillment_enabled = _flag_enabled(conn, 'oms_fulfillment_enabled')
+            auto_plan_enabled = _flag_enabled(conn, 'oms_auto_plan_enabled')
+            managed_isolation_enabled = _flag_enabled(
+                conn, 'oms_managed_product_isolation_enabled'
+            )
+            if not fulfillment_enabled or not (auto_plan_enabled or managed_isolation_enabled):
                 return
             for item in candidates:
                 if item['status'] not in {'processing', 'offline', 'on-hold', 'partial-shipped', 'shipped'}:
@@ -71,6 +76,21 @@ def _enqueue_fulfillment_plans(candidates):
                     "SELECT country FROM sites WHERE url=?", (item['source'],)
                 ).fetchone()
                 if not site or str(site['country'] or '').upper() not in {'PL', 'CZ', 'HU'}:
+                    continue
+                # Keep the legacy manual-shipping workflow unchanged for
+                # ordinary products while the full auto-plan rollout remains
+                # off. Orders containing one of the reserved WMS families are
+                # still planned immediately so those lines cannot leak to the
+                # legacy Poland partner queue.
+                if not auto_plan_enabled and not order_contains_managed_product(
+                    conn, item['order_id']
+                ):
+                    continue
+                # Do not retrofit already-shipped legacy orders into the new
+                # fulfillment domain merely because a historical line belongs
+                # to one of the four families. Their parcel history remains
+                # authoritative; isolation starts before shipment only.
+                if not auto_plan_enabled and item['status'] == 'shipped':
                     continue
                 version = hashlib.sha256(
                     f"{item['order_id']}|{item.get('date_modified') or ''}|{item['status']}".encode('utf-8')

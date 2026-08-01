@@ -780,6 +780,15 @@
             ['departed', '运输途中'],
             ['arrived', '已到达 Packeta 网点'],
         ];
+        const EXPRESSONE_HU_EVENT_PHRASES = [
+            ['szállítási adatok regisztrálva', '已登记发货信息，等待 Express One 收件'],
+            ['küldemény még nem érkezett be', '包裹尚未到达 Express One'],
+            ['sikeresen kézbesítve', '✅ 已签收/送达'],
+            ['kézbesítve', '✅ 已签收/送达'],
+            ['sikertelen kézbesítés', '⚠ 投递未成功'],
+            ['visszaküld', '↩ 已退回/退回中'],
+            ['megtagad', '🔴 收件人拒收'],
+        ];
         function carrierEventLabel(s) {
             const stripped = (s || '').replace(/^WA\d+(\/PL\d+)?,\s*/i, '').trim();
             if (INPOST_EVENT_LABELS[stripped]) return INPOST_EVENT_LABELS[stripped];
@@ -790,6 +799,9 @@
                 if (stripped.indexOf(en) !== -1) return zh;
             }
             const normalized = stripped.toLowerCase();
+            for (const [phrase, zh] of EXPRESSONE_HU_EVENT_PHRASES) {
+                if (normalized.indexOf(phrase) !== -1) return zh;
+            }
             for (const [phrase, zh] of PACKETA_EVENT_PHRASES) {
                 if (normalized.indexOf(phrase) !== -1) return zh;
             }
@@ -802,6 +814,7 @@
             num = encodeURIComponent(num || '');
             if (c.indexOf('inpost') !== -1) return 'https://inpost.pl/sledzenie-przesylek?number=' + num;
             if (c.indexOf('dpd') !== -1) return 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + num;
+            if (c.indexOf('express one') !== -1 || c.indexOf('expressone') !== -1 || c.indexOf('packeta-hu') !== -1) return 'https://tracking.expressone.hu/?plc_number=' + num;
             if (c.indexOf('packeta') !== -1 || c.indexOf('zasilkovna') !== -1 || c.indexOf('zásilkovna') !== -1) return 'https://tracking.packeta.com/en/' + num;
             if (c.indexOf('australia') !== -1 || c.indexOf('auspost') !== -1) return 'https://auspost.com.au/mypost/track/details/' + num;
             return 'https://www.17track.net/zh-CN/track#nums=' + num;

@@ -1342,7 +1342,43 @@ def handle_poll_tracking(conn, job: dict, payload: dict):
     key = key_row["value"] if key_row else None
     carrier = carrier_tracking.classify_carrier(shipment["carrier_slug"], tracking)
     try:
-        if carrier == "inpost":
+        if carrier == "expressone_hu":
+            result = carrier_tracking.expressone_hu_detail(tracking)
+            if result.get("ok"):
+                outcome = result.get("outcome")
+                normalized = {
+                    "in_transit": "in_transit", "attention": "exception",
+                    "returned": "returned", "delivered": "delivered",
+                }.get(outcome, "exception")
+                for event in (result.get("events") or [])[:20]:
+                    add_tracking_event(
+                        conn, sid, "expressone_hu", normalized,
+                        raw_status=str(event.get("code") or outcome or ""),
+                        event_at=event.get("time"), description=event.get("status"),
+                        raw_payload=result, commit=False,
+                    )
+                official_ok = True
+            # The official Express One page is authoritative; Track718 remains
+            # an independent supplemental source when configured.
+            if key:
+                third = carrier_tracking.track718_detail(
+                    tracking, key, code=None, poll=2, poll_wait=1
+                )
+                if third.get("ok"):
+                    outcome = third.get("outcome")
+                    normalized = {
+                        "in_transit": "in_transit", "attention": "exception",
+                        "returned": "returned", "delivered": "delivered",
+                    }.get(outcome, "exception")
+                    for event in (third.get("events") or [{}])[:20]:
+                        add_tracking_event(
+                            conn, sid, "track718", normalized,
+                            raw_status=str(third.get("result") or outcome or ""),
+                            event_at=event.get("time"), description=event.get("status"),
+                            raw_payload=third, commit=False,
+                        )
+                    third_party_ok = True
+        elif carrier == "inpost":
             result = carrier_tracking.inpost_status(tracking)
             if result.get("ok"):
                 outcome = result.get("outcome")
@@ -1354,7 +1390,11 @@ def handle_poll_tracking(conn, job: dict, payload: dict):
                 )
                 third_party_ok = True
         elif key:
-            code = "dpd-pl" if carrier == "dpd" else None
+            code = (
+                "dpd-pl" if carrier == "dpd"
+                else carrier_tracking.TRACK718_PACKETA if carrier == "packeta"
+                else None
+            )
             result = carrier_tracking.track718_detail(tracking, key, code=code, poll=2, poll_wait=1)
             if result.get("ok"):
                 outcome = result.get("outcome")

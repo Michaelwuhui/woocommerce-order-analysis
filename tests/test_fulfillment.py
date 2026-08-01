@@ -9,6 +9,8 @@ from fulfillment_service import (
     build_wms_payload,
     completion_guard,
     create_shipment,
+    managed_product_family,
+    order_contains_managed_product,
     plan_order,
     recompute_order_status,
     transition_fulfillment,
@@ -16,12 +18,14 @@ from fulfillment_service import (
 from inv_migrations import (
     down_009,
     down_010,
+    down_011,
     up_001,
     up_006,
     up_007,
     up_008,
     up_009,
     up_010,
+    up_011,
 )
 from fulfillment_woocommerce import _all_order_shipments, _ast_items, _customer_note_body
 
@@ -193,6 +197,112 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.assertEqual(1, state["has_shortage"])
         self.assertEqual(1, state["manual_review"])
         self.assertFalse(completion_guard(self.db, "short-1")[0])
+
+    def test_reserved_family_isolated_before_sku_mapping(self):
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES ('oms_managed_product_isolation_enabled','1')"
+        )
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+            (
+                "oms_managed_product_families",
+                json.dumps([
+                    "fumot-eco-4in1-80k", "fumot-leopard-40k",
+                    "fumot-randm-tornado-9000", "fumot-randm-tornado-15000",
+                ]),
+            ),
+        )
+        self.add_order(
+            "managed-no-map", "HU", product_id=999, sku="",
+            name="Fumot RandM Tornado 9000 - Kiwi Passion Fruit Guava",
+        )
+
+        result = plan_order(self.db, "managed-no-map")
+        item = self.db.execute(
+            "SELECT sku_id FROM oms_order_items WHERE order_id='managed-no-map'"
+        ).fetchone()
+
+        self.assertEqual("stock_shortage", result["aggregate_status"])
+        self.assertTrue(result["shortages"])
+        self.assertIsNone(item["sku_id"])
+
+    def test_reserved_family_never_falls_back_to_legacy_mapped_sku(self):
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES ('oms_managed_product_isolation_enabled','1')"
+        )
+        self.db.execute("DELETE FROM oms_sku_warehouses WHERE warehouse_id=2")
+        self.db.execute(
+            "UPDATE oms_warehouse_integrations SET inventory_authority='manual_partner' WHERE warehouse_id=1"
+        )
+        self.add_order(
+            "managed-legacy-map", "HU", product_id=101, sku="SKU1",
+            name="Fumot RandM Tornado 9000 Strawberry",
+        )
+
+        result = plan_order(self.db, "managed-legacy-map")
+
+        self.assertEqual("stock_shortage", result["aggregate_status"])
+        self.assertTrue(result["shortages"])
+        self.assertEqual([], self.allocations("managed-legacy-map"))
+
+    def test_managed_family_matching_is_exact_enough(self):
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES ('oms_managed_product_isolation_enabled','1')"
+        )
+        positives = [
+            {"name": "Fumot Eco 4in1 80K Blueberry"},
+            {"name": "Fumot Leopard 40K Mango"},
+            {"name": "Fumot RandM Tornado 9000 Strawberry"},
+            {"name": "Fumot RandM Tornado 15000 Grape"},
+        ]
+        for item in positives:
+            with self.subTest(item=item):
+                self.assertTrue(managed_product_family(self.db, item))
+        self.assertFalse(managed_product_family(
+            self.db, {"name": "Fumot RandM Tornado 90000 Strawberry"}
+        ))
+        self.assertFalse(managed_product_family(
+            self.db, {"name": "Generic Tornado 9000 replacement coil"}
+        ))
+        self.add_order(
+            "managed-detect", "HU", product_id=999, sku="",
+            name=positives[0]["name"],
+        )
+        self.assertTrue(order_contains_managed_product(self.db, "managed-detect"))
+
+    def test_packeta_hu_migration_is_fail_closed_and_reversible(self):
+        up_009(self.db)
+        up_010(self.db)
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS shipping_carriers (
+                 slug TEXT PRIMARY KEY, name TEXT, tracking_url TEXT, is_active INTEGER
+               )"""
+        )
+        before = self.db.execute(
+            "SELECT config_json,is_enabled,auto_submit FROM oms_warehouse_integrations WHERE provider='poland_wms'"
+        ).fetchone()
+
+        up_011(self.db)
+        carrier = self.db.execute(
+            "SELECT * FROM shipping_carriers WHERE slug='packeta-hu'"
+        ).fetchone()
+        integration = self.db.execute(
+            "SELECT config_json,is_enabled,auto_submit FROM oms_warehouse_integrations WHERE provider='poland_wms'"
+        ).fetchone()
+
+        self.assertIn("tracking.expressone.hu", carrier["tracking_url"])
+        self.assertEqual(0, integration["is_enabled"])
+        self.assertEqual(0, integration["auto_submit"])
+        self.assertEqual("managed_wms_skus", json.loads(integration["config_json"])["routing_policy"])
+
+        down_011(self.db)
+        restored = self.db.execute(
+            "SELECT config_json,is_enabled,auto_submit FROM oms_warehouse_integrations WHERE provider='poland_wms'"
+        ).fetchone()
+        self.assertEqual(dict(before), dict(restored))
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM shipping_carriers WHERE slug='packeta-hu'"
+        ).fetchone())
 
     def test_manual_partner_autoprovisions_czech_without_stock_quantity(self):
         self.db.execute(
@@ -676,6 +786,31 @@ class FulfillmentDomainTests(unittest.TestCase):
         shipments = _all_order_shipments(self.db, "ast-1", 1)
         self.assertEqual(["PL-SHIPPED"], [s["tracking_number"] for s in shipments])
         self.assertEqual(1, len(_ast_items(shipments)))
+
+    def test_ast_hungary_packeta_uses_expressone_custom_link(self):
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS shipping_carriers (
+                 slug TEXT PRIMARY KEY, name TEXT, tracking_url TEXT, is_active INTEGER
+               )"""
+        )
+        self.db.execute(
+            """INSERT OR REPLACE INTO shipping_carriers (slug,name,tracking_url,is_active)
+               VALUES ('packeta-hu','Packeta / Express One（匈牙利）',
+                       'https://tracking.expressone.hu/?plc_number={tracking}',1)"""
+        )
+        items = _ast_items([{
+            "tracking_number": "671555557697000013601086",
+            "carrier_slug": "packeta-hu",
+            "carrier_name": "Packeta / Express One（匈牙利）",
+            "shipped_at": "2026-07-30 10:48:00",
+            "products": [],
+        }], conn=self.db)
+
+        self.assertEqual("custom", items[0]["tracking_provider"])
+        self.assertEqual(
+            "https://tracking.expressone.hu/?plc_number=671555557697000013601086",
+            items[0]["custom_tracking_link"],
+        )
 
 
 if __name__ == "__main__":
