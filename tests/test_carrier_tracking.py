@@ -43,6 +43,12 @@ class CarrierClassificationTests(unittest.TestCase):
             "packeta",
             tracking.classify_carrier("packeta-hu", "Z1465635854", "HU"),
         )
+        self.assertEqual(
+            "expressone_hu",
+            tracking.classify_carrier(
+                "packeta", "671555557697000013601086", "HU"
+            ),
+        )
 
     def test_hungary_packeta_official_url_depends_on_number_type(self):
         self.assertEqual(

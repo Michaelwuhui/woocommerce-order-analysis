@@ -18306,6 +18306,11 @@ def get_carriers_for_site():
     # end (usage_count = 0) so the dropdown still highlights what the site
     # actually uses most.
     site = conn.execute('SELECT country FROM sites WHERE url = ?', (source,)).fetchone()
+    if site and site['country'] == 'HU':
+        # Historical Hungarian shipments may have used the generic Packeta
+        # slug. Present one unambiguous option going forward; the dedicated
+        # adapter selects Packeta or Express One tracking from the number.
+        carriers = [c for c in carriers if c['slug'] != 'packeta']
     required_slugs_by_country = {
         'AU': ('australia-post', 'ems'),
         'CZ': ('packeta',),

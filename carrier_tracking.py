@@ -62,6 +62,11 @@ def classify_carrier(provider, tracking_number=None, destination_country=None):
     if 'expressone' in p or 'express one' in p:
         return 'expressone_hu'
     if 'packeta' in p or 'zasilkovna' in p or 'zásilkovna' in p:
+        if (
+            str(destination_country or '').strip().upper() == 'HU'
+            and raw.isdigit() and len(raw) >= 20
+        ):
+            return 'expressone_hu'
         return 'packeta'
     if 'dpd' in p:
         return 'dpd'
