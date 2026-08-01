@@ -40,6 +40,20 @@ class CarrierClassificationTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
+            "packeta",
+            tracking.classify_carrier("packeta-hu", "Z1465635854", "HU"),
+        )
+
+    def test_hungary_packeta_official_url_depends_on_number_type(self):
+        self.assertEqual(
+            "https://tracking.packeta.com/en/Z1465635854",
+            tracking.packeta_hu_official_url("Z1465635854"),
+        )
+        self.assertEqual(
+            "https://tracking.expressone.hu/?plc_number=671555557697000013601086",
+            tracking.packeta_hu_official_url("671555557697000013601086"),
+        )
+        self.assertEqual(
             "expressone_hu",
             tracking.classify_carrier(
                 "custom", "671555557697000013601086", "HU"
@@ -131,6 +145,8 @@ class PacketaTrack718Tests(unittest.TestCase):
         self.assertIn("rejected by recipient", base)
         self.assertIn("https://tracking.expressone.hu/?plc_number=", base)
         self.assertIn("EXPRESSONE_HU_EVENT_PHRASES", base)
+        self.assertIn("const packetaHu", base)
+        self.assertIn("/^\\d{20,}$/", base)
 
 
 if __name__ == "__main__":

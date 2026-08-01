@@ -19,6 +19,7 @@ from inv_migrations import (
     down_009,
     down_010,
     down_011,
+    down_012,
     up_001,
     up_006,
     up_007,
@@ -26,6 +27,7 @@ from inv_migrations import (
     up_009,
     up_010,
     up_011,
+    up_012,
 )
 from fulfillment_woocommerce import _all_order_shipments, _ast_items, _customer_note_body
 
@@ -303,6 +305,35 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.assertIsNone(self.db.execute(
             "SELECT 1 FROM shipping_carriers WHERE slug='packeta-hu'"
         ).fetchone())
+
+    def test_packeta_hu_primary_carrier_migration_roundtrip(self):
+        up_009(self.db)
+        up_010(self.db)
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS shipping_carriers (
+                 slug TEXT PRIMARY KEY, name TEXT, tracking_url TEXT, is_active INTEGER
+               )"""
+        )
+        up_011(self.db)
+        before = dict(self.db.execute(
+            "SELECT slug,name,tracking_url,is_active FROM shipping_carriers WHERE slug='packeta-hu'"
+        ).fetchone())
+
+        up_012(self.db)
+        updated = self.db.execute(
+            "SELECT * FROM shipping_carriers WHERE slug='packeta-hu'"
+        ).fetchone()
+        self.assertIn("Packeta", updated["name"])
+        self.assertIn("Express One", updated["name"])
+        self.assertEqual(
+            "https://tracking.packeta.com/en/{tracking}", updated["tracking_url"]
+        )
+
+        down_012(self.db)
+        restored = dict(self.db.execute(
+            "SELECT slug,name,tracking_url,is_active FROM shipping_carriers WHERE slug='packeta-hu'"
+        ).fetchone())
+        self.assertEqual(before, restored)
 
     def test_manual_partner_autoprovisions_czech_without_stock_quantity(self):
         self.db.execute(
@@ -811,6 +842,16 @@ class FulfillmentDomainTests(unittest.TestCase):
             "https://tracking.expressone.hu/?plc_number=671555557697000013601086",
             items[0]["custom_tracking_link"],
         )
+
+        packeta_items = _ast_items([{
+            "tracking_number": "Z1465635854",
+            "carrier_slug": "packeta-hu",
+            "carrier_name": "Packeta（匈牙利，Express One 末端派送）",
+            "shipped_at": "2026-07-30 10:48:00",
+            "products": [],
+        }], conn=self.db)
+        self.assertEqual("packeta", packeta_items[0]["tracking_provider"])
+        self.assertEqual("", packeta_items[0]["custom_tracking_link"])
 
 
 if __name__ == "__main__":

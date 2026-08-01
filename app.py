@@ -17234,7 +17234,17 @@ def detect_site_tracking_format(conn, site_url):
     return 'unknown'
 
 
-def _ast_provider_for_carrier(carrier_slug):
+def _carrier_tracking_url(carrier_slug, tracking_number, tracking_url_template=''):
+    slug = (carrier_slug or '').lower().strip()
+    if slug == 'packeta-hu':
+        from carrier_tracking import packeta_hu_official_url
+        return packeta_hu_official_url(tracking_number)
+    return (tracking_url_template or '').replace(
+        '{tracking}', tracking_number
+    ).replace('{tracking_number}', tracking_number)
+
+
+def _ast_provider_for_carrier(carrier_slug, tracking_number=None):
     """Map our carrier slug to the AST plugin's tracking_provider value.
 
     Most slugs already match AST's expected provider name (australia-post,
@@ -17246,11 +17256,10 @@ def _ast_provider_for_carrier(carrier_slug):
         'dpd': 'dpd-pl',  # our 'dpd' carrier row stores the PL tracking URL
         'auspost': 'australia-post',
         'australia_post': 'australia-post',
-        # AST does not have a stable Packeta -> Express One HU provider.  A
-        # custom record preserves the exact official last-mile URL instead of
-        # sending customers to Czech Packeta tracking.
-        'packeta-hu': 'custom',
     }
+    if cs == 'packeta-hu':
+        number = str(tracking_number or '').strip()
+        return 'custom' if number.isdigit() and len(number) >= 20 else 'packeta'
     return aliases.get(cs, cs or 'custom')
 
 
@@ -17266,11 +17275,21 @@ def build_ast_tracking_value(tracking_number, carrier_slug, line_items):
                 'qty': str(it.get('quantity', 1))
             })
 
+    slug = (carrier_slug or '').lower().strip()
+    expressone_last_mile = (
+        slug == 'packeta-hu'
+        and tracking_number.isdigit() and len(tracking_number) >= 20
+    )
     return [{
         'tracking_number': tracking_number,
         'shipping_note': '',
-        'tracking_provider': _ast_provider_for_carrier(carrier_slug),
-        'custom_tracking_link': '',
+        'tracking_provider': _ast_provider_for_carrier(carrier_slug, tracking_number),
+        'custom_tracking_provider': (
+            'Express One（Packeta 匈牙利末端派送）'
+        ) if expressone_last_mile else '',
+        'custom_tracking_link': (
+            _carrier_tracking_url(slug, tracking_number)
+        ) if expressone_last_mile else '',
         'tracking_product_code': '',
         'date_shipped': str(int(time.time())),
         'products_list': products,
@@ -17288,7 +17307,10 @@ def build_villatheme_lineitem_payload(tracking_number, carrier_slug, carrier_nam
     """
     import time, json as _json
 
-    url_template = (tracking_url_template or '').replace('{tracking}', '{tracking_number}')
+    resolved_url = _carrier_tracking_url(
+        carrier_slug, tracking_number, tracking_url_template
+    )
+    url_template = resolved_url.replace(tracking_number, '{tracking_number}')
 
     carrier_data = {
         'carrier_slug': carrier_slug or 'custom',
@@ -17346,17 +17368,18 @@ def build_ast_tracking_items(parcels, line_items):
         ds = str(p.get('date_shipped') or int(time.time()))
         carrier_slug = (p.get('carrier_slug') or '').lower().strip()
         tracking_template = p.get('tracking_url_template') or ''
-        custom_link = ''
-        if carrier_slug == 'packeta-hu' and tracking_template:
-            custom_link = tracking_template.replace('{tracking}', tn).replace('{tracking_number}', tn)
+        official_link = _carrier_tracking_url(carrier_slug, tn, tracking_template)
+        is_expressone_last_mile = (
+            carrier_slug == 'packeta-hu' and tn.isdigit() and len(tn) >= 20
+        )
         items.append({
             'tracking_number': tn,
             'shipping_note': '',
-            'tracking_provider': _ast_provider_for_carrier(carrier_slug),
+            'tracking_provider': _ast_provider_for_carrier(carrier_slug, tn),
             'custom_tracking_provider': (
-                p.get('carrier_name') or 'Packeta / Express One（匈牙利）'
-            ) if carrier_slug == 'packeta-hu' else '',
-            'custom_tracking_link': custom_link,
+                'Express One（Packeta 匈牙利末端派送）'
+            ) if is_expressone_last_mile else '',
+            'custom_tracking_link': official_link if is_expressone_last_mile else '',
             'tracking_product_code': '',
             'date_shipped': ds,
             'products_list': products,
@@ -17377,7 +17400,10 @@ def build_villatheme_lineitem_payload_multi(parcels, line_items):
         tn = (p.get('tracking_number') or '').strip()
         if not tn:
             continue
-        url_template = (p.get('tracking_url_template') or '').replace('{tracking}', '{tracking_number}')
+        resolved_url = _carrier_tracking_url(
+            p.get('carrier_slug'), tn, p.get('tracking_url_template') or ''
+        )
+        url_template = resolved_url.replace(tn, '{tracking_number}')
         records.append({
             'tracking_number': tn,
             'carrier_slug': p.get('carrier_slug') or 'custom',
@@ -17541,9 +17567,9 @@ def ship_order():
     # Customer-facing tracking URL — resolve placeholders from the DB template.
     # No carrier-specific hardcoding here; if a new carrier needs a URL, add a
     # row to shipping_carriers instead.
-    tracking_url = ''
-    if tracking_url_template:
-        tracking_url = tracking_url_template.replace('{tracking}', tracking_number).replace('{tracking_number}', tracking_number)
+    tracking_url = _carrier_tracking_url(
+        carrier_slug, tracking_number, tracking_url_template
+    )
 
     line_items = parse_json_field(order['line_items']) or []
     fmt = detect_site_tracking_format(conn, order['source'])
@@ -17565,7 +17591,9 @@ def ship_order():
 
     def _mk_parcel(slug, tn, ds):
         c = carriers_by_slug.get(slug)
-        tmpl = ((c['tracking_url'] if c else '') or '')
+        tmpl = _carrier_tracking_url(
+            slug, tn, ((c['tracking_url'] if c else '') or '')
+        )
         return {
             'tracking_number': tn,
             'carrier_slug': slug,
@@ -19104,7 +19132,7 @@ def order_carrier_status(order_id):
         if res.get('events'):
             return jsonify({
                 'success': True,
-                'carrier': 'Packeta / Express One（匈牙利）',
+                'carrier': 'Packeta（Express One 匈牙利末端派送）',
                 'tracking_number': number,
                 'outcome': res.get('outcome', 'unknown'),
                 'events': res['events'],
@@ -19113,7 +19141,7 @@ def order_carrier_status(order_id):
             })
         return jsonify({
             'success': True,
-            'carrier': 'Packeta / Express One（匈牙利）',
+            'carrier': 'Packeta（Express One 匈牙利末端派送）',
             'tracking_number': number,
             'outcome': res.get('outcome', 'unknown'),
             'events': [],

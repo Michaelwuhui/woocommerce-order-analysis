@@ -811,10 +811,18 @@
         // empty (e.g. Track718 can't crawl Australia Post for some numbers).
         function carrierWebUrl(carrier, num) {
             const c = (carrier || '').toLowerCase();
-            num = encodeURIComponent(num || '');
+            const rawNum = (num || '').trim();
+            num = encodeURIComponent(rawNum);
             if (c.indexOf('inpost') !== -1) return 'https://inpost.pl/sledzenie-przesylek?number=' + num;
             if (c.indexOf('dpd') !== -1) return 'https://tracktrace.dpd.com.pl/parcelDetails?typ=1&p1=' + num;
-            if (c.indexOf('express one') !== -1 || c.indexOf('expressone') !== -1 || c.indexOf('packeta-hu') !== -1) return 'https://tracking.expressone.hu/?plc_number=' + num;
+            const packetaHu = c.indexOf('packeta-hu') !== -1 ||
+                (c.indexOf('packeta') !== -1 && (c.indexOf('express one') !== -1 || c.indexOf('expressone') !== -1));
+            if (packetaHu) {
+                return /^\d{20,}$/.test(rawNum)
+                    ? 'https://tracking.expressone.hu/?plc_number=' + num
+                    : 'https://tracking.packeta.com/en/' + num;
+            }
+            if (c.indexOf('express one') !== -1 || c.indexOf('expressone') !== -1) return 'https://tracking.expressone.hu/?plc_number=' + num;
             if (c.indexOf('packeta') !== -1 || c.indexOf('zasilkovna') !== -1 || c.indexOf('zásilkovna') !== -1) return 'https://tracking.packeta.com/en/' + num;
             if (c.indexOf('australia') !== -1 || c.indexOf('auspost') !== -1) return 'https://auspost.com.au/mypost/track/details/' + num;
             return 'https://www.17track.net/zh-CN/track#nums=' + num;

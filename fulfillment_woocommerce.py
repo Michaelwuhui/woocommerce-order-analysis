@@ -61,24 +61,29 @@ def detect_tracking_format(conn, site_url: str) -> str:
     return "ast"
 
 
-def _ast_provider(slug: str | None) -> str:
+def _ast_provider(slug: str | None, tracking_number: str | None = None) -> str:
     value = (slug or "custom").lower().strip()
+    if value == "packeta-hu":
+        tracking = str(tracking_number or "").strip()
+        return "custom" if tracking.isdigit() and len(tracking) >= 20 else "packeta"
     return {
         "inpost": "inpost-paczkomaty",
         "dpd": "dpd-pl",
         "auspost": "australia-post",
         "wms-auto": "custom",
-        "packeta-hu": "custom",
     }.get(value, value)
 
 
 def _tracking_url(conn, shipment: dict) -> str:
+    tracking = str(shipment.get("tracking_number") or "")
+    if (shipment.get("carrier_slug") or "").lower().strip() == "packeta-hu":
+        from carrier_tracking import packeta_hu_official_url
+        return packeta_hu_official_url(tracking)
     carrier = conn.execute(
         "SELECT tracking_url FROM shipping_carriers WHERE slug=?",
         (shipment.get("carrier_slug") or "",),
     ).fetchone()
     template = carrier["tracking_url"] if carrier else ""
-    tracking = str(shipment.get("tracking_number") or "")
     return (template or "").replace("{tracking}", tracking).replace(
         "{tracking_number}", tracking
     )
@@ -136,17 +141,23 @@ def _ast_items(shipments: list[dict], conn=None) -> list[dict]:
         except Exception:
             date_shipped = str(int(time.time()))
         carrier_slug = (shipment.get("carrier_slug") or "").lower().strip()
+        expressone_last_mile = (
+            carrier_slug == "packeta-hu"
+            and tracking.isdigit() and len(tracking) >= 20
+        )
         custom_tracking_link = (
             _tracking_url(conn, shipment)
-            if carrier_slug == "packeta-hu" and conn is not None else ""
+            if expressone_last_mile and conn is not None else ""
         )
         result.append({
             "tracking_number": tracking,
             "shipping_note": "",
-            "tracking_provider": _ast_provider(shipment.get("carrier_slug")),
+            "tracking_provider": _ast_provider(
+                shipment.get("carrier_slug"), tracking
+            ),
             "custom_tracking_provider": (
-                shipment.get("carrier_name") or "Packeta / Express One（匈牙利）"
-            ) if carrier_slug == "packeta-hu" else "",
+                "Express One（Packeta 匈牙利末端派送）"
+            ) if expressone_last_mile else "",
             "custom_tracking_link": custom_tracking_link,
             "tracking_product_code": "",
             "date_shipped": date_shipped,
@@ -162,7 +173,9 @@ def _villatheme_lines(conn, shipments: list[dict], order_lines: list[dict]) -> l
     carriers = {r["slug"]: dict(r) for r in conn.execute("SELECT * FROM shipping_carriers").fetchall()}
     for shipment in shipments:
         carrier = carriers.get(shipment.get("carrier_slug")) or {}
-        template = (carrier.get("tracking_url") or "").replace("{tracking}", "{tracking_number}")
+        resolved = _tracking_url(conn, shipment)
+        tracking = str(shipment.get("tracking_number") or "")
+        template = resolved.replace(tracking, "{tracking_number}") if tracking else resolved
         record = {
             "tracking_number": shipment.get("tracking_number"),
             "carrier_slug": shipment.get("carrier_slug") or "custom",

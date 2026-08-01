@@ -1748,6 +1748,63 @@ def down_011(conn):
     conn.commit()
 
 
+# ───────────────── 012: 匈牙利 Packeta 主承运商语义修正 ─────────────────
+
+MIGRATION_012_STATE_KEY = "migration_012_previous_state"
+
+
+def up_012(conn):
+    """Keep Packeta as carrier and Express One as Hungary last mile.
+
+    The stored template represents the primary Packeta number. Application
+    code switches to Express One only for a long numeric PLC number.
+    """
+    previous = None
+    if _migration_table_exists(conn, "shipping_carriers"):
+        row = conn.execute(
+            "SELECT slug,name,tracking_url,is_active FROM shipping_carriers WHERE slug='packeta-hu'"
+        ).fetchone()
+        previous = dict(row) if row else None
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+        (MIGRATION_012_STATE_KEY, json.dumps(previous, ensure_ascii=False)),
+    )
+    if _migration_table_exists(conn, "shipping_carriers"):
+        conn.execute(
+            """INSERT INTO shipping_carriers (slug,name,tracking_url,is_active)
+               VALUES ('packeta-hu','Packeta（匈牙利，Express One 末端派送）',
+                       'https://tracking.packeta.com/en/{tracking}',1)
+               ON CONFLICT(slug) DO UPDATE SET name=excluded.name,
+                 tracking_url=excluded.tracking_url,is_active=1"""
+        )
+    conn.commit()
+
+
+def down_012(conn):
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (MIGRATION_012_STATE_KEY,)
+    ).fetchone()
+    if not row:
+        return
+    previous = json.loads(row["value"])
+    if _migration_table_exists(conn, "shipping_carriers"):
+        if previous:
+            conn.execute(
+                """INSERT INTO shipping_carriers (slug,name,tracking_url,is_active)
+                   VALUES (?,?,?,?) ON CONFLICT(slug) DO UPDATE SET
+                     name=excluded.name,tracking_url=excluded.tracking_url,
+                     is_active=excluded.is_active""",
+                (
+                    previous["slug"], previous["name"],
+                    previous["tracking_url"], previous["is_active"],
+                ),
+            )
+        else:
+            conn.execute("DELETE FROM shipping_carriers WHERE slug='packeta-hu'")
+    conn.execute("DELETE FROM settings WHERE key=?", (MIGRATION_012_STATE_KEY,))
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -1760,6 +1817,7 @@ MIGRATIONS = [
     ('009', 'manual_partner_pl_and_packeta', up_009, down_009),
     ('010', 'new_poland_wms_isolated_routing', up_010, down_010),
     ('011', 'packeta_hu_and_managed_product_isolation', up_011, down_011),
+    ('012', 'packeta_hu_primary_last_mile_semantics', up_012, down_012),
 ]
 
 

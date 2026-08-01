@@ -16,6 +16,7 @@ import time
 import requests
 
 INPOST_TRACKING_URL = "https://api-shipx-pl.easypack24.net/v1/tracking/{number}"
+PACKETA_TRACKING_URL = "https://tracking.packeta.com/en/{number}"
 EXPRESSONE_HU_TRACKING_URL = "https://tracking.expressone.hu/?plc_number={number}"
 _HEADERS = {"User-Agent": "woo-analysis-tracker/1.0", "Accept": "application/json"}
 
@@ -50,7 +51,15 @@ def classify_carrier(provider, tracking_number=None, destination_country=None):
     p = (provider or '').lower()
     if 'inpost' in p or 'paczko' in p:
         return 'inpost'
-    if 'packeta-hu' in p or 'expressone' in p or 'express one' in p:
+    raw = (tracking_number or '').strip()
+    if 'packeta-hu' in p:
+        # Packeta is the contracting carrier. Express One only handles the
+        # Hungarian last mile and exposes a long numeric PLC number. Keep a
+        # Packeta Z-number on Packeta's own tracker.
+        if raw.isdigit() and len(raw) >= 20:
+            return 'expressone_hu'
+        return 'packeta'
+    if 'expressone' in p or 'express one' in p:
         return 'expressone_hu'
     if 'packeta' in p or 'zasilkovna' in p or 'zásilkovna' in p:
         return 'packeta'
@@ -61,7 +70,6 @@ def classify_carrier(provider, tracking_number=None, destination_country=None):
     if p and not p.startswith('custom') and p not in ('', 'unknown', 'auto', 'other'):
         return 'unknown'
     # No useful provider → guess by number FORMAT.
-    raw = (tracking_number or '').strip()
     if str(destination_country or '').strip().upper() == 'HU' and raw.isdigit() and len(raw) >= 20:
         return 'expressone_hu'
     if len(raw) == 11 and raw[:1].upper() == 'Z' and raw[1:].isdigit():
@@ -72,6 +80,21 @@ def classify_carrier(provider, tracking_number=None, destination_country=None):
     if 11 <= len(digits) <= 16:            # DPD-PL = ~13 digits (often + trailing letter)
         return 'dpd'
     return 'unknown'
+
+
+def packeta_hu_official_url(tracking_number):
+    """Return the right public tracker for a Hungarian Packeta shipment.
+
+    ``Z`` packet IDs remain on Packeta. Long numeric PLC numbers belong to
+    Express One, Packeta's Hungarian last-mile delivery partner.
+    """
+    number = (tracking_number or "").strip()
+    template = (
+        EXPRESSONE_HU_TRACKING_URL
+        if number.isdigit() and len(number) >= 20
+        else PACKETA_TRACKING_URL
+    )
+    return template.format(number=number)
 
 
 def _plain_html(value):
