@@ -842,7 +842,7 @@
                               : '<span class="text-muted small">⚪ 未查询</span>';
             return '<span class="badge" style="background:' + m[1] + ';color:' + m[2] + ';">' + m[0] + '</span>';
         }
-        function queryCarrier(orderId, orderNumber) {
+        function queryCarrier(orderId, orderNumber, trackingNumber) {
             // Pop the modal open IMMEDIATELY with a spinner. EMS (and other
             // Track718-aggregated carriers) often need 10–30s on the first query
             // while the platform crawls the carrier, so the user needs a clear
@@ -852,7 +852,7 @@
                 <div class="text-center py-4">
                     <div class="spinner-border text-info mb-3" role="status"><span class="visually-hidden">Loading…</span></div>
                     <div class="text-light mb-1">正在查询物流轨迹…<span id="carrierElapsed" class="text-muted"></span></div>
-                    <div class="small text-muted">#${orderNumber} · EMS 等物流首次查询需到聚合平台实时抓取，可能要 10–30 秒，请稍候…</div>
+                    <div class="small text-muted">#${orderNumber}${trackingNumber ? ' · ' + trackingNumber : ''} · EMS 等物流首次查询需到聚合平台实时抓取，可能要 10–30 秒，请稍候…</div>
                 </div>`);
             const timer = setInterval(function () {
                 const el = document.getElementById('carrierElapsed');
@@ -860,7 +860,9 @@
                 el.textContent = '（已等待 ' + Math.round((Date.now() - startedAt) / 1000) + ' 秒）';
             }, 1000);
             const stopTimer = function () { clearInterval(timer); };
-            fetch(`/api/order/${orderId}/carrier-status`)
+            const trackingQuery = trackingNumber
+                ? `?tracking_number=${encodeURIComponent(trackingNumber)}` : '';
+            fetch(`/api/order/${orderId}/carrier-status${trackingQuery}`)
                 .then(res => res.json())
                 .then(data => {
                     stopTimer();
@@ -1373,6 +1375,79 @@
                     // --- TRACKING INFORMATION LOGIC ---
                     var allTracking = [];
 
+                    function trackingEsc(value) {
+                        return String(value == null ? '' : value)
+                            .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                            .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                            .replace(/'/g, '&#39;');
+                    }
+                    function parcelItemsFromProducts(products) {
+                        if (!Array.isArray(products)) return [];
+                        return products.map(function (product) {
+                            product = product || {};
+                            var itemId = String(product.item_id || '');
+                            var productId = String(product.product || '');
+                            // Item-row identity is authoritative for variations.
+                            // A parent product ID can match several flavours, so
+                            // only use product/variation fallback when unique.
+                            var line = itemId ? lineItems.find(function (candidate) {
+                                return String(candidate.id || '') === itemId;
+                            }) : null;
+                            if (!line && productId) {
+                                var productMatches = lineItems.filter(function (candidate) {
+                                    return String(candidate.variation_id || '') === productId ||
+                                        String(candidate.product_id || '') === productId;
+                                });
+                                if (productMatches.length === 1) line = productMatches[0];
+                            }
+                            line = line || {};
+                            return {
+                                item_id: itemId,
+                                name: line.name || ('商品行 ' + (itemId || productId || '-')),
+                                sku: line.sku || '',
+                                qty: parseInt(product.qty || 0, 10) || 0
+                            };
+                        });
+                    }
+                    function lineParcelItem(item) {
+                        return [{
+                            item_id: String(item.id || ''),
+                            name: item.name || '商品',
+                            sku: item.sku || '',
+                            qty: parseInt(item.quantity || 0, 10) || 0
+                        }];
+                    }
+                    function mergeParcelItems(current, incoming) {
+                        current = Array.isArray(current) ? current : [];
+                        (Array.isArray(incoming) ? incoming : []).forEach(function (item) {
+                            var key = item.item_id
+                                ? 'item:' + String(item.item_id)
+                                : 'name:' + String(item.name || '');
+                            var existing = current.find(function (candidate) {
+                                var candidateKey = candidate.item_id
+                                    ? 'item:' + String(candidate.item_id)
+                                    : 'name:' + String(candidate.name || '');
+                                return candidateKey === key;
+                            });
+                            if (existing) {
+                                existing.qty = Math.max(parseInt(existing.qty || 0, 10), parseInt(item.qty || 0, 10));
+                                if (!existing.sku && item.sku) existing.sku = item.sku;
+                                if (item.name && item.name.indexOf('商品行 ') !== 0) existing.name = item.name;
+                            } else {
+                                current.push(item);
+                            }
+                        });
+                        return current;
+                    }
+                    function shipmentDate(value) {
+                        if (!value) return '';
+                        var raw = String(value).trim();
+                        var date = /^\d{9,13}$/.test(raw)
+                            ? new Date(parseInt(raw, 10) * (raw.length > 10 ? 1 : 1000))
+                            : new Date(raw.replace(' ', 'T'));
+                        return isNaN(date.getTime()) ? '' : date.toLocaleDateString('zh-CN');
+                    }
+
                     // 1. VillaTheme Plugin (in line_items)
                     lineItems.forEach(function (item) {
                         if (item.meta_data && Array.isArray(item.meta_data)) {
@@ -1382,18 +1457,17 @@
                                         var trackData = typeof meta.value === 'string' ? JSON.parse(meta.value) : meta.value;
                                         if (Array.isArray(trackData)) {
                                             trackData.forEach(function (td) {
-                                                allTracking.push({
-                                                    tracking_number: td.tracking_number,
-                                                    carrier_name: td.carrier_name || td.carrier_slug,
-                                                    carrier_url: td.carrier_url ? td.carrier_url.replace('{tracking_number}', td.tracking_number) : '',
-                                                    time: td.time,
-                                                    source: item.name
-                                                });
+                                                addCustomTracking(
+                                                    td.tracking_number, item.name,
+                                                    td.carrier_slug || td.carrier_name, td.time,
+                                                    lineParcelItem(item), false, false,
+                                                    td.carrier_url ? td.carrier_url.replace('{tracking_number}', td.tracking_number) : ''
+                                                );
                                             });
                                         }
                                     } catch (e) { }
                                 } else if (meta.key === 'tracking_number' && meta.value) {
-                                    addCustomTracking(meta.value, item.name);
+                                    addCustomTracking(meta.value, item.name, '', null, lineParcelItem(item));
                                 }
                             });
                         }
@@ -1420,7 +1494,11 @@
                                         // Carrier + URL come from the explicit provider (ems / inpost /
                                         // dpd / australia-post …), NOT a digit-length heuristic — that
                                         // mis-tagged EMS numbers like LM…CN as DPD. Dedup-aware.
-                                        addCustomTracking(item.tracking_number, 'Order Info', item.tracking_provider, item.date_shipped);
+                                        addCustomTracking(
+                                            item.tracking_number, 'AST', item.tracking_provider,
+                                            item.date_shipped, parcelItemsFromProducts(item.products_list),
+                                            String(item.status_shipped || '') === '2', false
+                                        );
                                     }
                                 });
                             }
@@ -1431,11 +1509,20 @@
                         });
                     }
 
-                    // 4. Local Shipping Log (for manually shipped orders not yet synced)
-                    if (order.shipping_log && order.shipping_log.tracking_number) {
+                    // 4. Local order-system parcel history. This is the source
+                    // of truth for split-item quantities and can contain many rows.
+                    if (Array.isArray(order.shipment_parcels)) {
+                        order.shipment_parcels.forEach(function (parcel) {
+                            addCustomTracking(
+                                parcel.tracking_number, '订单系统', parcel.carrier_slug,
+                                parcel.shipped_at, parcel.items || [],
+                                !!parcel.is_partial, !!parcel.is_reship
+                            );
+                        });
+                    } else if (order.shipping_log && order.shipping_log.tracking_number) {
                         addCustomTracking(order.shipping_log.tracking_number, 'Shipping Log', order.shipping_log.carrier_slug);
                     }
-                    function addCustomTracking(tn, sourceName, provider, time) {
+                    function addCustomTracking(tn, sourceName, provider, time, items, isPartial, isReship, explicitUrl) {
                         tn = String(tn || '').trim();
                         if (!tn) return;
                         // Resolve carrier from the explicit provider/slug first; fall back to a
@@ -1447,16 +1534,27 @@
                             return String(t.tracking_number).toLowerCase() === tn.toLowerCase();
                         });
                         if (existing) {
-                            if (provider) { existing.carrier_name = resolved.name; existing.carrier_url = resolved.url; }
+                            if (provider) {
+                                existing.provider = provider;
+                                existing.carrier_name = resolved.name;
+                                existing.carrier_url = explicitUrl || resolved.url;
+                            }
                             if (!existing.time && time) existing.time = time;
+                            existing.items = mergeParcelItems(existing.items, items);
+                            existing.is_partial = existing.is_partial || !!isPartial;
+                            existing.is_reship = existing.is_reship || !!isReship;
                             return;
                         }
                         allTracking.push({
                             tracking_number: tn,
+                            provider: provider || '',
                             carrier_name: resolved.name,
-                            carrier_url: resolved.url,
+                            carrier_url: explicitUrl || resolved.url,
                             time: time || null,
-                            source: sourceName
+                            source: sourceName,
+                            items: mergeParcelItems([], items),
+                            is_partial: !!isPartial,
+                            is_reship: !!isReship
                         });
                     }
 
@@ -1499,23 +1597,36 @@
 
                     if (allTracking.length > 0) {
                         html += '<div class="col-12">';
-                        html += '<div class="info-card" style="border-color: rgba(16, 185, 129, 0.3);"><div class="card-header" style="background: linear-gradient(90deg, rgba(16, 185, 129, 0.15) 0%, transparent 100%);"><h6 style="color: #34d399;"><i class="bi bi-geo-alt-fill me-2"></i>运单追踪</h6></div>';
+                        html += '<div class="info-card" style="border-color: rgba(16, 185, 129, 0.3);"><div class="card-header d-flex align-items-center justify-content-between" style="background: linear-gradient(90deg, rgba(16, 185, 129, 0.15) 0%, transparent 100%);"><h6 class="mb-0" style="color: #34d399;"><i class="bi bi-geo-alt-fill me-2"></i>运单追踪</h6><span class="badge bg-success bg-opacity-25 text-success">共 ' + allTracking.length + ' 个包裹</span></div>';
                         html += '<div class="card-body">';
-                        html += '<button class="btn btn-sm btn-success mb-2" onclick="queryCarrier(\'' + order.id + '\', \'' + (order.number || '') + '\')"><i class="bi bi-truck me-1"></i>查物流（实时中文轨迹）</button>';
-                        allTracking.forEach(function (t) {
-                            html += '<div class="mb-2 p-2 rounded" style="background: rgba(16, 185, 129, 0.1);">';
-                            html += '<div><strong>运单号:</strong> <span class="text-info">' + t.tracking_number + '</span></div>';
-                            html += '<div><strong>物流商:</strong> ' + t.carrier_name + '</div>';
-                            if (t.time) {
-                                var d = new Date(parseInt(t.time) * 1000);
-                                if (!isNaN(d.getTime())) {
-                                    html += '<div><strong>发货日期:</strong> ' + d.toLocaleDateString('zh-CN') + '</div>';
-                                }
+                        allTracking.forEach(function (t, index) {
+                            var dateText = shipmentDate(t.time);
+                            var parcelStatus = t.is_reship ? '补发包裹' : (t.is_partial ? '部分发货' : (allTracking.length > 1 ? '最终批次' : '已发货'));
+                            var parcelBadge = t.is_reship ? 'bg-warning text-dark' : (t.is_partial ? 'bg-info bg-opacity-25 text-info' : 'bg-success bg-opacity-25 text-success');
+                            html += '<div class="mb-3 p-3 rounded" style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16,185,129,0.18);">';
+                            html += '<div class="d-flex align-items-center justify-content-between mb-2"><strong>包裹 ' + (index + 1) + '</strong><span class="badge ' + parcelBadge + '">' + parcelStatus + '</span></div>';
+                            html += '<div><strong>运单号:</strong> <span class="text-info">' + trackingEsc(t.tracking_number) + '</span></div>';
+                            html += '<div><strong>物流商:</strong> ' + trackingEsc(t.carrier_name) + '</div>';
+                            if (dateText) {
+                                html += '<div><strong>发货日期:</strong> ' + dateText + '</div>';
                             }
+                            if (t.items && t.items.length) {
+                                html += '<div class="mt-2 pt-2 border-top border-success border-opacity-25"><strong class="small">本包裹商品:</strong>';
+                                t.items.forEach(function (item) {
+                                    html += '<div class="small mt-1 ms-2"><span class="text-light">' + trackingEsc(item.name) + '</span>' +
+                                        (item.sku ? ' <code class="ms-1">' + trackingEsc(item.sku) + '</code>' : '') +
+                                        ' <span class="text-warning">× ' + (parseInt(item.qty || 0, 10) || 0) + '</span></div>';
+                                });
+                                html += '</div>';
+                            } else if (allTracking.length > 1) {
+                                html += '<div class="small text-muted mt-2">该历史包裹未记录商品明细</div>';
+                            }
+                            html += '<div class="mt-2 d-flex flex-wrap gap-2">';
+                            html += '<button class="btn btn-sm btn-success" data-order-id="' + trackingEsc(order.id) + '" data-order-number="' + trackingEsc(order.number || '') + '" data-tracking-number="' + trackingEsc(t.tracking_number) + '" onclick="queryCarrier(this.dataset.orderId, this.dataset.orderNumber, this.dataset.trackingNumber)"><i class="bi bi-truck me-1"></i>实时中文轨迹</button>';
                             if (t.carrier_url) {
-                                html += '<div class="mt-1"><a href="' + t.carrier_url + '" target="_blank" class="btn btn-sm btn-outline-success"><i class="bi bi-box-arrow-up-right me-1"></i>查询物流</a></div>';
+                                html += '<a href="' + trackingEsc(t.carrier_url) + '" target="_blank" rel="noopener" class="btn btn-sm btn-outline-success"><i class="bi bi-box-arrow-up-right me-1"></i>物流商官网</a>';
                             }
-                            html += '</div>';
+                            html += '</div></div>';
                         });
                         html += '</div></div></div>';
                     }

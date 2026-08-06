@@ -104,9 +104,10 @@ def _shipment_products(conn, shipment_id: str) -> list[dict]:
         if raw.get("id") is None:
             continue
         products.append({
-            "product": str(raw.get("product_id") or ""),
+            "product": str(raw.get("variation_id") or raw.get("product_id") or ""),
             "item_id": str(raw.get("id")),
             "qty": str(row["quantity"]),
+            "sku": str(raw.get("sku") or "").strip(),
         })
     return products
 
@@ -129,9 +130,9 @@ def _all_order_shipments(conn, order_id: str, revision: int) -> list[dict]:
     return result
 
 
-def _ast_items(shipments: list[dict], conn=None) -> list[dict]:
+def _ast_items(shipments: list[dict], conn=None, *, final: bool = False) -> list[dict]:
     result = []
-    for shipment in shipments:
+    for index, shipment in enumerate(shipments):
         tracking = (shipment.get("tracking_number") or "").strip()
         if not tracking:
             continue
@@ -162,7 +163,9 @@ def _ast_items(shipments: list[dict], conn=None) -> list[dict]:
             "tracking_product_code": "",
             "date_shipped": date_shipped,
             "products_list": shipment.get("products") or [],
-            "status_shipped": "1",
+            # AST: intermediate parcels are partial; only the parcel that
+            # closes all remaining quantities marks the order fully shipped.
+            "status_shipped": "1" if final and index == len(shipments) - 1 else "2",
             "tracking_id": hashlib.md5(f"{tracking}{date_shipped}".encode()).hexdigest(),
         })
     return result
@@ -363,7 +366,12 @@ def _notify_shipment(conn, site, order, shipment: dict, fmt: str, final: bool) -
             str(order["payment_method"] or "").lower() == "cod"
             and int(finance.get("fulfillment_count") or 0) > 1
         )
-        if split_cod:
+        if fmt == "ast":
+            # The native AST shipment API has already queued the shipment
+            # email. Do not call the compatibility trigger or post a customer
+            # note as either would create a duplicate notification.
+            result = "scheduled_ast_native"
+        elif split_cod:
             # A single generic AST template cannot explain two different COD
             # amounts safely.  Use one idempotent customer-note email per
             # parcel; tracking metadata is still written to AST.
@@ -381,19 +389,12 @@ def _notify_shipment(conn, site, order, shipment: dict, fmt: str, final: bool) -
             data = response.json() if response.status_code == 200 and response.text else {}
             plugin = data.get("plugin")
             sent = data.get("email_sent")
-            # AST only sends on the final status->shipped transition.  A partial
-            # shipment has no status transition, so guarantee the per-parcel
-            # notice with an idempotent Woo customer note.
-            if fmt == "ast" and not final:
-                _post_customer_note(conn, site, order, shipment, tracking_url)
-                result = "sent_partial_customer_note"
-            elif sent is True or (fmt == "ast" and final):
+            if sent is True:
                 result = f"sent_{plugin or fmt}"
             elif response.status_code == 404 or sent is False:
                 _post_customer_note(conn, site, order, shipment, tracking_url)
                 result = "sent_customer_note_fallback"
             else:
-                # AST final email is queued asynchronously and returns null.
                 result = f"scheduled_{plugin or fmt}"
     except Exception as exc:
         conn.execute(
@@ -442,16 +443,48 @@ def sync_shipment(conn, shipment_id: str) -> dict:
     }
     if final:
         payload["status"] = "shipped" if fmt == "ast" else "on-hold"
-    if fmt == "ast":
-        payload["meta_data"].append({"key": "_wc_shipment_tracking_items", "value": _ast_items(shipments, conn=conn)})
-    elif fmt == "villatheme":
+    elif fmt == "ast":
+        payload["status"] = "partial-shipped"
+    if fmt == "villatheme":
         payload["line_items"] = _villatheme_lines(conn, shipments, order_lines)
-    else:
+    elif fmt != "ast":
         payload["line_items"] = _custom_lines(shipments, order_lines)
 
     url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}"
+    if fmt == "ast":
+        products = shipment.get("products") or []
+        missing_sku = [product.get("item_id") for product in products if not product.get("sku")]
+        if missing_sku:
+            raise WooError(
+                f"AST 商品行缺少 SKU: {', '.join(map(str, missing_sku))}",
+                code="ast_sku_missing",
+            )
+        shipped_at = str(shipment.get("shipped_at") or utcnow())
+        ast_payload = {
+            "tracking_provider": _ast_provider(
+                shipment.get("carrier_slug"), shipment.get("tracking_number")
+            ),
+            "tracking_number": shipment["tracking_number"],
+            "date_shipped": shipped_at[:10],
+            "status_shipped": 1 if final else 2,
+            "shipping_note": "",
+            "custom_tracking_link": _tracking_url(conn, shipment),
+            "replace_tracking": 0,
+            "sku": ",".join(product["sku"] for product in products),
+            "qty": ",".join(str(product["qty"]) for product in products),
+        }
+        write_url = (
+            f"{site['url']}/wp-json/wc-ast-pro/v3/orders/"
+            f"{woo_post_id(order['id'])}/shipment-trackings"
+        )
+        write_method = "POST"
+        write_payload = ast_payload
+    else:
+        write_url = url
+        write_method = "PUT"
+        write_payload = payload
     try:
-        remote = _request("PUT", url, site, payload=payload)
+        remote = _request(write_method, write_url, site, payload=write_payload)
     except WooError as exc:
         if not exc.unknown_outcome:
             raise
@@ -485,7 +518,7 @@ def sync_shipment(conn, shipment_id: str) -> dict:
         "UPDATE oms_shipments SET woo_sync_status='synced', updated_at=CURRENT_TIMESTAMP WHERE id=?",
         (shipment_id,),
     )
-    if final:
+    if final or fmt == "ast":
         conn.execute("UPDATE orders SET status=? WHERE id=?", (payload["status"], order["id"]))
     notification = _notify_shipment(conn, site, order, shipment, fmt, final)
     record_event(
