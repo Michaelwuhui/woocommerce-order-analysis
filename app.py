@@ -17,6 +17,13 @@ import blocklist  # customer blocklist: auto-cancel COD orders from blacklisted 
 from shipping_export import build_australia_shipping_workbook
 from sales_board_rates import load_monthly_receipt_rates, resolve_sales_board_rate
 from sales_target_inheritance import load_sales_targets_for_month
+from shipment_split import (
+    ShipmentItemError,
+    normalize_batch_items,
+    order_products as split_order_products,
+    remaining_after as split_remaining_after,
+)
+from order_shipments import build_shipping_log_parcels, extract_tracking_candidates
 from partner_site_scope import (
     EFFECTIVE_PARTNER_SITES,
     get_partner_site_scope,
@@ -5024,10 +5031,22 @@ def get_order_details(order_id):
     else:
         order_dict['order_notes'] = _local_order_notes()
 
-    # Get local shipping log if exists (for manually shipped orders not yet synced)
-    shipping_log = conn.execute('SELECT tracking_number, carrier_slug, shipped_at FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
-    if shipping_log:
-        order_dict['shipping_log'] = dict(shipping_log)
+    # Return every locally recorded parcel, including the exact item quantities
+    # captured for split shipments. Keep shipping_log as a latest-parcel alias
+    # for older clients while the order-detail UI consumes shipment_parcels.
+    shipping_log_rows = conn.execute(
+        '''SELECT id, tracking_number, carrier_slug, shipped_at, status,
+                  items_json, is_partial, is_reship, reship_reason
+           FROM shipping_logs WHERE order_id = ?
+           ORDER BY COALESCE(shipped_at, '') ASC, id ASC''',
+        (order_id,),
+    ).fetchall()
+    shipping_logs = [dict(row) for row in shipping_log_rows]
+    order_dict['shipment_parcels'] = build_shipping_log_parcels(
+        shipping_logs, order_dict['line_items'] or []
+    )
+    if shipping_logs:
+        order_dict['shipping_log'] = shipping_logs[-1]
 
     # Resolve who marked the order as undelivered (for audit display)
     if order_dict.get('is_undelivered') and order_dict.get('undelivered_by'):
@@ -6184,6 +6203,11 @@ def init_shipping_tables():
     for ddl in (
         'ALTER TABLE shipping_logs ADD COLUMN reship_reason TEXT',
         'ALTER TABLE shipping_logs ADD COLUMN is_reship INTEGER DEFAULT 0',
+        # Item-level parcel contents are required for a truthful AST partial
+        # shipment.  is_partial records the semantic value written to AST
+        # (status_shipped=2) for each individual parcel.
+        'ALTER TABLE shipping_logs ADD COLUMN items_json TEXT',
+        'ALTER TABLE shipping_logs ADD COLUMN is_partial INTEGER DEFAULT 0',
     ):
         try:
             conn.execute(ddl)
@@ -16458,7 +16482,7 @@ def evaluate_big_order(product_count, total, qty_threshold, amount_threshold):
 @login_required
 @shipping_view_required
 def get_pending_orders():
-    """Get orders pending shipment (status=processing)"""
+    """Get orders pending or partially pending shipment."""
     conn = get_db_connection()
     qty_threshold, amount_threshold = get_big_order_thresholds(conn)
 
@@ -16484,7 +16508,7 @@ def get_pending_orders():
             GROUP BY order_id
             HAVING date_created = MAX(date_created)
         ) n ON o.id = n.order_id
-        WHERE o.status IN ('processing', 'offline')
+        WHERE o.status IN ('processing', 'offline', 'partial-shipped')
     '''
     params = []
     
@@ -16628,24 +16652,28 @@ def get_pending_orders():
             orders = visible_orders
 
     # Parcels already shipped for these orders (split shipment / 分批发货).
-    # shipping_logs is local-only and untouched by sync, so a partial order
-    # keeps its 'processing' status and stays in this queue; the parcel rows
-    # tell us how many packages already went out.
+    # shipping_logs is local-only and untouched by sync.  Partial AST orders
+    # stay in this queue through their explicit partial-shipped status; parcel
+    # rows provide the exact already-shipped item quantities.
     order_ids = [o['id'] for o in orders]
     parcels_map = {}
     if order_ids:
         ph = ','.join(['?'] * len(order_ids))
         for r in conn.execute(
             f'''SELECT sl.order_id, sl.tracking_number, sl.carrier_slug, sl.shipped_at,
+                       sl.items_json, sl.is_partial,
                        sc.name AS carrier_name
                 FROM shipping_logs sl
                 LEFT JOIN shipping_carriers sc ON sc.slug = sl.carrier_slug
                 WHERE sl.order_id IN ({ph}) ORDER BY sl.id''', order_ids).fetchall():
+            parcel_items = parse_json_field(r['items_json']) if r['items_json'] else []
             parcels_map.setdefault(r['order_id'], []).append({
                 'tracking_number': r['tracking_number'],
                 'carrier_slug': r['carrier_slug'],
                 'carrier_name': r['carrier_name'] or r['carrier_slug'],
                 'shipped_at': r['shipped_at'],
+                'items': parcel_items if isinstance(parcel_items, list) else [],
+                'is_partial': bool(r['is_partial']),
             })
 
     # Build the risk index once (small scan over flagged orders only) and
@@ -16704,7 +16732,14 @@ def get_pending_orders():
             'state_mismatch': _au_state_mismatch(addr),
             'customer_inpost_id': custom_fields['customer_inpost_id'],
             'customer_social': custom_fields['customer_social'],
-            'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (line_items or [])],
+            'products': [{
+                'item_id': item.get('id'),
+                'product_id': item.get('product_id'),
+                'variation_id': item.get('variation_id'),
+                'name': item.get('name', ''),
+                'quantity': item.get('quantity', 1),
+                'total': float(item.get('total', 0)),
+            } for item in (line_items or [])],
             'shipping_total': float(order['shipping_total'] or 0),
             'shipping_method': shipping_method,
             'product_count': product_count,
@@ -17352,14 +17387,7 @@ def build_ast_tracking_items(parcels, line_items):
     list and behave exactly as before.
     """
     import time, hashlib
-    products = []
-    for it in line_items or []:
-        if isinstance(it, dict) and it.get('id'):
-            products.append({
-                'product': str(it.get('product_id', '')),
-                'item_id': str(it.get('id')),
-                'qty': str(it.get('quantity', 1))
-            })
+    fallback_products = split_order_products(line_items)
     items = []
     for p in parcels or []:
         tn = (p.get('tracking_number') or '').strip()
@@ -17382,8 +17410,10 @@ def build_ast_tracking_items(parcels, line_items):
             'custom_tracking_link': official_link if is_expressone_last_mile else '',
             'tracking_product_code': '',
             'date_shipped': ds,
-            'products_list': products,
-            'status_shipped': '1',
+            'products_list': p.get('products_list') or fallback_products,
+            # AST: 1 = fully shipped, 2 = partially shipped.  Each parcel keeps
+            # the semantic value it had when it was created.
+            'status_shipped': '2' if p.get('is_partial') else '1',
             # Stable per (number, date) so re-PUTs don't churn the id.
             'tracking_id': hashlib.md5(f"{tn}{ds}".encode()).hexdigest(),
         })
@@ -17499,12 +17529,12 @@ def ship_order():
     # 分批发货 (split shipment) flags:
     #   new_parcel   → this action adds ANOTHER parcel: append a shipping_logs
     #                  row and rebuild the WP tracking value from ALL parcels.
-    #   more_batches → not the final batch: leave the order status untouched so
-    #                  it stays in the 待发货 queue and survives WC re-sync
-    #                  (sync overwrites status). Status only advances on the
-    #                  final batch (more_batches=False).
+    #   more_batches → not the final batch: AST orders transition to the native
+    #                  partial-shipped status; the queue includes that status so
+    #                  the remaining items can be shipped later.
     new_parcel = bool(data.get('new_parcel'))
     more_batches = bool(data.get('more_batches'))
+    requested_items = data.get('shipped_items')
     # 补发货 (re-shipment): re-send a NEW tracking after the first parcel was
     # lost / never sent. A non-empty reship_reason flags it. A reship writes ONLY
     # the new parcel to WP (replace — the customer sees just the live tracking),
@@ -17576,6 +17606,15 @@ def ship_order():
     fmt_label = {'ast': 'AST', 'villatheme': 'VillaTheme', 'custom_lineitem': '自定义', 'unknown': '默认(AST)'}.get(fmt, fmt)
     target_status = target_status_for_format(fmt)
 
+    try:
+        current_products = normalize_batch_items(
+            line_items, requested_items, require_explicit=new_parcel
+        )
+    except ShipmentItemError as exc:
+        conn.close()
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    current_items_json = json.dumps(current_products, ensure_ascii=False)
+
     api_headers = {
         "User-Agent": "WooCommerce API Client-Python/3.0.0",
         "Content-Type": "application/json",
@@ -17589,7 +17628,7 @@ def ship_order():
     carriers_by_slug = {r['slug']: r for r in conn.execute(
         'SELECT slug, name, tracking_url FROM shipping_carriers').fetchall()}
 
-    def _mk_parcel(slug, tn, ds):
+    def _mk_parcel(slug, tn, ds, products_list=None, is_partial=False):
         c = carriers_by_slug.get(slug)
         tmpl = _carrier_tracking_url(
             slug, tn, ((c['tracking_url'] if c else '') or '')
@@ -17600,6 +17639,8 @@ def ship_order():
             'carrier_name': (c['name'] if c else slug),
             'tracking_url_template': tmpl,
             'date_shipped': ds,
+            'products_list': products_list or [],
+            'is_partial': bool(is_partial),
         }
 
     def _shipped_at_unix(s):
@@ -17612,24 +17653,50 @@ def ship_order():
                 pass
         return new_ds
 
+    prior_parcels = []
     if new_parcel:
         prior = conn.execute(
-            'SELECT tracking_number, carrier_slug, shipped_at FROM shipping_logs WHERE order_id=? ORDER BY id',
+            '''SELECT tracking_number, carrier_slug, shipped_at, items_json, is_partial
+               FROM shipping_logs WHERE order_id=? ORDER BY id''',
             (order_id,)).fetchall()
-        parcels = [_mk_parcel(r['carrier_slug'], r['tracking_number'], _shipped_at_unix(r['shipped_at']))
-                   for r in prior if (r['tracking_number'] or '').strip()]
-        parcels.append(_mk_parcel(carrier_slug, tracking_number, new_ds))
+        for r in prior:
+            if not (r['tracking_number'] or '').strip():
+                continue
+            products = parse_json_field(r['items_json']) if r['items_json'] else []
+            prior_parcels.append(_mk_parcel(
+                r['carrier_slug'], r['tracking_number'], _shipped_at_unix(r['shipped_at']),
+                products if isinstance(products, list) else [], bool(r['is_partial'])
+            ))
+        try:
+            remaining = split_remaining_after(line_items, prior_parcels, current_products)
+        except ShipmentItemError as exc:
+            conn.close()
+            return jsonify({'success': False, 'error': str(exc)}), 409
+        has_remaining = any(qty > 0 for qty in remaining.values())
+        if more_batches and not has_remaining:
+            conn.close()
+            return jsonify({'success': False, 'error': '本批发货后已无剩余商品，请使用“发货并完成”'}), 409
+        if not more_batches and has_remaining:
+            conn.close()
+            return jsonify({'success': False, 'error': '仍有未发商品，请补足本批数量或使用“发货并继续”'}), 409
+        parcels = prior_parcels + [
+            _mk_parcel(carrier_slug, tracking_number, new_ds, current_products, more_batches)
+        ]
     else:
-        parcels = [_mk_parcel(carrier_slug, tracking_number, new_ds)]
+        parcels = [_mk_parcel(carrier_slug, tracking_number, new_ds, current_products, False)]
 
-    # Build the PUT payload: tracking meta (+ status, unless more batches follow).
+    # Build the PUT payload: tracking meta plus the truthful order state.
     # Status varies by site: AST uses its custom 'shipped' status; VillaTheme
     # and poland.php sites stay at the standard 'on-hold' status after shipping.
-    # During a partial shipment (more_batches) we DON'T send status, so the
-    # order stays in its pre-ship state (待发货) until the final batch.
     put_payload = {}
-    if not more_batches:
-        put_payload['status'] = target_status
+    expected_status = target_status
+    if more_batches and fmt in ('ast', 'unknown'):
+        expected_status = 'partial-shipped'
+    elif more_batches:
+        # Sites without AST do not register a partial status.  Retain their
+        # pre-ship state while still storing item-level parcel history locally.
+        expected_status = order['status']
+    put_payload['status'] = expected_status
     base_meta = [
         {'key': '_tracking_number', 'value': tracking_number},
         {'key': '_tracking_provider', 'value': carrier_slug},
@@ -17655,6 +17722,34 @@ def ship_order():
         ]
 
     status_url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}"
+    ast_api_url = f"{site['url']}/wp-json/wc-ast-pro/v3/orders/{woo_post_id(order['id'])}/shipment-trackings"
+    ast_api_payload = None
+    if fmt == 'ast':
+        by_item_id = {
+            str(item.get('id')): item for item in line_items
+            if isinstance(item, dict) and item.get('id') is not None
+        }
+        selected_lines = [by_item_id.get(str(p.get('item_id'))) for p in current_products]
+        missing_sku = [p.get('item_id') for p, item in zip(current_products, selected_lines)
+                       if not item or not str(item.get('sku') or '').strip()]
+        if missing_sku and new_parcel:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': f"分批商品行 {', '.join(map(str, missing_sku))} 缺少 SKU，AST 无法保存商品级发货明细"
+            }), 409
+        ast_api_payload = {
+            'tracking_provider': _ast_provider_for_carrier(carrier_slug, tracking_number),
+            'tracking_number': tracking_number,
+            'date_shipped': datetime.fromtimestamp(new_ds).strftime('%Y-%m-%d'),
+            'status_shipped': 2 if more_batches else 1,
+            'shipping_note': '',
+            'custom_tracking_link': tracking_url,
+            'replace_tracking': 1 if is_reship else 0,
+        }
+        if not missing_sku:
+            ast_api_payload['sku'] = ','.join(str(item.get('sku')).strip() for item in selected_lines)
+            ast_api_payload['qty'] = ','.join(str(p.get('qty')) for p in current_products)
     warnings = []
     remote_success = False
 
@@ -17702,7 +17797,7 @@ def ship_order():
         remote_id = str(payload.get('id') or '')
         if remote_id and remote_id != str(woo_post_id(order['id'])):
             return False
-        status_ok = more_batches or payload.get('status') == target_status
+        status_ok = payload.get('status') == expected_status
         return status_ok and _remote_order_has_tracking(payload)
 
     def _verify_remote_saved(reason):
@@ -17720,12 +17815,17 @@ def ship_order():
             print(f"[SHIP] verify remote saved failed: {verify_err}")
         return False
 
-    # PUT with retry. The same payload is idempotent so retrying after timeout is safe.
+    # AST goes through its native API so product rows are stored as the objects
+    # expected by AST's partial-shipment email template. Other plugins retain
+    # the existing WooCommerce order PUT path.
     for attempt in range(3):
         try:
-            resp = req.put(
-                status_url,
-                json=put_payload,
+            request_url = ast_api_url if ast_api_payload is not None else status_url
+            request_payload = ast_api_payload if ast_api_payload is not None else put_payload
+            request_method = req.post if ast_api_payload is not None else req.put
+            resp = request_method(
+                request_url,
+                json=request_payload,
                 auth=(site['consumer_key'], site['consumer_secret']),
                 timeout=60,
                 headers=api_headers
@@ -17751,9 +17851,9 @@ def ship_order():
                 warnings.append(f"远程返回 {resp.status_code}: {body}")
         except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
             print(f"[SHIP] {site['url']} order {order['id']} attempt {attempt+1} timed out: {e}")
-            # Verify by GET — the PUT may have actually applied even if the
+            # Verify by GET — the write may have actually applied even if the
             # response never made it back.
-            if _verify_remote_saved("PUT 响应超时，但二次查询确认运单已写入"):
+            if _verify_remote_saved("写入响应超时，但二次查询确认运单已写入"):
                 remote_success = True
                 break
             if attempt < 2:
@@ -17771,14 +17871,18 @@ def ship_order():
             existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
             if existing_log:
                 conn.execute(
-                    "UPDATE shipping_logs SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now') WHERE order_id=?",
-                    (tracking_number, carrier_slug, current_user.id, order_id)
+                    """UPDATE shipping_logs
+                       SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now'),
+                           items_json=?, is_partial=0
+                       WHERE order_id=?""",
+                    (tracking_number, carrier_slug, current_user.id, current_items_json, order_id)
                 )
             else:
                 conn.execute(
-                    '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
-                       VALUES (?, ?, ?, ?, ?, ?)''',
-                    (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
+                    '''INSERT INTO shipping_logs
+                       (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 0)''',
+                    (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id, current_items_json)
                 )
             conn.commit()
         # A failed reship must NOT stash/overwrite the original tracking row.
@@ -17798,25 +17902,28 @@ def ship_order():
             f"新运单号 {tracking_number}。补发原因：{reship_reason}"
         )
 
-    # Trigger the site's native shipment email.
-    #
-    # Why this is a separate call (and not just the meta_data PUT above):
-    #   - AST hooks into the wc-shipped status transition, so its email is
-    #     already on its way the moment the PUT lands. Our trigger endpoint
-    #     is a no-op for AST.
-    #   - VillaTheme (Orders Tracking for WooCommerce) does NOT hook into
+    # Trigger the site's native shipment email when the tracking API has not
+    # already done so. AST's native shipment endpoint handles both the status
+    # transition and its email; calling our trigger endpoint afterwards would
+    # duplicate the customer notification. VillaTheme (Orders Tracking for
+    # WooCommerce) does NOT hook into
     #     status changes — its admin save handler invokes
     #     VI_WOO_ORDERS_TRACKING_ADMIN_IMPORT_CSV::send_mail() directly.
     #     Setting meta via REST never triggers send_mail(), so VillaTheme
     #     sites stopped emailing customers after the ship_order rewrite.
     #     The trigger endpoint replicates the admin call.
-    # The endpoint itself decides which path applies; we just always call it
-    # and let it self-detect.
     email_trigger_info = None
     # Did a customer-facing notification actually go out? Only consumed by the
     # reship fallback below; harmless for normal ships.
     customer_notified = False
-    if send_email:
+    if send_email and fmt == 'ast' and ast_api_payload is not None:
+        email_trigger_info = {
+            'plugin': 'AST',
+            'email_sent': None,
+            'note': 'AST native shipment API handled the notification',
+        }
+        customer_notified = True
+    elif send_email:
         try:
             trig_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/trigger-shipment-email"
             trig_resp = req.post(
@@ -17850,12 +17957,9 @@ def ship_order():
         except Exception as e:
             warnings.append(f"邮件触发异常: {e}")
 
-    # 补发 MUST reach the customer with the NEW tracking. The plugin-native
-    # shipment email only reliably fires for VillaTheme (direct send_mail); AST
-    # emails on a wc-shipped status *transition* that a reship doesn't cause
-    # (the order is already shipped), and custom/unknown sites have no native
-    # trigger at all. So whenever nothing customer-facing went out above, fall
-    # back to a WooCommerce customer note that emails the buyer the new tracking.
+    # 补发 MUST reach the customer with the NEW tracking. Whenever neither the
+    # native tracking API nor the plugin-specific trigger sent a notification,
+    # fall back to a WooCommerce customer note containing the new tracking.
     if is_reship and send_email and not customer_notified:
         _post_fallback_customer_note(req, site, order, carrier_name, tracking_number, tracking_url, api_headers, warnings)
 
@@ -17876,16 +17980,15 @@ def ship_order():
 
     # Local DB: status + shipping_logs (mirror the remote state we just set).
     try:
-        # Advance status only on the final batch. During a partial shipment the
-        # order keeps its pre-ship status so it stays in the 待发货 queue.
-        if not more_batches:
-            conn.execute("UPDATE orders SET status=? WHERE id=?", (target_status, order_id))
+        conn.execute("UPDATE orders SET status=? WHERE id=?", (expected_status, order_id))
         if new_parcel:
             # Split shipment: record this parcel as its own row.
             conn.execute(
-                '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
-                   VALUES (?, ?, ?, ?, ?, ?)''',
-                (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
+                '''INSERT INTO shipping_logs
+                   (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                (order_id, order['number'], order['source'], tracking_number,
+                 carrier_slug, current_user.id, current_items_json, 1 if more_batches else 0)
             )
         elif is_reship:
             # Re-shipment: keep the original parcel row(s) untouched and append a
@@ -17907,14 +18010,19 @@ def ship_order():
             existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id=?', (order_id,)).fetchone()
             if existing_log:
                 conn.execute(
-                    "UPDATE shipping_logs SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now') WHERE order_id=?",
-                    (tracking_number, carrier_slug, current_user.id, order_id)
+                    """UPDATE shipping_logs
+                       SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now'),
+                           items_json=?, is_partial=0
+                       WHERE order_id=?""",
+                    (tracking_number, carrier_slug, current_user.id, current_items_json, order_id)
                 )
             else:
                 conn.execute(
-                    '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by)
-                       VALUES (?, ?, ?, ?, ?, ?)''',
-                    (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id)
+                    '''INSERT INTO shipping_logs
+                       (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 0)''',
+                    (order_id, order['number'], order['source'], tracking_number,
+                     carrier_slug, current_user.id, current_items_json)
                 )
         conn.commit()
     except Exception as e:
@@ -17927,7 +18035,7 @@ def ship_order():
     if is_reship:
         msg = f"补发成功（{fmt_label} 格式），新运单 {tracking_number}"
     elif more_batches:
-        msg = f"第 {parcel_count} 个包裹已发货（分批中，订单仍在待发货，可继续添加包裹）"
+        msg = f"第 {parcel_count} 个包裹已发货，订单已标记为部分发货，可继续添加包裹"
     elif new_parcel and parcel_count > 1:
         msg = f"最后一个包裹已发货，共 {parcel_count} 个包裹，订单已完成发货（{fmt_label} 格式）"
     else:
@@ -19092,48 +19200,46 @@ def order_carrier_status(order_id):
         return jsonify({'success': False, 'error': '订单不存在'}), 404
     krow = conn.execute("SELECT value FROM settings WHERE key='track718_api_key'").fetchone()
     key718 = krow['value'] if krow else None
+    shipping_logs = [dict(row) for row in conn.execute(
+        '''SELECT tracking_number, carrier_slug FROM shipping_logs
+           WHERE order_id=? AND trim(COALESCE(tracking_number, ''))!=''
+           ORDER BY COALESCE(shipped_at, '') ASC, id ASC''',
+        (order_id,),
+    ).fetchall()]
     conn.close()
 
-    # Extract tracking number + provider (AST -> VillaTheme -> _tracking_number)
-    number, provider = '', ''
     md = parse_json_field(order['meta_data']) or []
     li = parse_json_field(order['line_items']) or []
-    for m in md:
-        if isinstance(m, dict) and m.get('key') == '_wc_shipment_tracking_items':
-            v = m.get('value') or []
-            if v and isinstance(v[0], dict) and v[0].get('tracking_number'):
-                number = str(v[0]['tracking_number']).strip()
-                provider = str(v[0].get('tracking_provider', ''))
-                break
-    if not number:
-        for it in li:
-            for m in (it.get('meta_data', []) if isinstance(it, dict) else []):
-                if isinstance(m, dict) and m.get('key') == '_vi_wot_order_item_tracking_data':
-                    try:
-                        td = m.get('value')
-                        td = json.loads(td) if isinstance(td, str) else td
-                        if td and td[0].get('tracking_number'):
-                            number = str(td[0]['tracking_number']).strip()
-                            provider = str(td[0].get('carrier_slug') or td[0].get('carrier_name') or '')
-                    except Exception:
-                        pass
-                if number:
-                    break
-            if number:
-                break
-    if not number:
-        for m in md:
-            if isinstance(m, dict) and m.get('key') == '_tracking_provider':
-                provider = provider or str(m.get('value', ''))
-            if isinstance(m, dict) and m.get('key') == '_tracking_number' and str(m.get('value', '')).strip():
-                number = str(m['value']).strip()
-    if not number:
+    shipping_lines = parse_json_field(order['shipping_lines']) or []
+    candidates = extract_tracking_candidates(md, li, shipping_lines, shipping_logs)
+    if not candidates:
         return jsonify({'success': False, 'error': '该订单没有运单号'}), 404
+    requested_number = str(request.args.get('tracking_number') or '').strip()
+    if requested_number:
+        selected = next(
+            (candidate for candidate in candidates
+             if candidate['tracking_number'].casefold() == requested_number.casefold()),
+            None,
+        )
+        if not selected:
+            return jsonify({'success': False, 'error': '该运单不属于此订单'}), 404
+    else:
+        selected = candidates[0]
+    number = selected['tracking_number']
+    provider = selected['provider']
+    parcel_count = len(candidates)
+
+    def _cache_carrier_status(outcome):
+        # An outcome for one parcel must never mark an entire split order as
+        # delivered/returned. Keep the legacy order-level cache only for orders
+        # that truly have one unique tracking number.
+        if parcel_count == 1:
+            _persist_carrier_status(order_id, outcome)
 
     carrier = ct.classify_carrier(provider, number, order['destination_country'])
     if carrier == 'expressone_hu':
         res = ct.expressone_hu_detail(number)
-        _persist_carrier_status(order_id, res.get('outcome'))
+        _cache_carrier_status(res.get('outcome'))
         if res.get('events'):
             return jsonify({
                 'success': True,
@@ -19168,7 +19274,7 @@ def order_carrier_status(order_id):
                 # Longer poll: a fresh number's crawl can take ~10-20s; break early
                 # once a status lands (see track718_detail) so most clicks resolve.
                 res = ct.track718_detail(number, key718, code=ct.TRACK718_INPOST_PL, poll=8, poll_wait=3)
-                _persist_carrier_status(order_id, res.get('outcome'))
+                _cache_carrier_status(res.get('outcome'))
                 if res.get('events'):
                     return jsonify({'success': True, 'carrier': 'InPost', 'tracking_number': number,
                                     'outcome': res.get('outcome', 'unknown'), 'events': res['events'],
@@ -19187,7 +19293,7 @@ def order_carrier_status(order_id):
         d = r.json()
         raw = d.get('status', '')
         outcome = ct.INPOST_STATUS_MAP.get(raw, 'in_transit')
-        _persist_carrier_status(order_id, outcome)
+        _cache_carrier_status(outcome)
         events = sorted([{'time': ev.get('datetime', ''), 'status': ev.get('status', '')}
                          for ev in (d.get('tracking_details') or [])],
                         key=lambda e: e['time'], reverse=True)
@@ -19203,7 +19309,7 @@ def order_carrier_status(order_id):
         else None
     )
     res = ct.track718_detail(number, key718, code=carrier_code, poll=8, poll_wait=3)
-    _persist_carrier_status(order_id, res.get('outcome'))
+    _cache_carrier_status(res.get('outcome'))
     name_map = {'dpd-pl': 'DPD', 'china-post': '中国邮政/EMS', 'australia-post': 'Australia Post',
                 'inpost-paczkomaty': 'InPost', 'gls': 'GLS', 'poczta-polska': 'Poczta Polska'}
     cname = (

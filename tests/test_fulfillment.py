@@ -803,6 +803,19 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.set_stock(pl=1, hu=5)
         self.add_order("ast-1", "PL", 3)
         plan_order(self.db, "ast-1")
+        order_item = self.db.execute(
+            "SELECT id, raw_json FROM oms_order_items WHERE order_id='ast-1'"
+        ).fetchone()
+        raw_item = json.loads(order_item["raw_json"])
+        raw_item.update({
+            "product_id": 13792,
+            "variation_id": 13794,
+            "sku": "WATERMELON-ICE",
+        })
+        self.db.execute(
+            "UPDATE oms_order_items SET raw_json=? WHERE id=?",
+            (json.dumps(raw_item), order_item["id"]),
+        )
         fulfillments = self.db.execute(
             "SELECT id,warehouse_id,status FROM oms_fulfillments WHERE order_id='ast-1' ORDER BY warehouse_id"
         ).fetchall()
@@ -816,7 +829,12 @@ class FulfillmentDomainTests(unittest.TestCase):
         )
         shipments = _all_order_shipments(self.db, "ast-1", 1)
         self.assertEqual(["PL-SHIPPED"], [s["tracking_number"] for s in shipments])
-        self.assertEqual(1, len(_ast_items(shipments)))
+        partial_items = _ast_items(shipments)
+        self.assertEqual(1, len(partial_items))
+        self.assertEqual("2", partial_items[0]["status_shipped"])
+        self.assertEqual("13794", partial_items[0]["products_list"][0]["product"])
+        self.assertEqual("WATERMELON-ICE", partial_items[0]["products_list"][0]["sku"])
+        self.assertEqual("1", _ast_items(shipments, final=True)[0]["status_shipped"])
 
     def test_ast_hungary_packeta_uses_expressone_custom_link(self):
         self.db.execute(
