@@ -14,7 +14,11 @@ from flask import Flask, render_template, render_template_string, request, redir
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from oid_utils import woo_post_id  # cross-site-safe WC post id for REST calls
 import blocklist  # customer blocklist: auto-cancel COD orders from blacklisted phones
-from shipping_export import build_australia_shipping_workbook
+from shipping_export import (
+    build_australia_pending_workbook,
+    build_australia_shipping_workbook,
+    prepare_australia_pending_items,
+)
 from sales_board_rates import load_monthly_receipt_rates, resolve_sales_board_rate
 from sales_target_inheritance import load_sales_targets_for_month
 from shipment_split import (
@@ -19758,7 +19762,8 @@ def _australia_shipping_export_rows(status_kind='shipped'):
     earlier tracking numbers are superseded, so only the newest parcel is
     exported.  When a site's tracking plugin stores the number only in order
     metadata, process_shipped_order() supplies the same fallback used by the UI.
-    Pending orders are exported once per order with a blank tracking number.
+    Pending orders include their product/flavor/quantity lines for the picking
+    workbook; shipped orders retain the logistics partner parcel layout.
     """
     conn = get_db_connection()
     if status_kind == 'pending':
@@ -19892,13 +19897,27 @@ def _australia_shipping_export_rows(status_kind='shipped'):
         if order_number and not order_number.startswith('#'):
             order_number = '#' + order_number
 
+        pending_items = []
+        if status_kind == 'pending':
+            pending_items = prepare_australia_pending_items(
+                parse_json_field(order['line_items']) or []
+            )
+        street_address = ', '.join(part for part in (
+            (corrected_addr.get('address_1') or '').strip(),
+            (corrected_addr.get('address_2') or '').strip(),
+        ) if part)
+
         for parcel in active_parcels:
             rows.append({
+                'order_date': (order['date_created'] or '')[:10],
                 'order_number': order_number,
+                'items': pending_items,
                 'customer_name': processed.get('customer_name', ''),
                 'phone': processed.get('customer_phone', ''),
                 'city': (corrected_addr.get('city') or '').strip(),
                 'state': (corrected_addr.get('state') or '').strip().upper(),
+                'street_address': street_address,
+                'postcode': (corrected_addr.get('postcode') or '').strip(),
                 'address': _compose_address(corrected_addr),
                 'tracking_number': str(parcel.get('tracking_number') or '').strip(),
             })
@@ -19934,14 +19953,14 @@ def export_australia_shipping_list():
 @login_required
 @shipping_view_required
 def export_australia_pending_list():
-    """Export filtered AU pending orders with blank tracking-number cells."""
+    """Export filtered AU pending orders in the picking workbook layout."""
     if not _has_au_access():
         return jsonify({'error': '无澳洲发货数据权限'}), 403
     rows = _australia_shipping_export_rows('pending')
     if not rows:
         return jsonify({'error': '当前筛选条件下没有澳洲未发货订单'}), 404
 
-    output = build_australia_shipping_workbook(rows)
+    output = build_australia_pending_workbook(rows)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M')
     response = send_file(
         output,
@@ -19949,7 +19968,10 @@ def export_australia_pending_list():
         download_name=f'杭州小包_澳洲未发货_{timestamp}.xlsx',
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     )
-    response.headers['X-Export-Row-Count'] = str(len(rows))
+    response.headers['X-Export-Order-Count'] = str(len(rows))
+    response.headers['X-Export-Row-Count'] = str(sum(
+        max(1, len(row.get('items') or [])) for row in rows
+    ))
     return response
 
 
