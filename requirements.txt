@@ -6,3 +6,6 @@ openpyxl>=3.1.0
 requests>=2.31.0
 WooCommerce>=3.0.0
 gunicorn>=21.2.0
+Pillow>=11.0.0,<13
+beautifulsoup4==4.14.2
+playwright==1.58.0

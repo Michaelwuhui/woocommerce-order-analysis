@@ -49,6 +49,13 @@ from poland_wms import (
     PolandWmsResult,
     normalize_poland_tracking_status,
 )
+from order_notification_service import (
+    NotificationPermanent,
+    NotificationRetry,
+    enqueue_notification_failure_alert,
+    process_notification_alert,
+    process_notification_job,
+)
 
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
@@ -134,19 +141,85 @@ def retry_job(conn, job: dict, error: Exception, *, delay_seconds: int | None = 
                updated_at=CURRENT_TIMESTAMP WHERE id=?''',
         (_future(delay_seconds), code or getattr(error, "code", "retry"), str(error)[:1000], job["id"]),
     )
+    if job.get("aggregate_type") == "order_notification":
+        try:
+            enqueue_notification_failure_alert(
+                conn,
+                job,
+                phase="delayed",
+                error_code=code or getattr(error, "code", "retry"),
+            )
+        except Exception:
+            print("failed to queue delayed notification alert", file=sys.stderr, flush=True)
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
     conn.commit()
 
 
 def dead_job(conn, job: dict, error: Exception, *, code: str | None = None):
+    error_code = code or getattr(error, "code", "failed")
+    error_summary = str(error)[:1000]
     conn.execute(
         '''UPDATE oms_integration_jobs
            SET status='dead_letter', locked_at=NULL, locked_by=NULL,
                lease_expires_at=NULL, last_error_code=?, last_error=?,
                updated_at=CURRENT_TIMESTAMP WHERE id=?''',
-        (code or getattr(error, "code", "failed"), str(error)[:1000], job["id"]),
+        (error_code, error_summary, job["id"]),
     )
     if job.get("aggregate_type") == "order" and job.get("aggregate_id"):
         mark_manual_review(conn, job["aggregate_id"], f"异步任务失败: {job['job_type']} - {str(error)[:300]}", commit=False)
+    elif job.get("aggregate_type") == "order_notification" and job.get("aggregate_id"):
+        notification_job = conn.execute(
+            "SELECT status FROM order_notification_jobs WHERE id=?",
+            (job["aggregate_id"],),
+        ).fetchone()
+        if notification_job:
+            previous_status = notification_job["status"]
+            preserve_statuses = {
+                "SENT",
+                "MANUAL_REVIEW",
+                "READY_PREVIEW",
+                "READY_MANUAL",
+                "SKIPPED",
+            }
+            domain_status_changed = previous_status not in preserve_statuses and previous_status != "DEAD_LETTER"
+            if domain_status_changed:
+                conn.execute(
+                    '''UPDATE order_notification_jobs
+                       SET status='DEAD_LETTER',last_error_code=?,last_error_summary=?,
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?''',
+                    (error_code, error_summary, job["aggregate_id"]),
+                )
+            conn.execute(
+                '''INSERT INTO notification_audit_logs
+                   (action,object_type,object_id,actor_type,before_summary,after_summary)
+                   VALUES ('notification_queue_dead_letter','order_notification_job',?,'system',?,?)''',
+                (
+                    job["aggregate_id"],
+                    json_dump({"status": previous_status}),
+                    json_dump(
+                        {
+                            "status": "DEAD_LETTER" if domain_status_changed else previous_status,
+                            "domain_status_changed": domain_status_changed,
+                            "queue_job_id": job["id"],
+                            "attempts": int(job.get("attempts") or 0),
+                            "max_attempts": int(job.get("max_attempts") or 0),
+                            "error_code": error_code,
+                            "error_summary": error_summary,
+                        }
+                    ),
+                ),
+            )
+            try:
+                enqueue_notification_failure_alert(
+                    conn,
+                    job,
+                    phase="final",
+                    error_code=error_code,
+                )
+            except Exception:
+                print("failed to queue final notification alert", file=sys.stderr, flush=True)
+                print(traceback.format_exc(), file=sys.stderr, flush=True)
     conn.commit()
 
 
@@ -1466,6 +1539,8 @@ HANDLERS = {
     "RECOMPUTE_ORDER_STATUS": lambda c, j, p: recompute_order_status(c, p.get("order_id") or j["aggregate_id"]),
     "COMPLETE_WOOCOMMERCE_ORDER": lambda c, j, p: complete_order(c, p.get("order_id") or j["aggregate_id"]),
     "RECONCILE": handle_reconcile,
+    "ORDER_NOTIFICATION": process_notification_job,
+    "ORDER_NOTIFICATION_ALERT": process_notification_alert,
 }
 
 
@@ -1533,6 +1608,10 @@ def run_one(conn) -> bool:
         finish_job(conn, job["id"], result)
     except RetryTask as exc:
         retry_job(conn, job, exc, delay_seconds=exc.delay_seconds, code=exc.code)
+    except NotificationRetry as exc:
+        retry_job(conn, job, exc, delay_seconds=exc.delay_seconds, code=exc.code)
+    except NotificationPermanent as exc:
+        dead_job(conn, job, exc, code=exc.code)
     except (WmsError, PolandWmsError) as exc:
         if exc.retryable:
             retry_job(conn, job, exc, code=exc.code)

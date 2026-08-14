@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce Orders Tracking REST API
  * Description: Provides REST API endpoints for woo-orders-tracking functionality (Adapted for custom implementation)
  * Author: Custom Development
- * Version: 1.2.0
+ * Version: 1.2.1
  */
 
 if (!defined('ABSPATH')) {
@@ -198,6 +198,7 @@ class WOT_REST_API {
         $debug = (bool)$request->get_param('debug');
 
         $logs = array();
+        $seen_log_ids = array();
         $detected_plugin = null;
         $tried = array();
         $like_email = '%' . $wpdb->esc_like($email) . '%';
@@ -261,8 +262,10 @@ class WOT_REST_API {
                     foreach ($rows as $r) {
                         if (!is_array($r)) $r = (array)$r;
                         if (!$order_ref_check($r)) continue;
+                        $log_id = (int)($r['id'] ?? 0);
+                        if ($log_id && isset($seen_log_ids[$log_id])) continue;
                         $logs[] = array(
-                            'id'       => (int)($r['id'] ?? 0),
+                            'id'       => $log_id,
                             'to'       => isset($r['to']) ? $r['to'] : '',
                             'from'     => isset($r['from']) ? $r['from'] : '',
                             'subject'  => $r['subject'] ?? '',
@@ -271,6 +274,7 @@ class WOT_REST_API {
                             'source'   => $r['source'] ?? 'fluent-smtp',
                             'sent_at'  => $r['created_at'] ?? '',
                         );
+                        if ($log_id) $seen_log_ids[$log_id] = true;
                         if (count($logs) >= $limit) break;
                     }
                 }
@@ -352,11 +356,10 @@ class WOT_REST_API {
             ), ARRAY_A);
         });
 
-        // If the Logger class already gave us results, skip the raw-table
-        // fallbacks — no point reading the same data twice.
-        if ($detected_plugin) {
-            $adapters = array();
-        }
+        // Always probe the raw table as well. Some FluentSMTP versions ignore
+        // or cap Logger::get() search arguments, and a recipient search cannot
+        // discover the administrator copy of an order email. Deduplication by
+        // log ID keeps rows returned by both paths from appearing twice.
 
         foreach ($adapters as $a) {
             list($suffix, $label, $cb) = $a;
@@ -370,6 +373,8 @@ class WOT_REST_API {
                 // Apply the same per-order filter so this fallback path is
                 // also restricted to emails that mention THIS order.
                 if (!$order_ref_check($r)) continue;
+                $log_id = (int)($r['id'] ?? 0);
+                if ($log_id && isset($seen_log_ids[$log_id])) continue;
                 // FluentSMTP stores `to` as a JSON array — render it readable
                 $to_pretty = $r['to'];
                 if (is_string($to_pretty) && strlen($to_pretty) && $to_pretty[0] === '[') {
@@ -391,7 +396,7 @@ class WOT_REST_API {
                     $status_norm = (string)$status_raw ?: 'unknown';
                 }
                 $logs[] = array(
-                    'id'       => (int)($r['id'] ?? 0),
+                    'id'       => $log_id,
                     'to'       => $to_pretty,
                     'from'     => $r['from'] ?? '',
                     'subject'  => $r['subject'] ?? '',
@@ -400,6 +405,7 @@ class WOT_REST_API {
                     'source'   => $r['source'] ?? '',
                     'sent_at'  => $r['created_at'] ?? '',
                 );
+                if ($log_id) $seen_log_ids[$log_id] = true;
                 if (count($logs) >= $limit) break;
             }
             break; // first matching table wins
