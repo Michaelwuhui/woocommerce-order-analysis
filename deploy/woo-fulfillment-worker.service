@@ -10,6 +10,7 @@ Group=root
 WorkingDirectory=/www/wwwroot/woo-analysis
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/etc/woo-analysis/fulfillment.env
+EnvironmentFile=-/etc/woo-analysis/order-notification.env
 ExecStart=/www/wwwroot/woo-analysis/venv/bin/python /www/wwwroot/woo-analysis/fulfillment_worker.py --idle-sleep 5
 Restart=always
 RestartSec=5

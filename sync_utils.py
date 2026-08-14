@@ -107,6 +107,17 @@ def _enqueue_fulfillment_plans(candidates):
         # optional fulfillment queue is unavailable during rollout.
         print(f"[fulfillment] enqueue skipped: {exc}")
 
+
+def _enqueue_order_notifications(candidates):
+    """Dark-launched order-card notifications after the authoritative commit."""
+    try:
+        from order_notification_service import enqueue_synced_orders
+
+        enqueue_synced_orders(candidates)
+    except Exception as exc:
+        # Notification availability must never break WooCommerce synchronization.
+        print(f"[order-notification] enqueue skipped: {type(exc).__name__}")
+
 # 线程局部存储，用于数据库连接复用
 _thread_local = threading.local()
 
@@ -279,6 +290,7 @@ def save_orders_to_db(orders_data, connection=None):
         cursor.executemany(insert_query, processed_orders)
         connection.commit()
         _enqueue_fulfillment_plans(planning_candidates)
+        _enqueue_order_notifications(planning_candidates)
         
     except Exception as e:
         print(f"Error saving orders: {e}")

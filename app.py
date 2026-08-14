@@ -4927,7 +4927,15 @@ def get_order_details(order_id):
     ''', (order_id,)).fetchone()
     
     if not order:
+        conn.close()
         return jsonify({'error': 'Order not found'}), 404
+
+    allowed_sources = get_user_allowed_sources(
+        current_user.id, current_user.is_admin(), current_user.is_viewer()
+    )
+    if allowed_sources is not None and order['source'] not in allowed_sources:
+        conn.close()
+        return jsonify({'error': '无权查看该站点订单', 'site_forbidden': True}), 403
     
     order_dict = dict(order)
     
@@ -5049,6 +5057,18 @@ def get_order_details(order_id):
     order_dict['shipment_parcels'] = build_shipping_log_parcels(
         shipping_logs, order_dict['line_items'] or []
     )
+    if getattr(current_user, 'username', None) == 'admin':
+        try:
+            from order_notification_service import notification_schema_exists, notification_summary
+            order_dict['group_notification'] = (
+                notification_summary(conn, str(order_id))
+                if notification_schema_exists(conn)
+                else {'order_id': str(order_id), 'latest': None, 'jobs': []}
+            )
+        except Exception:
+            order_dict['group_notification'] = {
+                'order_id': str(order_id), 'latest': None, 'jobs': []
+            }
     if shipping_logs:
         order_dict['shipping_log'] = shipping_logs[-1]
 
@@ -23695,6 +23715,12 @@ try:
     app.register_blueprint(fulfillment_bp)
 except Exception as _e:
     app.logger.warning('多仓履约模块未加载: %s', _e)
+
+try:
+    from order_notification_api import order_notification_bp
+    app.register_blueprint(order_notification_bp)
+except Exception as _e:
+    app.logger.warning('订单图片通知模块未加载: %s', _e)
 
 @app.context_processor
 def inject_inventory_perms():

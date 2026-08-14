@@ -1805,6 +1805,169 @@ def down_012(conn):
     conn.commit()
 
 
+# ───────────────── 013: 订单图片群通知 ─────────────────
+
+def up_013(conn):
+    """Create the durable order-notification domain.
+
+    Delivery is deliberately dark-launched: jobs may be generated for local
+    preview/testing, while the real provider flag remains disabled.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS notification_targets (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            channel_type TEXT NOT NULL
+                CHECK(channel_type IN ('WECOM_BOT','MANUAL_WECHAT','FAKE')),
+            secret_ref TEXT,
+            store_id TEXT,
+            warehouse_id INTEGER,
+            shipping_method TEXT,
+            environment TEXT NOT NULL DEFAULT 'test'
+                CHECK(environment IN ('test','production')),
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+            rate_limit_per_minute INTEGER NOT NULL DEFAULT 15
+                CHECK(rate_limit_per_minute BETWEEN 1 AND 60),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(warehouse_id) REFERENCES warehouses(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_notification_targets_route
+            ON notification_targets(enabled, store_id, warehouse_id, shipping_method);
+
+        CREATE TABLE IF NOT EXISTS order_notification_event_inbox (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            occurred_at TEXT,
+            source TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'received',
+            error_summary TEXT,
+            received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS order_notification_jobs (
+            id TEXT PRIMARY KEY,
+            queue_job_id INTEGER,
+            event_id TEXT NOT NULL,
+            event_type TEXT NOT NULL CHECK(event_type IN
+                ('ORDER_READY','ORDER_UPDATED','ORDER_CANCELLED','ORDER_HOLD','MANUAL_RESEND')),
+            store_id TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            order_version TEXT NOT NULL,
+            target_id TEXT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            snapshot_hash TEXT NOT NULL,
+            changed_fields_json TEXT,
+            template_version TEXT NOT NULL,
+            image_paths_json TEXT,
+            sent_pages_json TEXT,
+            image_sha256 TEXT,
+            image_width INTEGER,
+            image_height INTEGER,
+            image_bytes INTEGER,
+            scheduled_at TEXT NOT NULL,
+            sent_at TEXT,
+            resend_of TEXT,
+            resend_sequence INTEGER NOT NULL DEFAULT 0,
+            last_error_code TEXT,
+            last_error_summary TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(target_id) REFERENCES notification_targets(id),
+            FOREIGN KEY(queue_job_id) REFERENCES oms_integration_jobs(id),
+            FOREIGN KEY(resend_of) REFERENCES order_notification_jobs(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_order_notification_order
+            ON order_notification_jobs(order_id, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_order_notification_status
+            ON order_notification_jobs(status, scheduled_at);
+
+        CREATE TABLE IF NOT EXISTS order_notification_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            attempt_no INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            http_status INTEGER,
+            provider_error_code TEXT,
+            response_summary TEXT,
+            result TEXT NOT NULL CHECK(result IN
+                ('STARTED','SUCCESS','RETRYABLE','PERMANENT_FAILURE','BLOCKED','MANUAL_READY')),
+            FOREIGN KEY(job_id) REFERENCES order_notification_jobs(id),
+            UNIQUE(job_id, attempt_no)
+        );
+
+        CREATE TABLE IF NOT EXISTS notification_audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            object_type TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            actor_type TEXT NOT NULL,
+            actor_id TEXT,
+            request_id TEXT,
+            before_summary TEXT,
+            after_summary TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_notification_audit_object
+            ON notification_audit_logs(object_type, object_id, created_at);
+        """
+    )
+    defaults = {
+        "order_notification_enabled": "0",
+        "order_notification_send_enabled": "0",
+        "order_notification_test_send_enabled": "0",
+        "order_notification_debounce_seconds": "45",
+        "order_notification_template_version": "order-card-v1",
+        "order_notification_image_retention_days": "30",
+        "order_notification_render_source": "email",
+    }
+    for key, value in defaults.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", (key, value)
+        )
+    conn.commit()
+
+
+def down_013(conn):
+    """Remove an unused notification schema, never historical audit data."""
+    for table in (
+        "notification_targets",
+        "order_notification_attempts",
+        "notification_audit_logs",
+        "order_notification_jobs",
+        "order_notification_event_inbox",
+    ):
+        if _migration_table_exists(conn, table):
+            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            if count:
+                raise RuntimeError(
+                    "013 含通知/审计历史，拒绝删除；请关闭开关并保留表作为回滚"
+                )
+    conn.executescript(
+        """
+        DROP TABLE IF EXISTS order_notification_attempts;
+        DROP TABLE IF EXISTS notification_audit_logs;
+        DROP TABLE IF EXISTS order_notification_jobs;
+        DROP TABLE IF EXISTS order_notification_event_inbox;
+        DROP TABLE IF EXISTS notification_targets;
+        """
+    )
+    conn.execute(
+        "DELETE FROM settings WHERE key IN "
+        "('order_notification_enabled','order_notification_send_enabled',"
+        "'order_notification_test_send_enabled',"
+        "'order_notification_debounce_seconds','order_notification_template_version',"
+        "'order_notification_image_retention_days','order_notification_render_source')"
+    )
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -1818,6 +1981,7 @@ MIGRATIONS = [
     ('010', 'new_poland_wms_isolated_routing', up_010, down_010),
     ('011', 'packeta_hu_and_managed_product_isolation', up_011, down_011),
     ('012', 'packeta_hu_primary_last_mile_semantics', up_012, down_012),
+    ('013', 'order_image_group_notifications', up_013, down_013),
 ]
 
 

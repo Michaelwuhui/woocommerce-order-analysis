@@ -228,6 +228,14 @@
                         </ul>
                     </li>
                     {% endif %}
+                    {% if current_user.username == 'admin' %}
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('order_notification.') else '' }}"
+                            href="{{ url_for('order_notification.notification_dashboard') }}">
+                            <i class="bi bi-image me-1"></i>群通知
+                        </a>
+                    </li>
+                    {% endif %}
                     {% if current_user.can_manage_users() %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint in ['settings','users_page'] else '' }}"
@@ -1035,6 +1043,29 @@
                     {% endif %}
                     html += '</div></div></div>';
 
+                    {% if current_user.username == 'admin' %}
+                    // Order image notification status and audit trail (super admin only).
+                    var notify = order.group_notification || {latest:null,jobs:[]};
+                    var latestNotify = notify.latest;
+                    var notifyEsc = function(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function(c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); };
+                    html += '<div class="col-12"><div class="info-card" style="border-color:rgba(14,165,233,.35)">';
+                    html += '<div class="card-header"><h6 class="text-info"><i class="bi bi-image me-2"></i>群通知</h6></div><div class="card-body">';
+                    if (!latestNotify) {
+                        html += '<div class="text-muted">尚未触发通知。正式发送开关默认关闭。</div>';
+                    } else {
+                        html += '<div class="row g-2"><div class="col-md-3"><b>状态</b><div><span class="badge bg-secondary">' + notifyEsc(latestNotify.status) + '</span></div></div>';
+                        html += '<div class="col-md-3"><b>目标</b><div>' + notifyEsc(latestNotify.target_name || '路由待处理') + '</div></div>';
+                        html += '<div class="col-md-3"><b>事件 / 模板</b><div>' + notifyEsc(latestNotify.event_type) + ' · ' + notifyEsc(latestNotify.template_version) + '</div></div>';
+                        html += '<div class="col-md-3"><b>尝试</b><div>' + Number((latestNotify.attempts || []).length) + ' 次</div></div></div>';
+                        if (latestNotify.last_error_code) html += '<div class="alert alert-warning py-2 mt-3 mb-2"><code>' + notifyEsc(latestNotify.last_error_code) + '</code> · ' + notifyEsc(latestNotify.last_error_summary || '') + '</div>';
+                        html += '<div class="d-flex flex-wrap gap-2 mt-3">';
+                        if (latestNotify.image_count) html += '<a class="btn btn-sm btn-outline-info" target="_blank" href="/api/order-notifications/' + encodeURIComponent(latestNotify.id) + '/image/1"><i class="bi bi-eye me-1"></i>预览/下载图片</a>';
+                        if (canEditThisOrder) html += '<button class="btn btn-sm btn-outline-warning" onclick="manualResendOrderNotification(\'' + notifyEsc(order.id) + '\',\'' + notifyEsc(latestNotify.id) + '\')"><i class="bi bi-arrow-repeat me-1"></i>人工重发</button>';
+                        html += '<a class="btn btn-sm btn-outline-secondary" href="/order-notifications"><i class="bi bi-list-ul me-1"></i>查看通知历史</a></div>';
+                    }
+                    html += '</div></div></div>';
+                    {% endif %}
+
                     // Multi-warehouse fulfillment: each warehouse and parcel
                     // remains independent, including official + third-party events.
                     if (order.fulfillment) {
@@ -1643,6 +1674,19 @@
                 });
         }
 
+        function manualResendOrderNotification(orderId, jobId) {
+            if (!window.confirm('确认创建一条有审计记录的人工重发任务？不会绕过企业微信发送开关。')) return;
+            fetch('/api/order/' + encodeURIComponent(orderId) + '/notifications/' + encodeURIComponent(jobId) + '/resend', {
+                method: 'POST',
+                headers: {'X-Requested-With': 'XMLHttpRequest'}
+            }).then(function(response) {
+                return response.json().then(function(body) { return {ok: response.ok, body: body}; });
+            }).then(function(result) {
+                if (!result.ok) throw new Error(result.body.error || '重发任务创建失败');
+                showOrderDetail(orderId);
+            }).catch(function(error) { window.alert(error.message); });
+        }
+
         // Load (or refresh) the customer email log for an order. The data
         // comes from whichever email-logging plugin is installed on the
         // source site (FluentSMTP / WP Mail SMTP / Email Log).
@@ -1684,8 +1728,9 @@
                         var resp = e.response ? '<div class="small text-muted mt-1" style="word-break:break-word;">' + e.response + '</div>' : '';
                         // Make the whole row clickable → open the email body modal.
                         // We use cursor:pointer + a subtle hover via inline JS to keep it self-contained.
+                        var encodedOrderId = encodeURIComponent(String(orderId));
                         var clickAttr = e.id
-                            ? 'role="button" style="cursor:pointer" onclick="showEmailDetail({order:' + orderId + ',logId:' + e.id + '})" title="点击查看邮件正文"'
+                            ? 'role="button" style="cursor:pointer" onclick="showEmailDetail({order:decodeURIComponent(\'' + encodedOrderId + '\'),logId:' + e.id + '})" title="点击查看邮件正文"'
                             : 'style="opacity:0.7"';
                         var openIcon = e.id ? '<i class="bi bi-box-arrow-up-right text-muted ms-2" style="font-size:11px;"></i>' : '';
                         return '<div class="d-flex mb-2 pb-2 border-bottom border-secondary border-opacity-25" ' + clickAttr + '>'
@@ -1904,18 +1949,23 @@
         //   showEmailDetail({order: orderId, logId: X}) — order modal context
         //   showEmailDetail({site:  siteId,  logId: X}) — customer modal context
         // Backward-compat: showEmailDetail(orderId, logId) — same as order mode.
+        function escapeEmailHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
         function showEmailDetail(scopeOrOrderId, logIdOrUndef) {
             var url;
             if (typeof scopeOrOrderId === 'object' && scopeOrOrderId !== null) {
                 if (scopeOrOrderId.order) {
-                    url = '/api/order/' + scopeOrOrderId.order + '/emails/' + scopeOrOrderId.logId;
+                    url = '/api/order/' + encodeURIComponent(scopeOrOrderId.order) + '/emails/' + encodeURIComponent(scopeOrOrderId.logId);
                 } else if (scopeOrOrderId.site) {
-                    url = '/api/site/' + scopeOrOrderId.site + '/emails/' + scopeOrOrderId.logId;
+                    url = '/api/site/' + encodeURIComponent(scopeOrOrderId.site) + '/emails/' + encodeURIComponent(scopeOrOrderId.logId);
                 } else {
                     return;
                 }
             } else {
-                url = '/api/order/' + scopeOrOrderId + '/emails/' + logIdOrUndef;
+                url = '/api/order/' + encodeURIComponent(scopeOrOrderId) + '/emails/' + encodeURIComponent(logIdOrUndef);
             }
             var modalEl = document.getElementById('emailDetailModal');
             var bodyEl = document.getElementById('emailDetailBody');
@@ -1932,7 +1982,7 @@
                     }
                     var statusBadge = (e.status === 'sent')
                         ? '<span class="badge bg-success bg-opacity-25 text-success">已发送</span>'
-                        : '<span class="badge bg-danger bg-opacity-25 text-danger">' + (e.status || 'failed') + '</span>';
+                        : '<span class="badge bg-danger bg-opacity-25 text-danger">' + escapeEmailHtml(e.status || 'failed') + '</span>';
                     var when = (e.sent_at || '').replace('T', ' ').substring(0, 19);
                     var headersStr = '';
                     if (e.headers) {
@@ -1942,38 +1992,38 @@
                     }
                     var html = '';
                     html += '<div class="row g-2 mb-3">';
-                    html += '<div class="col-md-6"><strong>主题:</strong> <span style="color:#e2e8f0;">' + (e.subject || '(无主题)') + '</span></div>';
-                    html += '<div class="col-md-6 text-md-end">' + statusBadge + (e.plugin ? ' <span class="badge bg-secondary bg-opacity-25 text-light ms-1" style="font-size:10px;">' + e.plugin + '</span>' : '') + '</div>';
-                    html += '<div class="col-md-6"><strong>收件人:</strong> <span class="text-muted" style="word-break:break-all;">' + (e.to || '-') + '</span></div>';
-                    html += '<div class="col-md-6 text-md-end"><strong>发件人:</strong> <span class="text-muted">' + (e.from || '-') + '</span></div>';
-                    html += '<div class="col-md-6"><strong>发送时间:</strong> <span class="text-muted">' + when + '</span></div>';
-                    if (e.source) html += '<div class="col-md-6 text-md-end"><strong>SMTP:</strong> <span class="text-muted">' + e.source + '</span></div>';
+                    html += '<div class="col-md-6"><strong>主题:</strong> <span style="color:#e2e8f0;">' + escapeEmailHtml(e.subject || '(无主题)') + '</span></div>';
+                    html += '<div class="col-md-6 text-md-end">' + statusBadge + (e.plugin ? ' <span class="badge bg-secondary bg-opacity-25 text-light ms-1" style="font-size:10px;">' + escapeEmailHtml(e.plugin) + '</span>' : '') + '</div>';
+                    html += '<div class="col-md-6"><strong>收件人:</strong> <span class="text-muted" style="word-break:break-all;">' + escapeEmailHtml(e.to || '-') + '</span></div>';
+                    html += '<div class="col-md-6 text-md-end"><strong>发件人:</strong> <span class="text-muted">' + escapeEmailHtml(e.from || '-') + '</span></div>';
+                    html += '<div class="col-md-6"><strong>发送时间:</strong> <span class="text-muted">' + escapeEmailHtml(when) + '</span></div>';
+                    if (e.source) html += '<div class="col-md-6 text-md-end"><strong>SMTP:</strong> <span class="text-muted">' + escapeEmailHtml(e.source) + '</span></div>';
                     html += '</div>';
 
                     if (e.response) {
-                        html += '<div class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25 small" style="word-break:break-word;"><strong>响应/错误:</strong> ' + e.response + '</div>';
+                        html += '<div class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25 small" style="word-break:break-word;"><strong>响应/错误:</strong> ' + escapeEmailHtml(e.response) + '</div>';
                     }
 
-                    // Body — sandboxed iframe so any HTML/CSS in the email
-                    // is contained and can't run scripts or load remote
-                    // tracking pixels (sandbox without allow-scripts blocks both).
+                    // Body — sandbox blocks active capabilities; an injected CSP also
+                    // blocks remote images, fonts and tracking pixels.
                     if (e.body) {
-                        var srcdocEsc = String(e.body)
+                        var isolatedBody = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src \'unsafe-inline\'; font-src \'none\'; connect-src \'none\'; frame-src \'none\'">' + String(e.body);
+                        var srcdocEsc = isolatedBody
                             .replace(/&/g, '&amp;')
                             .replace(/"/g, '&quot;');
                         html += '<div class="mt-3"><strong>正文:</strong></div>';
                         html += '<div class="bg-white rounded mt-1" style="padding:0;">';
-                        html += '<iframe sandbox style="width:100%; min-height:480px; border:0; border-radius:4px;" srcdoc="' + srcdocEsc + '"></iframe>';
+                        html += '<iframe sandbox title="邮件正文安全预览" style="width:100%; min-height:480px; border:0; border-radius:4px;" srcdoc="' + srcdocEsc + '"></iframe>';
                         html += '</div>';
                         html += '<div class="text-end mt-2"><button class="btn btn-sm btn-outline-light" onclick="document.getElementById(\'emailRawBody\').classList.toggle(\'d-none\')"><i class="bi bi-code me-1"></i>查看 HTML 源码</button></div>';
-                        html += '<pre id="emailRawBody" class="d-none mt-2 p-2 bg-black text-light small rounded" style="max-height:300px; overflow:auto; white-space:pre-wrap; word-break:break-all;">' + String(e.body).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</pre>';
+                        html += '<pre id="emailRawBody" class="d-none mt-2 p-2 bg-black text-light small rounded" style="max-height:300px; overflow:auto; white-space:pre-wrap; word-break:break-all;">' + escapeEmailHtml(e.body) + '</pre>';
                     } else {
                         html += '<div class="text-muted small">该日志条目没有保存正文（部分插件只记录元数据）</div>';
                     }
 
                     if (headersStr) {
                         html += '<details class="mt-3"><summary class="text-info" style="cursor:pointer;">邮件头</summary>';
-                        html += '<pre class="mt-2 p-2 bg-black text-light small rounded" style="max-height:200px; overflow:auto; white-space:pre-wrap;">' + headersStr.replace(/</g,'&lt;') + '</pre>';
+                        html += '<pre class="mt-2 p-2 bg-black text-light small rounded" style="max-height:200px; overflow:auto; white-space:pre-wrap;">' + escapeEmailHtml(headersStr) + '</pre>';
                         html += '</details>';
                     }
 
