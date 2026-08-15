@@ -20,6 +20,7 @@ from flask_login import current_user, login_required
 
 from fulfillment_common import get_conn, json_dump, utcnow
 from order_notification_service import (
+    ACTIVE_STATUSES,
     AUTOMATIC_EVENT_TYPES,
     DEFAULT_POLICY,
     EVENT_TYPES,
@@ -31,13 +32,16 @@ from order_notification_service import (
     load_policy,
     notification_schema_exists,
     notification_summary,
+    target_manager_names,
 )
 from order_notification_renderer import TEMPLATE_VERSION, render_order_cards
 from order_notification_email import EmailRenderError, render_logged_admin_email
 from order_notification_provider import (
     ProviderError,
-    resolve_secret_ref,
-    validate_wecom_webhook,
+    encrypt_managed_webhook,
+    managed_webhook_ready,
+    provider_for,
+    resolve_target_webhook,
 )
 
 
@@ -116,11 +120,30 @@ def _setting(conn, key: str, default: str = "") -> str:
 
 def _target_dict(row) -> dict:
     target = dict(row)
+    manager_names = list(target_manager_names(target))
+    target.pop("manager_names_json", None)
+    target["manager_names"] = manager_names
     secret_ref = str(target.pop("secret_ref", "") or "")
+    secret_ciphertext = str(target.pop("secret_ciphertext", "") or "")
     secret_name = secret_ref[4:] if secret_ref.startswith("env:") else ""
     target["secret_ref_name"] = secret_name
-    target["secret_configured"] = bool(secret_name)
-    target["secret_available"] = bool(secret_name and os.environ.get(secret_name))
+    target["secret_source"] = (
+        "managed" if secret_ciphertext else "environment" if secret_name else "none"
+    )
+    target["secret_configured"] = bool(secret_ciphertext or secret_name)
+    target["secret_available"] = False
+    target["secret_error"] = None
+    if target["secret_configured"]:
+        try:
+            resolve_target_webhook(
+                {
+                    "secret_ciphertext": secret_ciphertext,
+                    "secret_ref": secret_ref,
+                }
+            )
+            target["secret_available"] = True
+        except ProviderError as exc:
+            target["secret_error"] = exc.code
     return target
 
 
@@ -129,10 +152,13 @@ def _configuration_snapshot(conn) -> dict:
     targets = [
         _target_dict(row)
         for row in conn.execute(
-            """SELECT id,name,channel_type,secret_ref,store_id,warehouse_id,
+            """SELECT id,name,channel_type,secret_ref,secret_ciphertext,
+                      webhook_fingerprint,store_id,manager_scope,manager_names_json,warehouse_id,
                       shipping_method,environment,enabled,rate_limit_per_minute,
                       created_at,updated_at
-               FROM notification_targets ORDER BY environment,name,id"""
+               FROM notification_targets
+               WHERE deleted_at IS NULL
+               ORDER BY environment,name,id"""
         ).fetchall()
     ]
     sites = [
@@ -140,6 +166,17 @@ def _configuration_snapshot(conn) -> dict:
         for row in conn.execute(
             "SELECT id,url,manager,country FROM sites ORDER BY country,url"
         ).fetchall()
+    ]
+    manager_site_counts = {}
+    for site in sites:
+        manager = str(site.get("manager") or "").strip()
+        if manager:
+            manager_site_counts[manager] = manager_site_counts.get(manager, 0) + 1
+    managers = [
+        {"name": name, "site_count": site_count}
+        for name, site_count in sorted(
+            manager_site_counts.items(), key=lambda item: item[0].casefold()
+        )
     ]
     warehouses = [
         dict(row)
@@ -156,6 +193,7 @@ def _configuration_snapshot(conn) -> dict:
         "mode": "off" if not enabled else "preview",
         "production_send_enabled": production_send,
         "test_send_enabled": test_send,
+        "managed_webhook_ready": managed_webhook_ready(),
         "sending_locked": True,
         "debounce_seconds": int(_setting(conn, "order_notification_debounce_seconds", "45") or 45),
         "retention_days": int(_setting(conn, "order_notification_image_retention_days", "30") or 30),
@@ -166,6 +204,7 @@ def _configuration_snapshot(conn) -> dict:
         "policy": policy,
         "targets": targets,
         "sites": sites,
+        "managers": managers,
         "warehouses": warehouses,
         "recent_orders": recent_orders,
         "preview_default_status": "new",
@@ -677,6 +716,7 @@ def notification_preview():
                 },
                 "routing": {
                     "store_id": snapshot["store_id"],
+                    "manager_name": snapshot.get("site_manager"),
                     "warehouse_id": snapshot["warehouse_id"],
                     "shipping_method": snapshot["shipping_method"],
                 },
@@ -767,7 +807,7 @@ def notification_test_send():
         if target.get("channel_type") != "WECOM_BOT":
             return jsonify({"error": "test_target_channel_invalid"}), 400
         try:
-            validate_wecom_webhook(resolve_secret_ref(target.get("secret_ref")))
+            resolve_target_webhook(target)
         except ProviderError as exc:
             return jsonify({"error": exc.code}), 409
 
@@ -844,10 +884,14 @@ def notification_targets():
     try:
         if request.method == "GET":
             rows = conn.execute(
-                """SELECT id,name,channel_type,secret_ref,store_id,warehouse_id,shipping_method,
+                """SELECT id,name,channel_type,secret_ref,secret_ciphertext,
+                          webhook_fingerprint,store_id,manager_scope,manager_names_json,
+                          warehouse_id,shipping_method,
                           environment,enabled,rate_limit_per_minute,
                           created_at,updated_at
-                   FROM notification_targets ORDER BY environment,name,id"""
+                   FROM notification_targets
+                   WHERE deleted_at IS NULL
+                   ORDER BY environment,name,id"""
             ).fetchall()
             return jsonify([_target_dict(row) for row in rows])
         csrf = _require_ajax()
@@ -862,32 +906,93 @@ def notification_targets():
         existing = conn.execute(
             "SELECT * FROM notification_targets WHERE id=?", (target_id,)
         ).fetchone()
+        if existing and existing["deleted_at"]:
+            return jsonify({"error": "target_deleted"}), 410
+        webhook_url = str(data.get("webhook_url") or "").strip()
+        if len(webhook_url) > 2048:
+            return jsonify({"error": "webhook_invalid"}), 400
         supplied_secret_ref = str(data.get("secret_ref") or "") or None
-        secret_ref = supplied_secret_ref
-        if channel == "WECOM_BOT" and not secret_ref and existing:
-            secret_ref = existing["secret_ref"]
+        secret_ref = existing["secret_ref"] if existing else None
+        secret_ciphertext = existing["secret_ciphertext"] if existing else None
+        fingerprint = existing["webhook_fingerprint"] if existing else None
         if channel not in {"WECOM_BOT", "MANUAL_WECHAT", "FAKE"}:
             return jsonify({"error": "channel_invalid"}), 400
         if environment not in {"test", "production"}:
             return jsonify({"error": "environment_invalid"}), 400
         if channel == "WECOM_BOT":
-            if not secret_ref or not re.fullmatch(r"env:[A-Z][A-Z0-9_]{2,100}", secret_ref):
-                return jsonify({"error": "secret_ref_invalid"}), 400
-            ref_name = secret_ref[4:]
-            if environment == "test" and "TEST" not in ref_name:
-                return jsonify({"error": "test_secret_ref_must_be_isolated"}), 400
-            if environment == "production" and "TEST" in ref_name:
-                return jsonify({"error": "production_cannot_use_test_secret"}), 400
+            if webhook_url:
+                secret_ciphertext, fingerprint = encrypt_managed_webhook(webhook_url)
+                secret_ref = None
+            elif supplied_secret_ref:
+                if not re.fullmatch(r"env:[A-Z][A-Z0-9_]{2,100}", supplied_secret_ref):
+                    return jsonify({"error": "secret_ref_invalid"}), 400
+                ref_name = supplied_secret_ref[4:]
+                if environment == "test" and "TEST" not in ref_name:
+                    return jsonify({"error": "test_secret_ref_must_be_isolated"}), 400
+                if environment == "production" and "TEST" in ref_name:
+                    return jsonify({"error": "production_cannot_use_test_secret"}), 400
+                secret_ref = supplied_secret_ref
+                secret_ciphertext = None
+                fingerprint = None
+            if not secret_ciphertext and not secret_ref:
+                return jsonify({"error": "webhook_required"}), 400
         else:
             secret_ref = None
+            secret_ciphertext = None
+            fingerprint = None
         name = str(data.get("name") or "").strip()[:120]
         if not name:
             return jsonify({"error": "name_required"}), 400
         store_id = str(data.get("store_id") or "").strip() or None
-        if store_id and not conn.execute(
-            "SELECT 1 FROM sites WHERE url=?", (store_id,)
-        ).fetchone():
-            return jsonify({"error": "store_invalid"}), 400
+        site_row = None
+        if store_id:
+            site_row = conn.execute(
+                "SELECT manager FROM sites WHERE url=?", (store_id,)
+            ).fetchone()
+            if not site_row:
+                return jsonify({"error": "store_invalid"}), 400
+        manager_scope = str(
+            data.get("manager_scope")
+            or (existing["manager_scope"] if existing else "all")
+        ).strip().lower()
+        if manager_scope not in {"all", "selected"}:
+            return jsonify({"error": "manager_scope_invalid"}), 400
+        raw_manager_names = data.get("manager_names")
+        if raw_manager_names is None:
+            manager_names = (
+                list(target_manager_names(dict(existing))) if existing else []
+            )
+        elif isinstance(raw_manager_names, list):
+            manager_names = sorted(
+                {
+                    str(value).strip()
+                    for value in raw_manager_names
+                    if isinstance(value, str) and str(value).strip()
+                },
+                key=str.casefold,
+            )
+        else:
+            return jsonify({"error": "manager_names_invalid"}), 400
+        if manager_scope == "all":
+            manager_names = []
+        elif not manager_names:
+            return jsonify({"error": "manager_selection_required"}), 400
+        if len(manager_names) > 100 or any(len(value) > 120 for value in manager_names):
+            return jsonify({"error": "manager_names_invalid"}), 400
+        available_managers = {
+            str(row[0]).strip()
+            for row in conn.execute(
+                "SELECT DISTINCT manager FROM sites WHERE TRIM(COALESCE(manager,''))<>''"
+            ).fetchall()
+        }
+        if any(value not in available_managers for value in manager_names):
+            return jsonify({"error": "manager_invalid"}), 400
+        if (
+            site_row
+            and manager_scope == "selected"
+            and str(site_row["manager"] or "").strip() not in manager_names
+        ):
+            return jsonify({"error": "store_manager_mismatch"}), 400
         warehouse_id = data.get("warehouse_id")
         if warehouse_id in (None, ""):
             warehouse_id = None
@@ -902,40 +1007,66 @@ def notification_targets():
         if not isinstance(enabled, bool):
             return jsonify({"error": "enabled_invalid"}), 400
         if enabled:
-            duplicate_route = conn.execute(
+            same_route_rows = conn.execute(
                 """SELECT id FROM notification_targets
                    WHERE id<>? AND enabled=1
+                     AND deleted_at IS NULL
                      AND environment=?
                      AND store_id IS ? AND warehouse_id IS ?
                      AND LOWER(COALESCE(shipping_method,''))=LOWER(COALESCE(?,''))""",
-                (target_id, environment, store_id, warehouse_id, shipping_method),
-            ).fetchone()
-            if duplicate_route:
-                return jsonify({"error": "route_ambiguous"}), 409
+                (
+                    target_id, environment, store_id, warehouse_id, shipping_method,
+                ),
+            ).fetchall()
+            for route_row in same_route_rows:
+                other = dict(conn.execute(
+                    "SELECT * FROM notification_targets WHERE id=?",
+                    (route_row["id"],),
+                ).fetchone())
+                other_scope = other.get("manager_scope") or "all"
+                if manager_scope != other_scope:
+                    continue
+                if manager_scope == "all" or set(manager_names).intersection(
+                    target_manager_names(other)
+                ):
+                    return jsonify({"error": "route_ambiguous"}), 409
         before = conn.execute(
-            "SELECT id,name,channel_type,store_id,warehouse_id,shipping_method,environment,enabled,rate_limit_per_minute FROM notification_targets WHERE id=?",
+            """SELECT id,name,channel_type,webhook_fingerprint,store_id,
+                      manager_scope,manager_names_json,warehouse_id,shipping_method,
+                      environment,enabled,rate_limit_per_minute
+                 FROM notification_targets WHERE id=?""",
             (target_id,),
         ).fetchone()
         conn.execute(
             """INSERT INTO notification_targets
-               (id,name,channel_type,secret_ref,store_id,warehouse_id,shipping_method,
-                environment,enabled,rate_limit_per_minute)
-               VALUES (?,?,?,?,?,?,?,?,?,?)
+               (id,name,channel_type,secret_ref,secret_ciphertext,webhook_fingerprint,
+                store_id,manager_scope,manager_names_json,warehouse_id,shipping_method,
+                environment,enabled,rate_limit_per_minute,deleted_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
                ON CONFLICT(id) DO UPDATE SET name=excluded.name,
                  channel_type=excluded.channel_type,secret_ref=excluded.secret_ref,
-                 store_id=excluded.store_id,warehouse_id=excluded.warehouse_id,
+                 secret_ciphertext=excluded.secret_ciphertext,
+                 webhook_fingerprint=excluded.webhook_fingerprint,
+                 store_id=excluded.store_id,manager_scope=excluded.manager_scope,
+                 manager_names_json=excluded.manager_names_json,
+                 warehouse_id=excluded.warehouse_id,
                  shipping_method=excluded.shipping_method,environment=excluded.environment,
                  enabled=excluded.enabled,rate_limit_per_minute=excluded.rate_limit_per_minute,
                  updated_at=CURRENT_TIMESTAMP""",
             (
-                target_id, name, channel, secret_ref, store_id,
+                target_id, name, channel, secret_ref, secret_ciphertext, fingerprint,
+                store_id, manager_scope,
+                json.dumps(manager_names, ensure_ascii=False, separators=(",", ":")),
                 warehouse_id, shipping_method,
                 environment, 1 if enabled else 0,
                 max(1, min(15, int(data.get("rate_limit_per_minute") or 15))),
             ),
         )
         after = conn.execute(
-            "SELECT id,name,channel_type,store_id,warehouse_id,shipping_method,environment,enabled,rate_limit_per_minute FROM notification_targets WHERE id=?",
+            """SELECT id,name,channel_type,webhook_fingerprint,store_id,
+                      manager_scope,manager_names_json,warehouse_id,shipping_method,
+                      environment,enabled,rate_limit_per_minute
+                 FROM notification_targets WHERE id=?""",
             (target_id,),
         ).fetchone()
         conn.execute(
@@ -953,9 +1084,168 @@ def notification_targets():
         return jsonify(_target_dict(conn.execute(
             "SELECT * FROM notification_targets WHERE id=?", (target_id,)
         ).fetchone())), 200 if before else 201
+    except ProviderError as exc:
+        conn.rollback()
+        status = 503 if exc.code in {
+            "webhook_master_key_missing", "webhook_master_key_invalid"
+        } else 400
+        return jsonify({"error": exc.code}), status
     except (TypeError, ValueError):
         conn.rollback()
         return jsonify({"error": "invalid_configuration"}), 400
+    finally:
+        conn.close()
+
+
+@order_notification_bp.route(
+    "/api/order-notifications/targets/<target_id>", methods=["DELETE"]
+)
+@notification_super_admin_required
+def notification_target_delete(target_id):
+    csrf = _require_ajax()
+    if csrf:
+        return csrf
+    data = request.get_json(silent=True) or {}
+    if data.get("confirmed") is not True:
+        return jsonify({"error": "target_delete_confirmation_required"}), 400
+    conn = get_conn()
+    try:
+        target = conn.execute(
+            """SELECT * FROM notification_targets
+                 WHERE id=? AND deleted_at IS NULL""",
+            (target_id,),
+        ).fetchone()
+        if not target:
+            return jsonify({"error": "target_missing"}), 404
+        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+        active = conn.execute(
+            f"""SELECT COUNT(*) FROM order_notification_jobs
+                  WHERE target_id=? AND status IN ({placeholders})""",
+            (target_id, *sorted(ACTIVE_STATUSES)),
+        ).fetchone()[0]
+        if active:
+            return jsonify({"error": "target_has_active_jobs", "active_jobs": active}), 409
+        before = _target_dict(target)
+        conn.execute(
+            """UPDATE notification_targets
+                  SET enabled=0,secret_ref=NULL,secret_ciphertext=NULL,
+                      webhook_fingerprint=NULL,deleted_at=CURRENT_TIMESTAMP,
+                      updated_at=CURRENT_TIMESTAMP
+                WHERE id=?""",
+            (target_id,),
+        )
+        conn.execute(
+            """INSERT INTO notification_audit_logs
+               (action,object_type,object_id,actor_type,actor_id,before_summary,after_summary)
+               VALUES ('target_deleted','notification_target',?,'user',?,?,?)""",
+            (
+                target_id,
+                str(current_user.id),
+                json_dump(before),
+                json_dump({"deleted": True, "secret_cleared": True}),
+            ),
+        )
+        conn.commit()
+        return jsonify({"id": target_id, "deleted": True, "secret_cleared": True})
+    finally:
+        conn.close()
+
+
+@order_notification_bp.route(
+    "/api/order-notifications/targets/<target_id>/test", methods=["POST"]
+)
+@notification_super_admin_required
+def notification_target_test_message(target_id):
+    csrf = _require_ajax()
+    if csrf:
+        return csrf
+    data = request.get_json(silent=True) or {}
+    if data.get("confirmed") is not True:
+        return jsonify({"error": "test_message_confirmation_required"}), 400
+    conn = get_conn()
+    request_id = "target-test-" + uuid.uuid4().hex
+    try:
+        row = conn.execute(
+            """SELECT * FROM notification_targets
+                 WHERE id=? AND deleted_at IS NULL""",
+            (target_id,),
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "target_missing"}), 404
+        target = dict(row)
+        if target.get("channel_type") != "WECOM_BOT":
+            return jsonify({"error": "test_target_channel_invalid"}), 400
+        recent = conn.execute(
+            """SELECT 1 FROM notification_audit_logs
+                WHERE action='target_test_started'
+                  AND object_type='notification_target' AND object_id=?
+                  AND created_at>=datetime('now','-10 seconds')
+                LIMIT 1""",
+            (target_id,),
+        ).fetchone()
+        if recent:
+            return jsonify({"error": "test_message_rate_limited"}), 429
+        manager_names = target_manager_names(target)
+        manager_label = (
+            "全部负责人"
+            if target.get("manager_scope") != "selected"
+            else "、".join(manager_names)
+        )
+        conn.execute(
+            """INSERT INTO notification_audit_logs
+               (action,object_type,object_id,actor_type,actor_id,request_id,after_summary)
+               VALUES ('target_test_started','notification_target',?,'user',?,?,?)""",
+            (
+                target_id,
+                str(current_user.id),
+                request_id,
+                json_dump({"target_name": target["name"], "managers": manager_label}),
+            ),
+        )
+        conn.commit()
+        content = (
+            "✅ 订单系统群通知测试\n"
+            f"目标：{str(target['name'])[:120]}\n"
+            f"负责人：{manager_label[:500]}\n"
+            "这是一条连接测试消息；收到即表示企业微信群机器人可用。\n"
+            f"时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+        try:
+            result = provider_for("WECOM_BOT").send_text(content, target)
+        except ProviderError as exc:
+            conn.execute(
+                """INSERT INTO notification_audit_logs
+                   (action,object_type,object_id,actor_type,actor_id,request_id,after_summary)
+                   VALUES ('target_test_failed','notification_target',?,'user',?,?,?)""",
+                (
+                    target_id,
+                    str(current_user.id),
+                    request_id,
+                    json_dump({"error": exc.code, "http_status": exc.http_status}),
+                ),
+            )
+            conn.commit()
+            return jsonify({"error": exc.code}), 503 if exc.retryable else 409
+        conn.execute(
+            """INSERT INTO notification_audit_logs
+               (action,object_type,object_id,actor_type,actor_id,request_id,after_summary)
+               VALUES ('target_test_sent','notification_target',?,'user',?,?,?)""",
+            (
+                target_id,
+                str(current_user.id),
+                request_id,
+                json_dump({"provider": result.get("provider"), "messages": 1}),
+            ),
+        )
+        conn.commit()
+        return jsonify(
+            {
+                "id": target_id,
+                "sent": True,
+                "provider": result.get("provider"),
+                "webhook_fingerprint": target.get("webhook_fingerprint"),
+            }
+        )
     finally:
         conn.close()
 

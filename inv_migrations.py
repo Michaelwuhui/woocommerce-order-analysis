@@ -1968,6 +1968,87 @@ def down_013(conn):
     conn.commit()
 
 
+# ───────────────── 014: 前端管理多负责人群 Webhook ─────────────────
+
+def up_014(conn):
+    """Add encrypted webhooks, multi-manager routing and soft deletion."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    if "manager_scope" not in columns:
+        conn.execute(
+            """ALTER TABLE notification_targets ADD COLUMN manager_scope TEXT
+               NOT NULL DEFAULT 'all'
+               CHECK(manager_scope IN ('all','selected'))"""
+        )
+    if "manager_names_json" not in columns:
+        conn.execute(
+            """ALTER TABLE notification_targets ADD COLUMN manager_names_json TEXT
+               NOT NULL DEFAULT '[]'"""
+        )
+    if "secret_ciphertext" not in columns:
+        conn.execute(
+            "ALTER TABLE notification_targets ADD COLUMN secret_ciphertext TEXT"
+        )
+    if "webhook_fingerprint" not in columns:
+        conn.execute(
+            "ALTER TABLE notification_targets ADD COLUMN webhook_fingerprint TEXT"
+        )
+    if "deleted_at" not in columns:
+        conn.execute(
+            "ALTER TABLE notification_targets ADD COLUMN deleted_at TEXT"
+        )
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_notification_targets_route;
+        CREATE INDEX IF NOT EXISTS idx_notification_targets_route
+            ON notification_targets(
+                enabled, deleted_at, environment, store_id, manager_scope,
+                warehouse_id, shipping_method
+            );
+        """
+    )
+    conn.commit()
+
+
+def down_014(conn):
+    """Remove managed webhook fields only when no target depends on them."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    required = {
+        "manager_scope", "manager_names_json", "secret_ciphertext",
+        "webhook_fingerprint", "deleted_at",
+    }
+    if not required.issubset(columns):
+        return
+    used = conn.execute(
+        """SELECT COUNT(*) FROM notification_targets
+             WHERE manager_scope<>'all'
+                OR manager_names_json<>'[]'
+                OR secret_ciphertext IS NOT NULL
+                OR webhook_fingerprint IS NOT NULL
+                OR deleted_at IS NOT NULL"""
+    ).fetchone()[0]
+    if used:
+        raise RuntimeError(
+            "014 含前端管理的群 Webhook 或负责人路由，拒绝删除"
+        )
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_notification_targets_route;
+        ALTER TABLE notification_targets DROP COLUMN deleted_at;
+        ALTER TABLE notification_targets DROP COLUMN webhook_fingerprint;
+        ALTER TABLE notification_targets DROP COLUMN secret_ciphertext;
+        ALTER TABLE notification_targets DROP COLUMN manager_names_json;
+        ALTER TABLE notification_targets DROP COLUMN manager_scope;
+        CREATE INDEX IF NOT EXISTS idx_notification_targets_route
+            ON notification_targets(enabled, store_id, warehouse_id, shipping_method);
+        """
+    )
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -1982,6 +2063,7 @@ MIGRATIONS = [
     ('011', 'packeta_hu_and_managed_product_isolation', up_011, down_011),
     ('012', 'packeta_hu_primary_last_mile_semantics', up_012, down_012),
     ('013', 'order_image_group_notifications', up_013, down_013),
+    ('014', 'managed_multi_manager_group_webhooks', up_014, down_014),
 ]
 
 

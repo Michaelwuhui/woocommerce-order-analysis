@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 import requests
+from cryptography.fernet import Fernet
 from flask import Flask
 from flask_login import LoginManager, UserMixin, login_user
 from PIL import Image
@@ -24,7 +25,13 @@ from order_notification_api import (
     order_notification_bp,
     verify_event_request,
 )
-from order_notification_provider import ProviderError, WeComBotProvider, validate_wecom_webhook
+from order_notification_provider import (
+    ProviderError,
+    WeComBotProvider,
+    encrypt_managed_webhook,
+    resolve_target_webhook,
+    validate_wecom_webhook,
+)
 from order_notification_renderer import render_order_cards
 from order_notification_service import (
     NotificationPermanent,
@@ -73,6 +80,7 @@ def _conn(path):
         """
     )
     inv_migrations.up_013(conn)
+    inv_migrations.up_014(conn)
     conn.execute("INSERT INTO warehouses VALUES (1,'波兰主仓','PL')")
     conn.execute(
         "INSERT INTO sites (id,url,manager,country,cod_on_hold_is_shipped) VALUES (1,?,'Michael','PL',1)",
@@ -142,6 +150,20 @@ def _create(conn, event="ORDER_READY", event_id="evt-1"):
 
 def test_migration_dark_launch_and_history_safe_down(tmp_path):
     conn = _conn(tmp_path / "migration.db")
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    assert {
+        "manager_scope", "manager_names_json", "secret_ciphertext",
+        "webhook_fingerprint", "deleted_at",
+    }.issubset(columns)
+    inv_migrations.down_014(conn)
+    rolled_back_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    assert "manager_scope" not in rolled_back_columns
+    assert "secret_ciphertext" not in rolled_back_columns
+    inv_migrations.up_014(conn)
     flags = dict(
         conn.execute(
             "SELECT key,value FROM settings WHERE key LIKE 'order_notification_%enabled'"
@@ -162,6 +184,97 @@ def test_migration_dark_launch_and_history_safe_down(tmp_path):
         "SELECT 1 FROM sqlite_master WHERE name='notification_targets'"
     ).fetchone()
     conn.close()
+
+
+def test_manager_group_route_covers_multiple_sites_and_site_route_overrides(db):
+    second_store = "https://second-manager-site.test"
+    other_store = "https://other-manager-site.test"
+    db.execute(
+        "INSERT INTO sites (id,url,manager,country) VALUES (2,?,'Michael','CZ')",
+        (second_store,),
+    )
+    db.execute(
+        "INSERT INTO sites (id,url,manager,country) VALUES (3,?,'Alice','AU')",
+        (other_store,),
+    )
+    db.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,manager_scope,manager_names_json,environment)
+           VALUES ('manager-team','负责人联合群','FAKE','selected','["Alice","Michael"]','test')"""
+    )
+    db.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,store_id,environment)
+           VALUES ('site-override','站点专属群','FAKE',?,'test')""",
+        (STORE,),
+    )
+    db.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,manager_scope,manager_names_json,environment)
+           VALUES ('all-managers','全部负责人兜底群','FAKE','all','[]','test')"""
+    )
+    db.commit()
+
+    first_snapshot = authoritative_snapshot(db, "1-1465")
+    target, error = order_notification_service.resolve_target(
+        db, first_snapshot, environment="test"
+    )
+    assert error is None
+    assert target["id"] == "site-override"
+
+    second_snapshot = {
+        **first_snapshot,
+        "store_id": second_store,
+        "site_manager": "Michael",
+    }
+    target, error = order_notification_service.resolve_target(
+        db, second_snapshot, environment="test"
+    )
+    assert error is None
+    assert target["id"] == "manager-team"
+    assert order_notification_service.target_matches_snapshot(
+        target, second_snapshot
+    )
+    db.execute("UPDATE orders SET source=? WHERE id='1-1465'", (second_store,))
+    db.commit()
+    queued = create_job_for_order(
+        db,
+        "1-1465",
+        event_id="manager-route-event",
+        requested_event="ORDER_READY",
+        target_environment="test",
+    )
+    assert queued["created"] is True
+    assert queued["job"]["target_id"] == "manager-team"
+
+    alice_snapshot = {
+        **first_snapshot,
+        "store_id": other_store,
+        "site_manager": "Alice",
+    }
+    target, error = order_notification_service.resolve_target(
+        db, alice_snapshot, environment="test"
+    )
+    assert error is None
+    assert target["id"] == "manager-team"
+    manager_target = dict(
+        db.execute(
+            "SELECT * FROM notification_targets WHERE id='manager-team'"
+        ).fetchone()
+    )
+    assert order_notification_service.target_matches_snapshot(
+        manager_target, alice_snapshot
+    )
+    unmatched_snapshot = {
+        **first_snapshot,
+        "store_id": "https://unassigned.test",
+        "site_manager": "Bob",
+    }
+    target, error = order_notification_service.resolve_target(
+        db, unmatched_snapshot, environment="test"
+    )
+    assert error is None
+    assert target["id"] == "all-managers"
 
 
 def test_snapshot_is_minimized_and_uses_date_modified_not_wc_version(db):
@@ -546,6 +659,34 @@ def test_wecom_provider_payload_and_transient_error(tmp_path, monkeypatch):
         validate_wecom_webhook("https://qyapi.weixin.qq.com:444/cgi-bin/webhook/send?key=x")
     with pytest.raises(ProviderError):
         validate_wecom_webhook("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x&next=evil")
+
+
+def test_managed_webhook_is_encrypted_and_resolved_only_server_side(monkeypatch):
+    master_key = Fernet.generate_key().decode("ascii")
+    webhook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=managed-secret"
+    monkeypatch.setenv("ORDER_NOTIFICATION_WEBHOOK_MASTER_KEY", master_key)
+
+    ciphertext, fingerprint = encrypt_managed_webhook(webhook)
+
+    assert webhook not in ciphertext
+    assert "managed-secret" not in ciphertext
+    assert len(fingerprint) == 12
+    assert resolve_target_webhook(
+        {"secret_ciphertext": ciphertext, "secret_ref": None}
+    ) == webhook
+    success = _Session(_Response(200, {"errcode": 0, "errmsg": "ok"}))
+    result = WeComBotProvider(success).send_text(
+        "加密目标测试",
+        {"secret_ciphertext": ciphertext, "secret_ref": None},
+    )
+    assert result["accepted"] is True
+    assert success.calls[0][0] == webhook
+    monkeypatch.setenv("ORDER_NOTIFICATION_WEBHOOK_MASTER_KEY", Fernet.generate_key().decode("ascii"))
+    with pytest.raises(ProviderError) as error:
+        resolve_target_webhook(
+            {"secret_ciphertext": ciphertext, "secret_ref": None}
+        )
+    assert error.value.code == "webhook_decrypt_failed"
 
 
 def test_retry_queues_one_privacy_minimized_alert_and_sends_it_idempotently(
@@ -958,10 +1099,15 @@ def test_super_admin_console_updates_preview_only_configuration_and_locks_sendin
     setup = _conn(db_path)
     setup.close()
     client, get_test_conn = _notification_api_test_client(db_path, monkeypatch)
+    monkeypatch.delenv("ORDER_NOTIFICATION_WEBHOOK_MASTER_KEY", raising=False)
 
     loaded = client.get("/api/order-notifications/config")
     assert loaded.status_code == 200
     assert loaded.get_json()["sending_locked"] is True
+    assert loaded.get_json()["managed_webhook_ready"] is False
+    assert loaded.get_json()["managers"] == [
+        {"name": "Michael", "site_count": 1}
+    ]
     locked = client.post(
         "/api/order-notifications/config",
         headers={"X-Requested-With": "XMLHttpRequest"},
@@ -1198,6 +1344,7 @@ def test_safe_preview_renders_real_snapshot_without_job_queue_or_send(
         "status": "processing",
         "store": "example.test",
     }
+    assert data["routing"]["manager_name"] == "Michael"
     assert data["images"] and data["images"][0]["data_url"].startswith(
         "data:image/png;base64,"
     )
@@ -1490,6 +1637,283 @@ def test_target_console_hides_secret_value_and_rejects_ambiguous_route(
     )
     assert duplicate.status_code == 409
     assert duplicate.get_json()["error"] == "route_ambiguous"
+
+
+def test_frontend_managed_webhook_test_message_and_soft_delete(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "managed-webhook-console.db"
+    setup = _conn(db_path)
+    setup.execute(
+        "INSERT INTO sites (id,url,manager,country) VALUES (2,?,'Alice','AU')",
+        ("https://alice-managed.test",),
+    )
+    setup.commit()
+    setup.close()
+    client, get_test_conn = _notification_api_test_client(db_path, monkeypatch)
+    webhook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=front-end-secret"
+    payload = {
+        "name": "负责人联合群",
+        "channel_type": "WECOM_BOT",
+        "environment": "production",
+        "webhook_url": webhook,
+        "manager_scope": "selected",
+        "manager_names": ["Michael", "Alice"],
+        "enabled": False,
+    }
+
+    missing_key = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json=payload,
+    )
+    assert missing_key.status_code == 503
+    assert missing_key.get_json()["error"] == "webhook_master_key_missing"
+
+    monkeypatch.setenv(
+        "ORDER_NOTIFICATION_WEBHOOK_MASTER_KEY",
+        Fernet.generate_key().decode("ascii"),
+    )
+    created = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json=payload,
+    )
+    assert created.status_code == 201
+    target = created.get_json()
+    assert target["manager_names"] == ["Alice", "Michael"]
+    assert target["secret_source"] == "managed"
+    assert target["secret_available"] is True
+    assert target["webhook_fingerprint"]
+    assert "front-end-secret" not in json.dumps(target)
+    assert "secret_ciphertext" not in target
+    target_id = target["id"]
+    listed = client.get("/api/order-notifications/targets").get_json()
+    assert len(listed) == 1
+    assert "front-end-secret" not in json.dumps(listed)
+    assert "secret_ciphertext" not in listed[0]
+
+    verify = get_test_conn()
+    stored = verify.execute(
+        """SELECT secret_ref,secret_ciphertext,webhook_fingerprint
+             FROM notification_targets WHERE id=?""",
+        (target_id,),
+    ).fetchone()
+    assert stored["secret_ref"] is None
+    assert stored["secret_ciphertext"]
+    assert "front-end-secret" not in stored["secret_ciphertext"]
+    original_ciphertext = stored["secret_ciphertext"]
+    verify.close()
+
+    edited_payload = {**payload, "id": target_id, "name": "负责人联合群（已编辑）"}
+    edited_payload.pop("webhook_url")
+    edited = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json=edited_payload,
+    )
+    assert edited.status_code == 200
+    assert edited.get_json()["name"] == "负责人联合群（已编辑）"
+    verify = get_test_conn()
+    assert verify.execute(
+        "SELECT secret_ciphertext FROM notification_targets WHERE id=?",
+        (target_id,),
+    ).fetchone()[0] == original_ciphertext
+    verify.close()
+
+    captured = []
+
+    class CaptureProvider:
+        def send_text(self, content, target_row):
+            captured.append((content, target_row["id"]))
+            return {"accepted": True, "provider": "wecom", "messages": 1}
+
+    monkeypatch.setattr(
+        order_notification_api,
+        "provider_for",
+        lambda channel: CaptureProvider(),
+    )
+    sent = client.post(
+        f"/api/order-notifications/targets/{target_id}/test",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={"confirmed": True},
+    )
+    assert sent.status_code == 200
+    assert sent.get_json()["sent"] is True
+    assert len(captured) == 1
+    assert "Alice、Michael" in captured[0][0]
+    assert "订单 #" not in captured[0][0]
+    assert "front-end-secret" not in captured[0][0]
+    limited = client.post(
+        f"/api/order-notifications/targets/{target_id}/test",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={"confirmed": True},
+    )
+    assert limited.status_code == 429
+    assert limited.get_json()["error"] == "test_message_rate_limited"
+
+    deleted = client.delete(
+        f"/api/order-notifications/targets/{target_id}",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={"confirmed": True},
+    )
+    assert deleted.status_code == 200
+    assert deleted.get_json() == {
+        "id": target_id,
+        "deleted": True,
+        "secret_cleared": True,
+    }
+    assert client.get("/api/order-notifications/targets").get_json() == []
+    verify = get_test_conn()
+    removed = verify.execute(
+        """SELECT enabled,secret_ref,secret_ciphertext,webhook_fingerprint,deleted_at
+             FROM notification_targets WHERE id=?""",
+        (target_id,),
+    ).fetchone()
+    assert removed["enabled"] == 0
+    assert removed["secret_ref"] is None
+    assert removed["secret_ciphertext"] is None
+    assert removed["webhook_fingerprint"] is None
+    assert removed["deleted_at"]
+    actions = {
+        row[0]
+        for row in verify.execute(
+            """SELECT action FROM notification_audit_logs
+                 WHERE object_type='notification_target' AND object_id=?""",
+            (target_id,),
+        ).fetchall()
+    }
+    assert {"target_created", "target_test_started", "target_test_sent", "target_deleted"}.issubset(actions)
+    verify.close()
+
+
+def test_target_delete_refuses_to_orphan_active_notification_job(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "target-delete-active.db"
+    setup = _conn(db_path)
+    _target(setup)
+    created = _create(setup)
+    assert created["job"]["status"] == "PENDING"
+    setup.close()
+    client, _ = _notification_api_test_client(db_path, monkeypatch)
+
+    blocked = client.delete(
+        "/api/order-notifications/targets/target-1",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={"confirmed": True},
+    )
+
+    assert blocked.status_code == 409
+    assert blocked.get_json()["error"] == "target_has_active_jobs"
+    assert blocked.get_json()["active_jobs"] == 1
+
+
+def test_target_console_saves_manager_group_route_and_validates_assignment(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "console-manager-target.db"
+    setup = _conn(db_path)
+    setup.execute(
+        "INSERT INTO sites (id,url,manager,country) VALUES (2,?,'Alice','AU')",
+        ("https://alice-store.test",),
+    )
+    setup.commit()
+    setup.close()
+    client, _ = _notification_api_test_client(db_path, monkeypatch)
+
+    created = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={
+                "name": "Michael 负责人群",
+                "channel_type": "MANUAL_WECHAT",
+                "environment": "test",
+                "manager_scope": "selected",
+                "manager_names": ["Michael"],
+                "enabled": True,
+            },
+        )
+    assert created.status_code == 201
+    assert created.get_json()["manager_scope"] == "selected"
+    assert created.get_json()["manager_names"] == ["Michael"]
+    assert created.get_json()["store_id"] is None
+
+    all_managers = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={
+            "name": "全部负责人兜底群",
+            "channel_type": "MANUAL_WECHAT",
+            "environment": "test",
+            "manager_scope": "all",
+            "manager_names": ["Michael", "Alice"],
+            "enabled": True,
+        },
+    )
+    assert all_managers.status_code == 201
+    assert all_managers.get_json()["manager_scope"] == "all"
+    assert all_managers.get_json()["manager_names"] == []
+
+    alice = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={
+            "name": "Alice 负责人群",
+            "channel_type": "MANUAL_WECHAT",
+            "environment": "test",
+            "manager_scope": "selected",
+            "manager_names": ["Alice"],
+            "enabled": True,
+        },
+    )
+    assert alice.status_code == 201
+
+    duplicate = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={
+                "name": "Michael 冲突群",
+                "channel_type": "MANUAL_WECHAT",
+                "environment": "test",
+                "manager_scope": "selected",
+                "manager_names": ["Michael"],
+                "enabled": True,
+        },
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.get_json()["error"] == "route_ambiguous"
+
+    mismatch = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={
+            "name": "错误归属",
+            "channel_type": "MANUAL_WECHAT",
+                "environment": "test",
+                "store_id": STORE,
+                "manager_scope": "selected",
+                "manager_names": ["Alice"],
+                "enabled": True,
+        },
+    )
+    assert mismatch.status_code == 400
+    assert mismatch.get_json()["error"] == "store_manager_mismatch"
+
+    missing = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={
+            "name": "不存在负责人",
+                "channel_type": "MANUAL_WECHAT",
+                "environment": "test",
+                "manager_scope": "selected",
+                "manager_names": ["Nobody"],
+                "enabled": True,
+        },
+    )
+    assert missing.status_code == 400
+    assert missing.get_json()["error"] == "manager_invalid"
 
 
 def test_update_and_cancel_cards_are_distinct_and_audited(db, tmp_path):
