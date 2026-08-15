@@ -2049,6 +2049,88 @@ def down_014(conn):
     conn.commit()
 
 
+# ───────────────── 015: 负责人群同时抄送总群 ─────────────────
+
+def up_015(conn):
+    """Allow one specific route to fan out to its environment fallback group."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    if "copy_to_fallback" not in columns:
+        conn.execute(
+            """ALTER TABLE notification_targets ADD COLUMN copy_to_fallback INTEGER
+               NOT NULL DEFAULT 0 CHECK(copy_to_fallback IN (0,1))"""
+        )
+    conn.commit()
+
+
+def down_015(conn):
+    """Remove the fan-out flag only when no route has enabled it."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    if "copy_to_fallback" not in columns:
+        return
+    used = conn.execute(
+        "SELECT COUNT(*) FROM notification_targets WHERE copy_to_fallback=1"
+    ).fetchone()[0]
+    if used:
+        raise RuntimeError("015 仍有目标启用抄送总群，拒绝删除字段")
+    conn.execute("ALTER TABLE notification_targets DROP COLUMN copy_to_fallback")
+    conn.commit()
+
+
+# ───────────────── 016: 国家级订单群路由 ─────────────────
+
+def up_016(conn):
+    """Add an optional country dimension between site and manager routing."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    if "country_code" not in columns:
+        conn.execute(
+            "ALTER TABLE notification_targets ADD COLUMN country_code TEXT COLLATE NOCASE"
+        )
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_notification_targets_route;
+        CREATE INDEX IF NOT EXISTS idx_notification_targets_route
+            ON notification_targets(
+                enabled, deleted_at, environment, store_id, country_code,
+                manager_scope, warehouse_id, shipping_method
+            );
+        """
+    )
+    conn.commit()
+
+
+def down_016(conn):
+    """Remove country routing only when no target uses it."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    if "country_code" not in columns:
+        return
+    used = conn.execute(
+        """SELECT COUNT(*) FROM notification_targets
+             WHERE TRIM(COALESCE(country_code,''))<>''"""
+    ).fetchone()[0]
+    if used:
+        raise RuntimeError("016 仍有目标使用国家路由，拒绝删除字段")
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_notification_targets_route;
+        ALTER TABLE notification_targets DROP COLUMN country_code;
+        CREATE INDEX IF NOT EXISTS idx_notification_targets_route
+            ON notification_targets(
+                enabled, deleted_at, environment, store_id, manager_scope,
+                warehouse_id, shipping_method
+            );
+        """
+    )
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -2064,6 +2146,8 @@ MIGRATIONS = [
     ('012', 'packeta_hu_primary_last_mile_semantics', up_012, down_012),
     ('013', 'order_image_group_notifications', up_013, down_013),
     ('014', 'managed_multi_manager_group_webhooks', up_014, down_014),
+    ('015', 'copy_specific_routes_to_fallback_group', up_015, down_015),
+    ('016', 'country_order_notification_routes', up_016, down_016),
 ]
 
 

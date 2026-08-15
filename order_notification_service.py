@@ -394,6 +394,10 @@ def resolve_target(
             continue
         if target.get("store_id") and target["store_id"] != snapshot.get("store_id"):
             continue
+        if target.get("country_code") and str(target["country_code"]).casefold() != str(
+            snapshot.get("site_country") or ""
+        ).casefold():
+            continue
         if not target_matches_manager(target, snapshot.get("site_manager")):
             continue
         if target.get("warehouse_id") is not None and target["warehouse_id"] != snapshot.get("warehouse_id"):
@@ -401,10 +405,10 @@ def resolve_target(
         if target.get("shipping_method") and target["shipping_method"].casefold() != str(snapshot.get("shipping_method") or "").casefold():
             continue
         # Every higher-level dimension outweighs every possible combination
-        # below it. A site route therefore overrides a manager route, while a
-        # manager route overrides warehouse/shipping fallbacks.
+        # below it: site > country > manager > warehouse > shipping > fallback.
         score = (
-            8 * bool(target.get("store_id"))
+            16 * bool(target.get("store_id"))
+            + 8 * bool(target.get("country_code"))
             + 4 * (target.get("manager_scope") == "selected")
             + 2 * (target.get("warehouse_id") is not None)
             + bool(target.get("shipping_method"))
@@ -417,6 +421,43 @@ def resolve_target(
     if len(best) != 1:
         return None, "route_ambiguous"
     return best[0], None
+
+
+def is_fallback_target(target: dict) -> bool:
+    """Return whether a target is the all-site/all-manager environment fallback."""
+    return bool(
+        not target.get("store_id")
+        and not target.get("country_code")
+        and target.get("manager_scope", "all") != "selected"
+        and target.get("warehouse_id") is None
+        and not target.get("shipping_method")
+    )
+
+
+def resolve_fallback_target(
+    conn,
+    *,
+    environment: str,
+    exclude_target_id: str | None = None,
+) -> tuple[dict | None, str | None]:
+    """Resolve the unique enabled fallback inside one hard environment boundary."""
+    if environment not in {"test", "production"}:
+        raise NotificationPermanent("通知目标环境无效", code="target_environment_invalid")
+    rows = conn.execute(
+        """SELECT * FROM notification_targets
+             WHERE enabled=1 AND deleted_at IS NULL AND environment=?""",
+        (environment,),
+    ).fetchall()
+    matches = [
+        dict(row)
+        for row in rows
+        if row["id"] != exclude_target_id and is_fallback_target(dict(row))
+    ]
+    if not matches:
+        return None, "fallback_route_missing"
+    if len(matches) != 1:
+        return None, "fallback_route_ambiguous"
+    return matches[0], None
 
 
 def target_manager_names(target: dict) -> tuple[str, ...]:
@@ -444,6 +485,10 @@ def target_matches_manager(target: dict, manager_name: str | None) -> bool:
 def target_matches_snapshot(target: dict, snapshot: dict) -> bool:
     """Return whether an explicitly selected target still covers this order."""
     if target.get("store_id") and target["store_id"] != snapshot.get("store_id"):
+        return False
+    if target.get("country_code") and str(target["country_code"]).casefold() != str(
+        snapshot.get("site_country") or ""
+    ).casefold():
         return False
     if not target_matches_manager(target, snapshot.get("site_manager")):
         return False
@@ -717,67 +762,135 @@ def create_job_for_order(
         return {"created": False, "reason": "not_eligible"}
     if allowed_event_types is not None and event_type not in allowed_event_types:
         return {"created": False, "reason": "event_type_not_enabled"}
-    target, route_error = resolve_target(
-        conn, snapshot, environment=target_environment
-    )
+    target, route_error = resolve_target(conn, snapshot, environment=target_environment)
     version = order_version(snapshot)
-    target_key = target["id"] if target else route_error
-    idem_source = f"{snapshot['store_id']}|{order_id}|{event_type}|{version}|{target_key}|{resend_sequence}"
-    idem = hashlib.sha256(idem_source.encode("utf-8")).hexdigest()
-    existing = conn.execute(
-        "SELECT * FROM order_notification_jobs WHERE idempotency_key=?", (idem,)
-    ).fetchone()
-    if existing:
-        return {"created": False, "duplicate": True, "job": dict(existing)}
-
-    job_id = uuid.uuid4().hex
     debounce = int(_setting(conn, "order_notification_debounce_seconds", "45") or 45)
     scheduled_at = _schedule_after(0 if resend_of else debounce)
     template = _setting(conn, "order_notification_template_version", TEMPLATE_VERSION)
     snap_hash = snapshot_hash(snapshot)
-    status = "DEAD_LETTER" if route_error else ("PENDING" if debounce == 0 or resend_of else "DEBOUNCING")
-    conn.execute(
-        """INSERT INTO order_notification_jobs
-           (id,event_id,event_type,store_id,order_id,order_version,target_id,
-            idempotency_key,status,snapshot_json,snapshot_hash,changed_fields_json,
-            template_version,scheduled_at,resend_of,resend_sequence,last_error_code,last_error_summary)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            job_id, event_id, event_type, snapshot["store_id"], order_id, version,
-            target["id"] if target else None, idem, status, _json(snapshot), snap_hash,
-            _json(changes), template, scheduled_at, resend_of, resend_sequence,
-            route_error, "没有唯一通知目标" if route_error else None,
-        ),
-    )
-    queue_job_id = None
-    if target:
-        queue_job_id = enqueue_job(
-            conn,
-            "ORDER_NOTIFICATION",
-            "order_notification",
-            job_id,
-            f"order-notification:{idem}",
-            {"notification_job_id": job_id},
-            available_at=scheduled_at,
-            max_attempts=NOTIFICATION_MAX_ATTEMPTS,
+    actor = actor or {"type": "system", "id": None}
+
+    def insert_job(job_target: dict | None, job_route_error: str | None, role: str):
+        target_key = job_target["id"] if job_target else job_route_error
+        idem_source = (
+            f"{snapshot['store_id']}|{order_id}|{event_type}|{version}|"
+            f"{target_key}|{resend_sequence}"
+        )
+        idem = hashlib.sha256(idem_source.encode("utf-8")).hexdigest()
+        existing = conn.execute(
+            "SELECT * FROM order_notification_jobs WHERE idempotency_key=?", (idem,)
+        ).fetchone()
+        if existing:
+            return dict(existing), False
+        job_id = uuid.uuid4().hex
+        status = "DEAD_LETTER" if job_route_error else (
+            "PENDING" if debounce == 0 or resend_of else "DEBOUNCING"
         )
         conn.execute(
-            "UPDATE order_notification_jobs SET queue_job_id=? WHERE id=?", (queue_job_id, job_id)
+            """INSERT INTO order_notification_jobs
+               (id,event_id,event_type,store_id,order_id,order_version,target_id,
+                idempotency_key,status,snapshot_json,snapshot_hash,changed_fields_json,
+                template_version,scheduled_at,resend_of,resend_sequence,last_error_code,last_error_summary)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                job_id, event_id, event_type, snapshot["store_id"], order_id, version,
+                job_target["id"] if job_target else None, idem, status,
+                _json(snapshot), snap_hash, _json(changes), template, scheduled_at,
+                resend_of, resend_sequence, job_route_error,
+                "没有唯一通知目标" if job_route_error else None,
+            ),
         )
-    actor = actor or {"type": "system", "id": None}
-    conn.execute(
-        """INSERT INTO notification_audit_logs
-           (action,object_type,object_id,actor_type,actor_id,after_summary)
-           VALUES ('job_created','order_notification_job',?,?,?,?)""",
-        (
-            job_id,
-            actor.get("type", "system"),
-            actor.get("id"),
-            _json({"event_type": event_type, "status": status, "route_error": route_error}),
-        ),
+        queue_job_id = None
+        if job_target:
+            queue_job_id = enqueue_job(
+                conn,
+                "ORDER_NOTIFICATION",
+                "order_notification",
+                job_id,
+                f"order-notification:{idem}",
+                {"notification_job_id": job_id},
+                available_at=scheduled_at,
+                max_attempts=NOTIFICATION_MAX_ATTEMPTS,
+            )
+            conn.execute(
+                "UPDATE order_notification_jobs SET queue_job_id=? WHERE id=?",
+                (queue_job_id, job_id),
+            )
+        conn.execute(
+            """INSERT INTO notification_audit_logs
+               (action,object_type,object_id,actor_type,actor_id,after_summary)
+               VALUES ('job_created','order_notification_job',?,?,?,?)""",
+            (
+                job_id,
+                actor.get("type", "system"),
+                actor.get("id"),
+                _json(
+                    {
+                        "event_type": event_type,
+                        "status": status,
+                        "route_error": job_route_error,
+                        "delivery_role": role,
+                    }
+                ),
+            ),
+        )
+        return dict(
+            conn.execute(
+                "SELECT * FROM order_notification_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        ), True
+
+    primary_job, primary_created = insert_job(target, route_error, "primary")
+    if not primary_created:
+        return {"created": False, "duplicate": True, "job": primary_job}
+
+    jobs = [primary_job]
+    fallback_copy_job = None
+    fallback_copy_error = None
+    should_copy = bool(
+        target
+        and target.get("copy_to_fallback")
+        and not resend_of
+        and event_type == "ORDER_READY"
     )
+    if should_copy:
+        fallback_target, fallback_copy_error = resolve_fallback_target(
+            conn,
+            environment=str(target.get("environment") or target_environment or ""),
+            exclude_target_id=target["id"],
+        )
+        if fallback_target:
+            fallback_copy_job, _ = insert_job(
+                fallback_target, None, "fallback_copy"
+            )
+            jobs.append(fallback_copy_job)
+        else:
+            conn.execute(
+                """INSERT INTO notification_audit_logs
+                   (action,object_type,object_id,actor_type,actor_id,after_summary)
+                   VALUES ('fallback_copy_skipped','order_notification_job',?,?,?,?)""",
+                (
+                    primary_job["id"],
+                    actor.get("type", "system"),
+                    actor.get("id"),
+                    _json(
+                        {
+                            "event_type": event_type,
+                            "target_id": target["id"],
+                            "error": fallback_copy_error,
+                        }
+                    ),
+                ),
+            )
     conn.commit()
-    return {"created": True, "duplicate": False, "job": dict(conn.execute("SELECT * FROM order_notification_jobs WHERE id=?", (job_id,)).fetchone())}
+    return {
+        "created": True,
+        "duplicate": False,
+        "job": primary_job,
+        "jobs": jobs,
+        "fallback_copy_job": fallback_copy_job,
+        "fallback_copy_error": fallback_copy_error,
+    }
 
 
 def create_test_send_job(

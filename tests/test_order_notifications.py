@@ -81,6 +81,8 @@ def _conn(path):
     )
     inv_migrations.up_013(conn)
     inv_migrations.up_014(conn)
+    inv_migrations.up_015(conn)
+    inv_migrations.up_016(conn)
     conn.execute("INSERT INTO warehouses VALUES (1,'波兰主仓','PL')")
     conn.execute(
         "INSERT INTO sites (id,url,manager,country,cod_on_hold_is_shipped) VALUES (1,?,'Michael','PL',1)",
@@ -155,8 +157,16 @@ def test_migration_dark_launch_and_history_safe_down(tmp_path):
     }
     assert {
         "manager_scope", "manager_names_json", "secret_ciphertext",
-        "webhook_fingerprint", "deleted_at",
+        "webhook_fingerprint", "deleted_at", "copy_to_fallback", "country_code",
     }.issubset(columns)
+    inv_migrations.down_016(conn)
+    assert "country_code" not in {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    inv_migrations.down_015(conn)
+    assert "copy_to_fallback" not in {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
     inv_migrations.down_014(conn)
     rolled_back_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
@@ -164,6 +174,8 @@ def test_migration_dark_launch_and_history_safe_down(tmp_path):
     assert "manager_scope" not in rolled_back_columns
     assert "secret_ciphertext" not in rolled_back_columns
     inv_migrations.up_014(conn)
+    inv_migrations.up_015(conn)
+    inv_migrations.up_016(conn)
     flags = dict(
         conn.execute(
             "SELECT key,value FROM settings WHERE key LIKE 'order_notification_%enabled'"
@@ -183,6 +195,38 @@ def test_migration_dark_launch_and_history_safe_down(tmp_path):
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE name='notification_targets'"
     ).fetchone()
+    conn.close()
+
+
+def test_copy_to_fallback_migration_refuses_enabled_routes(tmp_path):
+    conn = _conn(tmp_path / "copy-migration.db")
+    conn.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,copy_to_fallback)
+           VALUES ('copying','负责人群','FAKE',1)"""
+    )
+    conn.commit()
+    with pytest.raises(RuntimeError, match="拒绝删除字段"):
+        inv_migrations.down_015(conn)
+    assert "copy_to_fallback" in {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    conn.close()
+
+
+def test_country_route_migration_refuses_used_country(tmp_path):
+    conn = _conn(tmp_path / "country-migration.db")
+    conn.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,country_code)
+           VALUES ('poland','波兰群','FAKE','PL')"""
+    )
+    conn.commit()
+    with pytest.raises(RuntimeError, match="拒绝删除字段"):
+        inv_migrations.down_016(conn)
+    assert "country_code" in {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
     conn.close()
 
 
@@ -275,6 +319,194 @@ def test_manager_group_route_covers_multiple_sites_and_site_route_overrides(db):
     )
     assert error is None
     assert target["id"] == "all-managers"
+
+
+def test_country_route_covers_all_country_sites_between_site_and_manager_priority(db):
+    second_poland = "https://second-poland.test"
+    australia = "https://australia.test"
+    db.execute(
+        "INSERT INTO sites (id,url,manager,country) VALUES (2,?,'Michael','PL')",
+        (second_poland,),
+    )
+    db.execute(
+        "INSERT INTO sites (id,url,manager,country) VALUES (3,?,'Michael','AU')",
+        (australia,),
+    )
+    db.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,store_id,environment)
+           VALUES ('site-route','指定站点群','FAKE',?,'test')""",
+        (STORE,),
+    )
+    db.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,country_code,environment)
+           VALUES ('country-pl','波兰订单群','FAKE','PL','test')"""
+    )
+    db.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,manager_scope,manager_names_json,environment)
+           VALUES ('manager-route','Michael 负责人群','FAKE','selected','["Michael"]','test')"""
+    )
+    db.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,environment)
+           VALUES ('fallback-route','全部站点总群','FAKE','test')"""
+    )
+    db.commit()
+
+    base = authoritative_snapshot(db, "1-1465")
+    target, error = order_notification_service.resolve_target(
+        db, base, environment="test"
+    )
+    assert error is None and target["id"] == "site-route"
+
+    poland_snapshot = {
+        **base,
+        "store_id": second_poland,
+        "site_country": "PL",
+        "site_manager": "Michael",
+    }
+    target, error = order_notification_service.resolve_target(
+        db, poland_snapshot, environment="test"
+    )
+    assert error is None and target["id"] == "country-pl"
+    assert order_notification_service.target_matches_snapshot(target, poland_snapshot)
+
+    australia_snapshot = {
+        **base,
+        "store_id": australia,
+        "site_country": "AU",
+        "site_manager": "Michael",
+    }
+    target, error = order_notification_service.resolve_target(
+        db, australia_snapshot, environment="test"
+    )
+    assert error is None and target["id"] == "manager-route"
+
+    unmatched = {
+        **australia_snapshot,
+        "store_id": "https://alice-australia.test",
+        "site_manager": "Alice",
+    }
+    target, error = order_notification_service.resolve_target(
+        db, unmatched, environment="test"
+    )
+    assert error is None and target["id"] == "fallback-route"
+
+    db.execute("UPDATE orders SET source=? WHERE id='1-1465'", (second_poland,))
+    db.commit()
+    created = create_job_for_order(
+        db,
+        "1-1465",
+        event_id="country-route-event",
+        requested_event="ORDER_READY",
+        target_environment="test",
+    )
+    assert created["created"] is True
+    assert created["job"]["target_id"] == "country-pl"
+
+
+def test_specific_route_can_copy_new_order_to_unique_fallback(db, tmp_path, monkeypatch):
+    db.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,manager_scope,manager_names_json,
+            environment,copy_to_fallback)
+           VALUES ('manager-primary','Michael 负责人群','FAKE','selected','["Michael"]',
+                   'test',1)"""
+    )
+    db.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,manager_scope,manager_names_json,environment)
+           VALUES ('fallback-group','全部站点总群','FAKE','all','[]','test')"""
+    )
+    db.commit()
+
+    created = create_job_for_order(
+        db,
+        "1-1465",
+        event_id="copy-event",
+        requested_event="ORDER_READY",
+        target_environment="test",
+    )
+
+    assert created["created"] is True
+    assert created["job"]["target_id"] == "manager-primary"
+    assert created["fallback_copy_error"] is None
+    assert created["fallback_copy_job"]["target_id"] == "fallback-group"
+    assert [job["target_id"] for job in created["jobs"]] == [
+        "manager-primary",
+        "fallback-group",
+    ]
+    rows = db.execute(
+        """SELECT target_id,idempotency_key,status
+             FROM order_notification_jobs ORDER BY queue_job_id"""
+    ).fetchall()
+    assert [row["target_id"] for row in rows] == [
+        "manager-primary",
+        "fallback-group",
+    ]
+    assert len({row["idempotency_key"] for row in rows}) == 2
+    assert db.execute(
+        "SELECT COUNT(*) FROM oms_integration_jobs WHERE job_type='ORDER_NOTIFICATION'"
+    ).fetchone()[0] == 2
+    roles = {
+        json.loads(row[0])["delivery_role"]
+        for row in db.execute(
+            """SELECT after_summary FROM notification_audit_logs
+                 WHERE action='job_created' AND object_type='order_notification_job'"""
+        ).fetchall()
+    }
+    assert roles == {"primary", "fallback_copy"}
+
+    duplicate = create_job_for_order(
+        db,
+        "1-1465",
+        event_id="copy-event",
+        requested_event="ORDER_READY",
+        target_environment="test",
+    )
+    assert duplicate["duplicate"] is True
+    assert db.execute("SELECT COUNT(*) FROM order_notification_jobs").fetchone()[0] == 2
+
+    monkeypatch.setenv("ORDER_NOTIFICATION_IMAGE_DIR", str(tmp_path / "copy-cards"))
+    assert fulfillment_worker.run_one(db) is True
+    assert fulfillment_worker.run_one(db) is True
+    assert dict(
+        db.execute(
+            "SELECT status,COUNT(*) FROM order_notification_jobs GROUP BY status"
+        ).fetchone()
+    ) == {"status": "SENT", "COUNT(*)": 2}
+
+
+def test_missing_fallback_never_blocks_primary_and_is_audited(db):
+    db.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,manager_scope,manager_names_json,
+            environment,copy_to_fallback)
+           VALUES ('manager-primary','Michael 负责人群','FAKE','selected','["Michael"]',
+                   'test',1)"""
+    )
+    db.commit()
+
+    created = create_job_for_order(
+        db,
+        "1-1465",
+        event_id="copy-missing-event",
+        requested_event="ORDER_READY",
+        target_environment="test",
+    )
+
+    assert created["created"] is True
+    assert created["job"]["target_id"] == "manager-primary"
+    assert created["fallback_copy_job"] is None
+    assert created["fallback_copy_error"] == "fallback_route_missing"
+    assert db.execute("SELECT COUNT(*) FROM order_notification_jobs").fetchone()[0] == 1
+    audit = db.execute(
+        """SELECT after_summary FROM notification_audit_logs
+             WHERE action='fallback_copy_skipped'"""
+    ).fetchone()
+    assert json.loads(audit[0])["error"] == "fallback_route_missing"
 
 
 def test_snapshot_is_minimized_and_uses_date_modified_not_wc_version(db):
@@ -1108,6 +1340,9 @@ def test_super_admin_console_updates_preview_only_configuration_and_locks_sendin
     assert loaded.get_json()["managers"] == [
         {"name": "Michael", "site_count": 1}
     ]
+    assert loaded.get_json()["countries"] == [
+        {"code": "PL", "site_count": 1}
+    ]
     locked = client.post(
         "/api/order-notifications/config",
         headers={"X-Requested-With": "XMLHttpRequest"},
@@ -1914,6 +2149,186 @@ def test_target_console_saves_manager_group_route_and_validates_assignment(
     )
     assert missing.status_code == 400
     assert missing.get_json()["error"] == "manager_invalid"
+
+    country = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={
+            "name": "波兰订单群",
+            "channel_type": "MANUAL_WECHAT",
+            "environment": "test",
+            "country_code": "pl",
+            "manager_scope": "all",
+            "enabled": True,
+        },
+    )
+    assert country.status_code == 201
+    assert country.get_json()["country_code"] == "PL"
+
+    duplicate_country = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={
+            "name": "重复波兰群",
+            "channel_type": "MANUAL_WECHAT",
+            "environment": "test",
+            "country_code": "PL",
+            "manager_scope": "all",
+            "enabled": True,
+        },
+    )
+    assert duplicate_country.status_code == 409
+    assert duplicate_country.get_json()["error"] == "route_ambiguous"
+
+    invalid_country = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={
+            "name": "不存在国家",
+            "channel_type": "MANUAL_WECHAT",
+            "environment": "test",
+            "country_code": "DE",
+            "manager_scope": "all",
+            "enabled": True,
+        },
+    )
+    assert invalid_country.status_code == 400
+    assert invalid_country.get_json()["error"] == "country_invalid"
+
+    country_mismatch = client.post(
+        "/api/order-notifications/targets",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        json={
+            "name": "站点国家冲突",
+            "channel_type": "MANUAL_WECHAT",
+            "environment": "test",
+            "store_id": STORE,
+            "country_code": "AU",
+            "manager_scope": "all",
+            "enabled": True,
+        },
+    )
+    assert country_mismatch.status_code == 400
+    assert country_mismatch.get_json()["error"] == "store_country_mismatch"
+
+
+def test_target_console_validates_copy_fallback_and_protects_total_group(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "console-copy-fallback.db"
+    setup = _conn(db_path)
+    setup.close()
+    client, _ = _notification_api_test_client(db_path, monkeypatch)
+    headers = {"X-Requested-With": "XMLHttpRequest"}
+    manager_payload = {
+        "name": "Michael 负责人群",
+        "channel_type": "MANUAL_WECHAT",
+        "environment": "production",
+        "manager_scope": "selected",
+        "manager_names": ["Michael"],
+        "copy_to_fallback": True,
+        "enabled": True,
+    }
+
+    missing = client.post(
+        "/api/order-notifications/targets", headers=headers, json=manager_payload
+    )
+    assert missing.status_code == 409
+    assert missing.get_json()["error"] == "fallback_route_missing"
+
+    self_copy = client.post(
+        "/api/order-notifications/targets",
+        headers=headers,
+        json={
+            "name": "错误总群",
+            "channel_type": "MANUAL_WECHAT",
+            "environment": "production",
+            "manager_scope": "all",
+            "copy_to_fallback": True,
+            "enabled": True,
+        },
+    )
+    assert self_copy.status_code == 400
+    assert self_copy.get_json()["error"] == "fallback_cannot_copy_to_itself"
+
+    fallback = client.post(
+        "/api/order-notifications/targets",
+        headers=headers,
+        json={
+            "name": "全部站点总群",
+            "channel_type": "MANUAL_WECHAT",
+            "environment": "production",
+            "manager_scope": "all",
+            "copy_to_fallback": False,
+            "enabled": True,
+        },
+    )
+    assert fallback.status_code == 201
+    fallback_id = fallback.get_json()["id"]
+    assert fallback.get_json()["copy_to_fallback"] is False
+
+    manager = client.post(
+        "/api/order-notifications/targets", headers=headers, json=manager_payload
+    )
+    assert manager.status_code == 201
+    manager_id = manager.get_json()["id"]
+    assert manager.get_json()["copy_to_fallback"] is True
+
+    invalid_type = client.post(
+        "/api/order-notifications/targets",
+        headers=headers,
+        json={**manager_payload, "id": manager_id, "copy_to_fallback": "yes"},
+    )
+    assert invalid_type.status_code == 400
+    assert invalid_type.get_json()["error"] == "copy_to_fallback_invalid"
+
+    blocked_disable = client.post(
+        "/api/order-notifications/targets",
+        headers=headers,
+        json={
+            "id": fallback_id,
+            "name": "全部站点总群",
+            "channel_type": "MANUAL_WECHAT",
+            "environment": "production",
+            "manager_scope": "all",
+            "copy_to_fallback": False,
+            "enabled": False,
+        },
+    )
+    assert blocked_disable.status_code == 409
+    assert blocked_disable.get_json()["error"] == "fallback_target_in_use"
+    assert blocked_disable.get_json()["dependent_targets"] == 1
+
+    blocked_delete = client.delete(
+        f"/api/order-notifications/targets/{fallback_id}",
+        headers=headers,
+        json={"confirmed": True},
+    )
+    assert blocked_delete.status_code == 409
+    assert blocked_delete.get_json()["error"] == "fallback_target_in_use"
+
+    manager_payload.update({"id": manager_id, "copy_to_fallback": False})
+    disabled_copy = client.post(
+        "/api/order-notifications/targets", headers=headers, json=manager_payload
+    )
+    assert disabled_copy.status_code == 200
+    assert disabled_copy.get_json()["copy_to_fallback"] is False
+
+    fallback_disabled = client.post(
+        "/api/order-notifications/targets",
+        headers=headers,
+        json={
+            "id": fallback_id,
+            "name": "全部站点总群",
+            "channel_type": "MANUAL_WECHAT",
+            "environment": "production",
+            "manager_scope": "all",
+            "copy_to_fallback": False,
+            "enabled": False,
+        },
+    )
+    assert fallback_disabled.status_code == 200
+    assert fallback_disabled.get_json()["enabled"] == 0
 
 
 def test_update_and_cancel_cards_are_distinct_and_audited(db, tmp_path):
