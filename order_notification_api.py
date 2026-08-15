@@ -29,9 +29,11 @@ from order_notification_service import (
     create_job_for_order,
     create_test_send_job,
     flag_enabled,
+    is_fallback_target,
     load_policy,
     notification_schema_exists,
     notification_summary,
+    resolve_fallback_target,
     target_manager_names,
 )
 from order_notification_renderer import TEMPLATE_VERSION, render_order_cards
@@ -120,6 +122,7 @@ def _setting(conn, key: str, default: str = "") -> str:
 
 def _target_dict(row) -> dict:
     target = dict(row)
+    target["copy_to_fallback"] = bool(target.get("copy_to_fallback"))
     manager_names = list(target_manager_names(target))
     target.pop("manager_names_json", None)
     target["manager_names"] = manager_names
@@ -153,8 +156,9 @@ def _configuration_snapshot(conn) -> dict:
         _target_dict(row)
         for row in conn.execute(
             """SELECT id,name,channel_type,secret_ref,secret_ciphertext,
-                      webhook_fingerprint,store_id,manager_scope,manager_names_json,warehouse_id,
+                      webhook_fingerprint,store_id,country_code,manager_scope,manager_names_json,warehouse_id,
                       shipping_method,environment,enabled,rate_limit_per_minute,
+                      copy_to_fallback,
                       created_at,updated_at
                FROM notification_targets
                WHERE deleted_at IS NULL
@@ -177,6 +181,15 @@ def _configuration_snapshot(conn) -> dict:
         for name, site_count in sorted(
             manager_site_counts.items(), key=lambda item: item[0].casefold()
         )
+    ]
+    country_site_counts = {}
+    for site in sites:
+        country = str(site.get("country") or "").strip().upper()
+        if country:
+            country_site_counts[country] = country_site_counts.get(country, 0) + 1
+    countries = [
+        {"code": code, "site_count": site_count}
+        for code, site_count in sorted(country_site_counts.items())
     ]
     warehouses = [
         dict(row)
@@ -204,6 +217,7 @@ def _configuration_snapshot(conn) -> dict:
         "policy": policy,
         "targets": targets,
         "sites": sites,
+        "countries": countries,
         "managers": managers,
         "warehouses": warehouses,
         "recent_orders": recent_orders,
@@ -885,9 +899,10 @@ def notification_targets():
         if request.method == "GET":
             rows = conn.execute(
                 """SELECT id,name,channel_type,secret_ref,secret_ciphertext,
-                          webhook_fingerprint,store_id,manager_scope,manager_names_json,
+                          webhook_fingerprint,store_id,country_code,manager_scope,manager_names_json,
                           warehouse_id,shipping_method,
                           environment,enabled,rate_limit_per_minute,
+                          copy_to_fallback,
                           created_at,updated_at
                    FROM notification_targets
                    WHERE deleted_at IS NULL
@@ -947,10 +962,25 @@ def notification_targets():
         site_row = None
         if store_id:
             site_row = conn.execute(
-                "SELECT manager FROM sites WHERE url=?", (store_id,)
+                "SELECT manager,country FROM sites WHERE url=?", (store_id,)
             ).fetchone()
             if not site_row:
                 return jsonify({"error": "store_invalid"}), 400
+        country_code = str(data.get("country_code") or "").strip().upper() or None
+        available_countries = {
+            str(row[0]).strip().upper()
+            for row in conn.execute(
+                "SELECT DISTINCT country FROM sites WHERE TRIM(COALESCE(country,''))<>''"
+            ).fetchall()
+        }
+        if country_code and country_code not in available_countries:
+            return jsonify({"error": "country_invalid"}), 400
+        if (
+            site_row
+            and country_code
+            and str(site_row["country"] or "").strip().upper() != country_code
+        ):
+            return jsonify({"error": "store_country_mismatch"}), 400
         manager_scope = str(
             data.get("manager_scope")
             or (existing["manager_scope"] if existing else "all")
@@ -1006,16 +1036,75 @@ def notification_targets():
         enabled = data.get("enabled", True)
         if not isinstance(enabled, bool):
             return jsonify({"error": "enabled_invalid"}), 400
+        copy_to_fallback = data.get(
+            "copy_to_fallback",
+            bool(existing["copy_to_fallback"]) if existing else False,
+        )
+        if not isinstance(copy_to_fallback, bool):
+            return jsonify({"error": "copy_to_fallback_invalid"}), 400
+        candidate = {
+            "id": target_id,
+            "store_id": store_id,
+            "country_code": country_code,
+            "manager_scope": manager_scope,
+            "manager_names_json": json.dumps(
+                manager_names, ensure_ascii=False, separators=(",", ":")
+            ),
+            "warehouse_id": warehouse_id,
+            "shipping_method": shipping_method,
+            "environment": environment,
+            "enabled": 1 if enabled else 0,
+            "copy_to_fallback": 1 if copy_to_fallback else 0,
+        }
+        if copy_to_fallback and is_fallback_target(candidate):
+            return jsonify({"error": "fallback_cannot_copy_to_itself"}), 400
+        if enabled and copy_to_fallback:
+            _, fallback_error = resolve_fallback_target(
+                conn,
+                environment=environment,
+                exclude_target_id=target_id,
+            )
+            if fallback_error:
+                return jsonify({"error": fallback_error}), 409
+        if existing and existing["enabled"] and is_fallback_target(dict(existing)):
+            remains_same_fallback = bool(
+                enabled
+                and environment == existing["environment"]
+                and is_fallback_target(candidate)
+            )
+            if not remains_same_fallback:
+                fallback_users = conn.execute(
+                    """SELECT COUNT(*) FROM notification_targets
+                         WHERE id<>? AND enabled=1 AND deleted_at IS NULL
+                           AND environment=? AND copy_to_fallback=1""",
+                    (target_id, existing["environment"]),
+                ).fetchone()[0]
+                if fallback_users:
+                    _, alternate_error = resolve_fallback_target(
+                        conn,
+                        environment=existing["environment"],
+                        exclude_target_id=target_id,
+                    )
+                    if alternate_error:
+                        return jsonify(
+                            {
+                                "error": "fallback_target_in_use",
+                                "dependent_targets": fallback_users,
+                            }
+                        ), 409
         if enabled:
             same_route_rows = conn.execute(
                 """SELECT id FROM notification_targets
                    WHERE id<>? AND enabled=1
                      AND deleted_at IS NULL
                      AND environment=?
-                     AND store_id IS ? AND warehouse_id IS ?
+                     AND store_id IS ?
+                     AND LOWER(COALESCE(country_code,''))=LOWER(COALESCE(?,''))
+                     AND warehouse_id IS ?
                      AND LOWER(COALESCE(shipping_method,''))=LOWER(COALESCE(?,''))""",
                 (
-                    target_id, environment, store_id, warehouse_id, shipping_method,
+                    target_id, environment, store_id, country_code,
+                    warehouse_id, shipping_method,
                 ),
             ).fetchall()
             for route_row in same_route_rows:
@@ -1031,41 +1120,44 @@ def notification_targets():
                 ):
                     return jsonify({"error": "route_ambiguous"}), 409
         before = conn.execute(
-            """SELECT id,name,channel_type,webhook_fingerprint,store_id,
+            """SELECT id,name,channel_type,webhook_fingerprint,store_id,country_code,
                       manager_scope,manager_names_json,warehouse_id,shipping_method,
-                      environment,enabled,rate_limit_per_minute
+                      environment,enabled,rate_limit_per_minute,copy_to_fallback
                  FROM notification_targets WHERE id=?""",
             (target_id,),
         ).fetchone()
         conn.execute(
             """INSERT INTO notification_targets
                (id,name,channel_type,secret_ref,secret_ciphertext,webhook_fingerprint,
-                store_id,manager_scope,manager_names_json,warehouse_id,shipping_method,
-                environment,enabled,rate_limit_per_minute,deleted_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+                store_id,country_code,manager_scope,manager_names_json,warehouse_id,shipping_method,
+                environment,enabled,rate_limit_per_minute,copy_to_fallback,deleted_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
                ON CONFLICT(id) DO UPDATE SET name=excluded.name,
                  channel_type=excluded.channel_type,secret_ref=excluded.secret_ref,
                  secret_ciphertext=excluded.secret_ciphertext,
                  webhook_fingerprint=excluded.webhook_fingerprint,
-                 store_id=excluded.store_id,manager_scope=excluded.manager_scope,
+                 store_id=excluded.store_id,country_code=excluded.country_code,
+                 manager_scope=excluded.manager_scope,
                  manager_names_json=excluded.manager_names_json,
                  warehouse_id=excluded.warehouse_id,
                  shipping_method=excluded.shipping_method,environment=excluded.environment,
                  enabled=excluded.enabled,rate_limit_per_minute=excluded.rate_limit_per_minute,
+                 copy_to_fallback=excluded.copy_to_fallback,
                  updated_at=CURRENT_TIMESTAMP""",
             (
                 target_id, name, channel, secret_ref, secret_ciphertext, fingerprint,
-                store_id, manager_scope,
+                store_id, country_code, manager_scope,
                 json.dumps(manager_names, ensure_ascii=False, separators=(",", ":")),
                 warehouse_id, shipping_method,
                 environment, 1 if enabled else 0,
                 max(1, min(15, int(data.get("rate_limit_per_minute") or 15))),
+                1 if copy_to_fallback else 0,
             ),
         )
         after = conn.execute(
-            """SELECT id,name,channel_type,webhook_fingerprint,store_id,
+            """SELECT id,name,channel_type,webhook_fingerprint,store_id,country_code,
                       manager_scope,manager_names_json,warehouse_id,shipping_method,
-                      environment,enabled,rate_limit_per_minute
+                      environment,enabled,rate_limit_per_minute,copy_to_fallback
                  FROM notification_targets WHERE id=?""",
             (target_id,),
         ).fetchone()
@@ -1117,6 +1209,26 @@ def notification_target_delete(target_id):
         ).fetchone()
         if not target:
             return jsonify({"error": "target_missing"}), 404
+        if target["enabled"] and is_fallback_target(dict(target)):
+            fallback_users = conn.execute(
+                """SELECT COUNT(*) FROM notification_targets
+                     WHERE id<>? AND enabled=1 AND deleted_at IS NULL
+                       AND environment=? AND copy_to_fallback=1""",
+                (target_id, target["environment"]),
+            ).fetchone()[0]
+            if fallback_users:
+                _, alternate_error = resolve_fallback_target(
+                    conn,
+                    environment=target["environment"],
+                    exclude_target_id=target_id,
+                )
+                if alternate_error:
+                    return jsonify(
+                        {
+                            "error": "fallback_target_in_use",
+                            "dependent_targets": fallback_users,
+                        }
+                    ), 409
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
         active = conn.execute(
             f"""SELECT COUNT(*) FROM order_notification_jobs

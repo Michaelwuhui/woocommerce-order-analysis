@@ -250,7 +250,7 @@
   <div class="card notify-panel mb-3">
     <div class="card-header bg-transparent border-secondary d-flex flex-wrap justify-content-between align-items-center gap-2">
       <div><i class="bi bi-diagram-3 me-2"></i><span class="fw-semibold">通知目标与路由</span></div>
-      <span class="notify-help">具体站点优先于负责人群；负责人群可覆盖其名下多个站点，同优先级只允许唯一命中。</span>
+      <span class="notify-help">优先级：具体站点 &gt; 国家 &gt; 负责人 &gt; 仓库 &gt; 配送方式 &gt; 总群兜底。</span>
     </div>
     <div class="card-body border-bottom border-secondary">
       {% if not control.managed_webhook_ready %}
@@ -279,10 +279,18 @@
             <option value="production">正式环境</option>
           </select>
         </div>
+        <div class="col-md-4 col-xl-2">
+          <label class="form-label" for="targetCountry">国家</label>
+          <select class="form-select bg-dark text-light border-secondary" id="targetCountry">
+            <option value="">全部国家</option>
+            {% for country in control.countries %}<option value="{{ country.code }}">{{ country.code }}（{{ country.site_count }} 个站点）</option>{% endfor %}
+          </select>
+          <div class="notify-help">选择国家后，将覆盖该国家内符合其余条件的所有站点。</div>
+        </div>
         <div class="col-md-6 col-xl-3">
           <label class="form-label" for="targetStore">站点</label>
           <select class="form-select bg-dark text-light border-secondary" id="targetStore">
-            <option value="">全部站点（兜底）</option>
+            <option value="">全部站点</option>
             {% for site in control.sites %}<option value="{{ site.url }}">{{ site.country or '—' }} · {{ site.url|replace('https://','')|replace('http://','') }}</option>{% endfor %}
           </select>
         </div>
@@ -320,6 +328,10 @@
         </div>
         <div class="col-md-3 col-xl-2 d-flex align-items-end pb-2">
           <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="targetEnabled" checked><label class="form-check-label" for="targetEnabled">启用路由</label></div>
+        </div>
+        <div class="col-md-5 col-xl-3 d-flex flex-column justify-content-end pb-2">
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="targetCopyToFallback"><label class="form-check-label" for="targetCopyToFallback">同时抄送总群</label></div>
+          <div class="notify-help" id="targetCopyToFallbackHelp">主路由发送后，再向同环境的全部站点兜底群发送一次。</div>
         </div>
         <div class="col-12 d-flex gap-2">
           <button class="btn btn-primary" type="submit"><i class="bi bi-plus-circle me-1"></i><span id="targetSubmitText">新增目标</span></button>
@@ -391,6 +403,13 @@
     manager_names_invalid: '负责人选择数据无效。',
     manager_selection_required: '请至少选择一位负责人，或勾选覆盖全部负责人。',
     store_manager_mismatch: '所选站点不属于该负责人，请修正路由范围。',
+    country_invalid: '所选国家不存在可用站点，请刷新页面后重试。',
+    store_country_mismatch: '所选站点不属于该国家，请修正路由范围。',
+    copy_to_fallback_invalid: '抄送总群开关值无效。',
+    fallback_cannot_copy_to_itself: '全部站点兜底群不能再抄送给自己。',
+    fallback_route_missing: '当前环境没有启用的“全部站点＋全部负责人”总群，请先创建或启用总群。',
+    fallback_route_ambiguous: '当前环境存在多个总群候选，无法确定抄送目标。',
+    fallback_target_in_use: '该总群正在被其他目标用于抄送，请先关闭这些目标的“同时抄送总群”。',
     webhook_required: '企业微信群机器人必须填写 Webhook。',
     webhook_master_key_missing: '服务器尚未配置 Webhook 加密主密钥。',
     webhook_master_key_invalid: '服务器 Webhook 加密主密钥格式无效。',
@@ -459,7 +478,8 @@
     const manager = target.manager_scope === 'selected'
       ? `负责人 ${managerNames.map(name => `${name}（${managerSiteCounts.get(name) || 0}站）`).join('、')}`
       : '全部负责人';
-    return [target.store_id || '全部站点', manager, target.warehouse_id ? `仓库 ${target.warehouse_id}` : '全部仓库', target.shipping_method || '全部配送'].join(' / ');
+    const route = [target.store_id || '全部站点', target.country_code ? `国家 ${target.country_code}` : '全部国家', manager, target.warehouse_id ? `仓库 ${target.warehouse_id}` : '全部仓库', target.shipping_method || '全部配送'].join(' / ');
+    return target.copy_to_fallback ? `${route} / 同时抄送总群` : route;
   };
   const targetCoversManager = (target, managerName) => target.manager_scope !== 'selected' || (target.manager_names || []).includes(managerName);
   let currentPreview = null;
@@ -557,6 +577,19 @@
     }
   }
   const selectedManagerNames = () => Array.from(byId('targetManagers').selectedOptions).map(option => option.value);
+  function refreshCopyToFallbackControl() {
+    const isFallback = !byId('targetStore').value
+      && !byId('targetCountry').value
+      && byId('targetAllManagers').checked
+      && !byId('targetWarehouse').value
+      && !byId('targetShipping').value.trim();
+    const control = byId('targetCopyToFallback');
+    control.disabled = isFallback;
+    if (isFallback) control.checked = false;
+    byId('targetCopyToFallbackHelp').textContent = isFallback
+      ? '当前目标本身就是总群兜底路由，不会重复抄送。'
+      : `开启后将额外发送到${byId('targetEnvironment').value === 'production' ? '正式环境' : '隔离测试环境'}的全部站点兜底群。`;
+  }
   function managerSelectionChanged() {
     const all = byId('targetAllManagers').checked;
     const select = byId('targetManagers');
@@ -567,6 +600,7 @@
     byId('targetManagerHelp').textContent = all
       ? '将覆盖当前及以后新增的全部负责人。'
       : selected ? `已选择 ${selected} 位负责人。` : '请选择至少一位负责人，或勾选覆盖全部。';
+    refreshCopyToFallbackControl();
   }
   function channelChanged() {
     const isWeCom = byId('targetChannel').value === 'WECOM_BOT';
@@ -585,21 +619,22 @@
     byId('targetForm').reset(); byId('targetId').value = ''; byId('targetRate').value = '15'; byId('targetEnabled').checked = true;
     Array.from(byId('targetManagers').options).forEach(option => { option.selected = false; });
     byId('targetAllManagers').checked = false;
+    byId('targetCopyToFallback').checked = false;
     byId('targetSubmitText').textContent = '新增目标'; byId('targetCancelEdit').classList.add('d-none'); managerSelectionChanged(); channelChanged();
   }
   function editTarget(target) {
     byId('targetId').value = target.id; byId('targetName').value = target.name; byId('targetChannel').value = target.channel_type;
-    byId('targetEnvironment').value = target.environment; byId('targetStore').value = target.store_id || ''; byId('targetWarehouse').value = target.warehouse_id || '';
+    byId('targetEnvironment').value = target.environment; byId('targetCountry').value = target.country_code || ''; byId('targetStore').value = target.store_id || ''; byId('targetWarehouse').value = target.warehouse_id || '';
     const names = new Set(target.manager_names || []); Array.from(byId('targetManagers').options).forEach(option => { option.selected = names.has(option.value); });
     byId('targetAllManagers').checked = target.manager_scope !== 'selected';
     byId('targetShipping').value = target.shipping_method || ''; byId('targetWebhook').value = ''; byId('targetRate').value = target.rate_limit_per_minute;
-    byId('targetEnabled').checked = Boolean(target.enabled); byId('targetSubmitText').textContent = '保存目标'; byId('targetCancelEdit').classList.remove('d-none'); managerSelectionChanged(); channelChanged();
+    byId('targetEnabled').checked = Boolean(target.enabled); byId('targetCopyToFallback').checked = Boolean(target.copy_to_fallback); byId('targetSubmitText').textContent = '保存目标'; byId('targetCancelEdit').classList.remove('d-none'); managerSelectionChanged(); channelChanged();
     byId('targetForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
   function targetPayload(target = null) {
-    if (target) return { id: target.id, name: target.name, channel_type: target.channel_type, environment: target.environment, store_id: target.store_id, manager_scope: target.manager_scope, manager_names: target.manager_names, warehouse_id: target.warehouse_id, shipping_method: target.shipping_method, rate_limit_per_minute: target.rate_limit_per_minute, enabled: !Boolean(target.enabled) };
+    if (target) return { id: target.id, name: target.name, channel_type: target.channel_type, environment: target.environment, country_code: target.country_code, store_id: target.store_id, manager_scope: target.manager_scope, manager_names: target.manager_names, warehouse_id: target.warehouse_id, shipping_method: target.shipping_method, rate_limit_per_minute: target.rate_limit_per_minute, copy_to_fallback: Boolean(target.copy_to_fallback), enabled: !Boolean(target.enabled) };
     const channel = byId('targetChannel').value; const webhook = byId('targetWebhook').value.trim(); const allManagers = byId('targetAllManagers').checked;
-    return { id: byId('targetId').value || undefined, name: byId('targetName').value.trim(), channel_type: channel, environment: byId('targetEnvironment').value, store_id: byId('targetStore').value || null, manager_scope: allManagers ? 'all' : 'selected', manager_names: allManagers ? [] : selectedManagerNames(), warehouse_id: byId('targetWarehouse').value || null, shipping_method: byId('targetShipping').value.trim() || null, webhook_url: channel === 'WECOM_BOT' && webhook ? webhook : undefined, rate_limit_per_minute: Number(byId('targetRate').value), enabled: byId('targetEnabled').checked };
+    return { id: byId('targetId').value || undefined, name: byId('targetName').value.trim(), channel_type: channel, environment: byId('targetEnvironment').value, country_code: byId('targetCountry').value || null, store_id: byId('targetStore').value || null, manager_scope: allManagers ? 'all' : 'selected', manager_names: allManagers ? [] : selectedManagerNames(), warehouse_id: byId('targetWarehouse').value || null, shipping_method: byId('targetShipping').value.trim() || null, webhook_url: channel === 'WECOM_BOT' && webhook ? webhook : undefined, rate_limit_per_minute: Number(byId('targetRate').value), copy_to_fallback: byId('targetCopyToFallback').checked, enabled: byId('targetEnabled').checked };
   }
   async function saveTarget(payload) {
     const saved = await api('/api/order-notifications/targets', { method: 'POST', body: JSON.stringify(payload) });
@@ -703,6 +738,11 @@
   byId('targetChannel').addEventListener('change', channelChanged);
   byId('targetManagers').addEventListener('change', managerSelectionChanged);
   byId('targetAllManagers').addEventListener('change', managerSelectionChanged);
+  byId('targetStore').addEventListener('change', refreshCopyToFallbackControl);
+  byId('targetCountry').addEventListener('change', refreshCopyToFallbackControl);
+  byId('targetWarehouse').addEventListener('change', refreshCopyToFallbackControl);
+  byId('targetShipping').addEventListener('input', refreshCopyToFallbackControl);
+  byId('targetEnvironment').addEventListener('change', refreshCopyToFallbackControl);
   byId('targetManagersSelectAll').addEventListener('click', () => {
     Array.from(byId('targetManagers').options).forEach(option => { option.selected = true; });
     managerSelectionChanged();
