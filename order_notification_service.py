@@ -383,7 +383,10 @@ def resolve_target(
     """Resolve one route, optionally inside a hard test/production boundary."""
     if environment not in {None, "test", "production"}:
         raise NotificationPermanent("通知目标环境无效", code="target_environment_invalid")
-    rows = conn.execute("SELECT * FROM notification_targets WHERE enabled=1").fetchall()
+    rows = conn.execute(
+        """SELECT * FROM notification_targets
+             WHERE enabled=1 AND deleted_at IS NULL"""
+    ).fetchall()
     candidates = []
     for row in rows:
         target = dict(row)
@@ -391,11 +394,21 @@ def resolve_target(
             continue
         if target.get("store_id") and target["store_id"] != snapshot.get("store_id"):
             continue
+        if not target_matches_manager(target, snapshot.get("site_manager")):
+            continue
         if target.get("warehouse_id") is not None and target["warehouse_id"] != snapshot.get("warehouse_id"):
             continue
         if target.get("shipping_method") and target["shipping_method"].casefold() != str(snapshot.get("shipping_method") or "").casefold():
             continue
-        score = 4 * bool(target.get("store_id")) + 2 * (target.get("warehouse_id") is not None) + bool(target.get("shipping_method"))
+        # Every higher-level dimension outweighs every possible combination
+        # below it. A site route therefore overrides a manager route, while a
+        # manager route overrides warehouse/shipping fallbacks.
+        score = (
+            8 * bool(target.get("store_id"))
+            + 4 * (target.get("manager_scope") == "selected")
+            + 2 * (target.get("warehouse_id") is not None)
+            + bool(target.get("shipping_method"))
+        )
         candidates.append((score, target))
     if not candidates:
         return None, "route_missing"
@@ -406,9 +419,33 @@ def resolve_target(
     return best[0], None
 
 
+def target_manager_names(target: dict) -> tuple[str, ...]:
+    values = json_load(target.get("manager_names_json"), []) or []
+    if not isinstance(values, list):
+        return ()
+    return tuple(
+        sorted(
+            {
+                str(value).strip()
+                for value in values
+                if isinstance(value, str) and str(value).strip()
+            },
+            key=str.casefold,
+        )
+    )
+
+
+def target_matches_manager(target: dict, manager_name: str | None) -> bool:
+    if target.get("manager_scope") != "selected":
+        return True
+    return str(manager_name or "").strip() in target_manager_names(target)
+
+
 def target_matches_snapshot(target: dict, snapshot: dict) -> bool:
     """Return whether an explicitly selected target still covers this order."""
     if target.get("store_id") and target["store_id"] != snapshot.get("store_id"):
+        return False
+    if not target_matches_manager(target, snapshot.get("site_manager")):
         return False
     if (
         target.get("warehouse_id") is not None

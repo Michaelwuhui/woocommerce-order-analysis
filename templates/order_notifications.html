@@ -250,9 +250,14 @@
   <div class="card notify-panel mb-3">
     <div class="card-header bg-transparent border-secondary d-flex flex-wrap justify-content-between align-items-center gap-2">
       <div><i class="bi bi-diagram-3 me-2"></i><span class="fw-semibold">通知目标与路由</span></div>
-      <span class="notify-help">站点 + 仓库 + 配送方式越具体，优先级越高；同优先级只允许唯一命中。</span>
+      <span class="notify-help">具体站点优先于负责人群；负责人群可覆盖其名下多个站点，同优先级只允许唯一命中。</span>
     </div>
     <div class="card-body border-bottom border-secondary">
+      {% if not control.managed_webhook_ready %}
+      <div class="alert alert-warning py-2" id="webhookMasterWarning">
+        服务器尚未配置 Webhook 加密主密钥；现有环境变量目标仍可使用，但前端新增或更换 Webhook 暂不可用。
+      </div>
+      {% endif %}
       <form id="targetForm" class="row g-3">
         <input type="hidden" id="targetId">
         <div class="col-md-4 col-xl-3">
@@ -281,6 +286,18 @@
             {% for site in control.sites %}<option value="{{ site.url }}">{{ site.country or '—' }} · {{ site.url|replace('https://','')|replace('http://','') }}</option>{% endfor %}
           </select>
         </div>
+        <div class="col-md-6 col-xl-3">
+          <label class="form-label" for="targetManagers">站点负责人（可多选）</label>
+          <select class="form-select bg-dark text-light border-secondary" id="targetManagers" multiple size="5">
+            {% for manager in control.managers %}<option value="{{ manager.name }}">{{ manager.name }}（{{ manager.site_count }} 个站点）</option>{% endfor %}
+          </select>
+          <div class="d-flex flex-wrap gap-2 mt-2">
+            <button class="btn btn-sm btn-outline-secondary" id="targetManagersSelectAll" type="button">全选当前负责人</button>
+            <button class="btn btn-sm btn-outline-secondary" id="targetManagersClear" type="button">清空</button>
+          </div>
+          <div class="form-check mt-2"><input class="form-check-input" type="checkbox" id="targetAllManagers"><label class="form-check-label" for="targetAllManagers">覆盖全部负责人（含以后新增）</label></div>
+          <div class="notify-help" id="targetManagerHelp">请选择至少一位负责人，或勾选覆盖全部。</div>
+        </div>
         <div class="col-md-6 col-xl-2">
           <label class="form-label" for="targetWarehouse">仓库</label>
           <select class="form-select bg-dark text-light border-secondary" id="targetWarehouse">
@@ -292,10 +309,10 @@
           <label class="form-label" for="targetShipping">配送方式（精确匹配，可留空）</label>
           <input class="form-control bg-dark text-light border-secondary" id="targetShipping" maxlength="160" placeholder="例如 InPost Paczkomat">
         </div>
-        <div class="col-md-5 col-xl-3 d-none" id="targetSecretGroup">
-          <label class="form-label" for="targetSecret">服务器环境变量名</label>
-          <div class="input-group"><span class="input-group-text bg-dark text-light border-secondary">env:</span><input class="form-control bg-dark text-light border-secondary" id="targetSecret" maxlength="100" placeholder="TEST_WECOM_WEBHOOK"></div>
-          <div class="notify-help">这里只保存变量名，不保存 Webhook 地址。</div>
+        <div class="col-md-5 col-xl-4 d-none" id="targetSecretGroup">
+          <label class="form-label" for="targetWebhook">企业微信群 Webhook</label>
+          <input class="form-control bg-dark text-light border-secondary" type="password" id="targetWebhook" maxlength="2048" autocomplete="new-password" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…">
+          <div class="notify-help" id="targetWebhookHelp">提交后由服务器加密保存；页面不会回显完整地址。</div>
         </div>
         <div class="col-md-2 col-xl-2">
           <label class="form-label" for="targetRate">每分钟上限</label>
@@ -368,7 +385,16 @@
   };
   const errorText = code => ({
     sending_locked: '发送开关由服务端锁定，本页面不能开启。',
-    route_ambiguous: '此路由会与现有目标产生同优先级冲突。',
+    route_ambiguous: '此路由与现有目标覆盖了相同负责人，请调整负责人或路由范围。',
+    manager_invalid: '所选站点负责人不存在，请刷新页面后重试。',
+    manager_scope_invalid: '负责人覆盖方式无效。',
+    manager_names_invalid: '负责人选择数据无效。',
+    manager_selection_required: '请至少选择一位负责人，或勾选覆盖全部负责人。',
+    store_manager_mismatch: '所选站点不属于该负责人，请修正路由范围。',
+    webhook_required: '企业微信群机器人必须填写 Webhook。',
+    webhook_master_key_missing: '服务器尚未配置 Webhook 加密主密钥。',
+    webhook_master_key_invalid: '服务器 Webhook 加密主密钥格式无效。',
+    webhook_decrypt_failed: '已保存的 Webhook 无法解密，请重新填写。',
     secret_ref_invalid: '企业微信目标必须填写合规的服务器环境变量名。',
     test_secret_ref_must_be_isolated: '测试环境变量名必须包含 TEST。',
     production_cannot_use_test_secret: '正式环境不能使用带 TEST 的变量名。',
@@ -398,9 +424,15 @@
     test_target_missing: '隔离测试目标不存在或已停用。',
     test_target_required: '只允许发送到隔离测试目标。',
     test_target_channel_invalid: '隔离测试目标必须使用企业微信群机器人。',
-    test_target_scope_mismatch: '该测试目标的站点、仓库或配送范围与订单不匹配。',
+    test_target_scope_mismatch: '该测试目标的站点、负责人、仓库或配送范围与订单不匹配。',
     secret_missing: '测试目标的 Webhook 尚未注入服务器。',
     webhook_invalid: '服务器中的企业微信 Webhook 格式无效。',
+    target_delete_confirmation_required: '删除目标前必须明确确认。',
+    target_has_active_jobs: '该目标仍有处理中任务，请等待任务结束或先停用。',
+    target_missing: '通知目标不存在或已经删除。',
+    target_deleted: '通知目标已经删除，不能继续编辑。',
+    test_message_confirmation_required: '发送测试消息前必须明确确认。',
+    test_message_rate_limited: '测试消息操作过于频繁，请十秒后重试。',
     order_not_ready_for_test: '该订单当前不属于可发送的新订单状态。'
   }[code] || code || '操作失败');
   async function api(url, options = {}) {
@@ -421,7 +453,15 @@
     return body;
   }
   const csv = id => byId(id).value.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
-  const routeLabel = target => [target.store_id || '全部站点', target.warehouse_id ? `仓库 ${target.warehouse_id}` : '全部仓库', target.shipping_method || '全部配送'].join(' / ');
+  const managerSiteCounts = new Map((state.managers || []).map(item => [item.name, item.site_count]));
+  const routeLabel = target => {
+    const managerNames = target.manager_names || [];
+    const manager = target.manager_scope === 'selected'
+      ? `负责人 ${managerNames.map(name => `${name}（${managerSiteCounts.get(name) || 0}站）`).join('、')}`
+      : '全部负责人';
+    return [target.store_id || '全部站点', manager, target.warehouse_id ? `仓库 ${target.warehouse_id}` : '全部仓库', target.shipping_method || '全部配送'].join(' / ');
+  };
+  const targetCoversManager = (target, managerName) => target.manager_scope !== 'selected' || (target.manager_names || []).includes(managerName);
   let currentPreview = null;
 
   function updateKpis() {
@@ -453,7 +493,10 @@
       addCell(row, routeLabel(target), 'small');
       let secret = '不需要'; let secretClass = 'text-muted';
       if (target.channel_type === 'WECOM_BOT') {
-        secret = target.secret_available ? `${target.secret_ref_name} · 已注入` : `${target.secret_ref_name || '未配置'} · 未注入`;
+        const identity = target.secret_source === 'managed'
+          ? `加密保存 · #${target.webhook_fingerprint || '未知'}`
+          : target.secret_ref_name ? `环境变量 · ${target.secret_ref_name}` : '未配置';
+        secret = `${identity} · ${target.secret_available ? '可用' : '不可用'}`;
         secretClass = target.secret_available ? 'notify-secret-ok small' : 'notify-secret-missing small';
       }
       addCell(row, secret, secretClass);
@@ -462,7 +505,12 @@
       const actions = document.createElement('td'); actions.className = 'text-end text-nowrap';
       const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'btn btn-sm btn-outline-info me-2'; edit.textContent = '编辑'; edit.addEventListener('click', () => editTarget(target));
       const toggle = document.createElement('button'); toggle.type = 'button'; toggle.className = `btn btn-sm ${target.enabled ? 'btn-outline-warning' : 'btn-outline-success'}`; toggle.textContent = target.enabled ? '停用' : '启用'; toggle.addEventListener('click', () => toggleTarget(target));
-      actions.append(edit, toggle); row.appendChild(actions); body.appendChild(row);
+      actions.append(edit, toggle);
+      if (target.channel_type === 'WECOM_BOT') {
+        const test = document.createElement('button'); test.type = 'button'; test.className = 'btn btn-sm btn-outline-primary ms-2'; test.textContent = '测试消息'; test.disabled = !target.secret_available; test.addEventListener('click', () => testTargetWebhook(target)); actions.appendChild(test);
+      }
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'btn btn-sm btn-outline-danger ms-2'; remove.textContent = '删除'; remove.addEventListener('click', () => deleteTarget(target)); actions.appendChild(remove);
+      row.appendChild(actions); body.appendChild(row);
     });
     refreshTestSendPanel();
   }
@@ -481,6 +529,7 @@
       && target.channel_type === 'WECOM_BOT'
       && Boolean(target.secret_available)
       && (!target.store_id || target.store_id === routing.store_id)
+      && targetCoversManager(target, routing.manager_name)
       && (!target.warehouse_id || Number(target.warehouse_id) === Number(routing.warehouse_id))
       && (!target.shipping_method || String(target.shipping_method).toLowerCase() === String(routing.shipping_method || '').toLowerCase())
     );
@@ -507,24 +556,50 @@
         : '将发送系统脱敏卡片到隔离测试群。';
     }
   }
+  const selectedManagerNames = () => Array.from(byId('targetManagers').selectedOptions).map(option => option.value);
+  function managerSelectionChanged() {
+    const all = byId('targetAllManagers').checked;
+    const select = byId('targetManagers');
+    select.disabled = all;
+    byId('targetManagersSelectAll').disabled = all;
+    byId('targetManagersClear').disabled = all;
+    const selected = all ? (state.managers || []).length : selectedManagerNames().length;
+    byId('targetManagerHelp').textContent = all
+      ? '将覆盖当前及以后新增的全部负责人。'
+      : selected ? `已选择 ${selected} 位负责人。` : '请选择至少一位负责人，或勾选覆盖全部。';
+  }
   function channelChanged() {
-    byId('targetSecretGroup').classList.toggle('d-none', byId('targetChannel').value !== 'WECOM_BOT');
+    const isWeCom = byId('targetChannel').value === 'WECOM_BOT';
+    const current = state.targets.find(item => item.id === byId('targetId').value);
+    const webhook = byId('targetWebhook');
+    byId('targetSecretGroup').classList.toggle('d-none', !isWeCom);
+    webhook.disabled = isWeCom && !state.managed_webhook_ready;
+    webhook.required = isWeCom && !Boolean(current && current.secret_configured);
+    byId('targetWebhookHelp').textContent = current && current.secret_configured
+      ? `已配置 ${current.secret_source === 'managed' ? `密文 #${current.webhook_fingerprint}` : `环境变量 ${current.secret_ref_name}`}；留空表示不修改。`
+      : state.managed_webhook_ready
+        ? '提交后由服务器加密保存；页面不会回显完整地址。'
+        : '服务器尚未配置加密主密钥，暂时不能从前端新增 Webhook。';
   }
   function resetTargetForm() {
     byId('targetForm').reset(); byId('targetId').value = ''; byId('targetRate').value = '15'; byId('targetEnabled').checked = true;
-    byId('targetSubmitText').textContent = '新增目标'; byId('targetCancelEdit').classList.add('d-none'); channelChanged();
+    Array.from(byId('targetManagers').options).forEach(option => { option.selected = false; });
+    byId('targetAllManagers').checked = false;
+    byId('targetSubmitText').textContent = '新增目标'; byId('targetCancelEdit').classList.add('d-none'); managerSelectionChanged(); channelChanged();
   }
   function editTarget(target) {
     byId('targetId').value = target.id; byId('targetName').value = target.name; byId('targetChannel').value = target.channel_type;
     byId('targetEnvironment').value = target.environment; byId('targetStore').value = target.store_id || ''; byId('targetWarehouse').value = target.warehouse_id || '';
-    byId('targetShipping').value = target.shipping_method || ''; byId('targetSecret').value = target.secret_ref_name || ''; byId('targetRate').value = target.rate_limit_per_minute;
-    byId('targetEnabled').checked = Boolean(target.enabled); byId('targetSubmitText').textContent = '保存目标'; byId('targetCancelEdit').classList.remove('d-none'); channelChanged();
+    const names = new Set(target.manager_names || []); Array.from(byId('targetManagers').options).forEach(option => { option.selected = names.has(option.value); });
+    byId('targetAllManagers').checked = target.manager_scope !== 'selected';
+    byId('targetShipping').value = target.shipping_method || ''; byId('targetWebhook').value = ''; byId('targetRate').value = target.rate_limit_per_minute;
+    byId('targetEnabled').checked = Boolean(target.enabled); byId('targetSubmitText').textContent = '保存目标'; byId('targetCancelEdit').classList.remove('d-none'); managerSelectionChanged(); channelChanged();
     byId('targetForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
   function targetPayload(target = null) {
-    if (target) return { id: target.id, name: target.name, channel_type: target.channel_type, environment: target.environment, store_id: target.store_id, warehouse_id: target.warehouse_id, shipping_method: target.shipping_method, rate_limit_per_minute: target.rate_limit_per_minute, enabled: !Boolean(target.enabled) };
-    const channel = byId('targetChannel').value; const secretName = byId('targetSecret').value.trim().toUpperCase();
-    return { id: byId('targetId').value || undefined, name: byId('targetName').value.trim(), channel_type: channel, environment: byId('targetEnvironment').value, store_id: byId('targetStore').value || null, warehouse_id: byId('targetWarehouse').value || null, shipping_method: byId('targetShipping').value.trim() || null, secret_ref: channel === 'WECOM_BOT' && secretName ? `env:${secretName}` : null, rate_limit_per_minute: Number(byId('targetRate').value), enabled: byId('targetEnabled').checked };
+    if (target) return { id: target.id, name: target.name, channel_type: target.channel_type, environment: target.environment, store_id: target.store_id, manager_scope: target.manager_scope, manager_names: target.manager_names, warehouse_id: target.warehouse_id, shipping_method: target.shipping_method, rate_limit_per_minute: target.rate_limit_per_minute, enabled: !Boolean(target.enabled) };
+    const channel = byId('targetChannel').value; const webhook = byId('targetWebhook').value.trim(); const allManagers = byId('targetAllManagers').checked;
+    return { id: byId('targetId').value || undefined, name: byId('targetName').value.trim(), channel_type: channel, environment: byId('targetEnvironment').value, store_id: byId('targetStore').value || null, manager_scope: allManagers ? 'all' : 'selected', manager_names: allManagers ? [] : selectedManagerNames(), warehouse_id: byId('targetWarehouse').value || null, shipping_method: byId('targetShipping').value.trim() || null, webhook_url: channel === 'WECOM_BOT' && webhook ? webhook : undefined, rate_limit_per_minute: Number(byId('targetRate').value), enabled: byId('targetEnabled').checked };
   }
   async function saveTarget(payload) {
     const saved = await api('/api/order-notifications/targets', { method: 'POST', body: JSON.stringify(payload) });
@@ -535,6 +610,21 @@
   }
   async function toggleTarget(target) {
     try { await saveTarget(targetPayload(target)); message(`目标“${target.name}”已${target.enabled ? '停用' : '启用'}。`); } catch (error) { message(error.message, 'danger'); }
+  }
+  async function deleteTarget(target) {
+    if (!window.confirm(`确认删除通知目标“${target.name}”？\n系统会立即停用路由并清除已保存的 Webhook，但保留历史发送和审计记录。`)) return;
+    try {
+      await api(`/api/order-notifications/targets/${encodeURIComponent(target.id)}`, { method: 'DELETE', body: JSON.stringify({ confirmed: true }) });
+      state.targets = state.targets.filter(item => item.id !== target.id);
+      renderTargets(); updateKpis(); resetTargetForm(); message(`目标“${target.name}”已删除，Webhook 密文已清除。`);
+    } catch (error) { message(error.message, 'danger'); }
+  }
+  async function testTargetWebhook(target) {
+    if (!window.confirm(`确认向“${target.name}”发送一条不含订单和客户资料的连接测试消息？`)) return;
+    try {
+      await api(`/api/order-notifications/targets/${encodeURIComponent(target.id)}/test`, { method: 'POST', body: JSON.stringify({ confirmed: true }) });
+      message(`测试消息已成功发送到“${target.name}”。`);
+    } catch (error) { message(error.message, 'danger'); }
   }
 
   const storeHost = source => String(source || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
@@ -611,6 +701,16 @@
   }
   byId('previewSource').addEventListener('change', previewSourceChanged);
   byId('targetChannel').addEventListener('change', channelChanged);
+  byId('targetManagers').addEventListener('change', managerSelectionChanged);
+  byId('targetAllManagers').addEventListener('change', managerSelectionChanged);
+  byId('targetManagersSelectAll').addEventListener('click', () => {
+    Array.from(byId('targetManagers').options).forEach(option => { option.selected = true; });
+    managerSelectionChanged();
+  });
+  byId('targetManagersClear').addEventListener('click', () => {
+    Array.from(byId('targetManagers').options).forEach(option => { option.selected = false; });
+    managerSelectionChanged();
+  });
   byId('targetCancelEdit').addEventListener('click', resetTargetForm);
   byId('targetForm').addEventListener('submit', async event => {
     event.preventDefault();
@@ -673,7 +773,7 @@
     const payload = { enabled: byId('configEnabled').checked, debounce_seconds: Number(byId('configDebounce').value), retention_days: Number(byId('configRetention').value), render_source: byId('configRenderSource').value, policy: { ready_statuses: csv('readyStatuses'), cancel_statuses: csv('cancelStatuses'), hold_statuses: csv('holdStatuses'), excluded_statuses: csv('excludedStatuses'), allow_site_cod_on_hold: byId('allowCodHold').checked, updated_fields: Array.from(document.querySelectorAll('.updated-field:checked')).map(item => item.value) } };
     try { const result = await api('/api/order-notifications/config', { method: 'POST', body: JSON.stringify(payload) }); state.enabled = result.enabled; updateKpis(); message('制卡规则已保存；发送开关未改变。'); } catch (error) { message(error.message, 'danger'); }
   });
-  renderTargets(); updateKpis(); channelChanged(); previewSourceChanged();
+  renderTargets(); updateKpis(); managerSelectionChanged(); channelChanged(); previewSourceChanged();
 })();
 </script>
 {% endblock %}

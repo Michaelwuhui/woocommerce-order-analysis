@@ -10,10 +10,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 from PIL import Image
 
 
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
+WEBHOOK_MASTER_KEY_ENV = "ORDER_NOTIFICATION_WEBHOOK_MASTER_KEY"
 
 
 class ProviderError(RuntimeError):
@@ -37,6 +39,67 @@ def resolve_secret_ref(secret_ref: str | None) -> str:
     if not secret:
         raise ProviderError("密钥引用未注入", code="secret_missing")
     return secret
+
+
+def _managed_webhook_cipher() -> Fernet:
+    value = os.environ.get(WEBHOOK_MASTER_KEY_ENV, "").strip()
+    if not value:
+        raise ProviderError(
+            "服务器尚未配置 Webhook 加密主密钥",
+            code="webhook_master_key_missing",
+        )
+    try:
+        return Fernet(value.encode("ascii"))
+    except (ValueError, TypeError, UnicodeEncodeError) as exc:
+        raise ProviderError(
+            "Webhook 加密主密钥格式无效",
+            code="webhook_master_key_invalid",
+        ) from exc
+
+
+def managed_webhook_ready() -> bool:
+    try:
+        _managed_webhook_cipher()
+        return True
+    except ProviderError:
+        return False
+
+
+def webhook_fingerprint(url: str) -> str:
+    """Return a non-secret identifier suitable for the administrator UI."""
+    validate_wecom_webhook(url)
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:12].upper()
+
+
+def encrypt_managed_webhook(url: str) -> tuple[str, str]:
+    value = str(url or "").strip()
+    validate_wecom_webhook(value)
+    encrypted = _managed_webhook_cipher().encrypt(value.encode("utf-8"))
+    return encrypted.decode("ascii"), webhook_fingerprint(value)
+
+
+def decrypt_managed_webhook(ciphertext: str | None) -> str:
+    value = str(ciphertext or "").strip()
+    if not value:
+        raise ProviderError("目标未配置 Webhook", code="secret_missing")
+    try:
+        webhook = _managed_webhook_cipher().decrypt(value.encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError, UnicodeError) as exc:
+        raise ProviderError(
+            "Webhook 密文无法解密",
+            code="webhook_decrypt_failed",
+        ) from exc
+    validate_wecom_webhook(webhook)
+    return webhook
+
+
+def resolve_target_webhook(target: dict) -> str:
+    """Resolve a managed encrypted webhook, falling back to legacy env refs."""
+    if target.get("secret_ciphertext"):
+        return decrypt_managed_webhook(target.get("secret_ciphertext"))
+    webhook = resolve_secret_ref(target.get("secret_ref"))
+    validate_wecom_webhook(webhook)
+    return webhook
 
 
 def validate_wecom_webhook(url: str) -> None:
@@ -159,8 +222,7 @@ class WeComBotProvider:
         return body
 
     def send_images(self, image_paths: list[str], target: dict) -> dict:
-        webhook = resolve_secret_ref(target.get("secret_ref"))
-        validate_wecom_webhook(webhook)
+        webhook = resolve_target_webhook(target)
         accepted = 0
         for path in image_paths:
             payload, _ = _image_payload(path)
@@ -173,8 +235,7 @@ class WeComBotProvider:
         content = str(content or "").strip()
         if not content or len(content.encode("utf-8")) > 2048:
             raise ProviderError("企业微信文本为空或超过 2048 字节", code="text_size_invalid")
-        webhook = resolve_secret_ref(target.get("secret_ref"))
-        validate_wecom_webhook(webhook)
+        webhook = resolve_target_webhook(target)
         self._send_payload(
             webhook,
             {"msgtype": "text", "text": {"content": content}},
