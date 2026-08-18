@@ -19,6 +19,7 @@ PRODUCT_EDIT_FIELDS = {
 
 PRODUCT_STATE_FIELDS = (
     "id",
+    "parent_id",
     "name",
     "slug",
     "sku",
@@ -230,8 +231,52 @@ def find_child_product(req, site, master_item):
     return None, f'子站未找到对应商品（SKU={sku or "空"}）'
 
 
+def wcms_stock_meta_update(child_item, master_item, payload):
+    """Return companion stock metadata for the site's custom WCMS bridge.
+
+    Some child stores intentionally restore WooCommerce's core stock fields
+    from ``wcms_stock_*`` metadata after every product save.  Detect that
+    contract from the child response and update the bridge metadata together
+    with the requested core fields.  Stores without this metadata are left
+    untouched.
+    """
+    if not any(
+        key in payload
+        for key in ("manage_stock", "stock_quantity", "stock_status")
+    ):
+        return []
+    child_meta = {
+        str(row.get("key")): row.get("value")
+        for row in (child_item.get("meta_data") or [])
+        if isinstance(row, dict)
+    }
+    if "wcms_stock_manage" not in child_meta:
+        return []
+
+    quantity = master_item.get("stock_quantity")
+    try:
+        quantity = int(quantity) if quantity is not None else 0
+    except (TypeError, ValueError):
+        quantity = 0
+    status = master_item.get("stock_status") or "instock"
+    return [
+        {
+            "key": "wcms_stock_manage",
+            "value": "yes" if bool(master_item.get("manage_stock")) else "no",
+        },
+        {"key": "wcms_stock_qty", "value": max(0, quantity)},
+        {"key": "wcms_stock_status", "value": status},
+    ]
+
+
 def verify_product_child_sync(req, site, master_item, payload):
-    """Verify that a master-routed write reached the selected child site."""
+    """Ensure that a master-routed write reaches the selected child site.
+
+    WooCommerce Multistore does not reliably propagate stock and price changes
+    made through the master's REST API.  Read the child first; if it has not
+    converged, write the same whitelisted payload through the child's own REST
+    credentials and require an authoritative read-back before reporting success.
+    """
     if not site["product_master_id"]:
         return {
             "status": "not_applicable",
@@ -252,10 +297,54 @@ def verify_product_child_sync(req, site, master_item, payload):
     child_state = product_state_snapshot(child_item)
     mismatches = product_payload_mismatches(child_item, payload)
     if mismatches:
+        child_url = (site["url"] or "").rstrip("/")
+        child_id = child_item.get("id")
+        parent_id = child_item.get("parent_id")
+        if not child_id:
+            return {
+                "status": "error",
+                "detail": "已定位子站商品，但响应缺少商品 ID，无法补写",
+                "state": child_state,
+            }
+        if parent_id:
+            resource_url = (
+                f"{child_url}/wp-json/wc/v3/products/{parent_id}"
+                f"/variations/{child_id}"
+            )
+        elif child_item.get("type") == "variation":
+            return {
+                "status": "error",
+                "detail": "已定位子站变体，但响应缺少父商品 ID，无法补写",
+                "state": child_state,
+            }
+        else:
+            resource_url = f"{child_url}/wp-json/wc/v3/products/{child_id}"
+
+        direct_payload = dict(payload)
+        bridge_meta = wcms_stock_meta_update(child_item, master_item, payload)
+        if bridge_meta:
+            direct_payload["meta_data"] = bridge_meta
+
+        final, write_error, write_trace = wc_product_update_verified(
+            req,
+            resource_url,
+            (site["consumer_key"], site["consumer_secret"]),
+            direct_payload,
+        )
+        if write_error:
+            return {
+                "status": "error",
+                "detail": "子站自动同步未完成，直接补写也失败：" + write_error,
+                "state": product_state_snapshot(final or child_item),
+                "direct_update": True,
+                "trace": write_trace,
+            }
         return {
-            "status": "pending",
-            "detail": "子站尚未达到目标状态：" + "；".join(mismatches),
-            "state": child_state,
+            "status": "verified",
+            "detail": "主站写入成功；子站未自动同步，已直接补写并回读一致",
+            "state": product_state_snapshot(final),
+            "direct_update": True,
+            "trace": write_trace,
         }
     return {
         "status": "verified",

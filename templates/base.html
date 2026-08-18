@@ -523,6 +523,7 @@
                     progressBar.classList.remove('bg-success', 'bg-danger');
                     progressBar.classList.add('bg-primary');
                     statusText.textContent = '正在启动全局同步任务...';
+                    statusText.classList.remove('text-danger', 'text-warning', 'text-success');
                     logConsole.innerHTML = '';
                     closeBtn.disabled = true;
                     closeBtn.textContent = '完成'; // Reset button text

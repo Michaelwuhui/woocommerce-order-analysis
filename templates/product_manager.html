@@ -1809,7 +1809,43 @@
         bootstrap.Modal.getOrCreateInstance($('pmCloneModal')).show();
     }
 
-    function applyClone() {
+    const ACTIVE_CLONE_JOB_KEY = 'productManagerActiveCloneJob';
+
+    function resetCloneButton() {
+        const applyBtn = $('pmCloneApplyBtn');
+        applyBtn.disabled = false;
+        applyBtn.innerHTML = '<i class="bi bi-files me-1"></i>开始克隆';
+    }
+
+    async function pollCloneJob(jobId) {
+        try {
+            const response = await fetch(`/api/product-manager/clone-jobs/${encodeURIComponent(jobId)}`);
+            const job = await parseProductManagerJson(response);
+            const completed = Number(job.completed_count || 0);
+            const total = Number(job.total_count || 0);
+            const current = job.current_product_id ? `，正在处理产品 #${job.current_product_id}` : '';
+            $('pmCloneFeedback').innerHTML = `
+                <div class="text-info small">
+                    后台克隆进度：${completed}/${total}${escapeHtml(current)}。关闭页面不会中断任务。
+                </div>`;
+
+            if (job.terminal) {
+                sessionStorage.removeItem(ACTIVE_CLONE_JOB_KEY);
+                resetCloneButton();
+                bootstrap.Modal.getInstance($('pmCloneModal'))?.hide();
+                showCloneResult(job);
+                return;
+            }
+            window.setTimeout(() => pollCloneJob(jobId), 2000);
+        } catch (err) {
+            $('pmCloneFeedback').innerHTML = `
+                <div class="text-warning small">
+                    克隆任务已提交，但进度查询失败：${escapeHtml(err.message)}。刷新页面后会继续查询，请勿重复提交。
+                </div>`;
+        }
+    }
+
+    async function applyClone() {
         const ids = JSON.parse($('pmCloneApplyBtn').dataset.productIds || '[]');
         const targetId = $('pmCloneTarget').value;
         if (!targetId) {
@@ -1829,31 +1865,29 @@
 
         const applyBtn = $('pmCloneApplyBtn');
         applyBtn.disabled = true;
-        applyBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>克隆中... (每个产品约 30 秒)';
-        $('pmCloneFeedback').innerHTML = '<div class="text-info small">克隆涉及拉取源数据 + 创建目标产品 + 同步变体，可能需要几分钟，请勿关闭页面。</div>';
+        applyBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>正在提交后台任务...';
+        $('pmCloneFeedback').innerHTML = '<div class="text-info small">正在创建后台克隆任务...</div>';
 
-        fetch('/api/product-manager/clone', {
-            method: 'POST',
-            headers: {'Content-Type':'application/json'},
-            body: JSON.stringify(payload),
-        })
-            .then(r => r.json())
-            .then(data => {
-                applyBtn.disabled = false;
-                applyBtn.innerHTML = '<i class="bi bi-files me-1"></i>开始克隆';
-                bootstrap.Modal.getInstance($('pmCloneModal'))?.hide();
-                showCloneResult(data);
-            })
-            .catch(err => {
-                applyBtn.disabled = false;
-                applyBtn.innerHTML = '<i class="bi bi-files me-1"></i>开始克隆';
-                $('pmCloneFeedback').innerHTML = `<div class="text-danger small">请求失败: ${escapeHtml(err.message)}</div>`;
+        try {
+            const response = await fetch('/api/product-manager/clone', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify(payload),
             });
+            const data = await parseProductManagerJson(response);
+            if (!data.job_id) throw new Error('服务器未返回克隆任务 ID');
+            sessionStorage.setItem(ACTIVE_CLONE_JOB_KEY, data.job_id);
+            applyBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>后台克隆中...';
+            await pollCloneJob(data.job_id);
+        } catch (err) {
+            resetCloneButton();
+            $('pmCloneFeedback').innerHTML = `<div class="text-danger small">请求失败: ${escapeHtml(err.message)}</div>`;
+        }
     }
 
     function showCloneResult(data) {
         const succ = data.success_count || 0;
-        const fail = data.failed_count || 0;
+        const fail = data.failed_count || (data.last_error ? 1 : 0);
         const targetUrl = (data.target_url || '').replace(/^https?:\/\/(www\.)?/, '');
         let html = `
             <div class="row g-3 mb-3">
@@ -1871,6 +1905,10 @@
                 </div>
             </div>
             <div class="text-muted small mb-2">目标站: <code>${escapeHtml(targetUrl)}</code></div>`;
+
+        if (data.last_error) {
+            html += `<div class="alert alert-danger py-2 small">${escapeHtml(data.last_error)}</div>`;
+        }
 
         if (data.results?.success?.length) {
             html += '<h6 class="text-light mt-3 mb-2">成功明细</h6><div style="max-height:240px;overflow-y:auto;">';
@@ -1932,6 +1970,15 @@
     });
 
     $('pmCloneApplyBtn').addEventListener('click', applyClone);
+
+    // Resume progress display after a refresh. The worker itself is independent
+    // of the browser, so this only restores observability and never resubmits.
+    const activeCloneJob = sessionStorage.getItem(ACTIVE_CLONE_JOB_KEY);
+    if (activeCloneJob) {
+        $('pmCloneApplyBtn').disabled = true;
+        $('pmCloneApplyBtn').innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>后台克隆中...';
+        pollCloneJob(activeCloneJob);
+    }
 
 })();
 </script>
