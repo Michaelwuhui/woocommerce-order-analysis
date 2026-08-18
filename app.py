@@ -44,6 +44,16 @@ from product_manager_service import (
     verify_product_child_sync as _verify_product_child_sync,
     wc_product_update_verified as _wc_product_update_verified,
 )
+from product_clone_jobs import (
+    enqueue_clone_job,
+    get_clone_job,
+    init_product_clone_jobs,
+)
+from sync_runtime_status import (
+    init_sync_runtime_status,
+    load_sync_runtime_status,
+    save_sync_runtime_status,
+)
 
 app = Flask(__name__)
 app.secret_key = 'woocommerce-order-analysis-secret-key-2024'
@@ -7106,6 +7116,12 @@ with app.app_context():
     init_product_costs_tables()
     init_warehouses()
     init_blocklist_tables()
+    _clone_jobs_conn = get_db_connection()
+    try:
+        init_product_clone_jobs(_clone_jobs_conn)
+        init_sync_runtime_status(_clone_jobs_conn)
+    finally:
+        _clone_jobs_conn.close()
 
 @app.route('/settings')
 @login_required
@@ -8440,6 +8456,47 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
     if src_sku:
         payload['sku'] = src_sku
 
+        # A timed-out web request may already have created the target product.
+        # Reusing the exact SKU makes retries safe and prevents unwanted -COPY
+        # duplicates.  Drafts are also given a best-effort inline-image repair,
+        # because that is the final phase most likely to be cut off by timeout.
+        try:
+            existing_resp = req.get(
+                f'{tgt_url}/wp-json/wc/v3/products',
+                auth=(tgt_ck, tgt_cs), params={'sku': src_sku, 'per_page': 10},
+                timeout=30, headers=_WC_HEADERS,
+            )
+            existing_products, existing_err = _parse_wc_response(existing_resp)
+        except Exception as e:
+            existing_products, existing_err = None, str(e)
+        if not existing_err and isinstance(existing_products, list):
+            existing = next(
+                (p for p in existing_products
+                 if (p.get('sku') or '').strip().casefold() == src_sku.casefold()),
+                None,
+            )
+            if existing and existing.get('id'):
+                warnings.append(
+                    f'SKU "{src_sku}" 已存在于目标站产品 #{existing["id"]}，'
+                    '已跳过创建以避免重复'
+                )
+                if options.get('include_images') and existing.get('status') == 'draft':
+                    try:
+                        _migrate_inline_images_after_clone(
+                            src, existing, src_url, tgt_url, tgt_ck, tgt_cs,
+                            existing['id'], warnings,
+                        )
+                    except Exception as e:
+                        warnings.append(f'现有草稿文案内图片修复异常：{e}')
+                return {
+                    'new_id': existing['id'],
+                    'name': existing.get('name'),
+                    'sku': existing.get('sku', ''),
+                    'permalink': existing.get('permalink', ''),
+                    'warnings': warnings,
+                    'skipped_existing': True,
+                }
+
     # Images — WC fetches these from URL on POST
     if options.get('include_images'):
         imgs = src.get('images') or []
@@ -8476,7 +8533,8 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
     if attrs_out:
         payload['attributes'] = attrs_out
 
-    # 3. POST to target — handle SKU collision with -COPY suffix
+    # 3. POST to target. Exact-SKU retries are intentionally never renamed to
+    #    -COPY: a collision is safer to report than to silently duplicate stock.
     def _post_create(p):
         return req.post(
             f'{tgt_url}/wp-json/wc/v3/products',
@@ -8488,19 +8546,6 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
         new_data, err = _parse_wc_response(resp)
     except Exception as e:
         return {'error': f'创建目标产品失败: {e}'}
-
-    if err and src_sku and ('sku' in err.lower() or 'unique' in err.lower()):
-        # Retry with a -COPY suffix
-        retry_payload = dict(payload)
-        retry_payload['sku'] = src_sku + '-COPY'
-        try:
-            resp = _post_create(retry_payload)
-            new_data, err = _parse_wc_response(resp)
-            if not err:
-                warnings.append(f'SKU "{src_sku}" 在目标站冲突，已改用 "{retry_payload["sku"]}"')
-                payload = retry_payload
-        except Exception as e:
-            return {'error': f'重试创建失败: {e}'}
 
     if err:
         return {'error': f'创建目标产品失败: {err}'}
@@ -8565,6 +8610,12 @@ def product_manager_clone():
     product_ids = data.get('product_ids') or []
     if not (source_site_id and target_site_id and isinstance(product_ids, list) and product_ids):
         return jsonify({'error': '请提供 source_site_id / target_site_id / product_ids'}), 400
+    try:
+        product_ids = [int(pid) for pid in product_ids]
+    except (TypeError, ValueError):
+        return jsonify({'error': 'product_ids 必须是整数列表'}), 400
+    if any(pid <= 0 for pid in product_ids):
+        return jsonify({'error': 'product_ids 必须是正整数'}), 400
     if source_site_id == target_site_id:
         return jsonify({'error': '源站点和目标站点不能相同'}), 400
     if len(product_ids) > 50:
@@ -8585,33 +8636,43 @@ def product_manager_clone():
     except ValueError as e:
         conn.close()
         return jsonify({'error': str(e)}), 400
-    conn.close()
-
-    results = {'success': [], 'failed': []}
-    for pid in product_ids:
-        try:
-            r = _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs, pid, options)
-        except Exception as e:
-            results['failed'].append({'product_id': pid, 'error': f'未知错误: {e}'})
-            continue
-        if r.get('error'):
-            results['failed'].append({'product_id': pid, 'error': r['error']})
-        else:
-            results['success'].append({
-                'source_id': pid,
-                'target_id': r['new_id'],
-                'name': r.get('name'),
-                'sku': r.get('sku'),
-                'permalink': r.get('permalink'),
-                'warnings': r.get('warnings') or [],
-            })
+    try:
+        job = enqueue_clone_job(
+            conn,
+            source_site_id=source_site_id,
+            target_site_id=target_site_id,
+            product_ids=product_ids,
+            options=options,
+            target_url=tgt_url,
+            created_by_id=str(current_user.id),
+            created_by_name=current_user.name or current_user.username,
+        )
+    finally:
+        conn.close()
 
     return jsonify({
-        'success_count': len(results['success']),
-        'failed_count': len(results['failed']),
-        'results': results,
-        'target_url': tgt_url,
-    })
+        'job_id': job['id'],
+        'status': job['status'],
+        'total_count': job['total_count'],
+        'target_url': job['target_url'],
+    }), 202
+
+
+@app.route('/api/product-manager/clone-jobs/<job_id>', methods=['GET'])
+@login_required
+@product_manager_required
+def product_manager_clone_job(job_id):
+    """Return durable clone progress; operators can only view their own jobs."""
+    conn = get_db_connection()
+    try:
+        job = get_clone_job(conn, job_id)
+    finally:
+        conn.close()
+    if not job:
+        return jsonify({'error': '克隆任务不存在'}), 404
+    if current_user.username != 'admin' and str(job['created_by_id']) != str(current_user.id):
+        return jsonify({'error': '无权查看该克隆任务'}), 403
+    return jsonify(job)
 
 
 @app.route('/product-manager')
@@ -8762,6 +8823,21 @@ def delete_site(site_id):
 # Format: {site_id: {'status': 'idle'|'running'|'success'|'error', 'progress': 0, 'message': '', 'logs': []}}
 SYNC_STATUS = {}
 
+
+def _persist_sync_status(status_id):
+    """Publish one in-memory status snapshot for every Gunicorn worker."""
+    entry = SYNC_STATUS.get(status_id)
+    if entry is None:
+        return
+    conn = get_db_connection()
+    try:
+        save_sync_runtime_status(conn, status_id, entry)
+    except Exception:
+        conn.rollback()
+        app.logger.exception('持久化同步状态失败: status_id=%s', status_id)
+    finally:
+        conn.close()
+
 @app.route('/api/sync/status/<int:site_id>')
 @login_required
 def get_sync_status(site_id):
@@ -8775,6 +8851,16 @@ def get_sync_status(site_id):
     a fresh 'unknown' status to the client.
     """
     import time as _time
+    # SQLite is authoritative because another Gunicorn worker may own the
+    # synchronization thread. A process-local dict is only a legacy fallback.
+    conn = get_db_connection()
+    try:
+        persisted = load_sync_runtime_status(conn, site_id)
+    finally:
+        conn.close()
+    if persisted is not None:
+        return jsonify(persisted)
+
     entry = SYNC_STATUS.get(site_id)
     if entry is None:
         # This worker has no record. Either the sync never ran here, or it
@@ -9044,47 +9130,14 @@ def check_site_api(site_id):
         write_status = 'unknown'
         error_msg = None
         
-        # 1. Test Read Permission
+        # Test connectivity with a read-only request.  Write permission is
+        # verified by actual product operations through authoritative read-back;
+        # do not create/delete notes on real customer orders just to probe it.
         try:
             response = wcapi.get("orders", params={"per_page": 1})
             if response.status_code == 200:
                 read_status = 'ok'
-                
-                # 2. Test Write Permission (Only if read is OK)
-                try:
-                    orders = response.json()
-                    if orders and len(orders) > 0:
-                        test_order_id = orders[0]['id']
-                        
-                        # Try to add test note
-                        test_note_response = wcapi.post(
-                            f"orders/{test_order_id}/notes",
-                            data={
-                                "note": "[API权限测试] 此消息用于验证写权限，将立即删除",
-                                "customer_note": False
-                            }
-                        )
-                        
-                        if test_note_response.status_code in (200, 201):
-                            write_status = 'ok'
-                            # Cleanup
-                            try:
-                                note_id = test_note_response.json().get('id')
-                                if note_id:
-                                    wcapi.delete(f"orders/{test_order_id}/notes/{note_id}")
-                            except:
-                                pass
-                        elif test_note_response.status_code in (401, 403):
-                            write_status = 'error'
-                            error_msg = "写权限被拒绝"
-                        else:
-                            write_status = 'error'
-                            error_msg = f"写入失败 HTTP {test_note_response.status_code}"
-                    else:
-                        write_status = 'unknown' # No order to test on
-                except Exception as e:
-                    write_status = 'error'
-                    error_msg = f"写测试出错: {str(e)}"
+                write_status = 'unknown'
             elif response.status_code in (401, 403):
                 read_status = 'error'
                 write_status = 'unknown'
@@ -9108,12 +9161,16 @@ def check_site_api(site_id):
         conn.commit()
         conn.close()
 
-        status = 'ok' if (read_status == 'ok' and write_status == 'ok') else 'error'
+        status = 'ok' if read_status == 'ok' else 'error'
+        if read_status == 'ok':
+            message = 'API连接正常（读权限已验证；写权限将在实际业务写入时回读验证）'
+        else:
+            message = error_msg or 'API连接异常'
         
         return jsonify({
             'success': True, 
             'status': status,
-            'message': error_msg or 'API连接正常',
+            'message': message,
             'read': read_status,
             'write': write_status
         })
@@ -9625,9 +9682,11 @@ def sync_all_data():
         'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Global sync job started"],
         'updated_at': _time.time(),
     }
+    _persist_sync_status(ALL_SITES_ID)
 
     def _touch():
         SYNC_STATUS[ALL_SITES_ID]['updated_at'] = _time.time()
+        _persist_sync_status(ALL_SITES_ID)
 
     def run_sync_all(app_context):
         with app_context:

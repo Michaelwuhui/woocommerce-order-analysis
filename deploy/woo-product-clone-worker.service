@@ -1,0 +1,23 @@
+[Unit]
+Description=Woo Analysis durable product clone worker
+After=network-online.target woo-analysis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/www/wwwroot/woo-analysis
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/www/wwwroot/woo-analysis/venv/bin/python /www/wwwroot/woo-analysis/product_clone_worker.py --idle-sleep 2
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/www/wwwroot/woo-analysis
+
+[Install]
+WantedBy=multi-user.target
