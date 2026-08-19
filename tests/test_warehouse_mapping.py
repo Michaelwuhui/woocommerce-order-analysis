@@ -172,6 +172,27 @@ class WarehouseMappingTests(unittest.TestCase):
         self.assertEqual('mapped', statuses[1])
         self.assertEqual('candidate', statuses[2])
 
+    def test_duplicate_parent_sku_is_not_used_as_variation_fallback(self):
+        scan_site_catalog(self.db, 10, 1, session=FakeWooSession())
+        self.db.execute(
+            """UPDATE inv_site_product_catalog
+               SET wc_sku='SHARED-PARENT-SKU',candidate_sku_id=1,match_method='exact_name',match_confidence=98
+               WHERE wc_variation_id=501"""
+        )
+        self.db.execute(
+            """UPDATE inv_site_product_catalog
+               SET wc_sku='SHARED-PARENT-SKU',candidate_sku_id=2,match_method='exact_name',match_confidence=98
+               WHERE wc_variation_id=502"""
+        )
+        self.db.commit()
+
+        applied = apply_safe_mappings(self.db, 10, 1, operator_name='tester')
+        self.assertEqual(2, applied['created'])
+        rows = self.db.execute(
+            'SELECT wc_variation_id,wc_sku,sku_id FROM inv_site_sku_map ORDER BY wc_variation_id'
+        ).fetchall()
+        self.assertEqual([(501, None, 1), (502, None, 2)], [tuple(row) for row in rows])
+
 
 if __name__ == '__main__':
     unittest.main()

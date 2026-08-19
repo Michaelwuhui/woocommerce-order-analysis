@@ -12,7 +12,7 @@ import html
 import json
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 
 def normalize_identifier(value):
@@ -431,6 +431,10 @@ def apply_safe_mappings(conn, site_id, warehouse_id, operator_id=None, operator_
     """Create only unique exact SKU/name mappings from the latest scan."""
     rows = _catalog_rows_with_map(conn, site_id, warehouse_id)
     allowed = {int(s["id"]) for s in warehouse_skus(conn, warehouse_id)}
+    wc_sku_counts = Counter(
+        str(row.get("wc_sku") or "").strip().lower()
+        for row in rows if str(row.get("wc_sku") or "").strip()
+    )
     created = []
     skipped = []
     for row in rows:
@@ -442,22 +446,36 @@ def apply_safe_mappings(conn, site_id, warehouse_id, operator_id=None, operator_
             continue
         conflict = conn.execute(
             """SELECT id,sku_id FROM inv_site_sku_map
-               WHERE site_id=? AND is_active=1 AND (
-                    (wc_product_id=? AND COALESCE(wc_variation_id,0)=?)
-                    OR (COALESCE(wc_sku,'')<>'' AND LOWER(wc_sku)=LOWER(?))
-               ) LIMIT 1""",
-            (site_id, row["wc_product_id"], row["wc_variation_id"] or 0, row["wc_sku"] or ""),
+               WHERE site_id=? AND is_active=1 AND wc_product_id=?
+                 AND COALESCE(wc_variation_id,0)=? LIMIT 1""",
+            (site_id, row["wc_product_id"], row["wc_variation_id"] or 0),
         ).fetchone()
         if conflict:
             skipped.append({"catalog_id": row["id"], "reason": "conflict"})
             continue
+        wc_sku = str(row.get("wc_sku") or "").strip() or None
+        # A number of Woo variable products reuse one parent-level SKU on all
+        # flavour variations.  Product+variation remains exact, but that shared
+        # SKU is ambiguous and must not become a fallback resolver key.
+        if wc_sku and wc_sku_counts[wc_sku.lower()] > 1:
+            wc_sku = None
+        if method == "exact_sku" and wc_sku:
+            sku_conflict = conn.execute(
+                """SELECT id,sku_id FROM inv_site_sku_map
+                   WHERE site_id=? AND is_active=1 AND COALESCE(wc_sku,'')<>''
+                     AND LOWER(wc_sku)=LOWER(?) AND sku_id<>? LIMIT 1""",
+                (site_id, wc_sku, int(sku_id)),
+            ).fetchone()
+            if sku_conflict:
+                skipped.append({"catalog_id": row["id"], "reason": "wc_sku_conflict"})
+                continue
         cursor = conn.execute(
             """INSERT INTO inv_site_sku_map
                  (site_id,wc_product_id,wc_variation_id,wc_sku,raw_name,sku_id,qty_per_item,is_active)
                VALUES (?,?,?,?,?,?,1,1)""",
             (
                 site_id, row["wc_product_id"], row["wc_variation_id"] or 0,
-                row["wc_sku"] or None, row["name"], int(sku_id),
+                wc_sku, row["name"], int(sku_id),
             ),
         )
         map_id = int(cursor.lastrowid)
