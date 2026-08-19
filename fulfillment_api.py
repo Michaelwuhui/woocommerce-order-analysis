@@ -7,7 +7,7 @@ import hmac
 import os
 from functools import wraps
 
-from flask import Blueprint, jsonify, render_template, request
+from flask import Blueprint, jsonify, redirect, render_template, request
 from flask_login import current_user, login_required
 
 from fulfillment_common import get_conn, json_dump, json_load, utcnow
@@ -383,6 +383,8 @@ def _domain_error(exc: DomainError):
 @login_required
 @fulfillment_view_required
 def fulfillment_page():
+    if not _can_manage_inventory():
+        return redirect('/shipping')
     return render_template(
         "fulfillment.html",
         can_manage_fulfillment=_can_manage_inventory(),
