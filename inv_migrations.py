@@ -2568,6 +2568,74 @@ def down_018(conn):
     conn.commit()
 
 
+# ───────────────── 019: 仓库优先的 Woo 商品目录与映射审计 ─────────────────
+
+def up_019(conn):
+    """Cache read-only Woo catalogue scans used by the mapping readiness UI."""
+    conn.executescript(
+        '''
+        CREATE TABLE IF NOT EXISTS inv_site_catalog_scans (
+            site_id        INTEGER NOT NULL,
+            warehouse_id   INTEGER NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'pending',
+            started_at     TEXT,
+            finished_at    TEXT,
+            total_products INTEGER NOT NULL DEFAULT 0,
+            error          TEXT,
+            PRIMARY KEY (site_id, warehouse_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS inv_site_product_catalog (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id           INTEGER NOT NULL,
+            warehouse_id      INTEGER NOT NULL,
+            wc_product_id     INTEGER NOT NULL,
+            wc_variation_id   INTEGER NOT NULL DEFAULT 0,
+            wc_sku            TEXT,
+            name              TEXT NOT NULL,
+            product_type      TEXT,
+            manage_stock      INTEGER NOT NULL DEFAULT 0,
+            stock_quantity    INTEGER,
+            permalink         TEXT,
+            candidate_sku_id  INTEGER,
+            match_method      TEXT,
+            match_confidence  INTEGER NOT NULL DEFAULT 0,
+            scanned_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(site_id, warehouse_id, wc_product_id, wc_variation_id),
+            FOREIGN KEY (candidate_sku_id) REFERENCES inv_skus(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_inv_catalog_site_wh
+            ON inv_site_product_catalog(site_id, warehouse_id);
+        CREATE INDEX IF NOT EXISTS idx_inv_catalog_candidate
+            ON inv_site_product_catalog(candidate_sku_id);
+
+        CREATE TABLE IF NOT EXISTS inv_mapping_audit (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            action        TEXT NOT NULL,
+            site_id       INTEGER NOT NULL,
+            warehouse_id  INTEGER,
+            sku_id        INTEGER,
+            map_id        INTEGER,
+            match_method  TEXT,
+            operator_id   INTEGER,
+            operator_name TEXT,
+            payload_json  TEXT,
+            created_at    TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_inv_mapping_audit_site
+            ON inv_mapping_audit(site_id, created_at);
+        '''
+    )
+    conn.commit()
+
+
+def down_019(conn):
+    conn.execute('DROP TABLE IF EXISTS inv_mapping_audit')
+    conn.execute('DROP TABLE IF EXISTS inv_site_product_catalog')
+    conn.execute('DROP TABLE IF EXISTS inv_site_catalog_scans')
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -2587,6 +2655,7 @@ MIGRATIONS = [
     ('016', 'country_order_notification_routes', up_016, down_016),
     ('017', 'jyjg_temporary_transit_finite_stock', up_017, down_017),
     ('018', 'manual_shipper_scope_and_replenishment', up_018, down_018),
+    ('019', 'warehouse_first_woo_mapping_catalog', up_019, down_019),
 ]
 
 
