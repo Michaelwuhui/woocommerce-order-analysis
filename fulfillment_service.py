@@ -8,15 +8,22 @@ worker/adapters so database transactions never remain open across the network.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 import sqlite3
+import unicodedata
 import uuid
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from fulfillment_common import json_dump, json_load, utcnow
+from inv_common import record_movement
+from managed_transfer_catalog import (
+    JYJG_TRANSIT_ROUTING_POLICY,
+    JYJG_TRANSIT_ROUTING_SETTING,
+)
 
 
 ACTIVE_ORDER_STATUSES = {"processing", "offline", "on-hold", "partial-shipped", "shipped"}
@@ -24,6 +31,7 @@ MANUAL_PARTNER_AVAILABLE = 2_147_483_647
 TRUE_VALUES = {"1", "true", "yes", "on"}
 EXCLUSIVE_SKU_ROUTING = "exclusive_mapped_skus"
 MANAGED_WMS_ROUTING = "managed_wms_skus"
+MANAGED_TRANSFER_ROUTING = JYJG_TRANSIT_ROUTING_POLICY
 MANAGED_PRODUCT_ISOLATION_SETTING = "oms_managed_product_isolation_enabled"
 MANAGED_PRODUCT_FAMILIES_SETTING = "oms_managed_product_families"
 DEFAULT_MANAGED_PRODUCT_FAMILIES = (
@@ -208,6 +216,97 @@ def order_contains_managed_product(conn: sqlite3.Connection, order_id: str) -> b
     )
 
 
+MANAGED_FAMILY_SKU_PREFIXES = {
+    "fumot-eco-4in1-80k": "80K-",
+    "fumot-leopard-40k": "40K-",
+    "fumot-randm-tornado-9000": "9K-",
+    "fumot-randm-tornado-15000": "15K-",
+}
+
+
+def _normalize_flavor(value: Any) -> str:
+    """Normalize separators/case without translating a flavor name."""
+
+    text = html.unescape(str(value or ""))
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return re.sub(r"[^A-Z0-9]+", "", text.upper())
+
+
+def _managed_flavor_candidates(item: dict) -> list[str]:
+    candidates: list[str] = []
+    for meta in item.get("meta_data") or []:
+        if not isinstance(meta, dict) or str(meta.get("key") or "").startswith("_"):
+            continue
+        value = meta.get("display_value") or meta.get("value")
+        if value not in (None, ""):
+            candidates.append(str(value))
+    name = html.unescape(str(item.get("name") or ""))
+    if " - " in name:
+        candidates.append(name.rsplit(" - ", 1)[-1])
+    return candidates
+
+
+def _resolve_managed_catalog_sku(
+    conn: sqlite3.Connection,
+    site_id: int,
+    family: str,
+    item: dict,
+) -> int | None:
+    """Resolve a managed line to one of the explicitly transferred SKUs.
+
+    A match is persisted by Woo product/variation id. Unknown flavors stay
+    unmapped and therefore visibly short; they never fall back to unlimited
+    partner inventory.
+    """
+
+    prefix = MANAGED_FAMILY_SKU_PREFIXES.get(family)
+    if not prefix:
+        return None
+    wanted = {
+        normalized
+        for normalized in (
+            _normalize_flavor(value) for value in _managed_flavor_candidates(item)
+        )
+        if normalized
+    }
+    if not wanted:
+        return None
+    matches = [
+        row
+        for row in conn.execute(
+            "SELECT id,sku_code,flavor FROM inv_skus WHERE is_active=1 AND sku_code LIKE ?",
+            (f"{prefix}%",),
+        ).fetchall()
+        if _normalize_flavor(row["flavor"]) in wanted
+    ]
+    if len(matches) != 1:
+        return None
+    sku_id = int(matches[0]["id"])
+    product_id = item.get("product_id")
+    variation_id = item.get("variation_id") or 0
+    if product_id not in (None, ""):
+        conn.execute(
+            '''INSERT INTO inv_site_sku_map
+               (site_id,wc_product_id,wc_variation_id,wc_sku,raw_name,
+                sku_id,qty_per_item,is_active)
+               VALUES (?,?,?,?,?,?,1,1)
+               ON CONFLICT(site_id,wc_product_id,wc_variation_id) DO UPDATE SET
+                 wc_sku=excluded.wc_sku,raw_name=excluded.raw_name,
+                 sku_id=excluded.sku_id,qty_per_item=1,is_active=1,
+                 updated_at=CURRENT_TIMESTAMP''',
+            (
+                site_id,
+                product_id,
+                variation_id,
+                item.get("sku") or "",
+                item.get("name") or item.get("parent_name") or "",
+                sku_id,
+            ),
+        )
+    return sku_id
+
+
 def _integration_config(value: Any) -> dict:
     config = json_load(value, {}) or {}
     return config if isinstance(config, dict) else {}
@@ -219,6 +318,146 @@ def _actor(actor: dict | None) -> tuple[str, str | None, str | None]:
         actor.get("type") or "system",
         str(actor.get("id")) if actor.get("id") is not None else None,
         actor.get("name"),
+    )
+
+
+def _warehouse_routing_policy(conn: sqlite3.Connection, warehouse_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT config_json FROM oms_warehouse_integrations WHERE warehouse_id=?",
+        (warehouse_id,),
+    ).fetchone()
+    return _integration_config(row["config_json"] if row else None).get("routing_policy")
+
+
+def _movement_recorded(
+    conn: sqlite3.Connection,
+    movement_type: str,
+    ref_id: str,
+) -> bool:
+    return bool(
+        conn.execute(
+            '''SELECT 1 FROM inv_movements
+               WHERE movement_type=? AND ref_type='oms_fulfillment_item'
+                 AND ref_id=? LIMIT 1''',
+            (movement_type, ref_id),
+        ).fetchone()
+    )
+
+
+def _apply_managed_transfer_stock_once(
+    conn: sqlite3.Connection,
+    *,
+    warehouse_id: int,
+    sku_id: int,
+    quantity: int,
+    movement_type: str,
+    ref_id: str,
+    order_id: str,
+    actor: dict | None,
+    note: str,
+) -> None:
+    """Apply one idempotent reservation/release/outbound movement."""
+
+    quantity = int(quantity)
+    if quantity <= 0 or _movement_recorded(conn, movement_type, ref_id):
+        return
+    stock = conn.execute(
+        "SELECT on_hand,reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?",
+        (warehouse_id, sku_id),
+    ).fetchone()
+    on_hand = int(stock["on_hand"] if stock else 0)
+    reserved = int(stock["reserved"] if stock else 0)
+    if movement_type == "reserve":
+        if on_hand - reserved < quantity:
+            raise DomainError("临时中转仓可用库存不足，请重新分仓", "stock_changed")
+        qty_delta, reserved_delta = 0, quantity
+    elif movement_type == "release":
+        if reserved < quantity:
+            raise DomainError("临时中转仓预留库存异常，请人工对账", "reservation_mismatch")
+        qty_delta, reserved_delta = 0, -quantity
+    elif movement_type == "sale_out":
+        if on_hand < quantity or reserved < quantity:
+            raise DomainError("临时中转仓出库库存异常，请人工对账", "reservation_mismatch")
+        qty_delta, reserved_delta = -quantity, -quantity
+    else:
+        raise DomainError("不支持的临时仓库存流水", "invalid_stock_movement")
+    _, actor_id, actor_name = _actor(actor)
+    record_movement(
+        conn,
+        warehouse_id=warehouse_id,
+        sku_id=sku_id,
+        movement_type=movement_type,
+        qty_delta=qty_delta,
+        reserved_delta=reserved_delta,
+        ref_type="oms_fulfillment_item",
+        ref_id=ref_id,
+        order_id=order_id,
+        operator_id=int(actor_id) if actor_id and str(actor_id).isdigit() else None,
+        operator_name=actor_name,
+        note=note,
+    )
+
+
+def _release_managed_transfer_reservations(
+    conn: sqlite3.Connection,
+    fulfillment: sqlite3.Row,
+    *,
+    actor: dict | None,
+    reason: str | None,
+) -> None:
+    if _warehouse_routing_policy(conn, fulfillment["warehouse_id"]) != MANAGED_TRANSFER_ROUTING:
+        return
+    items = conn.execute(
+        "SELECT * FROM oms_fulfillment_items WHERE fulfillment_id=?",
+        (fulfillment["id"],),
+    ).fetchall()
+    for item in items:
+        remaining = max(
+            0,
+            int(item["allocated_qty"])
+            - int(item["fulfilled_qty"])
+            - int(item["cancelled_qty"]),
+        )
+        reserve_ref = f"{item['id']}:reserve"
+        if not remaining or not _movement_recorded(conn, "reserve", reserve_ref):
+            continue
+        _apply_managed_transfer_stock_once(
+            conn,
+            warehouse_id=fulfillment["warehouse_id"],
+            sku_id=item["sku_id"],
+            quantity=remaining,
+            movement_type="release",
+            ref_id=f"{item['id']}:release",
+            order_id=fulfillment["order_id"],
+            actor=actor,
+            note=reason or "履约取消或重新分仓释放预留",
+        )
+
+
+def _consume_managed_transfer_stock(
+    conn: sqlite3.Connection,
+    fulfillment: sqlite3.Row,
+    item: sqlite3.Row,
+    shipment_id: str,
+    quantity: int,
+    *,
+    actor: dict | None,
+) -> None:
+    if _warehouse_routing_policy(conn, fulfillment["warehouse_id"]) != MANAGED_TRANSFER_ROUTING:
+        return
+    reserve_ref = f"{item['id']}:reserve"
+    if not _movement_recorded(conn, "reserve", reserve_ref):
+        raise DomainError("临时中转仓履约缺少库存预留记录", "reservation_missing")
+    _apply_managed_transfer_stock_once(
+        conn,
+        warehouse_id=fulfillment["warehouse_id"],
+        sku_id=item["sku_id"],
+        quantity=quantity,
+        movement_type="sale_out",
+        ref_id=f"{item['id']}:shipment:{shipment_id}",
+        order_id=fulfillment["order_id"],
+        actor=actor,
+        note="录入运单号后确认临时中转仓出库",
     )
 
 
@@ -311,6 +550,14 @@ def transition_fulfillment(
         return dict(row)
     if to_status not in FULFILLMENT_TRANSITIONS.get(current, set()):
         raise DomainError(f"非法履约状态转换: {current} → {to_status}", "illegal_transition")
+
+    if to_status in {"cancelled", "superseded"}:
+        _release_managed_transfer_reservations(
+            conn,
+            row,
+            actor=actor,
+            reason=reason,
+        )
 
     updates = {"status": to_status, "updated_at": utcnow(), "row_version": row["row_version"] + 1}
     if to_status == "accepted":
@@ -536,8 +783,17 @@ def sync_order_items(conn: sqlite3.Connection, order_id: str) -> list[dict]:
         line_id = str(item.get("id") if item.get("id") is not None else f"idx-{index}")
         active_keys.append(line_id)
         qty = int(item.get("quantity") or 0)
+        reserved_family = managed_product_family(conn, item)
         sku_id = _resolve_sku(conn, site["id"], item)
-        reserved_family = managed_product_family(conn, item) if not sku_id else None
+        if reserved_family:
+            managed_sku_id = _resolve_managed_catalog_sku(
+                conn,
+                site["id"],
+                reserved_family,
+                item,
+            )
+            if managed_sku_id:
+                sku_id = managed_sku_id
         if not sku_id and not reserved_family:
             sku_id = _ensure_manual_partner_sku(
                 conn,
@@ -609,6 +865,12 @@ def _candidate_warehouses(
         and _integration_config(r["config_json"]).get("routing_policy") == MANAGED_WMS_ROUTING
         for r in explicit
     )
+    managed_transfer_ids = {
+        r["warehouse_id"]
+        for r in explicit
+        if _integration_config(r["config_json"]).get("routing_policy")
+        == MANAGED_TRANSFER_ROUTING
+    }
     if managed_family or managed_wms_marker:
         # The four managed families may be stocked by both external WMS
         # warehouses. They are exclusive only against the legacy manual
@@ -618,7 +880,12 @@ def _candidate_warehouses(
             r["warehouse_id"]
             for r in explicit
             if r["provider"] in {"poland_wms", "hungary_wms"}
+            or r["warehouse_id"] in managed_transfer_ids
         }
+        if not _setting_enabled(
+            conn, JYJG_TRANSIT_ROUTING_SETTING, default=False
+        ):
+            explicit_ids -= managed_transfer_ids
         if not _setting_enabled(conn, "oms_new_pl_wms_routing_enabled", default=False):
             explicit_ids -= {
                 r["warehouse_id"] for r in explicit if r["provider"] == "poland_wms"
@@ -671,7 +938,12 @@ def _candidate_warehouses(
             continue
         config = _integration_config(d.get("config_json"))
         d["routing_policy"] = (
-            MANAGED_WMS_ROUTING if managed_family else config.get("routing_policy")
+            config.get("routing_policy")
+            or (
+                MANAGED_WMS_ROUTING
+                if managed_family and d["provider"] in {"poland_wms", "hungary_wms"}
+                else None
+            )
         )
         if d["provider"] == "poland_wms":
             if not _setting_enabled(conn, "oms_new_pl_wms_routing_enabled", default=False):
@@ -720,6 +992,8 @@ def _candidate_warehouses(
 
     def rank(c: dict):
         country = (c.get("country") or "").upper()
+        if c.get("routing_policy") == MANAGED_TRANSFER_ROUTING:
+            return (-2, c["priority"], c["warehouse_id"])
         if c.get("routing_policy") == EXCLUSIVE_SKU_ROUTING:
             return (-1, c["priority"], c["warehouse_id"])
         if market == "PL":
@@ -987,6 +1261,25 @@ def plan_order(
     if any(f["status"] not in PLANNABLE_FULFILLMENT_STATUSES for f in current_fulfillments):
         raise DomainError("履约已开始，不能自动重新分仓；请转人工处理", "fulfillment_already_started")
 
+    reusable_reservations: dict[tuple[int, int], int] = defaultdict(int)
+    if old_revision:
+        reserved_rows = conn.execute(
+            '''SELECT f.warehouse_id,fi.sku_id,
+                      SUM(MAX(0,fi.allocated_qty-fi.fulfilled_qty-fi.cancelled_qty)) AS qty
+               FROM oms_fulfillments f
+               JOIN oms_fulfillment_items fi ON fi.fulfillment_id=f.id
+               WHERE f.order_id=? AND f.revision=?
+                 AND f.status IN ('planned','ready_to_pick','ready_to_submit',
+                                  'stock_shortage','manual_hold')
+               GROUP BY f.warehouse_id,fi.sku_id''',
+            (order_id, old_revision),
+        ).fetchall()
+        for reserved in reserved_rows:
+            if _warehouse_routing_policy(conn, reserved["warehouse_id"]) == MANAGED_TRANSFER_ROUTING:
+                reusable_reservations[(reserved["warehouse_id"], reserved["sku_id"])] += int(
+                    reserved["qty"] or 0
+                )
+
     availability = {}
     assignments: dict[int, list[dict]] = defaultdict(list)
     shortages = []
@@ -1015,7 +1308,9 @@ def plan_order(
                 "qty": qty, "reason": "warehouse_mapping_missing",
             })
             continue
-        if candidates[0].get("routing_policy") == MANAGED_WMS_ROUTING:
+        if candidates[0].get("routing_policy") == MANAGED_TRANSFER_ROUTING:
+            plan_reasons.add("managed_transfer_stock")
+        elif candidates[0].get("routing_policy") == MANAGED_WMS_ROUTING:
             plan_reasons.add("managed_wms_route")
         elif candidates[0].get("routing_policy") == EXCLUSIVE_SKU_ROUTING:
             plan_reasons.add("exclusive_sku_route")
@@ -1029,7 +1324,7 @@ def plan_order(
         for candidate in candidates:
             key = (candidate["warehouse_id"], item["sku_id"])
             if key not in availability:
-                availability[key] = candidate["available"]
+                availability[key] = candidate["available"] + reusable_reservations.get(key, 0)
             take = min(remaining, availability[key])
             if take <= 0:
                 continue
@@ -1197,7 +1492,7 @@ def plan_order(
             ).fetchone()
             sw = line["candidate"]
             raw = conn.execute("SELECT raw_json FROM oms_order_items WHERE id=?", (line["order_item_id"],)).fetchone()
-            conn.execute(
+            cur = conn.execute(
                 '''INSERT INTO oms_fulfillment_items
                    (fulfillment_id, order_item_id, sku_id, allocated_qty,
                     sku_code_snapshot, barcode_snapshot, name_snapshot, raw_json)
@@ -1213,6 +1508,19 @@ def plan_order(
                     raw["raw_json"] if raw else None,
                 ),
             )
+            fulfillment_item_id = int(cur.lastrowid)
+            if sw.get("routing_policy") == MANAGED_TRANSFER_ROUTING:
+                _apply_managed_transfer_stock_once(
+                    conn,
+                    warehouse_id=warehouse_id,
+                    sku_id=line["sku_id"],
+                    quantity=line["qty"],
+                    movement_type="reserve",
+                    ref_id=f"{fulfillment_item_id}:reserve",
+                    order_id=order_id,
+                    actor=actor,
+                    note="临时中转仓分仓成功后预留库存",
+                )
             allocated_by_item[line["order_item_id"]] += line["qty"]
         for item_id, qty in allocated_by_item.items():
             conn.execute(
@@ -1678,6 +1986,14 @@ def create_shipment(
     for item in items:
         remaining = max(0, int(item["allocated_qty"]) - int(item["fulfilled_qty"]) - int(item["cancelled_qty"]))
         if remaining and SHIPMENT_PROGRESS.get(initial_status, 0) >= 2:
+            _consume_managed_transfer_stock(
+                conn,
+                fulfillment,
+                item,
+                shipment_id,
+                remaining,
+                actor=actor,
+            )
             conn.execute(
                 "INSERT INTO oms_shipment_items (shipment_id, fulfillment_item_id, quantity) VALUES (?,?,?)",
                 (shipment_id, item["id"], remaining),
@@ -1764,6 +2080,14 @@ def mark_shipment_shipped(
         for item in items:
             remaining = max(0, int(item["allocated_qty"]) - int(item["fulfilled_qty"]) - int(item["cancelled_qty"]))
             if remaining:
+                _consume_managed_transfer_stock(
+                    conn,
+                    fulfillment,
+                    item,
+                    shipment_id,
+                    remaining,
+                    actor=actor,
+                )
                 conn.execute(
                     "INSERT INTO oms_shipment_items (shipment_id, fulfillment_item_id, quantity) VALUES (?,?,?)",
                     (shipment_id, item["id"], remaining),

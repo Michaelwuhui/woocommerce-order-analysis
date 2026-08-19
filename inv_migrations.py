@@ -26,7 +26,14 @@ import datetime
 import json
 import sqlite3
 
-from inv_common import DB_FILE, get_conn
+from inv_common import DB_FILE, get_conn, record_movement
+from managed_transfer_catalog import (
+    JYJG_TRANSIT_ROUTING_POLICY,
+    JYJG_TRANSIT_ROUTING_SETTING,
+    JYJG_TRANSIT_WAREHOUSE_CODE,
+    JYJG_TRANSFER_SOURCE,
+    catalog_rows,
+)
 
 
 # ───────────────────────── 迁移注册表 ─────────────────────────
@@ -2131,6 +2138,278 @@ def down_016(conn):
     conn.commit()
 
 
+# ───────────────── 017: 金毅金谷临时中转仓与590支有限库存 ─────────────────
+
+MIGRATION_017_STATE_KEY = "migration_017_previous_state"
+
+
+def _migration_017_dict(row):
+    return dict(row) if row else None
+
+
+def up_017(conn):
+    """Create the finite-stock temporary transit warehouse.
+
+    This migration cannot submit an external WMS order. It seeds only the 59
+    approved SKUs, records 10 units each through the inventory ledger, grants
+    the existing Poland operators access, and enables PL/CZ/HU routing.
+    """
+
+    catalog = catalog_rows()
+    if len(catalog) != 59 or len({row["sku_code"] for row in catalog}) != 59:
+        raise RuntimeError("017 调拨目录必须包含59个唯一SKU")
+    if sum(int(row["quantity"]) for row in catalog) != 590:
+        raise RuntimeError("017 调拨目录合计必须为590支")
+
+    previous_setting = conn.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (JYJG_TRANSIT_ROUTING_SETTING,),
+    ).fetchone()
+    warehouse = conn.execute(
+        "SELECT * FROM warehouses WHERE code=?",
+        (JYJG_TRANSIT_WAREHOUSE_CODE,),
+    ).fetchone()
+    state = {
+        "setting": previous_setting["value"] if previous_setting else None,
+        "warehouse_existed": bool(warehouse),
+        "warehouse_active": int(warehouse["is_active"]) if warehouse else None,
+        "routes": [],
+        "permissions": [],
+    }
+    if not warehouse:
+        conn.execute(
+            "INSERT INTO warehouses (name,code,country,is_active) VALUES (?,?,?,1)",
+            ("金毅金谷临时中转仓", JYJG_TRANSIT_WAREHOUSE_CODE, "PL"),
+        )
+        warehouse = conn.execute(
+            "SELECT * FROM warehouses WHERE id=last_insert_rowid()"
+        ).fetchone()
+    warehouse_id = int(warehouse["id"])
+    state["warehouse_id"] = warehouse_id
+    state["integration"] = _migration_017_dict(conn.execute(
+        "SELECT * FROM oms_warehouse_integrations WHERE warehouse_id=?",
+        (warehouse_id,),
+    ).fetchone())
+    state["warehouse_ext"] = _migration_017_dict(conn.execute(
+        "SELECT * FROM inv_warehouse_ext WHERE warehouse_id=?",
+        (warehouse_id,),
+    ).fetchone())
+    state["routes"] = [
+        dict(row) for row in conn.execute(
+            "SELECT * FROM inv_market_warehouses WHERE warehouse_id=?",
+            (warehouse_id,),
+        ).fetchall()
+    ]
+
+    conn.execute(
+        "UPDATE warehouses SET name=?,country='PL',is_active=1 WHERE id=?",
+        ("金毅金谷临时中转仓", warehouse_id),
+    )
+    conn.execute(
+        '''INSERT INTO inv_warehouse_ext
+             (warehouse_id,ownership_type,partner_name,region,is_fulfillment,notes)
+           VALUES (?,'partner','金毅金谷','PL',1,?)
+           ON CONFLICT(warehouse_id) DO UPDATE SET
+             ownership_type='partner',partner_name='金毅金谷',region='PL',
+             is_fulfillment=1,notes=excluded.notes,updated_at=CURRENT_TIMESTAMP''',
+        (
+            warehouse_id,
+            "临时有限库存仓；仅管理已实际调拨的590支，金毅/金谷/钱品宏手工Packeta发货",
+        ),
+    )
+    integration_config = json.dumps(
+        {
+            "routing_policy": JYJG_TRANSIT_ROUTING_POLICY,
+            "stock_policy": "finite_local_ledger",
+            "shipping_mode": "manual_packeta",
+            "cutover_policy": "new_orders_only",
+            "source_workbook": JYJG_TRANSFER_SOURCE,
+            "sku_count": 59,
+            "initial_quantity": 590,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    conn.execute(
+        '''INSERT INTO oms_warehouse_integrations
+             (warehouse_id,provider,external_code,channel_code,base_url,
+              is_enabled,auto_submit,inventory_authority,tracking_mode,config_json)
+           VALUES (?,'internal',NULL,NULL,NULL,1,0,'local',
+                   'official_and_third_party',?)
+           ON CONFLICT(warehouse_id) DO UPDATE SET
+             provider='internal',external_code=NULL,channel_code=NULL,base_url=NULL,
+             is_enabled=1,auto_submit=0,inventory_authority='local',
+             tracking_mode='official_and_third_party',config_json=excluded.config_json,
+             updated_at=CURRENT_TIMESTAMP''',
+        (warehouse_id, integration_config),
+    )
+    for market in ("PL", "CZ", "HU"):
+        conn.execute(
+            '''INSERT INTO inv_market_warehouses
+                 (market_code,warehouse_id,priority,is_active,notes)
+               VALUES (?,?,1,1,?)
+               ON CONFLICT(market_code,warehouse_id) DO UPDATE SET
+                 priority=1,is_active=1,notes=excluded.notes,
+                 updated_at=CURRENT_TIMESTAMP''',
+            (market, warehouse_id, "四个Fumot系列已调拨SKU优先路由；库存用完后缺货"),
+        )
+
+    for item in catalog:
+        note_marker = json.dumps(
+            {
+                "managed_family": item["family"],
+                "source": JYJG_TRANSFER_SOURCE,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            '''INSERT INTO inv_skus
+                 (sku_code,name,puff_count,flavor,unit,is_active,notes)
+               VALUES (?,?,?,?, 'pcs',1,?)
+               ON CONFLICT(sku_code) DO UPDATE SET
+                 name=excluded.name,puff_count=excluded.puff_count,
+                 flavor=excluded.flavor,unit='pcs',is_active=1,
+                 notes=CASE
+                   WHEN COALESCE(inv_skus.notes,'') LIKE '%\"managed_family\"%'
+                     THEN inv_skus.notes
+                   ELSE TRIM(COALESCE(inv_skus.notes,'') || char(10) || excluded.notes)
+                 END,
+                 updated_at=CURRENT_TIMESTAMP''',
+            (
+                item["sku_code"],
+                f"{item['product_name']} - {item['flavor']}",
+                item["puff_count"],
+                item["flavor"],
+                note_marker,
+            ),
+        )
+        sku_id = int(conn.execute(
+            "SELECT id FROM inv_skus WHERE sku_code=?",
+            (item["sku_code"],),
+        ).fetchone()["id"])
+        conn.execute(
+            '''INSERT INTO oms_sku_warehouses
+                 (sku_id,warehouse_id,is_primary,is_enabled,product_type,notes)
+               VALUES (?,?,1,1,'P',?)
+               ON CONFLICT(sku_id,warehouse_id) DO UPDATE SET
+                 is_primary=1,is_enabled=1,product_type='P',notes=excluded.notes,
+                 updated_at=CURRENT_TIMESTAMP''',
+            (sku_id, warehouse_id, "金毅金谷临时调拨库存；不允许无限库存分配"),
+        )
+        stock = conn.execute(
+            "SELECT on_hand,reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?",
+            (warehouse_id, sku_id),
+        ).fetchone()
+        if stock and (int(stock["on_hand"]) != int(item["quantity"]) or int(stock["reserved"]) != 0):
+            raise RuntimeError(
+                f"017 {item['sku_code']} 已存在非预期库存 "
+                f"on_hand={stock['on_hand']} reserved={stock['reserved']}"
+            )
+        if not stock:
+            record_movement(
+                conn,
+                warehouse_id=warehouse_id,
+                sku_id=sku_id,
+                movement_type="init",
+                qty_delta=int(item["quantity"]),
+                ref_type="migration",
+                ref_id=f"017:{item['sku_code']}",
+                operator_name="system",
+                note=f"临时中转仓期初建账；来源 {JYJG_TRANSFER_SOURCE}",
+            )
+
+    if _migration_table_exists(conn, "users") and _migration_table_exists(
+        conn, "oms_warehouse_user_permissions"
+    ):
+        users = conn.execute(
+            '''SELECT id,username,name FROM users
+               WHERE LOWER(COALESCE(username,'')) IN ('jinyi','jingu','qianpinhong')
+                  OR COALESCE(name,'') IN ('金毅','金谷','钱品宏')'''
+        ).fetchall()
+        for user in users:
+            previous = conn.execute(
+                "SELECT * FROM oms_warehouse_user_permissions WHERE user_id=? AND warehouse_id=?",
+                (user["id"], warehouse_id),
+            ).fetchone()
+            state["permissions"].append({
+                "user_id": int(user["id"]),
+                "previous": _migration_017_dict(previous),
+            })
+            conn.execute(
+                '''INSERT INTO oms_warehouse_user_permissions
+                     (user_id,warehouse_id,can_view,can_pick,can_pack,can_ship,
+                      can_cancel,can_retry,can_reconcile)
+                   VALUES (?,?,1,1,1,1,1,0,0)
+                   ON CONFLICT(user_id,warehouse_id) DO UPDATE SET
+                     can_view=1,can_pick=1,can_pack=1,can_ship=1,can_cancel=1,
+                     updated_at=CURRENT_TIMESTAMP''',
+                (user["id"], warehouse_id),
+            )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?, '1')",
+        (JYJG_TRANSIT_ROUTING_SETTING,),
+    )
+    conn.execute(
+        '''UPDATE oms_order_items SET shortage_qty=0,updated_at=CURRENT_TIMESTAMP
+           WHERE order_id IN (
+             SELECT id FROM orders WHERE status IN ('cancelled','refunded','failed','trash')
+           )'''
+    )
+    conn.execute(
+        '''UPDATE oms_order_fulfillment_state
+           SET aggregate_status='cancelled',has_shortage=0,manual_review=0,
+               manual_reason=NULL,updated_at=CURRENT_TIMESTAMP
+           WHERE order_id IN (
+             SELECT id FROM orders WHERE status IN ('cancelled','refunded','failed','trash')
+           )'''
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+        (MIGRATION_017_STATE_KEY, json.dumps(state, ensure_ascii=False)),
+    )
+    conn.commit()
+
+
+def down_017(conn):
+    """Operational rollback: stop new routing and retain all stock/audit history."""
+
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (MIGRATION_017_STATE_KEY,),
+    ).fetchone()
+    if not row:
+        return
+    state = json.loads(row["value"])
+    warehouse_id = int(state["warehouse_id"])
+    previous_setting = state.get("setting")
+    if previous_setting is None:
+        conn.execute("DELETE FROM settings WHERE key=?", (JYJG_TRANSIT_ROUTING_SETTING,))
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+            (JYJG_TRANSIT_ROUTING_SETTING, previous_setting),
+        )
+    conn.execute(
+        "UPDATE inv_market_warehouses SET is_active=0,updated_at=CURRENT_TIMESTAMP WHERE warehouse_id=?",
+        (warehouse_id,),
+    )
+    conn.execute(
+        "UPDATE oms_warehouse_integrations SET is_enabled=0,auto_submit=0,updated_at=CURRENT_TIMESTAMP WHERE warehouse_id=?",
+        (warehouse_id,),
+    )
+    if not state.get("warehouse_existed"):
+        conn.execute("UPDATE warehouses SET is_active=0 WHERE id=?", (warehouse_id,))
+    else:
+        conn.execute(
+            "UPDATE warehouses SET is_active=? WHERE id=?",
+            (int(state.get("warehouse_active") or 0), warehouse_id),
+        )
+    conn.execute("DELETE FROM settings WHERE key=?", (MIGRATION_017_STATE_KEY,))
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -2148,6 +2427,7 @@ MIGRATIONS = [
     ('014', 'managed_multi_manager_group_webhooks', up_014, down_014),
     ('015', 'copy_specific_routes_to_fallback_group', up_015, down_015),
     ('016', 'country_order_notification_routes', up_016, down_016),
+    ('017', 'jyjg_temporary_transit_finite_stock', up_017, down_017),
 ]
 
 
