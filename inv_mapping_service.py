@@ -497,3 +497,108 @@ def apply_safe_mappings(conn, site_id, warehouse_id, operator_id=None, operator_
         created.append({"map_id": map_id, "sku_id": int(sku_id), "catalog_id": row["id"]})
     conn.commit()
     return {"created": len(created), "skipped": len(skipped), "items": created, "skipped_items": skipped}
+
+
+def confirm_mapping_candidates(
+    conn, site_id, warehouse_id, catalog_ids, operator_id=None, operator_name=None
+):
+    """Confirm a user-selected batch of one-to-one catalogue candidates.
+
+    Unlike ``apply_safe_mappings``, this accepts review-level candidates because
+    an operator has explicitly checked them.  The durable identity remains the
+    Woo product+variation pair.  A shared/ambiguous Woo SKU is omitted so it
+    cannot route another flavour through the fallback resolver.
+    """
+    selected = set()
+    for value in catalog_ids or []:
+        try:
+            selected.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    if not selected:
+        return {"created": 0, "skipped": 0, "items": [], "skipped_items": []}
+    if len(selected) > 500:
+        raise ValueError("单次最多确认 500 条映射")
+
+    rows = _catalog_rows_with_map(conn, site_id, warehouse_id)
+    allowed = {int(s["id"]) for s in warehouse_skus(conn, warehouse_id)}
+    wc_sku_counts = Counter(
+        str(row.get("wc_sku") or "").strip().lower()
+        for row in rows if str(row.get("wc_sku") or "").strip()
+    )
+    created = []
+    skipped = []
+    found = set()
+    for row in rows:
+        catalog_id = int(row["id"])
+        if catalog_id not in selected:
+            continue
+        found.add(catalog_id)
+        sku_id = row.get("candidate_sku_id")
+        if row.get("map_id"):
+            skipped.append({"catalog_id": catalog_id, "reason": "already_mapped"})
+            continue
+        if not sku_id or int(sku_id) not in allowed or not row.get("match_method"):
+            skipped.append({"catalog_id": catalog_id, "reason": "candidate_missing"})
+            continue
+        conflict = conn.execute(
+            """SELECT id FROM inv_site_sku_map
+               WHERE site_id=? AND wc_product_id=?
+                 AND COALESCE(wc_variation_id,0)=? AND is_active=1 LIMIT 1""",
+            (site_id, row["wc_product_id"], row["wc_variation_id"] or 0),
+        ).fetchone()
+        if conflict:
+            skipped.append({"catalog_id": catalog_id, "reason": "conflict"})
+            continue
+
+        wc_sku = str(row.get("wc_sku") or "").strip() or None
+        if wc_sku and wc_sku_counts[wc_sku.lower()] > 1:
+            wc_sku = None
+        if wc_sku:
+            fallback_conflict = conn.execute(
+                """SELECT id FROM inv_site_sku_map
+                   WHERE site_id=? AND COALESCE(wc_sku,'')<>'' AND LOWER(wc_sku)=LOWER(?)
+                     AND sku_id<>? AND is_active=1 LIMIT 1""",
+                (site_id, wc_sku, int(sku_id)),
+            ).fetchone()
+            if fallback_conflict:
+                wc_sku = None
+
+        cursor = conn.execute(
+            """INSERT INTO inv_site_sku_map
+                 (site_id,wc_product_id,wc_variation_id,wc_sku,raw_name,sku_id,qty_per_item,is_active)
+               VALUES (?,?,?,?,?,?,1,1)""",
+            (
+                site_id, row["wc_product_id"], row["wc_variation_id"] or 0,
+                wc_sku, row["name"], int(sku_id),
+            ),
+        )
+        map_id = int(cursor.lastrowid)
+        conn.execute(
+            """INSERT INTO inv_mapping_audit
+                 (action,site_id,warehouse_id,sku_id,map_id,match_method,
+                  operator_id,operator_name,payload_json)
+               VALUES ('batch_confirm',?,?,?,?,?,?,?,?)""",
+            (
+                site_id, warehouse_id, int(sku_id), map_id,
+                "manual_confirm:" + str(row.get("match_method") or "candidate"),
+                operator_id, operator_name,
+                json.dumps({
+                    "catalog_id": catalog_id,
+                    "wc_product_id": row["wc_product_id"],
+                    "wc_variation_id": row["wc_variation_id"],
+                    "wc_sku": row["wc_sku"],
+                    "stored_wc_sku": wc_sku,
+                    "name": row["name"],
+                }, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+        created.append({"map_id": map_id, "sku_id": int(sku_id), "catalog_id": catalog_id})
+
+    for catalog_id in sorted(selected - found):
+        skipped.append({"catalog_id": catalog_id, "reason": "not_found"})
+    conn.commit()
+    return {
+        "created": len(created), "skipped": len(skipped),
+        "items": created, "skipped_items": skipped,
+    }

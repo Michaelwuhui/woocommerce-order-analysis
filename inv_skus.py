@@ -473,3 +473,31 @@ def mapping_auto(site_id):
         return jsonify({'success': True, **result})
     finally:
         conn.close()
+
+
+@inv_sku_bp.route('/api/inv/mapping/confirm-batch/<int:site_id>', methods=['POST'])
+@login_required
+@inv_manage_required
+def mapping_confirm_batch(site_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        warehouse_id = int(data.get('warehouse_id') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': '仓库参数无效'}), 400
+    catalog_ids = data.get('catalog_ids')
+    if not isinstance(catalog_ids, list) or not catalog_ids:
+        return jsonify({'error': '请选择至少一条候选映射'}), 400
+    conn = get_conn()
+    try:
+        if not _mapping_scope_allowed(conn, warehouse_id, site_id):
+            return jsonify({'error': '站点不在该仓库的服务范围内'}), 400
+        uid, uname = current_operator()
+        result = inv_mapping_service.confirm_mapping_candidates(
+            conn, site_id, warehouse_id, catalog_ids,
+            operator_id=uid, operator_name=uname,
+        )
+        return jsonify({'success': True, **result})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    finally:
+        conn.close()

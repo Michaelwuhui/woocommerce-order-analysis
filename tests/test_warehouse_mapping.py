@@ -4,6 +4,7 @@ import unittest
 
 from inv_mapping_service import (
     apply_safe_mappings,
+    confirm_mapping_candidates,
     mapping_detail,
     mapping_overview,
     scan_site_catalog,
@@ -192,6 +193,27 @@ class WarehouseMappingTests(unittest.TestCase):
             'SELECT wc_variation_id,wc_sku,sku_id FROM inv_site_sku_map ORDER BY wc_variation_id'
         ).fetchall()
         self.assertEqual([(501, None, 1), (502, None, 2)], [tuple(row) for row in rows])
+
+    def test_review_candidates_can_be_confirmed_in_one_audited_batch(self):
+        scan_site_catalog(self.db, 10, 1, session=FakeWooSession())
+        review = self.db.execute(
+            """SELECT id FROM inv_site_product_catalog
+               WHERE match_method='review_family_flavor'"""
+        ).fetchone()
+        result = confirm_mapping_candidates(
+            self.db, 10, 1, [review['id']], operator_id=9, operator_name='reviewer'
+        )
+        self.assertEqual(1, result['created'])
+        mapping = self.db.execute(
+            'SELECT sku_id,wc_product_id,wc_variation_id FROM inv_site_sku_map'
+        ).fetchone()
+        self.assertEqual((2, 100, 502), tuple(mapping))
+        audit = self.db.execute(
+            'SELECT action,operator_name,match_method FROM inv_mapping_audit'
+        ).fetchone()
+        self.assertEqual('batch_confirm', audit['action'])
+        self.assertEqual('reviewer', audit['operator_name'])
+        self.assertEqual('manual_confirm:review_family_flavor', audit['match_method'])
 
 
 if __name__ == '__main__':
