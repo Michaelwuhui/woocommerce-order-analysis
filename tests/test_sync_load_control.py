@@ -73,6 +73,118 @@ def make_note_db():
     return conn
 
 
+def make_fulfillment_reconcile_db():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE oms_order_fulfillment_state (
+            order_id TEXT PRIMARY KEY,
+            aggregate_status TEXT,
+            has_shortage INTEGER,
+            manual_review INTEGER,
+            manual_reason TEXT,
+            updated_at TEXT
+        );
+        CREATE TABLE oms_order_items (
+            id INTEGER PRIMARY KEY,
+            order_id TEXT,
+            shortage_qty INTEGER,
+            updated_at TEXT
+        );
+        CREATE TABLE oms_fulfillments (
+            id INTEGER PRIMARY KEY,
+            order_id TEXT,
+            status TEXT
+        );
+        CREATE TABLE oms_domain_events (
+            id INTEGER PRIMARY KEY,
+            aggregate_type TEXT,
+            aggregate_id TEXT,
+            event_type TEXT,
+            from_status TEXT,
+            to_status TEXT,
+            actor_type TEXT,
+            reason TEXT,
+            payload_json TEXT
+        );
+        """
+    )
+    return conn
+
+
+def insert_shortage_state(conn, order_id, *, fulfillment_status=None):
+    conn.execute(
+        """INSERT INTO oms_order_fulfillment_state
+           (order_id, aggregate_status, has_shortage, manual_review, manual_reason)
+           VALUES (?, 'stock_shortage', 1, 1, '缺货')""",
+        (order_id,),
+    )
+    conn.execute(
+        "INSERT INTO oms_order_items (order_id, shortage_qty) VALUES (?, 2)",
+        (order_id,),
+    )
+    if fulfillment_status:
+        conn.execute(
+            "INSERT INTO oms_fulfillments (order_id, status) VALUES (?, ?)",
+            (order_id, fulfillment_status),
+        )
+
+
+def test_terminal_manual_order_clears_stale_shortage_and_writes_audit_event():
+    conn = make_fulfillment_reconcile_db()
+    insert_shortage_state(conn, "30-32565")
+
+    count = sync_utils.reconcile_legacy_terminal_shortages(
+        conn, [{"order_id": "30-32565", "status": "shipped"}]
+    )
+
+    assert count == 1
+    assert conn.execute(
+        """SELECT aggregate_status, has_shortage, manual_review, manual_reason
+           FROM oms_order_fulfillment_state WHERE order_id='30-32565'"""
+    ).fetchone() == ("shipped", 0, 0, None)
+    assert conn.execute(
+        "SELECT shortage_qty FROM oms_order_items WHERE order_id='30-32565'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        """SELECT event_type, from_status, to_status
+           FROM oms_domain_events WHERE aggregate_id='30-32565'"""
+    ).fetchone() == (
+        "legacy_terminal_shortage_reconciled",
+        "stock_shortage",
+        "shipped",
+    )
+
+
+def test_active_fulfillment_keeps_shortage_even_if_woo_status_is_terminal():
+    conn = make_fulfillment_reconcile_db()
+    insert_shortage_state(conn, "30-32567", fulfillment_status="pending")
+
+    count = sync_utils.reconcile_legacy_terminal_shortages(
+        conn, [{"order_id": "30-32567", "status": "shipped"}]
+    )
+
+    assert count == 0
+    assert conn.execute(
+        """SELECT aggregate_status, has_shortage, manual_review
+           FROM oms_order_fulfillment_state WHERE order_id='30-32567'"""
+    ).fetchone() == ("stock_shortage", 1, 1)
+
+
+def test_non_terminal_order_keeps_shortage_without_fulfillment():
+    conn = make_fulfillment_reconcile_db()
+    insert_shortage_state(conn, "30-32568")
+
+    count = sync_utils.reconcile_legacy_terminal_shortages(
+        conn, [{"order_id": "30-32568", "status": "processing"}]
+    )
+
+    assert count == 0
+    assert conn.execute(
+        "SELECT has_shortage FROM oms_order_fulfillment_state WHERE order_id='30-32568'"
+    ).fetchone()[0] == 1
+
+
 def test_subtract_minutes_preserves_timestamp_shape():
     assert (
         sync_utils._subtract_minutes_from_iso("2026-07-31T10:00:00", 10)

@@ -67,6 +67,30 @@ login_manager.login_message = '请先登录以访问此页面'
 # Database configuration
 DB_FILE = 'woocommerce_orders.db'
 
+FULFILLMENT_TERMINAL_ORDER_STATUSES = {
+    'shipped', 'completed', 'cancelled', 'refunded', 'failed', 'trash'
+}
+
+
+def visible_fulfillment_state(order_status, state):
+    """Hide a legacy shortage badge once the order has already terminated.
+
+    The database reconciliation performed during Woo sync is authoritative.
+    This display guard prevents a contradictory ``已发货 + 缺货`` row during
+    the short interval before the next sync, or when viewing old imported data.
+    It deliberately preserves all active and non-shortage fulfillment states.
+    """
+    if not state:
+        return state
+    status = str(order_status or '').strip().lower()
+    if (
+        status in FULFILLMENT_TERMINAL_ORDER_STATUSES
+        and state.get('aggregate_status') == 'stock_shortage'
+        and bool(state.get('has_shortage'))
+    ):
+        return None
+    return state
+
 # Simple user storage (in production, use a proper database)
 USERS = {
     'admin': {
@@ -2376,7 +2400,9 @@ def orders():
             ).fetchall()
         }
         for od in processed_orders:
-            od['fulfillment_state'] = state_map.get(od['id'])
+            od['fulfillment_state'] = visible_fulfillment_state(
+                od.get('status'), state_map.get(od['id'])
+            )
     
     # Get available sources (filtered by permissions and manager)
     conn = get_db_connection()
