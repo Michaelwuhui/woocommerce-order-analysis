@@ -19,7 +19,10 @@ import datetime
 from flask import Blueprint, render_template, request, jsonify
 from flask_login import login_required
 
-from inv_common import get_conn, inv_view_required, inv_manage_required, warehouse_scope_clause
+from inv_common import (
+    get_conn, inv_view_required, inv_manage_required, warehouse_scope_clause,
+    refresh_restock_notification,
+)
 import inv_batches
 
 inv_notify_bp = Blueprint('inv_notify', __name__)
@@ -69,28 +72,20 @@ def _create(conn, ntype, severity, title, body, dedup_key,
 
 def scan_restock(conn):
     """补货:可用 <= 补货点。"""
-    default_rp = _int_setting(conn, 'inv_default_reorder_point', DEFAULT_REORDER_POINT)
     rows = conn.execute('''
-        SELECT st.warehouse_id, st.sku_id, st.on_hand, st.reserved,
-               (st.on_hand - st.reserved) AS available,
-               k.sku_code, k.name AS sku_name, COALESCE(k.reorder_point,0) AS rp,
-               w.name AS warehouse_name
-        FROM inv_stock st JOIN inv_skus k ON k.id=st.sku_id JOIN warehouses w ON w.id=st.warehouse_id
+        SELECT st.warehouse_id, st.sku_id
+        FROM inv_stock st JOIN inv_skus k ON k.id=st.sku_id
         WHERE k.is_active=1
     ''').fetchall()
     n = 0
     for r in rows:
-        threshold = r['rp'] if r['rp'] and r['rp'] > 0 else default_rp
-        if r['available'] <= threshold:
-            sev = 'danger' if r['available'] <= 0 else 'warning'
-            sold = (r['available'] <= 0)
-            title = (f"售罄补货:{r['sku_code']} @ {r['warehouse_name']}" if sold
-                     else f"低库存补货:{r['sku_code']} @ {r['warehouse_name']}")
-            body = f"{r['sku_name']} 可用 {r['available']}(现存 {r['on_hand']} - 预留 {r['reserved']}),补货点 {threshold}"
-            if _create(conn, 'restock', sev, title, body,
-                       f"restock:{r['warehouse_id']}:{r['sku_id']}",
-                       sku_id=r['sku_id'], warehouse_id=r['warehouse_id']):
-                n += 1
+        before = conn.execute(
+            "SELECT 1 FROM inv_notifications WHERE dedup_key=? AND status='unread' LIMIT 1",
+            (f"restock:{r['warehouse_id']}:{r['sku_id']}",),
+        ).fetchone()
+        metrics = refresh_restock_notification(conn, r['warehouse_id'], r['sku_id'])
+        if metrics and metrics['is_low_stock'] and not before:
+            n += 1
     return n
 
 
@@ -264,8 +259,17 @@ def update_notification(nid, action):
     status = {'read': 'read', 'dismiss': 'dismissed', 'unread': 'unread'}[action]
     conn = get_conn()
     try:
-        conn.execute('UPDATE inv_notifications SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?', (status, nid))
+        sc, sp = warehouse_scope_clause('warehouse_id')
+        scope = ''
+        if sc:
+            scope = ' AND (warehouse_id IS NULL' + sc.replace(' AND ', ' OR ', 1) + ')'
+        cur = conn.execute(
+            'UPDATE inv_notifications SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?' + scope,
+            [status, nid] + sp,
+        )
         conn.commit()
+        if not cur.rowcount:
+            return jsonify({'error': '通知不存在或不在当前仓库范围'}), 404
         return jsonify({'success': True})
     finally:
         conn.close()
@@ -277,7 +281,14 @@ def update_notification(nid, action):
 def mark_all_read():
     conn = get_conn()
     try:
-        conn.execute("UPDATE inv_notifications SET status='read', updated_at=CURRENT_TIMESTAMP WHERE status='unread'")
+        sc, sp = warehouse_scope_clause('warehouse_id')
+        scope = ''
+        if sc:
+            scope = ' AND (warehouse_id IS NULL' + sc.replace(' AND ', ' OR ', 1) + ')'
+        conn.execute(
+            "UPDATE inv_notifications SET status='read', updated_at=CURRENT_TIMESTAMP WHERE status='unread'" + scope,
+            sp,
+        )
         conn.commit()
         return jsonify({'success': True})
     finally:

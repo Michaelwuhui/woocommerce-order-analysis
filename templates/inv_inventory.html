@@ -29,8 +29,8 @@
       </div>
       <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
         <table class="table table-dark table-hover align-middle mb-0">
-          <thead><tr class="text-white-50 small"><th>仓库</th><th>SKU</th><th>名称</th><th class="text-end">现存</th><th class="text-end">预留</th><th class="text-end">可用</th><th>更新时间</th></tr></thead>
-          <tbody id="stockTbody"><tr><td colspan="7" class="text-center text-white-50 py-4">加载中...</td></tr></tbody>
+          <thead><tr class="text-white-50 small"><th>仓库</th><th>SKU</th><th>名称</th><th class="text-end">现存</th><th class="text-end">预留</th><th class="text-end">可用</th><th>补货建议</th><th>更新时间</th></tr></thead>
+          <tbody id="stockTbody"><tr><td colspan="8" class="text-center text-white-50 py-4">加载中...</td></tr></tbody>
         </table></div></div></div>
     </div>
 
@@ -169,17 +169,18 @@ function loadStockDebounced(){clearTimeout(stockTimer);stockTimer=setTimeout(loa
 async function loadStock(){
   const p=new URLSearchParams();const wh=qs('stockWh').value;const q=qs('stockQ').value.trim();
   if(wh)p.set('warehouse_id',wh);if(q)p.set('q',q);if(qs('stockNonzero').checked)p.set('nonzero','1');
-  qs('stockTbody').innerHTML='<tr><td colspan="7" class="text-center text-white-50 py-4">加载中...</td></tr>';
+  qs('stockTbody').innerHTML='<tr><td colspan="8" class="text-center text-white-50 py-4">加载中...</td></tr>';
   let rows=[];
   try{rows=await (await fetch('/api/inv/stock?'+p)).json();}catch(e){
-    qs('stockTbody').innerHTML='<tr><td colspan="7" class="text-center text-danger py-4">库存加载失败</td></tr>';return;
+    qs('stockTbody').innerHTML='<tr><td colspan="8" class="text-center text-danger py-4">库存加载失败</td></tr>';return;
   }
   qs('stockTbody').innerHTML = rows.length? rows.map(s=>`<tr>
     <td>${esc(s.warehouse_name)}</td><td><code class="text-info">${esc(s.sku_code)}</code></td><td>${esc(s.sku_name)}</td>
     <td class="text-end">${s.on_hand}</td><td class="text-end text-warning">${s.reserved}</td>
     <td class="text-end fw-bold ${s.available>0?'text-success':'text-danger'}">${s.available}</td>
+    <td>${s.is_low_stock?`<span class="badge ${s.is_out_of_stock?'bg-danger':'bg-warning text-dark'}">${s.is_out_of_stock?'缺货':'库存不足'}</span><div class="small text-warning mt-1">建议补 ${s.suggested_replenishment}，补至 ${s.target_stock}</div>`:'<span class="text-muted small">库存充足</span>'}</td>
     <td class="small text-white-50">${esc(s.updated_at||'')}</td></tr>`).join('')
-    : '<tr><td colspan="7" class="text-center text-white-50 py-4">暂无库存</td></tr>';
+    : '<tr><td colspan="8" class="text-center text-white-50 py-4">暂无库存</td></tr>';
 }
 // ---- 流水 ----
 async function loadMovements(){

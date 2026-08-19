@@ -26,7 +26,13 @@ import datetime
 import json
 import sqlite3
 
-from inv_common import DB_FILE, get_conn, record_movement
+from inv_common import (
+    DB_FILE,
+    JYJG_REORDER_POINT_SETTING,
+    JYJG_TARGET_STOCK_SETTING,
+    get_conn,
+    record_movement,
+)
 from managed_transfer_catalog import (
     JYJG_TRANSIT_ROUTING_POLICY,
     JYJG_TRANSIT_ROUTING_SETTING,
@@ -2410,6 +2416,158 @@ def down_017(conn):
     conn.commit()
 
 
+# ───────────────── 018: 人工发货权限收口与中转仓补货策略 ─────────────────
+
+MIGRATION_018_STATE_KEY = "migration_018_previous_state"
+
+
+def up_018(conn):
+    """Make manual partner shipping a single-step, warehouse-scoped role."""
+
+    setting_keys = (JYJG_REORDER_POINT_SETTING, JYJG_TARGET_STOCK_SETTING)
+    previous_settings = {}
+    for key in setting_keys:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        previous_settings[key] = row["value"] if row else None
+
+    target_warehouses = conn.execute(
+        """SELECT id FROM warehouses
+           WHERE code=? OR code='波兰仓库' OR name='波兰仓库'
+           ORDER BY id""",
+        (JYJG_TRANSIT_WAREHOUSE_CODE,),
+    ).fetchall()
+    warehouse_ids = [int(row["id"]) for row in target_warehouses]
+    target_users = conn.execute(
+        """SELECT id FROM users
+           WHERE LOWER(COALESCE(username,'')) IN ('jinyi','jingu','qianpinhong')
+              OR COALESCE(name,'') IN ('金毅','金谷','钱品宏')
+           ORDER BY id"""
+    ).fetchall()
+    user_ids = [int(row["id"]) for row in target_users]
+
+    partner_id = None
+    if _migration_table_exists(conn, "partners"):
+        partner = conn.execute(
+            """SELECT id FROM partners
+               WHERE name LIKE '%金谷金毅%' OR name LIKE '%金毅金谷%'
+               ORDER BY id LIMIT 1"""
+        ).fetchone()
+        partner_id = int(partner["id"]) if partner else None
+
+    state = {
+        "settings": previous_settings,
+        "warehouse_ext": [],
+        "permissions": [],
+    }
+    for warehouse_id in warehouse_ids:
+        previous_ext = conn.execute(
+            "SELECT * FROM inv_warehouse_ext WHERE warehouse_id=?", (warehouse_id,)
+        ).fetchone()
+        state["warehouse_ext"].append({
+            "warehouse_id": warehouse_id,
+            "previous": dict(previous_ext) if previous_ext else None,
+        })
+        if partner_id is not None:
+            conn.execute(
+                """INSERT INTO inv_warehouse_ext
+                     (warehouse_id,ownership_type,partner_name,partner_id,is_fulfillment)
+                   VALUES (?,'partner','金毅金谷',?,1)
+                   ON CONFLICT(warehouse_id) DO UPDATE SET
+                     ownership_type='partner',partner_name='金毅金谷',partner_id=excluded.partner_id,
+                     is_fulfillment=1,updated_at=CURRENT_TIMESTAMP""",
+                (warehouse_id, partner_id),
+            )
+        for user_id in user_ids:
+            previous = conn.execute(
+                "SELECT * FROM oms_warehouse_user_permissions WHERE user_id=? AND warehouse_id=?",
+                (user_id, warehouse_id),
+            ).fetchone()
+            state["permissions"].append({
+                "user_id": user_id,
+                "warehouse_id": warehouse_id,
+                "previous": dict(previous) if previous else None,
+            })
+            conn.execute(
+                """INSERT INTO oms_warehouse_user_permissions
+                     (user_id,warehouse_id,can_view,can_pick,can_pack,can_ship,
+                      can_cancel,can_retry,can_reconcile)
+                   VALUES (?,?,1,0,0,1,0,0,0)
+                   ON CONFLICT(user_id,warehouse_id) DO UPDATE SET
+                     can_view=1,can_pick=0,can_pack=0,can_ship=1,can_cancel=0,
+                     can_retry=0,can_reconcile=0,updated_at=CURRENT_TIMESTAMP""",
+                (user_id, warehouse_id),
+            )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?, '3')",
+        (JYJG_REORDER_POINT_SETTING,),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?, '10')",
+        (JYJG_TARGET_STOCK_SETTING,),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+        (MIGRATION_018_STATE_KEY, json.dumps(state, ensure_ascii=False)),
+    )
+    conn.commit()
+
+
+def down_018(conn):
+    """Restore permissions, ownership links and replenishment settings."""
+
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (MIGRATION_018_STATE_KEY,)
+    ).fetchone()
+    if not row:
+        return
+    state = json.loads(row["value"])
+    for entry in state.get("permissions", []):
+        previous = entry.get("previous")
+        key = (entry["user_id"], entry["warehouse_id"])
+        if previous is None:
+            conn.execute(
+                "DELETE FROM oms_warehouse_user_permissions WHERE user_id=? AND warehouse_id=?",
+                key,
+            )
+        else:
+            conn.execute(
+                """UPDATE oms_warehouse_user_permissions SET
+                     can_view=?,can_pick=?,can_pack=?,can_ship=?,can_cancel=?,
+                     can_retry=?,can_reconcile=?,created_at=?,updated_at=?
+                   WHERE user_id=? AND warehouse_id=?""",
+                (
+                    previous["can_view"], previous["can_pick"], previous["can_pack"],
+                    previous["can_ship"], previous["can_cancel"], previous["can_retry"],
+                    previous["can_reconcile"], previous["created_at"], previous["updated_at"],
+                    *key,
+                ),
+            )
+    for entry in state.get("warehouse_ext", []):
+        previous = entry.get("previous")
+        warehouse_id = entry["warehouse_id"]
+        if previous is None:
+            conn.execute("DELETE FROM inv_warehouse_ext WHERE warehouse_id=?", (warehouse_id,))
+        else:
+            conn.execute(
+                """UPDATE inv_warehouse_ext SET
+                     ownership_type=?,partner_name=?,partner_id=?,region=?,is_fulfillment=?,
+                     notes=?,created_at=?,updated_at=? WHERE warehouse_id=?""",
+                (
+                    previous["ownership_type"], previous["partner_name"], previous["partner_id"],
+                    previous["region"], previous["is_fulfillment"], previous["notes"],
+                    previous["created_at"], previous["updated_at"], warehouse_id,
+                ),
+            )
+    for key, value in state.get("settings", {}).items():
+        if value is None:
+            conn.execute("DELETE FROM settings WHERE key=?", (key,))
+        else:
+            conn.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
+    conn.execute("DELETE FROM settings WHERE key=?", (MIGRATION_018_STATE_KEY,))
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -2428,6 +2586,7 @@ MIGRATIONS = [
     ('015', 'copy_specific_routes_to_fallback_group', up_015, down_015),
     ('016', 'country_order_notification_routes', up_016, down_016),
     ('017', 'jyjg_temporary_transit_finite_stock', up_017, down_017),
+    ('018', 'manual_shipper_scope_and_replenishment', up_018, down_018),
 ]
 
 

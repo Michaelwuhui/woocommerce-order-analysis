@@ -223,10 +223,17 @@ def list_market_routes():
         JOIN warehouses w ON w.id = mw.warehouse_id
         LEFT JOIN inv_warehouse_ext we ON we.warehouse_id = w.id
     '''
-    params = ()
+    where = []
+    params = []
     if market:
-        sql += ' WHERE mw.market_code = ?'
-        params = (market.upper(),)
+        where.append('mw.market_code = ?')
+        params.append(market.upper())
+    sc, sp = warehouse_scope_clause('mw.warehouse_id')
+    if sc:
+        where.append(sc.replace(' AND ', '', 1))
+        params.extend(sp)
+    if where:
+        sql += ' WHERE ' + ' AND '.join(where)
     sql += ' ORDER BY mw.market_code, mw.priority, mw.id'
     rows = conn.execute(sql, params).fetchall()
     conn.close()

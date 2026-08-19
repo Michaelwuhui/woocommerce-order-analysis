@@ -177,7 +177,7 @@
                         </a>
                     </li>
                     {% endif %}
-                    {% if current_user.is_admin() or current_user.can_ship() or current_user.can_view_shipping() or inv_can_view %}
+                    {% if can_manage_inv %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('fulfillment.') else '' }}"
                             href="{{ url_for('fulfillment.fulfillment_page') }}">

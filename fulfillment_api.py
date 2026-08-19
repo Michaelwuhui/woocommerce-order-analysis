@@ -20,6 +20,7 @@ from fulfillment_service import (
     recompute_order_status,
     transition_fulfillment,
 )
+from inv_common import replenishment_metrics
 
 
 fulfillment_bp = Blueprint("fulfillment", __name__)
@@ -509,13 +510,20 @@ def fulfillment_order_detail(order_id):
         output = []
         for fulfillment in fulfillments:
             data = dict(fulfillment)
-            data["items"] = [dict(r) for r in conn.execute(
+            item_rows = conn.execute(
                 '''SELECT fi.*, oi.name AS order_item_name, oi.ordered_qty,
                           oi.shortage_qty, oi.cancelled_qty AS order_cancelled_qty
                    FROM oms_fulfillment_items fi JOIN oms_order_items oi ON oi.id=fi.order_item_id
                    WHERE fi.fulfillment_id=? ORDER BY fi.id''',
                 (fulfillment["id"],),
-            ).fetchall()]
+            ).fetchall()
+            data["items"] = []
+            for item_row in item_rows:
+                item = dict(item_row)
+                item["stock"] = replenishment_metrics(
+                    conn, fulfillment["warehouse_id"], item_row["sku_id"]
+                )
+                data["items"].append(item)
             shipments = []
             for shipment in conn.execute(
                 "SELECT * FROM oms_shipments WHERE fulfillment_id=? ORDER BY created_at",
@@ -531,6 +539,21 @@ def fulfillment_order_detail(order_id):
                 ).fetchall()]
                 shipments.append(parcel)
             data["shipments"] = shipments
+            manual_statuses = {"ready_to_pick", "picking", "packed", "accepted"}
+            data["can_manual_ship"] = (
+                fulfillment["mode"] == "internal"
+                and fulfillment["status"] in manual_statuses
+            )
+            if fulfillment["mode"] != "internal":
+                data["manual_ship_block_reason"] = "该履约单由外部 WMS 处理，不能人工录入发货"
+            elif fulfillment["status"] == "stock_shortage":
+                data["manual_ship_block_reason"] = "该仓库存不足，请补货或人工调整后重新分仓"
+            elif fulfillment["status"] in {"shipped", "delivered"}:
+                data["manual_ship_block_reason"] = "该仓包裹已经发货"
+            elif fulfillment["status"] not in manual_statuses:
+                data["manual_ship_block_reason"] = f"当前状态 {fulfillment['status']} 暂不能发货"
+            else:
+                data["manual_ship_block_reason"] = None
             output.append(data)
         order = conn.execute(
             "SELECT id, number, status, source, date_created FROM orders WHERE id=?", (order_id,)
@@ -592,6 +615,23 @@ def api_create_shipment(fulfillment_id):
     conn = get_conn()
     try:
         _check_fulfillment_permission(conn, fulfillment_id, "can_ship")
+        fulfillment = conn.execute(
+            "SELECT id,order_id,mode,status FROM oms_fulfillments WHERE id=?",
+            (fulfillment_id,),
+        ).fetchone()
+        if fulfillment["mode"] != "internal":
+            raise DomainError(
+                "外部 WMS 履约单不能由发货员手工录入运单",
+                "manual_shipment_not_allowed",
+            )
+        allowed_statuses = {"ready_to_pick", "picking", "packed", "accepted"}
+        if fulfillment["status"] not in allowed_statuses:
+            message = (
+                "该仓库存不足，请补货或人工调整后重新分仓"
+                if fulfillment["status"] == "stock_shortage"
+                else f"当前履约状态 {fulfillment['status']} 不能录入发货"
+            )
+            raise DomainError(message, "fulfillment_not_shippable")
         shipment = create_shipment(
             conn,
             fulfillment_id,
@@ -601,8 +641,18 @@ def api_create_shipment(fulfillment_id):
             label_url=body.get("label_url"),
             tracking_source="internal_warehouse",
             actor=_actor(),
+            commit=False,
         )
-        return jsonify(shipment)
+        state = recompute_order_status(
+            conn, fulfillment["order_id"], actor=_actor(), commit=False
+        )
+        conn.commit()
+        return jsonify({
+            "success": True,
+            "message": "运单已录入，库存已扣减；客户通知和 WooCommerce 同步已进入队列",
+            "shipment": shipment,
+            "order_state": state,
+        })
     except DomainError as exc:
         conn.rollback()
         return _domain_error(exc)

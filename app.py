@@ -23464,7 +23464,18 @@ def save_profit_settings():
 @login_required
 def get_warehouses():
     conn = get_db_connection()
-    rows = conn.execute('SELECT * FROM warehouses ORDER BY country, name').fetchall()
+    from inv_common import visible_warehouse_ids
+    allowed = visible_warehouse_ids()
+    sql = 'SELECT * FROM warehouses'
+    params = []
+    if allowed is not None:
+        if not allowed:
+            rows = []
+            conn.close()
+            return jsonify(rows)
+        sql += f" WHERE id IN ({','.join('?' for _ in allowed)})"
+        params.extend(allowed)
+    rows = conn.execute(sql + ' ORDER BY country, name', params).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 

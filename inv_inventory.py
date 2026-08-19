@@ -21,6 +21,7 @@ from flask_login import login_required
 from inv_common import (
     get_conn, inv_view_required, inv_manage_required,
     record_movement, current_operator, warehouse_scope_clause,
+    replenishment_metrics,
 )
 
 inv_inv_bp = Blueprint('inv_inv', __name__)
@@ -41,8 +42,10 @@ def inventory_home():
 @inv_view_required
 def stock_page():
     conn = get_conn()
+    sc, sp = warehouse_scope_clause('id')
     warehouses = conn.execute(
-        'SELECT id, name, code, country FROM warehouses WHERE is_active=1 ORDER BY country, name'
+        'SELECT id, name, code, country FROM warehouses WHERE is_active=1'
+        + sc + ' ORDER BY country, name', sp
     ).fetchall()
     conn.close()
     return render_template('inv_inventory.html', warehouses=[dict(w) for w in warehouses])
@@ -188,8 +191,16 @@ def list_pos():
         sql += ' AND po.warehouse_id=?'; params.append(wid)
     sql += ' ORDER BY po.id DESC LIMIT 500'
     rows = conn.execute(sql, params).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item.update(replenishment_metrics(
+            conn, row['warehouse_id'], row['sku_id'],
+            on_hand=row['on_hand'], reserved=row['reserved'],
+        ))
+        result.append(item)
     conn.close()
-    return jsonify([dict(r) for r in rows])
+    return jsonify(result)
 
 
 @inv_inv_bp.route('/api/inv/purchase-orders/<int:pid>', methods=['GET'])

@@ -21,7 +21,9 @@ from inv_migrations import (
     down_011,
     down_012,
     down_017,
+    down_018,
     up_001,
+    up_005,
     up_006,
     up_007,
     up_008,
@@ -30,7 +32,9 @@ from inv_migrations import (
     up_011,
     up_012,
     up_017,
+    up_018,
 )
+from inv_common import record_movement, replenishment_metrics
 from fulfillment_woocommerce import _all_order_shipments, _ast_items, _customer_note_body
 
 
@@ -371,6 +375,83 @@ class FulfillmentDomainTests(unittest.TestCase):
                 (warehouse_id,),
             ).fetchone()[0],
         )
+
+    def test_jyjg_replenishment_warning_lifecycle(self):
+        up_005(self.db)
+        up_017(self.db)
+        warehouse_id = self.db.execute(
+            "SELECT id FROM warehouses WHERE code='PL-JYJG-TRANSIT'"
+        ).fetchone()[0]
+        sku_id = self.db.execute(
+            "SELECT id FROM inv_skus WHERE sku_code='40K-CI'"
+        ).fetchone()[0]
+
+        record_movement(
+            self.db, warehouse_id=warehouse_id, sku_id=sku_id,
+            movement_type="reserve", reserved_delta=7,
+            ref_type="test", ref_id="low-stock",
+        )
+        metrics = replenishment_metrics(self.db, warehouse_id, sku_id)
+        notice = self.db.execute(
+            "SELECT * FROM inv_notifications WHERE dedup_key=? AND status='unread'",
+            (f"restock:{warehouse_id}:{sku_id}",),
+        ).fetchone()
+        self.assertEqual(3, metrics["available"])
+        self.assertEqual(7, metrics["suggested_replenishment"])
+        self.assertIn("建议补 7 支", notice["body"])
+
+        record_movement(
+            self.db, warehouse_id=warehouse_id, sku_id=sku_id,
+            movement_type="release", reserved_delta=-7,
+            ref_type="test", ref_id="restocked",
+        )
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM inv_notifications WHERE dedup_key=? AND status='unread'",
+            (f"restock:{warehouse_id}:{sku_id}",),
+        ).fetchone())
+
+    def test_manual_shipper_scope_migration_roundtrip(self):
+        up_017(self.db)
+        warehouse_id = self.db.execute(
+            "SELECT id FROM warehouses WHERE code='PL-JYJG-TRANSIT'"
+        ).fetchone()[0]
+        self.db.execute(
+            "INSERT INTO users (id,username,name) VALUES (10,'jinyi','金毅')"
+        )
+        self.db.execute("CREATE TABLE partners (id INTEGER PRIMARY KEY, name TEXT)")
+        self.db.execute("INSERT INTO partners (id,name) VALUES (1,'金谷金毅（波兰）')")
+        self.db.commit()
+
+        up_018(self.db)
+        permission = self.db.execute(
+            """SELECT can_view,can_pick,can_pack,can_ship,can_cancel
+               FROM oms_warehouse_user_permissions WHERE user_id=10 AND warehouse_id=?""",
+            (warehouse_id,),
+        ).fetchone()
+        self.assertEqual((1, 0, 0, 1, 0), tuple(permission))
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT partner_id FROM inv_warehouse_ext WHERE warehouse_id=?",
+                (warehouse_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            ("3", "10"),
+            tuple(row[0] for row in self.db.execute(
+                "SELECT value FROM settings WHERE key IN ('inv_jyjg_reorder_point','inv_jyjg_target_stock') ORDER BY key"
+            ).fetchall()),
+        )
+
+        down_018(self.db)
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM oms_warehouse_user_permissions WHERE user_id=10 AND warehouse_id=?",
+            (warehouse_id,),
+        ).fetchone())
+        self.assertIsNone(self.db.execute(
+            "SELECT partner_id FROM inv_warehouse_ext WHERE warehouse_id=?",
+            (warehouse_id,),
+        ).fetchone()[0])
 
     def test_managed_family_matching_is_exact_enough(self):
         self.db.execute(
