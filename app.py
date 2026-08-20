@@ -17568,15 +17568,15 @@ def _post_fallback_customer_note(req, site, order, carrier_name, tracking_number
     WooCommerce sends its built-in 'Customer Note' email — uglier than the
     plugin-native one but better than no notification at all."""
     try:
+        from shipment_customer_messages import basic_shipment_note
+
         note_url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes"
-        if tracking_url:
-            note_content = (
-                f"Order has been shipped via {carrier_name}. "
-                f"Tracking Number: <a href='{tracking_url}'>{tracking_number}</a>"
-                f"\n<br>Track your package: <a href='{tracking_url}'>{tracking_url}</a>"
-            )
-        else:
-            note_content = f"Order has been shipped via {carrier_name}. Tracking Number: {tracking_number}"
+        note_content = basic_shipment_note(
+            site['country'] if 'country' in site.keys() else '',
+            carrier_name,
+            tracking_number,
+            tracking_url,
+        )
         note_resp = req.post(
             note_url,
             json={'note': note_content, 'customer_note': True},

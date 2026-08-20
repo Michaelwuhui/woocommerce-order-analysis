@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import time
+from decimal import Decimal
 from typing import Any
 
 import requests
@@ -18,6 +19,7 @@ from fulfillment_service import (
     record_event,
 )
 from oid_utils import woo_post_id
+from shipment_customer_messages import CUSTOMER_NOTE_TEXT, customer_language
 
 
 class WooError(RuntimeError):
@@ -34,7 +36,6 @@ API_HEADERS = {
     "Accept": "application/json",
 }
 NOTIFICATION_TEMPLATE_VERSION = SHIPMENT_NOTIFICATION_TEMPLATE_VERSION
-
 
 def detect_tracking_format(conn, site_url: str) -> str:
     rows = conn.execute(
@@ -157,7 +158,7 @@ def _ast_items(shipments: list[dict], conn=None, *, final: bool = False) -> list
                 shipment.get("carrier_slug"), tracking
             ),
             "custom_tracking_provider": (
-                "Express One（Packeta 匈牙利末端派送）"
+                "Express One (Packeta Hungary last-mile delivery)"
             ) if expressone_last_mile else "",
             "custom_tracking_link": custom_tracking_link,
             "tracking_product_code": "",
@@ -287,66 +288,115 @@ def _request(method: str, url: str, site, *, payload=None, timeout=60):
         return {}
 
 
-def _shipment_financial_context(conn, fulfillment_id: str) -> dict:
+def _shipment_financial_context(conn, fulfillment_id: str, shipment_id: str | None = None) -> dict:
     row = conn.execute(
-        '''SELECT ff.*, w.name AS warehouse_name, w.country AS warehouse_country,
-                  (SELECT COUNT(*)
-                   FROM oms_fulfillments active
-                   WHERE active.order_id=f.order_id
-                     AND active.revision=f.revision
-                     AND active.status NOT IN ('cancelled','superseded')) AS fulfillment_count
+        '''SELECT ff.*, f.id, f.order_id, f.revision, f.warehouse_id,
+                  w.name AS warehouse_name, w.country AS warehouse_country
            FROM oms_fulfillments f
            LEFT JOIN warehouses w ON w.id=f.warehouse_id
            LEFT JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
            WHERE f.id=?''',
         (fulfillment_id,),
     ).fetchone()
-    return dict(row) if row else {}
+    if not row:
+        return {}
+    context = dict(row)
+    active = conn.execute(
+        '''SELECT f.id,f.warehouse_id,ff.cod_amount,ff.merchandise_amount,
+                  ff.customer_shipping_amount,ff.order_adjustment_amount
+           FROM oms_fulfillments f
+           LEFT JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
+           WHERE f.order_id=? AND f.revision=?
+             AND f.status NOT IN ('cancelled','superseded')''',
+        (context["order_id"], context["revision"]),
+    ).fetchall()
+
+    # Only a shipment explicitly linked to multiple fulfillments is treated as
+    # one physical dispatch.  This preserves the financial wording of historic
+    # split shipments after a joint-dispatch group is configured.
+    linked_ids: set[str] = set()
+    if shipment_id:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='oms_shipment_fulfillments'"
+        ).fetchone()
+        if table:
+            linked_ids = {
+                str(item["fulfillment_id"])
+                for item in conn.execute(
+                    "SELECT fulfillment_id FROM oms_shipment_fulfillments WHERE shipment_id=?",
+                    (shipment_id,),
+                ).fetchall()
+            }
+    if len(linked_ids) < 2:
+        linked_ids = set()
+
+    def dispatch_key(item):
+        item_id = str(item["id"])
+        return f"shipment:{shipment_id}" if item_id in linked_ids else f"fulfillment:{item_id}"
+
+    current_key = dispatch_key(context)
+    keys = {dispatch_key(item) for item in active}
+    grouped = [item for item in active if dispatch_key(item) == current_key]
+    context["fulfillment_count"] = len(keys)
+    if len(grouped) > 1:
+        for column in (
+            "cod_amount", "merchandise_amount", "customer_shipping_amount",
+            "order_adjustment_amount",
+        ):
+            context[column] = format(
+                sum((Decimal(str(item[column] or "0")) for item in grouped), Decimal("0")),
+                "f",
+            )
+        context["warehouse_name"] = "Joint dispatch"
+    return context
 
 
-def _customer_note_body(conn, order, shipment: dict, tracking_url: str = "") -> str:
+def _customer_note_language(conn, order, site=None) -> str:
+    if site is None:
+        site = conn.execute("SELECT country FROM sites WHERE url=?", (order["source"],)).fetchone()
+    country = site["country"] if site and site["country"] else ""
+    return customer_language(country)
+
+
+def _customer_note_body(conn, order, shipment: dict, tracking_url: str = "", site=None) -> str:
     tracking = html.escape(str(shipment["tracking_number"]))
     carrier = html.escape(
         str(shipment.get("carrier_name") or shipment.get("carrier_slug") or "物流商")
     )
-    finance = _shipment_financial_context(conn, shipment["fulfillment_id"])
-    warehouse = html.escape(
-        str(finance.get("warehouse_name") or finance.get("warehouse_country") or "仓库")
+    finance = _shipment_financial_context(
+        conn, shipment["fulfillment_id"], shipment.get("id")
     )
+    text = CUSTOMER_NOTE_TEXT[_customer_note_language(conn, order, site)]
     if tracking_url:
         safe_url = html.escape(str(tracking_url), quote=True)
         tracking_part = f"<a href='{safe_url}'>{tracking}</a>"
     else:
         tracking_part = tracking
-    body = (
-        f"您的订单已有一个包裹从 {warehouse} 通过 {carrier} 发出。"
-        f"运单号：{tracking_part}。"
-    )
+    body = text["shipped"].format(carrier=carrier, tracking=tracking_part)
     if str(order["payment_method"] or "").lower() == "cod":
         if not finance or finance.get("cod_collection_role") not in {"collector", "instruction_only"}:
             raise WooError("包裹缺少 COD 金额快照，已阻止发送含糊的客户通知", code="cod_notice_missing")
         amount = html.escape(str(finance.get("cod_amount") or "0.00"))
         currency = html.escape(str(finance.get("cod_currency") or order["currency"] or ""))
-        body += f"本包裹货到付款金额：{amount} {currency}。"
+        body += text["cod"].format(amount=amount, currency=currency)
         if int(finance.get("fulfillment_count") or 0) > 1:
             shipping = str(finance.get("customer_shipping_amount") or "0.00")
             if float(shipping) > 0:
-                body += (
-                    f"其中包含本订单全部客户运费 {html.escape(shipping)} {currency}；"
-                    "其他仓库包裹不会重复收取订单运费。"
+                body += text["shipping_included"].format(
+                    shipping=html.escape(shipping), currency=currency
                 )
             else:
-                body += "本包裹只收取所含商品金额，不重复收取订单运费。"
-            body += "同一订单的其他仓库包裹将分别收取对应商品金额。"
+                body += text["shipping_not_repeated"]
+            body += text["other_amounts"]
     else:
-        body += "本包裹无需货到付款。"
+        body += text["no_cod"]
     if int(finance.get("fulfillment_count") or 0) > 1:
-        body += "订单内其他商品将由另一仓库分批发出。"
+        body += text["remaining"]
     return body
 
 
 def _post_customer_note(conn, site, order, shipment, tracking_url: str = "") -> None:
-    body = _customer_note_body(conn, order, shipment, tracking_url)
+    body = _customer_note_body(conn, order, shipment, tracking_url, site=site)
     url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes"
     _request("POST", url, site, payload={"note": body, "customer_note": True}, timeout=45)
 
@@ -361,7 +411,9 @@ def _notify_shipment(conn, site, order, shipment: dict, fmt: str, final: bool) -
         return "already_sent"
     try:
         tracking_url = _tracking_url(conn, shipment)
-        finance = _shipment_financial_context(conn, shipment["fulfillment_id"])
+        finance = _shipment_financial_context(
+            conn, shipment["fulfillment_id"], shipment.get("id")
+        )
         split_cod = (
             str(order["payment_method"] or "").lower() == "cod"
             and int(finance.get("fulfillment_count") or 0) > 1

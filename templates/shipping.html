@@ -1648,7 +1648,8 @@
                 const select = document.getElementById('shipFulfillmentSelect');
                 select.innerHTML = _shipFulfillments.map(f => {
                     const suffix = f.can_manual_ship ? '待发货' : (f.manual_ship_block_reason || f.status);
-                    return `<option value="${shipEscape(f.id)}">${shipEscape(f.warehouse_name || '未命名仓库')} · ${shipEscape(suffix)}</option>`;
+                    const name = f.dispatch_group_label || f.warehouse_name || '未命名仓库';
+                    return `<option value="${shipEscape(f.id)}">${shipEscape(name)} · ${shipEscape(suffix)}</option>`;
                 }).join('');
                 select.disabled = _shipFulfillments.length <= 1;
                 const first = _shipFulfillments.find(f => f.can_manual_ship) || _shipFulfillments[0];
@@ -1683,9 +1684,15 @@
                 const stockText = stock.managed_transfer
                     ? `<span class="${stock.is_low_stock ? 'text-warning fw-bold' : 'text-success'}">仓库可用 ${stock.available}</span>`
                     : '<span class="text-muted">合作仓人工备货</span>';
-                return `<tr><td>${shipEscape(item.order_item_name || item.name_snapshot || item.sku_code_snapshot)}</td><td class="text-center fw-bold">${remaining}</td><td class="text-end">${stockText}</td></tr>`;
+                const source = item.source_warehouse_name
+                    ? `<span class="badge bg-secondary bg-opacity-50 ms-1">${shipEscape(item.source_warehouse_name)}</span>` : '';
+                return `<tr><td>${shipEscape(item.order_item_name || item.name_snapshot || item.sku_code_snapshot)}${source}</td><td class="text-center fw-bold">${remaining}</td><td class="text-end">${stockText}</td></tr>`;
             }).join('');
-            detail.innerHTML = `<div class="mb-1"><b>${shipEscape(f.warehouse_name || '')}</b> · 只发下列商品</div><div class="table-responsive"><table class="table table-dark table-sm mb-0"><thead><tr><th>商品</th><th class="text-center">本包数量</th><th class="text-end">库存</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+            const dispatchTitle = f.dispatch_group_label || f.warehouse_name || '';
+            const dispatchHint = f.dispatch_group
+                ? ' · 联合装箱，只需录入一个运单号；库存仍按来源仓分别扣减'
+                : ' · 只发下列商品';
+            detail.innerHTML = `<div class="mb-1"><b>${shipEscape(dispatchTitle)}</b>${dispatchHint}</div><div class="table-responsive"><table class="table table-dark table-sm mb-0"><thead><tr><th>商品</th><th class="text-center">本包数量</th><th class="text-end">库存</th></tr></thead><tbody>${rows}</tbody></table></div>`;
             const low = (f.items || []).filter(item => item.stock && item.stock.managed_transfer && item.stock.is_low_stock);
             if (!f.can_manual_ship) {
                 warning.innerHTML = `<div class="alert alert-danger py-2 mb-0"><i class="bi bi-exclamation-triangle-fill me-1"></i>${shipEscape(f.manual_ship_block_reason || '该履约单暂不能发货')}</div>`;

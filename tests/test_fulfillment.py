@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import unittest
 from decimal import Decimal
@@ -22,6 +23,7 @@ from inv_migrations import (
     down_012,
     down_017,
     down_018,
+    down_020,
     up_001,
     up_005,
     up_006,
@@ -33,10 +35,12 @@ from inv_migrations import (
     up_012,
     up_017,
     up_018,
+    up_020,
 )
 from inv_common import record_movement, replenishment_metrics
 from inv_mapping_service import replan_shortage_orders_for_mappings
 from fulfillment_woocommerce import _all_order_shipments, _ast_items, _customer_note_body
+from shipment_customer_messages import basic_shipment_note
 
 
 class FulfillmentDomainTests(unittest.TestCase):
@@ -182,6 +186,19 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.add_order("hu-1", "HU", 2)
         plan_order(self.db, "hu-1")
         self.assertEqual([{"warehouse_id": 2, "qty": 2}], self.allocations("hu-1"))
+
+    def test_started_unchanged_order_plan_is_locked_noop_not_manual_failure(self):
+        self.add_order("locked-noop", "PL", 1)
+        planned = plan_order(self.db, "locked-noop")
+        create_shipment(self.db, planned["fulfillment_ids"][0], "LOCKED-001")
+
+        repeated = plan_order(self.db, "locked-noop")
+
+        state = self.db.execute(
+            "SELECT manual_review FROM oms_order_fulfillment_state WHERE order_id='locked-noop'"
+        ).fetchone()
+        self.assertEqual("locked_noop", repeated["action"])
+        self.assertEqual(0, state["manual_review"])
 
     def test_split_order_and_czech_cost_routing(self):
         self.set_stock(pl=1, hu=10)
@@ -423,6 +440,118 @@ class FulfillmentDomainTests(unittest.TestCase):
                 (warehouse_id,),
             ).fetchone()[0],
         )
+
+    def test_joint_dispatch_uses_one_tracking_and_separate_stock_ledgers(self):
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES ('oms_managed_product_isolation_enabled','1')"
+        )
+        up_017(self.db)
+        up_020(self.db)
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+            (
+                "oms_joint_dispatch_groups",
+                json.dumps({
+                    "jyjg": {
+                        "label": "Joint Poland dispatch",
+                        "warehouse_codes": ["PL", "PL-JYJG-TRANSIT"],
+                    }
+                }),
+            ),
+        )
+        self.db.execute(
+            "DELETE FROM oms_sku_warehouses WHERE sku_id=1 AND warehouse_id=2"
+        )
+        self.add_order("joint-dispatch", "CZ", 1)
+        items = json.loads(self.db.execute(
+            "SELECT line_items FROM orders WHERE id='joint-dispatch'"
+        ).fetchone()[0])
+        items.append({
+            "id": 502,
+            "product_id": 902,
+            "variation_id": 0,
+            "sku": "",
+            "name": "Fumot Leopard 40000 Puffs - Cola Ice",
+            "quantity": 1,
+            "total": "10.00",
+            "total_tax": "0.00",
+        })
+        self.db.execute(
+            "UPDATE orders SET line_items=?,total=20 WHERE id='joint-dispatch'",
+            (json.dumps(items),),
+        )
+        planned = plan_order(self.db, "joint-dispatch")
+        fulfillments = self.db.execute(
+            """SELECT id,warehouse_id FROM oms_fulfillments
+               WHERE order_id='joint-dispatch' AND status!='superseded' ORDER BY warehouse_id"""
+        ).fetchall()
+        self.assertEqual(2, len(fulfillments))
+        self.assertEqual(
+            ["PL", "PL-JYJG-TRANSIT"],
+            [self.db.execute("SELECT code FROM warehouses WHERE id=?", (row["warehouse_id"],)).fetchone()[0]
+             for row in fulfillments],
+        )
+
+        shipment = create_shipment(
+            self.db, fulfillments[0]["id"], "JOINT-TRACK-001", carrier_slug="packeta"
+        )
+        recompute_order_status(self.db, "joint-dispatch")
+
+        self.assertTrue(shipment["joint_dispatch"])
+        self.assertEqual(2, len(shipment["fulfillment_ids"]))
+        self.assertEqual(1, self.db.execute(
+            "SELECT COUNT(*) FROM oms_shipments WHERE tracking_number='JOINT-TRACK-001'"
+        ).fetchone()[0])
+        self.assertEqual(2, self.db.execute(
+            "SELECT COUNT(*) FROM oms_shipment_fulfillments WHERE shipment_id=?",
+            (shipment["id"],),
+        ).fetchone()[0])
+        self.assertEqual(2, self.db.execute(
+            "SELECT COUNT(*) FROM oms_shipment_items WHERE shipment_id=?",
+            (shipment["id"],),
+        ).fetchone()[0])
+        parcel_rows = _all_order_shipments(self.db, "joint-dispatch", planned["revision"])
+        self.assertEqual(1, len(parcel_rows))
+        self.assertEqual(2, len(parcel_rows[0]["products"]))
+        order = self.db.execute("SELECT * FROM orders WHERE id='joint-dispatch'").fetchone()
+        notice = _customer_note_body(self.db, order, shipment)
+        self.assertIn("Dobírka za tuto zásilku činí 20.00 EUR", notice)
+        self.assertNotIn("samostatné zásilce", notice)
+        self.assertIsNone(re.search(r"[\u4e00-\u9fff]", notice))
+        self.assertEqual(
+            ["shipped", "shipped"],
+            [row[0] for row in self.db.execute(
+                """SELECT status FROM oms_fulfillments
+                   WHERE order_id='joint-dispatch' AND status!='superseded' ORDER BY warehouse_id"""
+            ).fetchall()],
+        )
+        transit_stock = self.db.execute(
+            """SELECT st.on_hand,st.reserved FROM inv_stock st
+               JOIN inv_skus s ON s.id=st.sku_id
+               JOIN warehouses w ON w.id=st.warehouse_id
+               WHERE w.code='PL-JYJG-TRANSIT' AND s.sku_code='40K-CI'"""
+        ).fetchone()
+        self.assertEqual((9, 0), tuple(transit_stock))
+        aggregate = self.db.execute(
+            "SELECT aggregate_status FROM oms_order_fulfillment_state WHERE order_id='joint-dispatch'"
+        ).fetchone()[0]
+        self.assertEqual("shipped", aggregate)
+
+        add_tracking_event(
+            self.db, shipment["id"], "official", "delivered",
+            raw_status="delivered", external_event_id="joint-delivered",
+        )
+        recompute_order_status(self.db, "joint-dispatch")
+        self.assertEqual(
+            ["delivered", "delivered"],
+            [row[0] for row in self.db.execute(
+                """SELECT status FROM oms_fulfillments
+                   WHERE order_id='joint-dispatch' AND status!='superseded' ORDER BY warehouse_id"""
+            ).fetchall()],
+        )
+        self.assertTrue(completion_guard(self.db, "joint-dispatch")[0])
+
+        down_020(self.db)
 
     def test_jyjg_replenishment_warning_lifecycle(self):
         up_005(self.db)
@@ -967,8 +1096,8 @@ class FulfillmentDomainTests(unittest.TestCase):
                 "carrier_slug": "gls",
             },
         )
-        self.assertIn("货到付款金额：20000.00 HUF", hu_notice)
-        self.assertIn("不重复收取订单运费", hu_notice)
+        self.assertIn("Kwota pobrania dla tej przesyłki: 20000.00 HUF", hu_notice)
+        self.assertIn("koszt dostawy nie zostanie naliczony ponownie", hu_notice)
         pl_notice = _customer_note_body(
             self.db,
             order,
@@ -979,8 +1108,47 @@ class FulfillmentDomainTests(unittest.TestCase):
                 "carrier_slug": "dpd",
             },
         )
-        self.assertIn("货到付款金额：13490.00 HUF", pl_notice)
-        self.assertIn("全部客户运费 3490.00 HUF", pl_notice)
+        self.assertIn("Kwota pobrania dla tej przesyłki: 13490.00 HUF", pl_notice)
+        self.assertIn("pełny koszt dostawy zamówienia w wysokości 3490.00 HUF", pl_notice)
+
+        expected = {
+            "PL": "Przesyłka dla Twojego zamówienia",
+            "HU": "A rendeléséhez tartozó csomagot",
+            "CZ": "Zásilka k vaší objednávce",
+            "DE": "A parcel for your order",
+        }
+        for country, phrase in expected.items():
+            self.db.execute("UPDATE sites SET country=? WHERE id=1", (country,))
+            notice = _customer_note_body(
+                self.db,
+                order,
+                {
+                    "fulfillment_id": by_country["PL"]["fulfillment_id"],
+                    "tracking_number": "LANG-TRACK-1",
+                    "carrier_name": "DPD",
+                    "carrier_slug": "dpd",
+                },
+            )
+            self.assertIn(phrase, notice)
+            self.assertIsNone(re.search(r"[\u4e00-\u9fff]", notice))
+
+    def test_legacy_customer_note_uses_site_language_and_english_fallback(self):
+        expected = {
+            "PL": "Przesyłka dla Twojego zamówienia",
+            "HU": "A rendeléséhez tartozó csomagot",
+            "CZ": "Zásilka k vaší objednávce",
+            "SK": "A parcel for your order",
+        }
+        for country, phrase in expected.items():
+            note = basic_shipment_note(
+                country,
+                "Packeta",
+                "Z1465635854",
+                "https://tracking.packeta.com/en/Z1465635854",
+            )
+            self.assertIn(phrase, note)
+            self.assertIn("Z1465635854", note)
+            self.assertIsNone(re.search(r"[\u4e00-\u9fff]", note))
 
     def test_split_rounding_keeps_exact_cod_total(self):
         self.set_stock(pl=1, hu=10)

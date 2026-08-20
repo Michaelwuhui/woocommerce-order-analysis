@@ -34,6 +34,7 @@ MANAGED_WMS_ROUTING = "managed_wms_skus"
 MANAGED_TRANSFER_ROUTING = JYJG_TRANSIT_ROUTING_POLICY
 MANAGED_PRODUCT_ISOLATION_SETTING = "oms_managed_product_isolation_enabled"
 MANAGED_PRODUCT_FAMILIES_SETTING = "oms_managed_product_families"
+JOINT_DISPATCH_SETTING = "oms_joint_dispatch_groups"
 DEFAULT_MANAGED_PRODUCT_FAMILIES = (
     "fumot-eco-4in1-80k",
     "fumot-leopard-40k",
@@ -313,6 +314,109 @@ def _resolve_managed_catalog_sku(
 def _integration_config(value: Any) -> dict:
     config = json_load(value, {}) or {}
     return config if isinstance(config, dict) else {}
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone())
+
+
+def joint_dispatch_group(conn: sqlite3.Connection, warehouse_id: int) -> dict | None:
+    """Return the configured physical-dispatch group for one stock warehouse."""
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (JOINT_DISPATCH_SETTING,)).fetchone()
+    groups = json_load(row["value"], {}) if row else {}
+    if not isinstance(groups, dict):
+        return None
+    warehouse = conn.execute(
+        "SELECT id,code,name FROM warehouses WHERE id=?", (warehouse_id,)
+    ).fetchone()
+    if not warehouse:
+        return None
+    code = str(warehouse["code"] or "")
+    for key, raw in groups.items():
+        config = raw if isinstance(raw, dict) else {"warehouse_codes": raw}
+        codes = [str(value) for value in config.get("warehouse_codes") or []]
+        if code not in codes:
+            continue
+        if len(codes) < 2:
+            return None
+        marks = ",".join("?" for _ in codes)
+        rows = conn.execute(
+            f"SELECT id,code,name FROM warehouses WHERE is_active=1 AND code IN ({marks})",
+            codes,
+        ).fetchall()
+        by_code = {str(item["code"]): dict(item) for item in rows}
+        members = [by_code[item] for item in codes if item in by_code]
+        if len(members) < 2:
+            return None
+        return {
+            "key": str(key),
+            "label": str(config.get("label") or key),
+            "warehouses": members,
+            "warehouse_ids": [int(item["id"]) for item in members],
+        }
+    return None
+
+
+def joint_dispatch_fulfillments(
+    conn: sqlite3.Connection, fulfillment_id: str, *, pristine_only: bool = False
+) -> list[dict]:
+    """Resolve active internal fulfillments that share one physical dispatch."""
+    source = conn.execute(
+        "SELECT * FROM oms_fulfillments WHERE id=?", (fulfillment_id,)
+    ).fetchone()
+    if not source:
+        raise DomainError("履约单不存在", "fulfillment_not_found")
+    group = joint_dispatch_group(conn, source["warehouse_id"])
+    if not group or source["mode"] != "internal":
+        return [dict(source)]
+    marks = ",".join("?" for _ in group["warehouse_ids"])
+    rows = conn.execute(
+        f'''SELECT * FROM oms_fulfillments
+            WHERE order_id=? AND revision=? AND mode='internal'
+              AND status NOT IN ('cancelled','superseded')
+              AND warehouse_id IN ({marks})''',
+        (source["order_id"], source["revision"], *group["warehouse_ids"]),
+    ).fetchall()
+    by_warehouse = {int(row["warehouse_id"]): dict(row) for row in rows}
+    members = [
+        by_warehouse[warehouse_id]
+        for warehouse_id in group["warehouse_ids"]
+        if warehouse_id in by_warehouse
+    ]
+    if len(members) < 2:
+        return [dict(source)]
+    if pristine_only:
+        allowed = {"ready_to_pick", "picking", "packed", "accepted"}
+        if any(member["status"] not in allowed for member in members):
+            return [dict(source)]
+        member_ids = [member["id"] for member in members]
+        member_marks = ",".join("?" for _ in member_ids)
+        linked = conn.execute(
+            f"SELECT 1 FROM oms_shipments WHERE fulfillment_id IN ({member_marks}) LIMIT 1",
+            member_ids,
+        ).fetchone()
+        if linked:
+            return [dict(source)]
+    for member in members:
+        member["dispatch_group"] = group["key"]
+        member["dispatch_group_label"] = group["label"]
+    return members
+
+
+def shipment_fulfillment_ids(conn: sqlite3.Connection, shipment_id: str) -> list[str]:
+    if _table_exists(conn, "oms_shipment_fulfillments"):
+        rows = conn.execute(
+            "SELECT fulfillment_id FROM oms_shipment_fulfillments WHERE shipment_id=? ORDER BY role DESC,created_at",
+            (shipment_id,),
+        ).fetchall()
+        if rows:
+            return [str(row["fulfillment_id"]) for row in rows]
+    row = conn.execute(
+        "SELECT fulfillment_id FROM oms_shipments WHERE id=?", (shipment_id,)
+    ).fetchone()
+    return [str(row["fulfillment_id"])] if row else []
 
 
 def _actor(actor: dict | None) -> tuple[str, str | None, str | None]:
@@ -1232,6 +1336,33 @@ def _financial_terms_by_warehouse(
     return result
 
 
+def _source_items_match_synced(conn: sqlite3.Connection, order: sqlite3.Row | dict) -> bool:
+    source = json_load(order["line_items"], []) or []
+    expected = []
+    for index, item in enumerate(source):
+        line_id = str(item.get("id") if item.get("id") is not None else f"idx-{index}")
+        expected.append((
+            line_id,
+            int(item.get("product_id") or 0),
+            int(item.get("variation_id") or 0),
+            int(item.get("quantity") or 0),
+        ))
+    actual = [
+        (
+            str(row["woo_line_item_id"]),
+            int(row["wc_product_id"] or 0),
+            int(row["wc_variation_id"] or 0),
+            int(row["ordered_qty"] or 0),
+        )
+        for row in conn.execute(
+            '''SELECT woo_line_item_id,wc_product_id,wc_variation_id,ordered_qty
+               FROM oms_order_items WHERE order_id=? ORDER BY line_index,id''',
+            (order["id"],),
+        ).fetchall()
+    ]
+    return expected == actual
+
+
 def plan_order(
     conn: sqlite3.Connection,
     order_id: str,
@@ -1251,7 +1382,6 @@ def plan_order(
     if order["status"] not in ACTIVE_ORDER_STATUSES:
         raise DomainError(f"订单状态 {order['status']} 不允许创建履约单", "order_not_plannable")
 
-    items = sync_order_items(conn, order_id)
     old_state = conn.execute(
         "SELECT * FROM oms_order_fulfillment_state WHERE order_id=?", (order_id,)
     ).fetchone()
@@ -1262,7 +1392,18 @@ def plan_order(
     ).fetchall() if old_revision else []
 
     if any(f["status"] not in PLANNABLE_FULFILLMENT_STATUSES for f in current_fulfillments):
-        raise DomainError("履约已开始，不能自动重新分仓；请转人工处理", "fulfillment_already_started")
+        if _source_items_match_synced(conn, order):
+            if commit:
+                conn.commit()
+            return {
+                "order_id": order_id,
+                "revision": old_revision,
+                "aggregate_status": old_state["aggregate_status"] if old_state else "fulfillment_in_progress",
+                "action": "locked_noop",
+            }
+        raise DomainError("履约已开始且订单商品已变化，不能自动重新分仓；请转人工处理", "fulfillment_already_started")
+
+    items = sync_order_items(conn, order_id)
 
     reusable_reservations: dict[tuple[int, int], int] = defaultdict(int)
     if old_revision:
@@ -1960,9 +2101,12 @@ def create_shipment(
         (carrier_slug, tracking_number),
     ).fetchone()
     if existing:
-        if existing["fulfillment_id"] != fulfillment_id:
+        if fulfillment_id not in shipment_fulfillment_ids(conn, existing["id"]):
             raise DomainError("该运单号已属于其他履约单", "tracking_conflict")
         return dict(existing)
+
+    members = joint_dispatch_fulfillments(conn, fulfillment_id, pristine_only=True)
+    owner = members[0]
 
     shipment_id = _uuid()
     conn.execute(
@@ -1972,7 +2116,7 @@ def create_shipment(
            VALUES (?,?,?,?,?,?,?,?,?,?)''',
         (
             shipment_id,
-            fulfillment_id,
+            owner["id"],
             external_shipment_id,
             carrier_slug or "custom",
             carrier_name or carrier_slug or "WMS动态物流",
@@ -1983,30 +2127,43 @@ def create_shipment(
             utcnow() if SHIPMENT_PROGRESS.get(initial_status, 0) >= 2 else None,
         ),
     )
-    items = conn.execute(
-        "SELECT * FROM oms_fulfillment_items WHERE fulfillment_id=?", (fulfillment_id,)
-    ).fetchall()
-    for item in items:
-        remaining = max(0, int(item["allocated_qty"]) - int(item["fulfilled_qty"]) - int(item["cancelled_qty"]))
-        if remaining and SHIPMENT_PROGRESS.get(initial_status, 0) >= 2:
-            _consume_managed_transfer_stock(
-                conn,
-                fulfillment,
-                item,
-                shipment_id,
-                remaining,
-                actor=actor,
-            )
+    if _table_exists(conn, "oms_shipment_fulfillments"):
+        for index, member in enumerate(members):
             conn.execute(
-                "INSERT INTO oms_shipment_items (shipment_id, fulfillment_item_id, quantity) VALUES (?,?,?)",
-                (shipment_id, item["id"], remaining),
+                '''INSERT OR IGNORE INTO oms_shipment_fulfillments
+                   (shipment_id,fulfillment_id,role) VALUES (?,?,?)''',
+                (shipment_id, member["id"], "primary" if index == 0 else "companion"),
             )
-            conn.execute(
-                "UPDATE oms_fulfillment_items SET fulfilled_qty=fulfilled_qty+?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (remaining, item["id"]),
+    for member in members:
+        items = conn.execute(
+            "SELECT * FROM oms_fulfillment_items WHERE fulfillment_id=?", (member["id"],)
+        ).fetchall()
+        for item in items:
+            remaining = max(
+                0,
+                int(item["allocated_qty"])
+                - int(item["fulfilled_qty"])
+                - int(item["cancelled_qty"]),
             )
-    if SHIPMENT_PROGRESS.get(initial_status, 0) >= 2 and fulfillment["status"] != "shipped":
-        transition_fulfillment(conn, fulfillment_id, "shipped", actor=actor, reason="已生成运单")
+            if remaining and SHIPMENT_PROGRESS.get(initial_status, 0) >= 2:
+                _consume_managed_transfer_stock(
+                    conn,
+                    member,
+                    item,
+                    shipment_id,
+                    remaining,
+                    actor=actor,
+                )
+                conn.execute(
+                    "INSERT INTO oms_shipment_items (shipment_id, fulfillment_item_id, quantity) VALUES (?,?,?)",
+                    (shipment_id, item["id"], remaining),
+                )
+                conn.execute(
+                    "UPDATE oms_fulfillment_items SET fulfilled_qty=fulfilled_qty+?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (remaining, item["id"]),
+                )
+        if SHIPMENT_PROGRESS.get(initial_status, 0) >= 2 and member["status"] != "shipped":
+            transition_fulfillment(conn, member["id"], "shipped", actor=actor, reason="联合发货已生成运单")
     record_event(
         conn,
         "shipment",
@@ -2014,7 +2171,12 @@ def create_shipment(
         "created",
         to_status=initial_status,
         actor=actor,
-        payload={"tracking_number": tracking_number, "carrier_slug": carrier_slug},
+        payload={
+            "tracking_number": tracking_number,
+            "carrier_slug": carrier_slug,
+            "fulfillment_ids": [member["id"] for member in members],
+            "joint_dispatch": len(members) > 1,
+        },
     )
     conn.execute(
         '''INSERT INTO oms_shipment_notifications
@@ -2024,10 +2186,13 @@ def create_shipment(
         (shipment_id, SHIPMENT_NOTIFICATION_TEMPLATE_VERSION),
     )
     if SHIPMENT_PROGRESS.get(initial_status, 0) >= 2:
-        _enqueue_shipment_side_effects(conn, fulfillment, shipment_id, "created")
+        _enqueue_shipment_side_effects(conn, owner, shipment_id, "created")
     if commit:
         conn.commit()
-    return dict(conn.execute("SELECT * FROM oms_shipments WHERE id=?", (shipment_id,)).fetchone())
+    result = dict(conn.execute("SELECT * FROM oms_shipments WHERE id=?", (shipment_id,)).fetchone())
+    result["fulfillment_ids"] = [member["id"] for member in members]
+    result["joint_dispatch"] = len(members) > 1
+    return result
 
 
 def _enqueue_shipment_side_effects(conn, fulfillment, shipment_id: str, suffix: str) -> None:
@@ -2167,19 +2332,34 @@ def add_tracking_event(
     fulfillment = conn.execute(
         "SELECT * FROM oms_fulfillments WHERE id=?", (shipment["fulfillment_id"],)
     ).fetchone()
-    if updated["status"] == "delivered" and fulfillment["status"] == "shipped":
-        open_shipments = conn.execute(
-            "SELECT COUNT(*) AS n FROM oms_shipments WHERE fulfillment_id=? AND status NOT IN ('delivered','cancelled')",
-            (fulfillment["id"],),
-        ).fetchone()["n"]
-        if open_shipments == 0:
-            transition_fulfillment(
-                conn,
-                fulfillment["id"],
-                "delivered",
-                reason="该履约单全部包裹妥投",
-                correlation_id=correlation_id,
-            )
+    if updated["status"] == "delivered":
+        for linked_id in shipment_fulfillment_ids(conn, shipment_id):
+            linked = conn.execute(
+                "SELECT * FROM oms_fulfillments WHERE id=?", (linked_id,)
+            ).fetchone()
+            if not linked or linked["status"] != "shipped":
+                continue
+            if _table_exists(conn, "oms_shipment_fulfillments"):
+                open_shipments = conn.execute(
+                    '''SELECT COUNT(*) AS n
+                       FROM oms_shipment_fulfillments sf
+                       JOIN oms_shipments s ON s.id=sf.shipment_id
+                       WHERE sf.fulfillment_id=? AND s.status NOT IN ('delivered','cancelled')''',
+                    (linked_id,),
+                ).fetchone()["n"]
+            else:
+                open_shipments = conn.execute(
+                    "SELECT COUNT(*) AS n FROM oms_shipments WHERE fulfillment_id=? AND status NOT IN ('delivered','cancelled')",
+                    (linked_id,),
+                ).fetchone()["n"]
+            if open_shipments == 0:
+                transition_fulfillment(
+                    conn,
+                    linked_id,
+                    "delivered",
+                    reason="联合发货包裹妥投",
+                    correlation_id=correlation_id,
+                )
     if before != updated["status"]:
         enqueue_job(
             conn,

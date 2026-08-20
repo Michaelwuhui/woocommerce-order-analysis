@@ -2636,6 +2636,79 @@ def down_019(conn):
     conn.commit()
 
 
+# ───────────────── 020: 联合发货组与包裹履约关联 ─────────────────
+
+JOINT_DISPATCH_SETTING = "oms_joint_dispatch_groups"
+MIGRATION_020_STATE_KEY = "inv_migration_020_previous_state"
+
+
+def up_020(conn):
+    """Keep warehouse stock ledgers separate while allowing one physical parcel."""
+    conn.executescript(
+        '''
+        CREATE TABLE IF NOT EXISTS oms_shipment_fulfillments (
+            shipment_id   TEXT NOT NULL,
+            fulfillment_id TEXT NOT NULL,
+            role          TEXT NOT NULL DEFAULT 'companion',
+            created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (shipment_id, fulfillment_id),
+            FOREIGN KEY (shipment_id) REFERENCES oms_shipments(id) ON DELETE RESTRICT,
+            FOREIGN KEY (fulfillment_id) REFERENCES oms_fulfillments(id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_sf_fulfillment
+            ON oms_shipment_fulfillments(fulfillment_id, shipment_id);
+        INSERT OR IGNORE INTO oms_shipment_fulfillments (shipment_id,fulfillment_id,role)
+            SELECT id,fulfillment_id,'primary' FROM oms_shipments;
+        '''
+    )
+    previous = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (JOINT_DISPATCH_SETTING,)
+    ).fetchone()
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+        (
+            MIGRATION_020_STATE_KEY,
+            json.dumps({"joint_dispatch_groups": previous["value"] if previous else None}),
+        ),
+    )
+    if not previous:
+        conn.execute(
+            "INSERT INTO settings (key,value) VALUES (?,?)",
+            (
+                JOINT_DISPATCH_SETTING,
+                json.dumps(
+                    {
+                        "jyjg_poland": {
+                            "label": "金毅金谷联合发货",
+                            "warehouse_codes": ["波兰仓库", "PL-JYJG-TRANSIT"],
+                        }
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+    conn.commit()
+
+
+def down_020(conn):
+    state_row = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (MIGRATION_020_STATE_KEY,)
+    ).fetchone()
+    state = json.loads(state_row["value"]) if state_row and state_row["value"] else {}
+    previous = state.get("joint_dispatch_groups")
+    if previous is None:
+        conn.execute("DELETE FROM settings WHERE key=?", (JOINT_DISPATCH_SETTING,))
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+            (JOINT_DISPATCH_SETTING, previous),
+        )
+    conn.execute("DELETE FROM settings WHERE key=?", (MIGRATION_020_STATE_KEY,))
+    conn.execute("DROP TABLE IF EXISTS oms_shipment_fulfillments")
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -2656,6 +2729,7 @@ MIGRATIONS = [
     ('017', 'jyjg_temporary_transit_finite_stock', up_017, down_017),
     ('018', 'manual_shipper_scope_and_replenishment', up_018, down_018),
     ('019', 'warehouse_first_woo_mapping_catalog', up_019, down_019),
+    ('020', 'joint_dispatch_groups', up_020, down_020),
 ]
 
 
