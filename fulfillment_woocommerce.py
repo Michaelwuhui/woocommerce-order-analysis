@@ -361,7 +361,7 @@ def _customer_note_language(conn, order, site=None) -> str:
 def _customer_note_body(conn, order, shipment: dict, tracking_url: str = "", site=None) -> str:
     tracking = html.escape(str(shipment["tracking_number"]))
     carrier = html.escape(
-        str(shipment.get("carrier_name") or shipment.get("carrier_slug") or "物流商")
+        str(shipment.get("carrier_name") or shipment.get("carrier_slug") or "Carrier")
     )
     finance = _shipment_financial_context(
         conn, shipment["fulfillment_id"], shipment.get("id")
