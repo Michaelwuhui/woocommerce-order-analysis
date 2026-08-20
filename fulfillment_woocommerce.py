@@ -19,7 +19,11 @@ from fulfillment_service import (
     record_event,
 )
 from oid_utils import woo_post_id
-from shipment_customer_messages import CUSTOMER_NOTE_TEXT, customer_language
+from shipment_customer_messages import (
+    CUSTOMER_NOTE_TEXT,
+    customer_carrier_name,
+    customer_language,
+)
 
 
 class WooError(RuntimeError):
@@ -361,7 +365,9 @@ def _customer_note_language(conn, order, site=None) -> str:
 def _customer_note_body(conn, order, shipment: dict, tracking_url: str = "", site=None) -> str:
     tracking = html.escape(str(shipment["tracking_number"]))
     carrier = html.escape(
-        str(shipment.get("carrier_name") or shipment.get("carrier_slug") or "Carrier")
+        customer_carrier_name(
+            shipment.get("carrier_name") or shipment.get("carrier_slug") or "Carrier"
+        )
     )
     finance = _shipment_financial_context(
         conn, shipment["fulfillment_id"], shipment.get("id")

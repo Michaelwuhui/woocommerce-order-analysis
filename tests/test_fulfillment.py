@@ -1142,11 +1142,12 @@ class FulfillmentDomainTests(unittest.TestCase):
         for country, phrase in expected.items():
             note = basic_shipment_note(
                 country,
-                "Packeta",
+                "Packeta（匈牙利，Express One 末端派送）",
                 "Z1465635854",
                 "https://tracking.packeta.com/en/Z1465635854",
             )
             self.assertIn(phrase, note)
+            self.assertIn("Packeta / Express One", note)
             self.assertIn("Z1465635854", note)
             self.assertIsNone(re.search(r"[\u4e00-\u9fff]", note))
 

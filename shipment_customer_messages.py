@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import re
 
 
 CUSTOMER_NOTE_TEXT = {
@@ -50,6 +51,26 @@ def customer_language(country: str | None) -> str:
     return value if value in {"PL", "HU", "CZ"} else "EN"
 
 
+def customer_carrier_name(carrier_name: str | None) -> str:
+    """Return a safe, non-Chinese carrier label for customer messages."""
+    value = str(carrier_name or "").strip()
+    lowered = value.lower()
+    if "packeta" in lowered and "express one" in lowered:
+        return "Packeta / Express One"
+    if re.search(r"[\u4e00-\u9fff]", value):
+        for token, label in (
+            ("inpost", "InPost"),
+            ("packeta", "Packeta"),
+            ("dpd", "DPD"),
+            ("gls", "GLS"),
+            ("ems", "EMS"),
+        ):
+            if token in lowered:
+                return label
+        return "Carrier"
+    return value or "Carrier"
+
+
 def basic_shipment_note(
     country: str | None,
     carrier_name: str,
@@ -58,7 +79,7 @@ def basic_shipment_note(
 ) -> str:
     """Build the localized customer note used by the legacy shipping endpoint."""
     text = CUSTOMER_NOTE_TEXT[customer_language(country)]
-    carrier = html.escape(str(carrier_name or "Carrier"))
+    carrier = html.escape(customer_carrier_name(carrier_name))
     tracking = html.escape(str(tracking_number or ""))
     if tracking_url:
         safe_url = html.escape(str(tracking_url), quote=True)
