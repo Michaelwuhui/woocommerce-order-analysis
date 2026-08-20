@@ -225,12 +225,19 @@ def create_sku_map():
         return jsonify({'error': '每件折合数量必须是正整数'}), 400
     conn = get_conn()
     try:
-        conn.execute('''INSERT INTO inv_site_sku_map
+        cursor = conn.execute('''INSERT INTO inv_site_sku_map
             (site_id, wc_product_id, wc_variation_id, wc_sku, raw_name, sku_id, qty_per_item)
             VALUES (?,?,?,?,?,?,?)''',
             (site_id, wc_product_id, wc_variation_id, wc_sku, raw_name, sku_id, qty_per_item))
+        uid, uname = current_operator()
+        replan = inv_mapping_service.replan_shortage_orders_for_mappings(
+            conn, int(site_id), [{
+                'wc_product_id': wc_product_id,
+                'wc_variation_id': wc_variation_id,
+            }], operator_id=uid, operator_name=uname,
+        )
         conn.commit()
-        return jsonify({'success': True, 'id': conn.execute('SELECT last_insert_rowid()').fetchone()[0]})
+        return jsonify({'success': True, 'id': cursor.lastrowid, 'replan': replan})
     except Exception as e:
         if 'UNIQUE' in str(e):
             return jsonify({'error': '该站点的此商品(product+variation)已映射'}), 400

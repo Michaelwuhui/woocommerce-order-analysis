@@ -29,6 +29,24 @@ def _identifier_tokens(value):
     return re.findall(r"[a-z0-9]+", value)
 
 
+def _model_token(value):
+    """Normalize warehouse shorthand such as 40K to the shop's 40000."""
+    token = str(value or "").lower()
+    match = re.fullmatch(r"(\d+)k", token)
+    return str(int(match.group(1)) * 1000) if match else token
+
+
+def _flavor_key(value):
+    """Normalize known wording-only flavor aliases without translating them."""
+    text = html.unescape(str(value or ""))
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
+    # Warehouse sheets commonly say "Blueberry On Ice" while Woo uses
+    # "Blueberry Ice".  They describe the same flavor, not two SKUs.
+    text = re.sub(r"\bon[\s_-]+ice\b", "ice", text)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
 def _family_matches(sku, product_name):
     name_key = normalize_identifier(product_name)
     if sku["family_key"] and sku["family_key"] in name_key:
@@ -37,8 +55,10 @@ def _family_matches(sku, product_name):
     # "RandM") while keeping the brand, model and puff number.  Treat this as
     # a review-level family match, never as an automatic exact match.
     ignored = {"puff", "puffs", "randm", "disposable", "vape"}
-    family_tokens = [t for t in sku.get("family_tokens", []) if t not in ignored]
-    product_tokens = set(_identifier_tokens(product_name))
+    family_tokens = [
+        _model_token(t) for t in sku.get("family_tokens", []) if t not in ignored
+    ]
+    product_tokens = {_model_token(t) for t in _identifier_tokens(product_name)}
     numbers = [t for t in family_tokens if any(ch.isdigit() for ch in t)]
     words = [t for t in family_tokens if t not in numbers]
     return bool(
@@ -78,7 +98,7 @@ def warehouse_skus(conn, warehouse_id):
         item["family_key"] = normalize_identifier(item["family"])
         item["family_tokens"] = _identifier_tokens(item["family"])
         item["name_key"] = normalize_identifier(item.get("name"))
-        item["flavor_key"] = normalize_identifier(item.get("flavor"))
+        item["flavor_key"] = _flavor_key(item.get("flavor"))
         item["sku_key"] = normalize_identifier(item.get("sku_code"))
         item["barcode_key"] = normalize_identifier(item.get("barcode"))
         item["available"] = int(item.get("on_hand") or 0) - int(item.get("reserved") or 0)
@@ -137,6 +157,7 @@ def serving_sites(conn, warehouse_id):
 def _candidate_for_product(product, skus):
     sku_key = normalize_identifier(product.get("wc_sku"))
     name_key = normalize_identifier(product.get("name"))
+    flavor_name_key = _flavor_key(product.get("name"))
 
     if sku_key:
         exact = [s for s in skus if sku_key in (s["sku_key"], s["barcode_key"]) and sku_key]
@@ -150,7 +171,7 @@ def _candidate_for_product(product, skus):
     review = []
     for sku in skus:
         family_ok = _family_matches(sku, product.get("name"))
-        flavor_ok = bool(sku["flavor_key"] and sku["flavor_key"] in name_key)
+        flavor_ok = bool(sku["flavor_key"] and sku["flavor_key"] in flavor_name_key)
         if family_ok and flavor_ok:
             review.append(sku)
     if len(review) == 1:
@@ -427,6 +448,73 @@ def mapping_detail(conn, warehouse_id, site_id):
     }
 
 
+def replan_shortage_orders_for_mappings(
+    conn, site_id, mappings, operator_id=None, operator_name=None
+):
+    """Replan only unstarted shortage orders touched by newly saved mappings."""
+    required = {
+        "orders", "sites", "oms_order_items", "oms_order_fulfillment_state",
+        "oms_fulfillments",
+    }
+    existing = {
+        row["name"] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if not required.issubset(existing):
+        return {"matched": 0, "updated": 0, "failed": []}
+
+    pairs = sorted({
+        (int(item["wc_product_id"]), int(item.get("wc_variation_id") or 0))
+        for item in mappings or []
+        if item.get("wc_product_id") not in (None, "")
+    })
+    if not pairs:
+        return {"matched": 0, "updated": 0, "failed": []}
+    site = conn.execute("SELECT url FROM sites WHERE id=?", (site_id,)).fetchone()
+    if not site:
+        return {"matched": 0, "updated": 0, "failed": []}
+
+    pair_sql = " OR ".join(
+        "(oi.wc_product_id=? AND COALESCE(oi.wc_variation_id,0)=?)" for _ in pairs
+    )
+    params = [site["url"]]
+    for product_id, variation_id in pairs:
+        params.extend((product_id, variation_id))
+    order_ids = [
+        row["order_id"] for row in conn.execute(
+            f'''SELECT DISTINCT oi.order_id
+                FROM oms_order_items oi
+                JOIN orders o ON o.id=oi.order_id
+                JOIN oms_order_fulfillment_state ofs ON ofs.order_id=oi.order_id
+                WHERE o.source=? AND ofs.has_shortage=1 AND ({pair_sql})
+                ORDER BY oi.order_id''',
+            params,
+        ).fetchall()
+    ]
+    if not order_ids:
+        return {"matched": 0, "updated": 0, "failed": []}
+
+    from fulfillment_service import plan_order
+
+    actor = {"type": "user", "id": operator_id, "name": operator_name}
+    updated = 0
+    failed = []
+    for index, order_id in enumerate(order_ids):
+        savepoint = f"mapping_replan_{index}"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            result = plan_order(conn, order_id, actor=actor, commit=False)
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if result.get("action") != "noop":
+                updated += 1
+        except Exception as exc:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            failed.append({"order_id": order_id, "error": str(exc)[:240]})
+    return {"matched": len(order_ids), "updated": updated, "failed": failed}
+
+
 def apply_safe_mappings(conn, site_id, warehouse_id, operator_id=None, operator_name=None):
     """Create only unique exact SKU/name mappings from the latest scan."""
     rows = _catalog_rows_with_map(conn, site_id, warehouse_id)
@@ -494,9 +582,19 @@ def apply_safe_mappings(conn, site_id, warehouse_id, operator_id=None, operator_
                 }, ensure_ascii=False, separators=(",", ":")),
             ),
         )
-        created.append({"map_id": map_id, "sku_id": int(sku_id), "catalog_id": row["id"]})
+        created.append({
+            "map_id": map_id, "sku_id": int(sku_id), "catalog_id": row["id"],
+            "wc_product_id": row["wc_product_id"],
+            "wc_variation_id": row["wc_variation_id"] or 0,
+        })
+    replan = replan_shortage_orders_for_mappings(
+        conn, site_id, created, operator_id=operator_id, operator_name=operator_name
+    )
     conn.commit()
-    return {"created": len(created), "skipped": len(skipped), "items": created, "skipped_items": skipped}
+    return {
+        "created": len(created), "skipped": len(skipped), "items": created,
+        "skipped_items": skipped, "replan": replan,
+    }
 
 
 def confirm_mapping_candidates(
@@ -593,12 +691,19 @@ def confirm_mapping_candidates(
                 }, ensure_ascii=False, separators=(",", ":")),
             ),
         )
-        created.append({"map_id": map_id, "sku_id": int(sku_id), "catalog_id": catalog_id})
+        created.append({
+            "map_id": map_id, "sku_id": int(sku_id), "catalog_id": catalog_id,
+            "wc_product_id": row["wc_product_id"],
+            "wc_variation_id": row["wc_variation_id"] or 0,
+        })
 
     for catalog_id in sorted(selected - found):
         skipped.append({"catalog_id": catalog_id, "reason": "not_found"})
+    replan = replan_shortage_orders_for_mappings(
+        conn, site_id, created, operator_id=operator_id, operator_name=operator_name
+    )
     conn.commit()
     return {
         "created": len(created), "skipped": len(skipped),
-        "items": created, "skipped_items": skipped,
+        "items": created, "skipped_items": skipped, "replan": replan,
     }

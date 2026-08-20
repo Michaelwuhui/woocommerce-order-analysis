@@ -3,6 +3,7 @@ import sqlite3
 import unittest
 
 from inv_mapping_service import (
+    _candidate_for_product,
     apply_safe_mappings,
     confirm_mapping_candidates,
     mapping_detail,
@@ -214,6 +215,25 @@ class WarehouseMappingTests(unittest.TestCase):
         self.assertEqual('batch_confirm', audit['action'])
         self.assertEqual('reviewer', audit['operator_name'])
         self.assertEqual('manual_confirm:review_family_flavor', audit['match_method'])
+
+    def test_40k_family_and_on_ice_flavor_match_40000_shop_wording(self):
+        sku = {
+            'id': 15,
+            'family_key': 'fumotleopard40k',
+            'family_tokens': ['fumot', 'leopard', '40k'],
+            'name_key': 'fumotleopard40kblueberryonice',
+            'flavor_key': 'blueberryice',
+            'sku_key': '40kboi',
+            'barcode_key': '',
+        }
+        candidate = _candidate_for_product(
+            {
+                'wc_sku': 'FUMOT-LEOPARD-40000-PUFFS-BLUEBERRY-ICE',
+                'name': 'Fumot Leopard 40000 Puffs - Blueberry Ice',
+            },
+            [sku],
+        )
+        self.assertEqual((15, 'review_family_flavor', 85), candidate)
 
 
 if __name__ == '__main__':

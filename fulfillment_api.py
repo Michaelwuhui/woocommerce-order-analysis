@@ -509,6 +509,19 @@ def fulfillment_order_detail(order_id):
         fulfillments = conn.execute(query + " ORDER BY f.warehouse_id", params).fetchall()
         if not fulfillments:
             return jsonify({"error": "没有该订单的仓库权限"}), 403
+        shortage_rows = conn.execute(
+            '''SELECT name, sku_id, shortage_qty
+               FROM oms_order_items
+               WHERE order_id=? AND shortage_qty>0
+               ORDER BY line_index,id''',
+            (order_id,),
+        ).fetchall()
+        unmapped_units = sum(
+            int(row["shortage_qty"] or 0) for row in shortage_rows if not row["sku_id"]
+        )
+        stock_short_units = sum(
+            int(row["shortage_qty"] or 0) for row in shortage_rows if row["sku_id"]
+        )
         output = []
         for fulfillment in fulfillments:
             data = dict(fulfillment)
@@ -549,7 +562,14 @@ def fulfillment_order_detail(order_id):
             if fulfillment["mode"] != "internal":
                 data["manual_ship_block_reason"] = "该履约单由外部 WMS 处理，不能人工录入发货"
             elif fulfillment["status"] == "stock_shortage":
-                data["manual_ship_block_reason"] = "该仓库存不足，请补货或人工调整后重新分仓"
+                if unmapped_units:
+                    data["manual_ship_block_reason"] = (
+                        f"订单还有 {unmapped_units} 件商品未建立仓库 SKU 映射，请先完成映射并重新分仓"
+                    )
+                elif stock_short_units:
+                    data["manual_ship_block_reason"] = "该仓库存不足，请补货或人工调整后重新分仓"
+                else:
+                    data["manual_ship_block_reason"] = "分仓结果需要刷新，请重新分仓后再发货"
             elif fulfillment["status"] in {"shipped", "delivered"}:
                 data["manual_ship_block_reason"] = "该仓包裹已经发货"
             elif fulfillment["status"] not in manual_statuses:
@@ -628,11 +648,20 @@ def api_create_shipment(fulfillment_id):
             )
         allowed_statuses = {"ready_to_pick", "picking", "packed", "accepted"}
         if fulfillment["status"] not in allowed_statuses:
-            message = (
-                "该仓库存不足，请补货或人工调整后重新分仓"
-                if fulfillment["status"] == "stock_shortage"
-                else f"当前履约状态 {fulfillment['status']} 不能录入发货"
-            )
+            if fulfillment["status"] == "stock_shortage":
+                unresolved = conn.execute(
+                    '''SELECT COALESCE(SUM(shortage_qty),0) AS qty
+                       FROM oms_order_items
+                       WHERE order_id=? AND shortage_qty>0 AND sku_id IS NULL''',
+                    (fulfillment["order_id"],),
+                ).fetchone()["qty"]
+                message = (
+                    f"订单还有 {int(unresolved)} 件商品未建立仓库 SKU 映射，请先完成映射并重新分仓"
+                    if unresolved
+                    else "该仓库存不足，请补货或人工调整后重新分仓"
+                )
+            else:
+                message = f"当前履约状态 {fulfillment['status']} 不能录入发货"
             raise DomainError(message, "fulfillment_not_shippable")
         shipment = create_shipment(
             conn,

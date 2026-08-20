@@ -230,6 +230,9 @@ def _normalize_flavor(value: Any) -> str:
     text = html.unescape(str(value or ""))
     text = unicodedata.normalize("NFKD", text)
     text = "".join(char for char in text if not unicodedata.combining(char))
+    # Supplier inventory uses e.g. "Blueberry On Ice" while WooCommerce uses
+    # "Blueberry Ice".  Treat this wording-only difference as the same flavor.
+    text = re.sub(r"\bON[\s_-]+ICE\b", "ICE", text.upper())
     return re.sub(r"[^A-Z0-9]+", "", text.upper())
 
 

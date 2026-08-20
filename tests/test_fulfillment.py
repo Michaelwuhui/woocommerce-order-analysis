@@ -35,6 +35,7 @@ from inv_migrations import (
     up_018,
 )
 from inv_common import record_movement, replenishment_metrics
+from inv_mapping_service import replan_shortage_orders_for_mappings
 from fulfillment_woocommerce import _all_order_shipments, _ast_items, _customer_note_body
 
 
@@ -252,6 +253,53 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.assertEqual("stock_shortage", result["aggregate_status"])
         self.assertTrue(result["shortages"])
         self.assertEqual([], self.allocations("managed-legacy-map"))
+
+    def test_new_mapping_automatically_replans_matching_shortage_order(self):
+        self.add_order("mapping-replan", "PL", product_id=999, sku="", name="New product")
+        first = plan_order(self.db, "mapping-replan")
+        self.assertEqual("stock_shortage", first["aggregate_status"])
+        self.db.execute(
+            """INSERT INTO inv_site_sku_map
+               (site_id,wc_product_id,wc_variation_id,wc_sku,raw_name,sku_id,qty_per_item,is_active)
+               VALUES (1,999,0,NULL,'New product',1,1,1)"""
+        )
+
+        result = replan_shortage_orders_for_mappings(
+            self.db, 1, [{"wc_product_id": 999, "wc_variation_id": 0}],
+            operator_id=9, operator_name="tester",
+        )
+
+        state = self.db.execute(
+            "SELECT * FROM oms_order_fulfillment_state WHERE order_id='mapping-replan'"
+        ).fetchone()
+        self.assertEqual({"matched": 1, "updated": 1, "failed": []}, result)
+        self.assertEqual(0, state["has_shortage"])
+        self.assertEqual([{"warehouse_id": 1, "qty": 1}], self.allocations("mapping-replan"))
+
+    def test_managed_blueberry_on_ice_alias_allocates_blueberry_ice_order(self):
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES ('oms_managed_product_isolation_enabled','1')"
+        )
+        up_017(self.db)
+        warehouse_id = self.db.execute(
+            "SELECT id FROM warehouses WHERE code='PL-JYJG-TRANSIT'"
+        ).fetchone()[0]
+        self.add_order(
+            "blueberry-ice", "PL", product_id=904, sku="",
+            name="Fumot Leopard 40000 Puffs - Blueberry Ice",
+        )
+
+        result = plan_order(self.db, "blueberry-ice")
+        mapped = self.db.execute(
+            """SELECT s.sku_code FROM oms_order_items oi
+               JOIN inv_skus s ON s.id=oi.sku_id WHERE oi.order_id='blueberry-ice'"""
+        ).fetchone()["sku_code"]
+
+        self.assertFalse(result["shortages"])
+        self.assertEqual("40K-BOI", mapped)
+        self.assertEqual(
+            [{"warehouse_id": warehouse_id, "qty": 1}], self.allocations("blueberry-ice")
+        )
 
     def test_jyjg_transit_warehouse_uses_finite_reserved_stock(self):
         self.db.execute(
