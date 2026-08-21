@@ -240,6 +240,10 @@
                             </tbody>
                         </table>
                     </div>
+                    <div id="shippedPagination" class="d-none border-top border-secondary border-opacity-25 px-3 py-3 d-flex justify-content-between align-items-center gap-3 flex-wrap">
+                        <span id="shippedPageSummary" class="text-white-50 small"></span>
+                        <div id="shippedPageButtons" class="btn-group btn-group-sm" role="group" aria-label="已发货订单分页"></div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -998,13 +1002,53 @@
                     </div>`;
         }
 
-        function loadOrders() {
+        function renderShippedPagination(pagination) {
+            const wrapper = document.getElementById('shippedPagination');
+            const summary = document.getElementById('shippedPageSummary');
+            const buttons = document.getElementById('shippedPageButtons');
+            const total = Number(pagination.total || 0);
+            const page = Number(pagination.page || 1);
+            const pages = Number(pagination.pages || 1);
+            const perPage = Number(pagination.per_page || 50);
+
+            if (!total) {
+                wrapper.classList.add('d-none');
+                buttons.innerHTML = '';
+                return;
+            }
+
+            const first = (page - 1) * perPage + 1;
+            const last = Math.min(page * perPage, total);
+            summary.textContent = `第 ${first}-${last} 单，共 ${total} 单 · 第 ${page}/${pages} 页`;
+
+            const pageStart = Math.max(1, page - 2);
+            const pageEnd = Math.min(pages, page + 2);
+            const items = [
+                `<button type="button" class="btn btn-outline-light" ${page <= 1 ? 'disabled' : ''} onclick="changeShippedPage(${page - 1})">上一页</button>`
+            ];
+            for (let number = pageStart; number <= pageEnd; number += 1) {
+                items.push(`<button type="button" class="btn ${number === page ? 'btn-info' : 'btn-outline-light'}" ${number === page ? 'aria-current="page"' : ''} onclick="changeShippedPage(${number})">${number}</button>`);
+            }
+            items.push(`<button type="button" class="btn btn-outline-light" ${page >= pages ? 'disabled' : ''} onclick="changeShippedPage(${page + 1})">下一页</button>`);
+            buttons.innerHTML = items.join('');
+            wrapper.classList.remove('d-none');
+        }
+
+        function changeShippedPage(page) {
+            loadOrders(page, true);
+            document.getElementById('shippedTab').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        function loadOrders(requestedShippedPage = 1, shippedOnly = false) {
             const source = document.getElementById('siteFilter').value;
             const country = document.getElementById('countryFilter').value;
             const manager = document.getElementById('managerFilter').value;
             const dateFrom = document.getElementById('dateFrom').value;
             const dateTo = document.getElementById('dateTo').value;
             const search = document.getElementById('searchInput').value;
+            const shippedPage = Number.isInteger(requestedShippedPage) && requestedShippedPage > 0
+                ? requestedShippedPage
+                : 1;
 
             const params = new URLSearchParams({
                 source: source,
@@ -1012,11 +1056,13 @@
                 manager: manager,
                 start_date: dateFrom,
                 end_date: dateTo,
-                search: search
+                search: search,
+                page: shippedPage
             });
 
-            // Load pending orders
-            fetch(`/api/shipping/pending?${params.toString()}`)
+            // Load pending orders unless this request only changes the shipped page.
+            if (!shippedOnly) {
+                fetch(`/api/shipping/pending?${params.toString()}`)
                 .then(res => res.json())
                 .then(orders => {
                     const productInput = document.getElementById('pendingProductFilter');
@@ -1143,12 +1189,16 @@
             `;
                     }).join('');
                 });
+            }
 
             // Load shipped orders
             fetch(`/api/shipping/shipped?${params.toString()}`)
                 .then(res => res.json())
-                .then(orders => {
-                    document.getElementById('shippedCount').textContent = `已发货: ${orders.length}`;
+                .then(data => {
+                    const orders = data.orders || [];
+                    const pagination = data.pagination || { page: 1, per_page: 50, total: orders.length, pages: 1 };
+                    document.getElementById('shippedCount').textContent = `已发货: ${pagination.total}`;
+                    renderShippedPagination(pagination);
                     const tbody = document.getElementById('shippedOrdersBody');
                     if (orders.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="11" class="text-center py-4 text-muted">暂无已发货订单</td></tr>';
@@ -1271,8 +1321,9 @@
                     }).join('');
                 });
 
-            // Load 待确认结局 queue (shipped COD whose outcome was never recorded)
-            fetch(`/api/shipping/pending-outcome?${params.toString()}`)
+            // Load 待确认结局 unless this request only changes the shipped page.
+            if (!shippedOnly) {
+                fetch(`/api/shipping/pending-outcome?${params.toString()}`)
                 .then(res => res.json())
                 .then(orders => {
                     document.getElementById('outcomeCount').textContent = `待确认: ${orders.length}`;
@@ -1336,6 +1387,7 @@
                     }).join('');
                     applyOutcomeFilter();
                 });
+            }
         }
 
         // Filter the 待确认结局 list to only the "物流查无" rows (no carrier status
