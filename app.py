@@ -27,7 +27,12 @@ from shipment_split import (
     order_products as split_order_products,
     remaining_after as split_remaining_after,
 )
-from order_shipments import build_shipping_log_parcels, extract_tracking_candidates
+from order_shipments import (
+    build_shipping_log_parcels,
+    extract_tracking_candidates,
+    find_duplicate_tracking,
+    partition_shipping_logs,
+)
 from partner_site_scope import (
     EFFECTIVE_PARTNER_SITES,
     get_partner_site_scope,
@@ -16766,24 +16771,31 @@ def get_pending_orders():
     # rows provide the exact already-shipped item quantities.
     order_ids = [o['id'] for o in orders]
     parcels_map = {}
+    pending_shipments_map = {}
     if order_ids:
         ph = ','.join(['?'] * len(order_ids))
         for r in conn.execute(
             f'''SELECT sl.order_id, sl.tracking_number, sl.carrier_slug, sl.shipped_at,
-                       sl.items_json, sl.is_partial,
+                       sl.items_json, sl.is_partial, sl.status,
                        sc.name AS carrier_name
                 FROM shipping_logs sl
                 LEFT JOIN shipping_carriers sc ON sc.slug = sl.carrier_slug
                 WHERE sl.order_id IN ({ph}) ORDER BY sl.id''', order_ids).fetchall():
             parcel_items = parse_json_field(r['items_json']) if r['items_json'] else []
-            parcels_map.setdefault(r['order_id'], []).append({
+            shipment = {
                 'tracking_number': r['tracking_number'],
                 'carrier_slug': r['carrier_slug'],
                 'carrier_name': r['carrier_name'] or r['carrier_slug'],
                 'shipped_at': r['shipped_at'],
                 'items': parcel_items if isinstance(parcel_items, list) else [],
                 'is_partial': bool(r['is_partial']),
-            })
+                'status': r['status'] or 'shipped',
+            }
+            confirmed, pending = partition_shipping_logs([shipment])
+            if pending:
+                pending_shipments_map[r['order_id']] = pending[0]
+            else:
+                parcels_map.setdefault(r['order_id'], []).append(confirmed[0])
 
     # Build the risk index once (small scan over flagged orders only) and
     # reuse it for every row in this listing. Closing conn AFTER the build.
@@ -16865,6 +16877,8 @@ def get_pending_orders():
             'customer_risk': customer_risk,
             'parcels': parcels_map.get(order['id'], []),
             'parcels_shipped': len(parcels_map.get(order['id'], [])),
+            'pending_shipment': pending_shipments_map.get(order['id']),
+            'shipment_sync_pending': order['id'] in pending_shipments_map,
             'latest_note': order['latest_note'] or '',
             'latest_note_date': order['latest_note_date'] or '',
             'latest_note_author': order['latest_note_author'] or ''
@@ -17703,6 +17717,17 @@ def ship_order():
     carrier_name = carrier['name'] if carrier else carrier_slug
     tracking_url_template = (carrier['tracking_url'] if carrier else '') or ''
 
+    duplicate_tracking = find_duplicate_tracking(
+        conn, order_id, carrier_slug, tracking_number
+    )
+    if duplicate_tracking:
+        conn.close()
+        duplicate_number = duplicate_tracking.get('number') or duplicate_tracking.get('order_id')
+        return jsonify({
+            'success': False,
+            'error': f'该运单号已用于订单 #{duplicate_number}，不能重复绑定到不同订单，请核对运单号'
+        }), 409
+
     # Customer-facing tracking URL — resolve placeholders from the DB template.
     # No carrier-specific hardcoding here; if a new carrier needs a URL, add a
     # row to shipping_carriers instead.
@@ -17982,15 +18007,15 @@ def ship_order():
                 conn.execute(
                     """UPDATE shipping_logs
                        SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now'),
-                           items_json=?, is_partial=0
+                           items_json=?, is_partial=0, status='pending_sync'
                        WHERE order_id=?""",
                     (tracking_number, carrier_slug, current_user.id, current_items_json, order_id)
                 )
             else:
                 conn.execute(
                     '''INSERT INTO shipping_logs
-                       (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, 0)''',
+                       (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'pending_sync')''',
                     (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id, current_items_json)
                 )
             conn.commit()
@@ -18094,8 +18119,8 @@ def ship_order():
             # Split shipment: record this parcel as its own row.
             conn.execute(
                 '''INSERT INTO shipping_logs
-                   (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                   (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'shipped')''',
                 (order_id, order['number'], order['source'], tracking_number,
                  carrier_slug, current_user.id, current_items_json, 1 if more_batches else 0)
             )
@@ -18121,15 +18146,15 @@ def ship_order():
                 conn.execute(
                     """UPDATE shipping_logs
                        SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now'),
-                           items_json=?, is_partial=0
+                           items_json=?, is_partial=0, status='shipped'
                        WHERE order_id=?""",
                     (tracking_number, carrier_slug, current_user.id, current_items_json, order_id)
                 )
             else:
                 conn.execute(
                     '''INSERT INTO shipping_logs
-                       (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, 0)''',
+                       (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'shipped')''',
                     (order_id, order['number'], order['source'], tracking_number,
                      carrier_slug, current_user.id, current_items_json)
                 )

@@ -6,6 +6,9 @@ import json
 from typing import Any, Iterable
 
 
+PENDING_SYNC_STATUS = "pending_sync"
+
+
 def _dict(value: Any) -> dict:
     if isinstance(value, dict):
         return value
@@ -80,6 +83,34 @@ def build_shipping_log_parcels(shipping_logs: Iterable[Any], line_items: Iterabl
             "items": items,
         })
     return parcels
+
+
+def partition_shipping_logs(shipping_logs: Iterable[Any]) -> tuple[list[dict], list[dict]]:
+    """Separate confirmed parcels from attempts waiting for remote sync."""
+    confirmed: list[dict] = []
+    pending: list[dict] = []
+    for raw_row in shipping_logs or []:
+        row = _dict(raw_row)
+        if str(row.get("status") or "shipped") == PENDING_SYNC_STATUS:
+            pending.append(row)
+        else:
+            confirmed.append(row)
+    return confirmed, pending
+
+
+def find_duplicate_tracking(conn: Any, order_id: Any, carrier_slug: str, tracking_number: str) -> dict | None:
+    """Return another order already holding the same carrier/tracking pair."""
+    row = conn.execute(
+        """SELECT sl.order_id, o.number
+           FROM shipping_logs sl
+           LEFT JOIN orders o ON o.id=sl.order_id
+           WHERE sl.order_id<>?
+             AND lower(trim(COALESCE(sl.carrier_slug, '')))=lower(trim(?))
+             AND lower(trim(sl.tracking_number))=lower(trim(?))
+           ORDER BY sl.id DESC LIMIT 1""",
+        (order_id, carrier_slug, tracking_number),
+    ).fetchone()
+    return _dict(row) if row else None
 
 
 def extract_tracking_candidates(

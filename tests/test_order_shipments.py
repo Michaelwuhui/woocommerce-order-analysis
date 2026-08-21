@@ -1,7 +1,13 @@
 import json
+import sqlite3
 import unittest
 
-from order_shipments import build_shipping_log_parcels, extract_tracking_candidates
+from order_shipments import (
+    build_shipping_log_parcels,
+    extract_tracking_candidates,
+    find_duplicate_tracking,
+    partition_shipping_logs,
+)
 
 
 class OrderShipmentPresentationTests(unittest.TestCase):
@@ -84,6 +90,37 @@ class OrderShipmentPresentationTests(unittest.TestCase):
             ],
             candidates,
         )
+
+    def test_pending_sync_attempt_is_not_a_confirmed_parcel(self):
+        confirmed, pending = partition_shipping_logs([
+            {"id": 1, "status": "shipped", "tracking_number": "OK-1"},
+            {"id": 2, "status": "pending_sync", "tracking_number": "WAIT-1"},
+            {"id": 3, "status": None, "tracking_number": "LEGACY-1"},
+        ])
+
+        self.assertEqual(["OK-1", "LEGACY-1"], [row["tracking_number"] for row in confirmed])
+        self.assertEqual(["WAIT-1"], [row["tracking_number"] for row in pending])
+
+    def test_duplicate_tracking_is_detected_only_on_another_order(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE orders (id TEXT PRIMARY KEY, number TEXT);
+            CREATE TABLE shipping_logs (
+                id INTEGER PRIMARY KEY,
+                order_id TEXT,
+                carrier_slug TEXT,
+                tracking_number TEXT
+            );
+            INSERT INTO orders VALUES ('order-a', '1001'), ('order-b', '1002');
+            INSERT INTO shipping_logs (order_id,carrier_slug,tracking_number)
+            VALUES ('order-a','dpd','DPD-123');
+        """)
+
+        self.assertIsNone(find_duplicate_tracking(conn, "order-a", "dpd", "DPD-123"))
+        duplicate = find_duplicate_tracking(conn, "order-b", "DPD", "dpd-123")
+        self.assertEqual("order-a", duplicate["order_id"])
+        self.assertEqual("1001", duplicate["number"])
 
 
 if __name__ == "__main__":
