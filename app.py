@@ -17294,14 +17294,16 @@ def pending_outcome_ids_before():
 @login_required
 @shipping_view_required
 def get_shipped_orders():
-    """Get shipped orders (status=on-hold) with tracking info"""
+    """Get one page of shipped orders with tracking info."""
     conn = get_db_connection()
-    
+
     # Get filter parameters
     source_filter = request.args.get('source', '')
     country_filter = request.args.get('country', '')
-    
-    query = '''
+    page = max(request.args.get('page', 1, type=int) or 1, 1)
+    per_page = 50
+
+    select_query = '''
         SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created, o.date_modified,
                o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_lines, o.shipping_total,
                o.customer_note, o.warehouse_id,
@@ -17329,47 +17331,50 @@ def get_shipped_orders():
             GROUP BY order_id
             HAVING date_created = MAX(date_created)
         ) n ON o.id = n.order_id
-        WHERE o.status IN ('on-hold', 'shipped', 'partial-shipped')
     '''
+    conditions = ["o.status IN ('on-hold', 'shipped', 'partial-shipped')"]
     params = []
-    
+
     allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
     if allowed_sources is not None:
-        placeholders = ','.join(['?' for _ in allowed_sources])
-        query += f' AND o.source IN ({placeholders})'
-        params.extend(allowed_sources)
-    
+        if allowed_sources:
+            placeholders = ','.join(['?' for _ in allowed_sources])
+            conditions.append(f'o.source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+
     if source_filter:
-        query += ' AND o.source = ?'
+        conditions.append('o.source = ?')
         params.append(source_filter)
-        
+
     if country_filter:
-        query += ' AND s.country = ?'
+        conditions.append('s.country = ?')
         params.append(country_filter)
 
     manager_filter = request.args.get('manager', '')
     if manager_filter:
-        query += ' AND s.manager = ?'
+        conditions.append('s.manager = ?')
         params.append(manager_filter)
-        
+
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
     search = request.args.get('search')
-    
+
     if start_date:
-        query += ' AND o.date_created >= ?'
+        conditions.append('o.date_created >= ?')
         params.append(start_date + ' 00:00:00')
-    
+
     if end_date:
-        query += ' AND o.date_created <= ?'
+        conditions.append('o.date_created <= ?')
         params.append(end_date + ' 23:59:59')
-    
+
     if search:
         search_term = f'%{search}%'
         # Also match tracking numbers stored by external plugins (AST / VillaTheme / custom):
         # they live in meta_data, shipping_lines or line_items as JSON. LIKE on the raw JSON
         # is good enough for the typical case where tracking numbers are 10+ alphanumeric chars.
-        query += ''' AND (
+        conditions.append('''(
             o.number LIKE ?
             OR o.billing LIKE ?
             OR o.shipping LIKE ?
@@ -17377,12 +17382,28 @@ def get_shipped_orders():
             OR o.meta_data LIKE ?
             OR o.shipping_lines LIKE ?
             OR o.line_items LIKE ?
-        )'''
+        )''')
         params.extend([search_term] * 7)
 
-    query += ' ORDER BY sl.shipped_at DESC, o.date_modified DESC, o.date_created DESC'
-    
-    orders = conn.execute(query, params).fetchall()
+    where_sql = ' AND '.join(conditions)
+    total = conn.execute(
+        f'''SELECT COUNT(*) AS total
+            FROM orders o
+            LEFT JOIN sites s ON o.source = s.url
+            WHERE {where_sql}''',
+        params,
+    ).fetchone()['total']
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, pages)
+    offset = (page - 1) * per_page
+
+    query = (
+        select_query
+        + f' WHERE {where_sql}'
+        + ' ORDER BY sl.shipped_at DESC, o.date_modified DESC, o.date_created DESC, o.id DESC'
+        + ' LIMIT ? OFFSET ?'
+    )
+    orders = conn.execute(query, [*params, per_page, offset]).fetchall()
 
     # All parcels per order (split shipment / 分批发货) so a completed multi-
     # parcel order can show every tracking number, not just the latest.
@@ -17412,8 +17433,7 @@ def get_shipped_orders():
 
     # Get carriers for tracking URL
     carriers = {c['slug']: c for c in conn.execute('SELECT * FROM shipping_carriers').fetchall()}
-    conn.close()
-    
+
     # Mapping for Advanced Shipment Tracking Pro provider slugs
     ast_provider_mapping = {
         'inpost-paczkomaty': ('inpost', 'InPost'),
@@ -17449,7 +17469,18 @@ def get_shipped_orders():
             print(f"Error processing shipped order {order['number']}: {e}")
             continue
 
-    return jsonify(result)
+    conn.close()
+    return jsonify({
+        'orders': result,
+        'pagination': {
+            'page': page,
+            'per_page': per_page,
+            'total': total,
+            'pages': pages,
+            'has_previous': page > 1,
+            'has_next': page < pages,
+        },
+    })
 
 
 @app.route('/api/shipping/find-by-tracking')
