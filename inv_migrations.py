@@ -26,7 +26,20 @@ import datetime
 import json
 import sqlite3
 
-from inv_common import DB_FILE, get_conn
+from inv_common import (
+    DB_FILE,
+    JYJG_REORDER_POINT_SETTING,
+    JYJG_TARGET_STOCK_SETTING,
+    get_conn,
+    record_movement,
+)
+from managed_transfer_catalog import (
+    JYJG_TRANSIT_ROUTING_POLICY,
+    JYJG_TRANSIT_ROUTING_SETTING,
+    JYJG_TRANSIT_WAREHOUSE_CODE,
+    JYJG_TRANSFER_SOURCE,
+    catalog_rows,
+)
 
 
 # ───────────────────────── 迁移注册表 ─────────────────────────
@@ -1805,6 +1818,897 @@ def down_012(conn):
     conn.commit()
 
 
+# ───────────────── 013: 订单图片群通知 ─────────────────
+
+def up_013(conn):
+    """Create the durable order-notification domain.
+
+    Delivery is deliberately dark-launched: jobs may be generated for local
+    preview/testing, while the real provider flag remains disabled.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS notification_targets (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            channel_type TEXT NOT NULL
+                CHECK(channel_type IN ('WECOM_BOT','MANUAL_WECHAT','FAKE')),
+            secret_ref TEXT,
+            store_id TEXT,
+            warehouse_id INTEGER,
+            shipping_method TEXT,
+            environment TEXT NOT NULL DEFAULT 'test'
+                CHECK(environment IN ('test','production')),
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+            rate_limit_per_minute INTEGER NOT NULL DEFAULT 15
+                CHECK(rate_limit_per_minute BETWEEN 1 AND 60),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(warehouse_id) REFERENCES warehouses(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_notification_targets_route
+            ON notification_targets(enabled, store_id, warehouse_id, shipping_method);
+
+        CREATE TABLE IF NOT EXISTS order_notification_event_inbox (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            occurred_at TEXT,
+            source TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'received',
+            error_summary TEXT,
+            received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS order_notification_jobs (
+            id TEXT PRIMARY KEY,
+            queue_job_id INTEGER,
+            event_id TEXT NOT NULL,
+            event_type TEXT NOT NULL CHECK(event_type IN
+                ('ORDER_READY','ORDER_UPDATED','ORDER_CANCELLED','ORDER_HOLD','MANUAL_RESEND')),
+            store_id TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            order_version TEXT NOT NULL,
+            target_id TEXT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            snapshot_hash TEXT NOT NULL,
+            changed_fields_json TEXT,
+            template_version TEXT NOT NULL,
+            image_paths_json TEXT,
+            sent_pages_json TEXT,
+            image_sha256 TEXT,
+            image_width INTEGER,
+            image_height INTEGER,
+            image_bytes INTEGER,
+            scheduled_at TEXT NOT NULL,
+            sent_at TEXT,
+            resend_of TEXT,
+            resend_sequence INTEGER NOT NULL DEFAULT 0,
+            last_error_code TEXT,
+            last_error_summary TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(target_id) REFERENCES notification_targets(id),
+            FOREIGN KEY(queue_job_id) REFERENCES oms_integration_jobs(id),
+            FOREIGN KEY(resend_of) REFERENCES order_notification_jobs(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_order_notification_order
+            ON order_notification_jobs(order_id, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_order_notification_status
+            ON order_notification_jobs(status, scheduled_at);
+
+        CREATE TABLE IF NOT EXISTS order_notification_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            attempt_no INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            http_status INTEGER,
+            provider_error_code TEXT,
+            response_summary TEXT,
+            result TEXT NOT NULL CHECK(result IN
+                ('STARTED','SUCCESS','RETRYABLE','PERMANENT_FAILURE','BLOCKED','MANUAL_READY')),
+            FOREIGN KEY(job_id) REFERENCES order_notification_jobs(id),
+            UNIQUE(job_id, attempt_no)
+        );
+
+        CREATE TABLE IF NOT EXISTS notification_audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            object_type TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            actor_type TEXT NOT NULL,
+            actor_id TEXT,
+            request_id TEXT,
+            before_summary TEXT,
+            after_summary TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_notification_audit_object
+            ON notification_audit_logs(object_type, object_id, created_at);
+        """
+    )
+    defaults = {
+        "order_notification_enabled": "0",
+        "order_notification_send_enabled": "0",
+        "order_notification_test_send_enabled": "0",
+        "order_notification_debounce_seconds": "45",
+        "order_notification_template_version": "order-card-v1",
+        "order_notification_image_retention_days": "30",
+        "order_notification_render_source": "email",
+    }
+    for key, value in defaults.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", (key, value)
+        )
+    conn.commit()
+
+
+def down_013(conn):
+    """Remove an unused notification schema, never historical audit data."""
+    for table in (
+        "notification_targets",
+        "order_notification_attempts",
+        "notification_audit_logs",
+        "order_notification_jobs",
+        "order_notification_event_inbox",
+    ):
+        if _migration_table_exists(conn, table):
+            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            if count:
+                raise RuntimeError(
+                    "013 含通知/审计历史，拒绝删除；请关闭开关并保留表作为回滚"
+                )
+    conn.executescript(
+        """
+        DROP TABLE IF EXISTS order_notification_attempts;
+        DROP TABLE IF EXISTS notification_audit_logs;
+        DROP TABLE IF EXISTS order_notification_jobs;
+        DROP TABLE IF EXISTS order_notification_event_inbox;
+        DROP TABLE IF EXISTS notification_targets;
+        """
+    )
+    conn.execute(
+        "DELETE FROM settings WHERE key IN "
+        "('order_notification_enabled','order_notification_send_enabled',"
+        "'order_notification_test_send_enabled',"
+        "'order_notification_debounce_seconds','order_notification_template_version',"
+        "'order_notification_image_retention_days','order_notification_render_source')"
+    )
+    conn.commit()
+
+
+# ───────────────── 014: 前端管理多负责人群 Webhook ─────────────────
+
+def up_014(conn):
+    """Add encrypted webhooks, multi-manager routing and soft deletion."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    if "manager_scope" not in columns:
+        conn.execute(
+            """ALTER TABLE notification_targets ADD COLUMN manager_scope TEXT
+               NOT NULL DEFAULT 'all'
+               CHECK(manager_scope IN ('all','selected'))"""
+        )
+    if "manager_names_json" not in columns:
+        conn.execute(
+            """ALTER TABLE notification_targets ADD COLUMN manager_names_json TEXT
+               NOT NULL DEFAULT '[]'"""
+        )
+    if "secret_ciphertext" not in columns:
+        conn.execute(
+            "ALTER TABLE notification_targets ADD COLUMN secret_ciphertext TEXT"
+        )
+    if "webhook_fingerprint" not in columns:
+        conn.execute(
+            "ALTER TABLE notification_targets ADD COLUMN webhook_fingerprint TEXT"
+        )
+    if "deleted_at" not in columns:
+        conn.execute(
+            "ALTER TABLE notification_targets ADD COLUMN deleted_at TEXT"
+        )
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_notification_targets_route;
+        CREATE INDEX IF NOT EXISTS idx_notification_targets_route
+            ON notification_targets(
+                enabled, deleted_at, environment, store_id, manager_scope,
+                warehouse_id, shipping_method
+            );
+        """
+    )
+    conn.commit()
+
+
+def down_014(conn):
+    """Remove managed webhook fields only when no target depends on them."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    required = {
+        "manager_scope", "manager_names_json", "secret_ciphertext",
+        "webhook_fingerprint", "deleted_at",
+    }
+    if not required.issubset(columns):
+        return
+    used = conn.execute(
+        """SELECT COUNT(*) FROM notification_targets
+             WHERE manager_scope<>'all'
+                OR manager_names_json<>'[]'
+                OR secret_ciphertext IS NOT NULL
+                OR webhook_fingerprint IS NOT NULL
+                OR deleted_at IS NOT NULL"""
+    ).fetchone()[0]
+    if used:
+        raise RuntimeError(
+            "014 含前端管理的群 Webhook 或负责人路由，拒绝删除"
+        )
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_notification_targets_route;
+        ALTER TABLE notification_targets DROP COLUMN deleted_at;
+        ALTER TABLE notification_targets DROP COLUMN webhook_fingerprint;
+        ALTER TABLE notification_targets DROP COLUMN secret_ciphertext;
+        ALTER TABLE notification_targets DROP COLUMN manager_names_json;
+        ALTER TABLE notification_targets DROP COLUMN manager_scope;
+        CREATE INDEX IF NOT EXISTS idx_notification_targets_route
+            ON notification_targets(enabled, store_id, warehouse_id, shipping_method);
+        """
+    )
+    conn.commit()
+
+
+# ───────────────── 015: 负责人群同时抄送总群 ─────────────────
+
+def up_015(conn):
+    """Allow one specific route to fan out to its environment fallback group."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    if "copy_to_fallback" not in columns:
+        conn.execute(
+            """ALTER TABLE notification_targets ADD COLUMN copy_to_fallback INTEGER
+               NOT NULL DEFAULT 0 CHECK(copy_to_fallback IN (0,1))"""
+        )
+    conn.commit()
+
+
+def down_015(conn):
+    """Remove the fan-out flag only when no route has enabled it."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    if "copy_to_fallback" not in columns:
+        return
+    used = conn.execute(
+        "SELECT COUNT(*) FROM notification_targets WHERE copy_to_fallback=1"
+    ).fetchone()[0]
+    if used:
+        raise RuntimeError("015 仍有目标启用抄送总群，拒绝删除字段")
+    conn.execute("ALTER TABLE notification_targets DROP COLUMN copy_to_fallback")
+    conn.commit()
+
+
+# ───────────────── 016: 国家级订单群路由 ─────────────────
+
+def up_016(conn):
+    """Add an optional country dimension between site and manager routing."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    if "country_code" not in columns:
+        conn.execute(
+            "ALTER TABLE notification_targets ADD COLUMN country_code TEXT COLLATE NOCASE"
+        )
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_notification_targets_route;
+        CREATE INDEX IF NOT EXISTS idx_notification_targets_route
+            ON notification_targets(
+                enabled, deleted_at, environment, store_id, country_code,
+                manager_scope, warehouse_id, shipping_method
+            );
+        """
+    )
+    conn.commit()
+
+
+def down_016(conn):
+    """Remove country routing only when no target uses it."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(notification_targets)")
+    }
+    if "country_code" not in columns:
+        return
+    used = conn.execute(
+        """SELECT COUNT(*) FROM notification_targets
+             WHERE TRIM(COALESCE(country_code,''))<>''"""
+    ).fetchone()[0]
+    if used:
+        raise RuntimeError("016 仍有目标使用国家路由，拒绝删除字段")
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_notification_targets_route;
+        ALTER TABLE notification_targets DROP COLUMN country_code;
+        CREATE INDEX IF NOT EXISTS idx_notification_targets_route
+            ON notification_targets(
+                enabled, deleted_at, environment, store_id, manager_scope,
+                warehouse_id, shipping_method
+            );
+        """
+    )
+    conn.commit()
+
+
+# ───────────────── 017: 金毅金谷临时中转仓与590支有限库存 ─────────────────
+
+MIGRATION_017_STATE_KEY = "migration_017_previous_state"
+
+
+def _migration_017_dict(row):
+    return dict(row) if row else None
+
+
+def up_017(conn):
+    """Create the finite-stock temporary transit warehouse.
+
+    This migration cannot submit an external WMS order. It seeds only the 59
+    approved SKUs, records 10 units each through the inventory ledger, grants
+    the existing Poland operators access, and enables PL/CZ/HU routing.
+    """
+
+    catalog = catalog_rows()
+    if len(catalog) != 59 or len({row["sku_code"] for row in catalog}) != 59:
+        raise RuntimeError("017 调拨目录必须包含59个唯一SKU")
+    if sum(int(row["quantity"]) for row in catalog) != 590:
+        raise RuntimeError("017 调拨目录合计必须为590支")
+
+    previous_setting = conn.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (JYJG_TRANSIT_ROUTING_SETTING,),
+    ).fetchone()
+    warehouse = conn.execute(
+        "SELECT * FROM warehouses WHERE code=?",
+        (JYJG_TRANSIT_WAREHOUSE_CODE,),
+    ).fetchone()
+    state = {
+        "setting": previous_setting["value"] if previous_setting else None,
+        "warehouse_existed": bool(warehouse),
+        "warehouse_active": int(warehouse["is_active"]) if warehouse else None,
+        "routes": [],
+        "permissions": [],
+    }
+    if not warehouse:
+        conn.execute(
+            "INSERT INTO warehouses (name,code,country,is_active) VALUES (?,?,?,1)",
+            ("金毅金谷临时中转仓", JYJG_TRANSIT_WAREHOUSE_CODE, "PL"),
+        )
+        warehouse = conn.execute(
+            "SELECT * FROM warehouses WHERE id=last_insert_rowid()"
+        ).fetchone()
+    warehouse_id = int(warehouse["id"])
+    state["warehouse_id"] = warehouse_id
+    state["integration"] = _migration_017_dict(conn.execute(
+        "SELECT * FROM oms_warehouse_integrations WHERE warehouse_id=?",
+        (warehouse_id,),
+    ).fetchone())
+    state["warehouse_ext"] = _migration_017_dict(conn.execute(
+        "SELECT * FROM inv_warehouse_ext WHERE warehouse_id=?",
+        (warehouse_id,),
+    ).fetchone())
+    state["routes"] = [
+        dict(row) for row in conn.execute(
+            "SELECT * FROM inv_market_warehouses WHERE warehouse_id=?",
+            (warehouse_id,),
+        ).fetchall()
+    ]
+
+    conn.execute(
+        "UPDATE warehouses SET name=?,country='PL',is_active=1 WHERE id=?",
+        ("金毅金谷临时中转仓", warehouse_id),
+    )
+    conn.execute(
+        '''INSERT INTO inv_warehouse_ext
+             (warehouse_id,ownership_type,partner_name,region,is_fulfillment,notes)
+           VALUES (?,'partner','金毅金谷','PL',1,?)
+           ON CONFLICT(warehouse_id) DO UPDATE SET
+             ownership_type='partner',partner_name='金毅金谷',region='PL',
+             is_fulfillment=1,notes=excluded.notes,updated_at=CURRENT_TIMESTAMP''',
+        (
+            warehouse_id,
+            "临时有限库存仓；仅管理已实际调拨的590支，金毅/金谷/钱品宏手工Packeta发货",
+        ),
+    )
+    integration_config = json.dumps(
+        {
+            "routing_policy": JYJG_TRANSIT_ROUTING_POLICY,
+            "stock_policy": "finite_local_ledger",
+            "shipping_mode": "manual_packeta",
+            "cutover_policy": "new_orders_only",
+            "source_workbook": JYJG_TRANSFER_SOURCE,
+            "sku_count": 59,
+            "initial_quantity": 590,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    conn.execute(
+        '''INSERT INTO oms_warehouse_integrations
+             (warehouse_id,provider,external_code,channel_code,base_url,
+              is_enabled,auto_submit,inventory_authority,tracking_mode,config_json)
+           VALUES (?,'internal',NULL,NULL,NULL,1,0,'local',
+                   'official_and_third_party',?)
+           ON CONFLICT(warehouse_id) DO UPDATE SET
+             provider='internal',external_code=NULL,channel_code=NULL,base_url=NULL,
+             is_enabled=1,auto_submit=0,inventory_authority='local',
+             tracking_mode='official_and_third_party',config_json=excluded.config_json,
+             updated_at=CURRENT_TIMESTAMP''',
+        (warehouse_id, integration_config),
+    )
+    for market in ("PL", "CZ", "HU"):
+        conn.execute(
+            '''INSERT INTO inv_market_warehouses
+                 (market_code,warehouse_id,priority,is_active,notes)
+               VALUES (?,?,1,1,?)
+               ON CONFLICT(market_code,warehouse_id) DO UPDATE SET
+                 priority=1,is_active=1,notes=excluded.notes,
+                 updated_at=CURRENT_TIMESTAMP''',
+            (market, warehouse_id, "四个Fumot系列已调拨SKU优先路由；库存用完后缺货"),
+        )
+
+    for item in catalog:
+        note_marker = json.dumps(
+            {
+                "managed_family": item["family"],
+                "source": JYJG_TRANSFER_SOURCE,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            '''INSERT INTO inv_skus
+                 (sku_code,name,puff_count,flavor,unit,is_active,notes)
+               VALUES (?,?,?,?, 'pcs',1,?)
+               ON CONFLICT(sku_code) DO UPDATE SET
+                 name=excluded.name,puff_count=excluded.puff_count,
+                 flavor=excluded.flavor,unit='pcs',is_active=1,
+                 notes=CASE
+                   WHEN COALESCE(inv_skus.notes,'') LIKE '%\"managed_family\"%'
+                     THEN inv_skus.notes
+                   ELSE TRIM(COALESCE(inv_skus.notes,'') || char(10) || excluded.notes)
+                 END,
+                 updated_at=CURRENT_TIMESTAMP''',
+            (
+                item["sku_code"],
+                f"{item['product_name']} - {item['flavor']}",
+                item["puff_count"],
+                item["flavor"],
+                note_marker,
+            ),
+        )
+        sku_id = int(conn.execute(
+            "SELECT id FROM inv_skus WHERE sku_code=?",
+            (item["sku_code"],),
+        ).fetchone()["id"])
+        conn.execute(
+            '''INSERT INTO oms_sku_warehouses
+                 (sku_id,warehouse_id,is_primary,is_enabled,product_type,notes)
+               VALUES (?,?,1,1,'P',?)
+               ON CONFLICT(sku_id,warehouse_id) DO UPDATE SET
+                 is_primary=1,is_enabled=1,product_type='P',notes=excluded.notes,
+                 updated_at=CURRENT_TIMESTAMP''',
+            (sku_id, warehouse_id, "金毅金谷临时调拨库存；不允许无限库存分配"),
+        )
+        stock = conn.execute(
+            "SELECT on_hand,reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?",
+            (warehouse_id, sku_id),
+        ).fetchone()
+        if stock and (int(stock["on_hand"]) != int(item["quantity"]) or int(stock["reserved"]) != 0):
+            raise RuntimeError(
+                f"017 {item['sku_code']} 已存在非预期库存 "
+                f"on_hand={stock['on_hand']} reserved={stock['reserved']}"
+            )
+        if not stock:
+            record_movement(
+                conn,
+                warehouse_id=warehouse_id,
+                sku_id=sku_id,
+                movement_type="init",
+                qty_delta=int(item["quantity"]),
+                ref_type="migration",
+                ref_id=f"017:{item['sku_code']}",
+                operator_name="system",
+                note=f"临时中转仓期初建账；来源 {JYJG_TRANSFER_SOURCE}",
+            )
+
+    if _migration_table_exists(conn, "users") and _migration_table_exists(
+        conn, "oms_warehouse_user_permissions"
+    ):
+        users = conn.execute(
+            '''SELECT id,username,name FROM users
+               WHERE LOWER(COALESCE(username,'')) IN ('jinyi','jingu','qianpinhong')
+                  OR COALESCE(name,'') IN ('金毅','金谷','钱品宏')'''
+        ).fetchall()
+        for user in users:
+            previous = conn.execute(
+                "SELECT * FROM oms_warehouse_user_permissions WHERE user_id=? AND warehouse_id=?",
+                (user["id"], warehouse_id),
+            ).fetchone()
+            state["permissions"].append({
+                "user_id": int(user["id"]),
+                "previous": _migration_017_dict(previous),
+            })
+            conn.execute(
+                '''INSERT INTO oms_warehouse_user_permissions
+                     (user_id,warehouse_id,can_view,can_pick,can_pack,can_ship,
+                      can_cancel,can_retry,can_reconcile)
+                   VALUES (?,?,1,1,1,1,1,0,0)
+                   ON CONFLICT(user_id,warehouse_id) DO UPDATE SET
+                     can_view=1,can_pick=1,can_pack=1,can_ship=1,can_cancel=1,
+                     updated_at=CURRENT_TIMESTAMP''',
+                (user["id"], warehouse_id),
+            )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?, '1')",
+        (JYJG_TRANSIT_ROUTING_SETTING,),
+    )
+    conn.execute(
+        '''UPDATE oms_order_items SET shortage_qty=0,updated_at=CURRENT_TIMESTAMP
+           WHERE order_id IN (
+             SELECT id FROM orders WHERE status IN ('cancelled','refunded','failed','trash')
+           )'''
+    )
+    conn.execute(
+        '''UPDATE oms_order_fulfillment_state
+           SET aggregate_status='cancelled',has_shortage=0,manual_review=0,
+               manual_reason=NULL,updated_at=CURRENT_TIMESTAMP
+           WHERE order_id IN (
+             SELECT id FROM orders WHERE status IN ('cancelled','refunded','failed','trash')
+           )'''
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+        (MIGRATION_017_STATE_KEY, json.dumps(state, ensure_ascii=False)),
+    )
+    conn.commit()
+
+
+def down_017(conn):
+    """Operational rollback: stop new routing and retain all stock/audit history."""
+
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (MIGRATION_017_STATE_KEY,),
+    ).fetchone()
+    if not row:
+        return
+    state = json.loads(row["value"])
+    warehouse_id = int(state["warehouse_id"])
+    previous_setting = state.get("setting")
+    if previous_setting is None:
+        conn.execute("DELETE FROM settings WHERE key=?", (JYJG_TRANSIT_ROUTING_SETTING,))
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+            (JYJG_TRANSIT_ROUTING_SETTING, previous_setting),
+        )
+    conn.execute(
+        "UPDATE inv_market_warehouses SET is_active=0,updated_at=CURRENT_TIMESTAMP WHERE warehouse_id=?",
+        (warehouse_id,),
+    )
+    conn.execute(
+        "UPDATE oms_warehouse_integrations SET is_enabled=0,auto_submit=0,updated_at=CURRENT_TIMESTAMP WHERE warehouse_id=?",
+        (warehouse_id,),
+    )
+    if not state.get("warehouse_existed"):
+        conn.execute("UPDATE warehouses SET is_active=0 WHERE id=?", (warehouse_id,))
+    else:
+        conn.execute(
+            "UPDATE warehouses SET is_active=? WHERE id=?",
+            (int(state.get("warehouse_active") or 0), warehouse_id),
+        )
+    conn.execute("DELETE FROM settings WHERE key=?", (MIGRATION_017_STATE_KEY,))
+    conn.commit()
+
+
+# ───────────────── 018: 人工发货权限收口与中转仓补货策略 ─────────────────
+
+MIGRATION_018_STATE_KEY = "migration_018_previous_state"
+
+
+def up_018(conn):
+    """Make manual partner shipping a single-step, warehouse-scoped role."""
+
+    setting_keys = (JYJG_REORDER_POINT_SETTING, JYJG_TARGET_STOCK_SETTING)
+    previous_settings = {}
+    for key in setting_keys:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        previous_settings[key] = row["value"] if row else None
+
+    target_warehouses = conn.execute(
+        """SELECT id FROM warehouses
+           WHERE code=? OR code='波兰仓库' OR name='波兰仓库'
+           ORDER BY id""",
+        (JYJG_TRANSIT_WAREHOUSE_CODE,),
+    ).fetchall()
+    warehouse_ids = [int(row["id"]) for row in target_warehouses]
+    target_users = conn.execute(
+        """SELECT id FROM users
+           WHERE LOWER(COALESCE(username,'')) IN ('jinyi','jingu','qianpinhong')
+              OR COALESCE(name,'') IN ('金毅','金谷','钱品宏')
+           ORDER BY id"""
+    ).fetchall()
+    user_ids = [int(row["id"]) for row in target_users]
+
+    partner_id = None
+    if _migration_table_exists(conn, "partners"):
+        partner = conn.execute(
+            """SELECT id FROM partners
+               WHERE name LIKE '%金谷金毅%' OR name LIKE '%金毅金谷%'
+               ORDER BY id LIMIT 1"""
+        ).fetchone()
+        partner_id = int(partner["id"]) if partner else None
+
+    state = {
+        "settings": previous_settings,
+        "warehouse_ext": [],
+        "permissions": [],
+    }
+    for warehouse_id in warehouse_ids:
+        previous_ext = conn.execute(
+            "SELECT * FROM inv_warehouse_ext WHERE warehouse_id=?", (warehouse_id,)
+        ).fetchone()
+        state["warehouse_ext"].append({
+            "warehouse_id": warehouse_id,
+            "previous": dict(previous_ext) if previous_ext else None,
+        })
+        if partner_id is not None:
+            conn.execute(
+                """INSERT INTO inv_warehouse_ext
+                     (warehouse_id,ownership_type,partner_name,partner_id,is_fulfillment)
+                   VALUES (?,'partner','金毅金谷',?,1)
+                   ON CONFLICT(warehouse_id) DO UPDATE SET
+                     ownership_type='partner',partner_name='金毅金谷',partner_id=excluded.partner_id,
+                     is_fulfillment=1,updated_at=CURRENT_TIMESTAMP""",
+                (warehouse_id, partner_id),
+            )
+        for user_id in user_ids:
+            previous = conn.execute(
+                "SELECT * FROM oms_warehouse_user_permissions WHERE user_id=? AND warehouse_id=?",
+                (user_id, warehouse_id),
+            ).fetchone()
+            state["permissions"].append({
+                "user_id": user_id,
+                "warehouse_id": warehouse_id,
+                "previous": dict(previous) if previous else None,
+            })
+            conn.execute(
+                """INSERT INTO oms_warehouse_user_permissions
+                     (user_id,warehouse_id,can_view,can_pick,can_pack,can_ship,
+                      can_cancel,can_retry,can_reconcile)
+                   VALUES (?,?,1,0,0,1,0,0,0)
+                   ON CONFLICT(user_id,warehouse_id) DO UPDATE SET
+                     can_view=1,can_pick=0,can_pack=0,can_ship=1,can_cancel=0,
+                     can_retry=0,can_reconcile=0,updated_at=CURRENT_TIMESTAMP""",
+                (user_id, warehouse_id),
+            )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?, '3')",
+        (JYJG_REORDER_POINT_SETTING,),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?, '10')",
+        (JYJG_TARGET_STOCK_SETTING,),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+        (MIGRATION_018_STATE_KEY, json.dumps(state, ensure_ascii=False)),
+    )
+    conn.commit()
+
+
+def down_018(conn):
+    """Restore permissions, ownership links and replenishment settings."""
+
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (MIGRATION_018_STATE_KEY,)
+    ).fetchone()
+    if not row:
+        return
+    state = json.loads(row["value"])
+    for entry in state.get("permissions", []):
+        previous = entry.get("previous")
+        key = (entry["user_id"], entry["warehouse_id"])
+        if previous is None:
+            conn.execute(
+                "DELETE FROM oms_warehouse_user_permissions WHERE user_id=? AND warehouse_id=?",
+                key,
+            )
+        else:
+            conn.execute(
+                """UPDATE oms_warehouse_user_permissions SET
+                     can_view=?,can_pick=?,can_pack=?,can_ship=?,can_cancel=?,
+                     can_retry=?,can_reconcile=?,created_at=?,updated_at=?
+                   WHERE user_id=? AND warehouse_id=?""",
+                (
+                    previous["can_view"], previous["can_pick"], previous["can_pack"],
+                    previous["can_ship"], previous["can_cancel"], previous["can_retry"],
+                    previous["can_reconcile"], previous["created_at"], previous["updated_at"],
+                    *key,
+                ),
+            )
+    for entry in state.get("warehouse_ext", []):
+        previous = entry.get("previous")
+        warehouse_id = entry["warehouse_id"]
+        if previous is None:
+            conn.execute("DELETE FROM inv_warehouse_ext WHERE warehouse_id=?", (warehouse_id,))
+        else:
+            conn.execute(
+                """UPDATE inv_warehouse_ext SET
+                     ownership_type=?,partner_name=?,partner_id=?,region=?,is_fulfillment=?,
+                     notes=?,created_at=?,updated_at=? WHERE warehouse_id=?""",
+                (
+                    previous["ownership_type"], previous["partner_name"], previous["partner_id"],
+                    previous["region"], previous["is_fulfillment"], previous["notes"],
+                    previous["created_at"], previous["updated_at"], warehouse_id,
+                ),
+            )
+    for key, value in state.get("settings", {}).items():
+        if value is None:
+            conn.execute("DELETE FROM settings WHERE key=?", (key,))
+        else:
+            conn.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
+    conn.execute("DELETE FROM settings WHERE key=?", (MIGRATION_018_STATE_KEY,))
+    conn.commit()
+
+
+# ───────────────── 019: 仓库优先的 Woo 商品目录与映射审计 ─────────────────
+
+def up_019(conn):
+    """Cache read-only Woo catalogue scans used by the mapping readiness UI."""
+    conn.executescript(
+        '''
+        CREATE TABLE IF NOT EXISTS inv_site_catalog_scans (
+            site_id        INTEGER NOT NULL,
+            warehouse_id   INTEGER NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'pending',
+            started_at     TEXT,
+            finished_at    TEXT,
+            total_products INTEGER NOT NULL DEFAULT 0,
+            error          TEXT,
+            PRIMARY KEY (site_id, warehouse_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS inv_site_product_catalog (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id           INTEGER NOT NULL,
+            warehouse_id      INTEGER NOT NULL,
+            wc_product_id     INTEGER NOT NULL,
+            wc_variation_id   INTEGER NOT NULL DEFAULT 0,
+            wc_sku            TEXT,
+            name              TEXT NOT NULL,
+            product_type      TEXT,
+            manage_stock      INTEGER NOT NULL DEFAULT 0,
+            stock_quantity    INTEGER,
+            permalink         TEXT,
+            candidate_sku_id  INTEGER,
+            match_method      TEXT,
+            match_confidence  INTEGER NOT NULL DEFAULT 0,
+            scanned_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(site_id, warehouse_id, wc_product_id, wc_variation_id),
+            FOREIGN KEY (candidate_sku_id) REFERENCES inv_skus(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_inv_catalog_site_wh
+            ON inv_site_product_catalog(site_id, warehouse_id);
+        CREATE INDEX IF NOT EXISTS idx_inv_catalog_candidate
+            ON inv_site_product_catalog(candidate_sku_id);
+
+        CREATE TABLE IF NOT EXISTS inv_mapping_audit (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            action        TEXT NOT NULL,
+            site_id       INTEGER NOT NULL,
+            warehouse_id  INTEGER,
+            sku_id        INTEGER,
+            map_id        INTEGER,
+            match_method  TEXT,
+            operator_id   INTEGER,
+            operator_name TEXT,
+            payload_json  TEXT,
+            created_at    TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_inv_mapping_audit_site
+            ON inv_mapping_audit(site_id, created_at);
+        '''
+    )
+    conn.commit()
+
+
+def down_019(conn):
+    conn.execute('DROP TABLE IF EXISTS inv_mapping_audit')
+    conn.execute('DROP TABLE IF EXISTS inv_site_product_catalog')
+    conn.execute('DROP TABLE IF EXISTS inv_site_catalog_scans')
+    conn.commit()
+
+
+# ───────────────── 020: 联合发货组与包裹履约关联 ─────────────────
+
+JOINT_DISPATCH_SETTING = "oms_joint_dispatch_groups"
+MIGRATION_020_STATE_KEY = "inv_migration_020_previous_state"
+
+
+def up_020(conn):
+    """Keep warehouse stock ledgers separate while allowing one physical parcel."""
+    conn.executescript(
+        '''
+        CREATE TABLE IF NOT EXISTS oms_shipment_fulfillments (
+            shipment_id   TEXT NOT NULL,
+            fulfillment_id TEXT NOT NULL,
+            role          TEXT NOT NULL DEFAULT 'companion',
+            created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (shipment_id, fulfillment_id),
+            FOREIGN KEY (shipment_id) REFERENCES oms_shipments(id) ON DELETE RESTRICT,
+            FOREIGN KEY (fulfillment_id) REFERENCES oms_fulfillments(id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_oms_sf_fulfillment
+            ON oms_shipment_fulfillments(fulfillment_id, shipment_id);
+        INSERT OR IGNORE INTO oms_shipment_fulfillments (shipment_id,fulfillment_id,role)
+            SELECT id,fulfillment_id,'primary' FROM oms_shipments;
+        '''
+    )
+    previous = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (JOINT_DISPATCH_SETTING,)
+    ).fetchone()
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+        (
+            MIGRATION_020_STATE_KEY,
+            json.dumps({"joint_dispatch_groups": previous["value"] if previous else None}),
+        ),
+    )
+    if not previous:
+        conn.execute(
+            "INSERT INTO settings (key,value) VALUES (?,?)",
+            (
+                JOINT_DISPATCH_SETTING,
+                json.dumps(
+                    {
+                        "jyjg_poland": {
+                            "label": "金毅金谷联合发货",
+                            "warehouse_codes": ["波兰仓库", "PL-JYJG-TRANSIT"],
+                        }
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+    conn.commit()
+
+
+def down_020(conn):
+    state_row = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (MIGRATION_020_STATE_KEY,)
+    ).fetchone()
+    state = json.loads(state_row["value"]) if state_row and state_row["value"] else {}
+    previous = state.get("joint_dispatch_groups")
+    if previous is None:
+        conn.execute("DELETE FROM settings WHERE key=?", (JOINT_DISPATCH_SETTING,))
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+            (JOINT_DISPATCH_SETTING, previous),
+        )
+    conn.execute("DELETE FROM settings WHERE key=?", (MIGRATION_020_STATE_KEY,))
+    conn.execute("DROP TABLE IF EXISTS oms_shipment_fulfillments")
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -1818,6 +2722,14 @@ MIGRATIONS = [
     ('010', 'new_poland_wms_isolated_routing', up_010, down_010),
     ('011', 'packeta_hu_and_managed_product_isolation', up_011, down_011),
     ('012', 'packeta_hu_primary_last_mile_semantics', up_012, down_012),
+    ('013', 'order_image_group_notifications', up_013, down_013),
+    ('014', 'managed_multi_manager_group_webhooks', up_014, down_014),
+    ('015', 'copy_specific_routes_to_fallback_group', up_015, down_015),
+    ('016', 'country_order_notification_routes', up_016, down_016),
+    ('017', 'jyjg_temporary_transit_finite_stock', up_017, down_017),
+    ('018', 'manual_shipper_scope_and_replenishment', up_018, down_018),
+    ('019', 'warehouse_first_woo_mapping_catalog', up_019, down_019),
+    ('020', 'joint_dispatch_groups', up_020, down_020),
 ]
 
 

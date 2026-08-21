@@ -22,6 +22,10 @@ from functools import wraps
 # 允许用环境变量覆盖(自测时可指向副本),默认生产/副本同名文件。
 DB_FILE = os.environ.get('INV_DB_FILE', 'woocommerce_orders.db')
 
+JYJG_TRANSIT_WAREHOUSE_CODE = 'PL-JYJG-TRANSIT'
+JYJG_REORDER_POINT_SETTING = 'inv_jyjg_reorder_point'
+JYJG_TARGET_STOCK_SETTING = 'inv_jyjg_target_stock'
+
 
 def get_conn():
     """返回一个 row_factory=Row 的 sqlite 连接。调用方负责 close()。
@@ -33,6 +37,140 @@ def get_conn():
     # 外键约束:inv_* 之间的 ON DELETE CASCADE 需要它生效。
     conn.execute('PRAGMA foreign_keys = ON')
     return conn
+
+
+def _table_exists(conn, name):
+    return bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone())
+
+
+def _setting_int(conn, key, default):
+    if not _table_exists(conn, 'settings'):
+        return int(default)
+    row = conn.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+    try:
+        return int(row['value'] if row and row['value'] not in (None, '') else default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def replenishment_metrics(conn, warehouse_id, sku_id, *, on_hand=None, reserved=None):
+    """Return the visible low-stock/replenishment state for one warehouse SKU.
+
+    The temporary Jin Yi/Jin Gu warehouse starts with ten units per flavour.
+    Its operational warning point is therefore three, not the inventory
+    module's historical global default of ten. Other warehouses retain the
+    existing per-SKU/global policy.
+    """
+    stock = None
+    if on_hand is None or reserved is None:
+        stock = conn.execute(
+            'SELECT on_hand,reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?',
+            (warehouse_id, sku_id),
+        ).fetchone()
+        on_hand = int(stock['on_hand'] if stock else 0)
+        reserved = int(stock['reserved'] if stock else 0)
+    else:
+        on_hand = int(on_hand or 0)
+        reserved = int(reserved or 0)
+
+    warehouse = conn.execute(
+        'SELECT code FROM warehouses WHERE id=?', (warehouse_id,)
+    ).fetchone()
+    warehouse_code = str(warehouse['code'] if warehouse else '')
+    reorder_point = 0
+    if _table_exists(conn, 'inv_skus'):
+        columns = {
+            row['name'] for row in conn.execute('PRAGMA table_info(inv_skus)').fetchall()
+        }
+        if 'reorder_point' in columns:
+            sku = conn.execute(
+                'SELECT COALESCE(reorder_point,0) AS reorder_point FROM inv_skus WHERE id=?',
+                (sku_id,),
+            ).fetchone()
+            reorder_point = int(sku['reorder_point'] if sku else 0)
+
+    if warehouse_code == JYJG_TRANSIT_WAREHOUSE_CODE:
+        threshold = max(0, _setting_int(conn, JYJG_REORDER_POINT_SETTING, 3))
+        target = max(threshold, _setting_int(conn, JYJG_TARGET_STOCK_SETTING, 10))
+        managed_transfer = True
+    else:
+        threshold = reorder_point if reorder_point > 0 else max(
+            0, _setting_int(conn, 'inv_default_reorder_point', 10)
+        )
+        target = max(
+            threshold,
+            _setting_int(conn, 'inv_default_target_stock', max(threshold * 2, threshold)),
+        )
+        managed_transfer = False
+
+    available = on_hand - reserved
+    low = available <= threshold
+    return {
+        'on_hand': on_hand,
+        'reserved': reserved,
+        'available': available,
+        'reorder_point': threshold,
+        'target_stock': target,
+        'is_low_stock': low,
+        'is_out_of_stock': available <= 0,
+        'suggested_replenishment': max(0, target - available) if low else 0,
+        'managed_transfer': managed_transfer,
+    }
+
+
+def refresh_restock_notification(conn, warehouse_id, sku_id):
+    """Create/update/resolve the scoped restock notice for one stock row."""
+    if not _table_exists(conn, 'inv_notifications'):
+        return None
+    meta = conn.execute(
+        '''SELECT k.sku_code,k.name AS sku_name,w.name AS warehouse_name
+           FROM inv_skus k CROSS JOIN warehouses w
+           WHERE k.id=? AND w.id=?''',
+        (sku_id, warehouse_id),
+    ).fetchone()
+    if not meta:
+        return None
+    metrics = replenishment_metrics(conn, warehouse_id, sku_id)
+    dedup_key = f'restock:{warehouse_id}:{sku_id}'
+    existing = conn.execute(
+        "SELECT id FROM inv_notifications WHERE dedup_key=? AND status='unread' ORDER BY id DESC LIMIT 1",
+        (dedup_key,),
+    ).fetchone()
+    if not metrics['is_low_stock']:
+        conn.execute(
+            """UPDATE inv_notifications SET status='dismissed',updated_at=CURRENT_TIMESTAMP
+               WHERE dedup_key=? AND status='unread'""",
+            (dedup_key,),
+        )
+        return metrics
+
+    severity = 'danger' if metrics['is_out_of_stock'] else 'warning'
+    prefix = '售罄补货' if metrics['is_out_of_stock'] else '低库存补货'
+    title = f"{prefix}:{meta['sku_code']} @ {meta['warehouse_name']}"
+    body = (
+        f"{meta['sku_name']} 可用 {metrics['available']}"
+        f"（现存 {metrics['on_hand']} - 预留 {metrics['reserved']}），"
+        f"预警点 {metrics['reorder_point']}；建议补 {metrics['suggested_replenishment']} 支，"
+        f"补至目标库存 {metrics['target_stock']}"
+    )
+    if existing:
+        conn.execute(
+            '''UPDATE inv_notifications
+               SET severity=?,title=?,body=?,sku_id=?,warehouse_id=?,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?''',
+            (severity, title, body, sku_id, warehouse_id, existing['id']),
+        )
+    else:
+        conn.execute(
+            '''INSERT INTO inv_notifications
+               (ntype,severity,title,body,sku_id,warehouse_id,dedup_key)
+               VALUES ('restock',?,?,?,?,?,?)''',
+            (severity, title, body, sku_id, warehouse_id, dedup_key),
+        )
+    return metrics
 
 
 # ───────────────────────────── 审计流水 ─────────────────────────────
@@ -111,6 +249,7 @@ def record_movement(conn, *, warehouse_id, sku_id, movement_type,
                 'INSERT INTO inv_stock (warehouse_id, sku_id, on_hand, reserved) '
                 'VALUES (?,?,?,?)',
                 (warehouse_id, sku_id, on_hand_after, reserved_after))
+        refresh_restock_notification(conn, warehouse_id, sku_id)
 
     return movement_id
 
@@ -209,6 +348,31 @@ def partner_warehouse_ids():
         return []
 
 
+def explicit_warehouse_permission_ids(capability='can_view'):
+    """Warehouse ids explicitly granted by the OMS fulfillment permission table."""
+    from flask_login import current_user
+    if not getattr(current_user, 'is_authenticated', False):
+        return []
+    valid = {
+        'can_view', 'can_pick', 'can_pack', 'can_ship', 'can_cancel',
+        'can_retry', 'can_reconcile',
+    }
+    column = capability if capability in valid else 'can_view'
+    try:
+        conn = get_conn()
+        if not _table_exists(conn, 'oms_warehouse_user_permissions'):
+            conn.close()
+            return []
+        rows = conn.execute(
+            f'SELECT warehouse_id FROM oms_warehouse_user_permissions WHERE user_id=? AND {column}=1',
+            (current_user.id,),
+        ).fetchall()
+        conn.close()
+        return [int(row['warehouse_id']) for row in rows]
+    except Exception:
+        return []
+
+
 def visible_warehouse_ids():
     """当前用户可见仓库范围。None=全部;list=受限(合伙人只看自己仓)。
 
@@ -217,8 +381,11 @@ def visible_warehouse_ids():
     """
     if _is_admin() or can_view_inventory() or can_manage_inventory():
         return None
+    scoped = set(explicit_warehouse_permission_ids('can_view'))
     if is_partner_user():
-        return partner_warehouse_ids()
+        scoped.update(partner_warehouse_ids())
+    if scoped:
+        return sorted(scoped)
     return []  # 无任何库存权限 → 看不到(理论上不会进到这)
 
 

@@ -177,7 +177,7 @@
                         </a>
                     </li>
                     {% endif %}
-                    {% if current_user.is_admin() or current_user.can_ship() or current_user.can_view_shipping() or inv_can_view %}
+                    {% if can_manage_inv %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('fulfillment.') else '' }}"
                             href="{{ url_for('fulfillment.fulfillment_page') }}">
@@ -219,13 +219,21 @@
                             <li><a class="dropdown-item" href="{{ url_for('inv_inv.stock_page') }}"><i class="bi bi-clipboard-data me-2"></i>库存台账</a></li>
                             <li><a class="dropdown-item" href="{{ url_for('inv_batch.batches_page') }}"><i class="bi bi-calendar-x me-2"></i>批次/保质期</a></li>
                             <li><a class="dropdown-item" href="{{ url_for('inv_ord.orders_page') }}"><i class="bi bi-arrow-left-right me-2"></i>订单库存联动</a></li>
-                            <li><a class="dropdown-item" href="{{ url_for('inv_push.push_page') }}"><i class="bi bi-cloud-upload me-2"></i>库存下推/对账</a></li>
+                            {% if is_inv_admin %}<li><a class="dropdown-item" href="{{ url_for('inv_push.push_page') }}"><i class="bi bi-cloud-upload me-2"></i>Woo库存同步</a></li>{% endif %}
                             <li><a class="dropdown-item" href="{{ url_for('inv_notify.notifications_page') }}"><i class="bi bi-bell me-2"></i>库存通知中心</a></li>
                             <li><hr class="dropdown-divider"></li>
                             <li><a class="dropdown-item" href="{{ url_for('inv_report.reports_page') }}"><i class="bi bi-graph-up me-2"></i>库存报表</a></li>
                             <li><a class="dropdown-item" href="{{ url_for('inv_wh.warehouses_page') }}"><i class="bi bi-buildings me-2"></i>仓库管理</a></li>
-                            <li><a class="dropdown-item" href="{{ url_for('inv_sku.skus_page') }}"><i class="bi bi-upc-scan me-2"></i>SKU 主档</a></li>
+                            {% if can_manage_inv %}<li><a class="dropdown-item" href="{{ url_for('inv_sku.skus_page') }}"><i class="bi bi-diagram-3 me-2"></i>仓库SKU与站点映射</a></li>{% endif %}
                         </ul>
+                    </li>
+                    {% endif %}
+                    {% if current_user.username == 'admin' %}
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('order_notification.') else '' }}"
+                            href="{{ url_for('order_notification.notification_dashboard') }}">
+                            <i class="bi bi-image me-1"></i>群通知
+                        </a>
                     </li>
                     {% endif %}
                     {% if current_user.can_manage_users() %}
@@ -515,6 +523,7 @@
                     progressBar.classList.remove('bg-success', 'bg-danger');
                     progressBar.classList.add('bg-primary');
                     statusText.textContent = '正在启动全局同步任务...';
+                    statusText.classList.remove('text-danger', 'text-warning', 'text-success');
                     logConsole.innerHTML = '';
                     closeBtn.disabled = true;
                     closeBtn.textContent = '完成'; // Reset button text
@@ -842,7 +851,7 @@
                               : '<span class="text-muted small">⚪ 未查询</span>';
             return '<span class="badge" style="background:' + m[1] + ';color:' + m[2] + ';">' + m[0] + '</span>';
         }
-        function queryCarrier(orderId, orderNumber) {
+        function queryCarrier(orderId, orderNumber, trackingNumber) {
             // Pop the modal open IMMEDIATELY with a spinner. EMS (and other
             // Track718-aggregated carriers) often need 10–30s on the first query
             // while the platform crawls the carrier, so the user needs a clear
@@ -852,7 +861,7 @@
                 <div class="text-center py-4">
                     <div class="spinner-border text-info mb-3" role="status"><span class="visually-hidden">Loading…</span></div>
                     <div class="text-light mb-1">正在查询物流轨迹…<span id="carrierElapsed" class="text-muted"></span></div>
-                    <div class="small text-muted">#${orderNumber} · EMS 等物流首次查询需到聚合平台实时抓取，可能要 10–30 秒，请稍候…</div>
+                    <div class="small text-muted">#${orderNumber}${trackingNumber ? ' · ' + trackingNumber : ''} · EMS 等物流首次查询需到聚合平台实时抓取，可能要 10–30 秒，请稍候…</div>
                 </div>`);
             const timer = setInterval(function () {
                 const el = document.getElementById('carrierElapsed');
@@ -860,7 +869,9 @@
                 el.textContent = '（已等待 ' + Math.round((Date.now() - startedAt) / 1000) + ' 秒）';
             }, 1000);
             const stopTimer = function () { clearInterval(timer); };
-            fetch(`/api/order/${orderId}/carrier-status`)
+            const trackingQuery = trackingNumber
+                ? `?tracking_number=${encodeURIComponent(trackingNumber)}` : '';
+            fetch(`/api/order/${orderId}/carrier-status${trackingQuery}`)
                 .then(res => res.json())
                 .then(data => {
                     stopTimer();
@@ -1032,6 +1043,29 @@
                     html += '<p><strong>发货仓库:</strong> <span style="color:#a5b4fc;">' + (order.warehouse_name || '未分配') + '</span></p>';
                     {% endif %}
                     html += '</div></div></div>';
+
+                    {% if current_user.username == 'admin' %}
+                    // Order image notification status and audit trail (super admin only).
+                    var notify = order.group_notification || {latest:null,jobs:[]};
+                    var latestNotify = notify.latest;
+                    var notifyEsc = function(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function(c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); };
+                    html += '<div class="col-12"><div class="info-card" style="border-color:rgba(14,165,233,.35)">';
+                    html += '<div class="card-header"><h6 class="text-info"><i class="bi bi-image me-2"></i>群通知</h6></div><div class="card-body">';
+                    if (!latestNotify) {
+                        html += '<div class="text-muted">尚未触发通知。正式发送开关默认关闭。</div>';
+                    } else {
+                        html += '<div class="row g-2"><div class="col-md-3"><b>状态</b><div><span class="badge bg-secondary">' + notifyEsc(latestNotify.status) + '</span></div></div>';
+                        html += '<div class="col-md-3"><b>目标</b><div>' + notifyEsc(latestNotify.target_name || '路由待处理') + '</div></div>';
+                        html += '<div class="col-md-3"><b>事件 / 模板</b><div>' + notifyEsc(latestNotify.event_type) + ' · ' + notifyEsc(latestNotify.template_version) + '</div></div>';
+                        html += '<div class="col-md-3"><b>尝试</b><div>' + Number((latestNotify.attempts || []).length) + ' 次</div></div></div>';
+                        if (latestNotify.last_error_code) html += '<div class="alert alert-warning py-2 mt-3 mb-2"><code>' + notifyEsc(latestNotify.last_error_code) + '</code> · ' + notifyEsc(latestNotify.last_error_summary || '') + '</div>';
+                        html += '<div class="d-flex flex-wrap gap-2 mt-3">';
+                        if (latestNotify.image_count) html += '<a class="btn btn-sm btn-outline-info" target="_blank" href="/api/order-notifications/' + encodeURIComponent(latestNotify.id) + '/image/1"><i class="bi bi-eye me-1"></i>预览/下载图片</a>';
+                        if (canEditThisOrder) html += '<button class="btn btn-sm btn-outline-warning" onclick="manualResendOrderNotification(\'' + notifyEsc(order.id) + '\',\'' + notifyEsc(latestNotify.id) + '\')"><i class="bi bi-arrow-repeat me-1"></i>人工重发</button>';
+                        html += '<a class="btn btn-sm btn-outline-secondary" href="/order-notifications"><i class="bi bi-list-ul me-1"></i>查看通知历史</a></div>';
+                    }
+                    html += '</div></div></div>';
+                    {% endif %}
 
                     // Multi-warehouse fulfillment: each warehouse and parcel
                     // remains independent, including official + third-party events.
@@ -1373,6 +1407,79 @@
                     // --- TRACKING INFORMATION LOGIC ---
                     var allTracking = [];
 
+                    function trackingEsc(value) {
+                        return String(value == null ? '' : value)
+                            .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                            .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                            .replace(/'/g, '&#39;');
+                    }
+                    function parcelItemsFromProducts(products) {
+                        if (!Array.isArray(products)) return [];
+                        return products.map(function (product) {
+                            product = product || {};
+                            var itemId = String(product.item_id || '');
+                            var productId = String(product.product || '');
+                            // Item-row identity is authoritative for variations.
+                            // A parent product ID can match several flavours, so
+                            // only use product/variation fallback when unique.
+                            var line = itemId ? lineItems.find(function (candidate) {
+                                return String(candidate.id || '') === itemId;
+                            }) : null;
+                            if (!line && productId) {
+                                var productMatches = lineItems.filter(function (candidate) {
+                                    return String(candidate.variation_id || '') === productId ||
+                                        String(candidate.product_id || '') === productId;
+                                });
+                                if (productMatches.length === 1) line = productMatches[0];
+                            }
+                            line = line || {};
+                            return {
+                                item_id: itemId,
+                                name: line.name || ('商品行 ' + (itemId || productId || '-')),
+                                sku: line.sku || '',
+                                qty: parseInt(product.qty || 0, 10) || 0
+                            };
+                        });
+                    }
+                    function lineParcelItem(item) {
+                        return [{
+                            item_id: String(item.id || ''),
+                            name: item.name || '商品',
+                            sku: item.sku || '',
+                            qty: parseInt(item.quantity || 0, 10) || 0
+                        }];
+                    }
+                    function mergeParcelItems(current, incoming) {
+                        current = Array.isArray(current) ? current : [];
+                        (Array.isArray(incoming) ? incoming : []).forEach(function (item) {
+                            var key = item.item_id
+                                ? 'item:' + String(item.item_id)
+                                : 'name:' + String(item.name || '');
+                            var existing = current.find(function (candidate) {
+                                var candidateKey = candidate.item_id
+                                    ? 'item:' + String(candidate.item_id)
+                                    : 'name:' + String(candidate.name || '');
+                                return candidateKey === key;
+                            });
+                            if (existing) {
+                                existing.qty = Math.max(parseInt(existing.qty || 0, 10), parseInt(item.qty || 0, 10));
+                                if (!existing.sku && item.sku) existing.sku = item.sku;
+                                if (item.name && item.name.indexOf('商品行 ') !== 0) existing.name = item.name;
+                            } else {
+                                current.push(item);
+                            }
+                        });
+                        return current;
+                    }
+                    function shipmentDate(value) {
+                        if (!value) return '';
+                        var raw = String(value).trim();
+                        var date = /^\d{9,13}$/.test(raw)
+                            ? new Date(parseInt(raw, 10) * (raw.length > 10 ? 1 : 1000))
+                            : new Date(raw.replace(' ', 'T'));
+                        return isNaN(date.getTime()) ? '' : date.toLocaleDateString('zh-CN');
+                    }
+
                     // 1. VillaTheme Plugin (in line_items)
                     lineItems.forEach(function (item) {
                         if (item.meta_data && Array.isArray(item.meta_data)) {
@@ -1382,18 +1489,17 @@
                                         var trackData = typeof meta.value === 'string' ? JSON.parse(meta.value) : meta.value;
                                         if (Array.isArray(trackData)) {
                                             trackData.forEach(function (td) {
-                                                allTracking.push({
-                                                    tracking_number: td.tracking_number,
-                                                    carrier_name: td.carrier_name || td.carrier_slug,
-                                                    carrier_url: td.carrier_url ? td.carrier_url.replace('{tracking_number}', td.tracking_number) : '',
-                                                    time: td.time,
-                                                    source: item.name
-                                                });
+                                                addCustomTracking(
+                                                    td.tracking_number, item.name,
+                                                    td.carrier_slug || td.carrier_name, td.time,
+                                                    lineParcelItem(item), false, false,
+                                                    td.carrier_url ? td.carrier_url.replace('{tracking_number}', td.tracking_number) : ''
+                                                );
                                             });
                                         }
                                     } catch (e) { }
                                 } else if (meta.key === 'tracking_number' && meta.value) {
-                                    addCustomTracking(meta.value, item.name);
+                                    addCustomTracking(meta.value, item.name, '', null, lineParcelItem(item));
                                 }
                             });
                         }
@@ -1420,7 +1526,11 @@
                                         // Carrier + URL come from the explicit provider (ems / inpost /
                                         // dpd / australia-post …), NOT a digit-length heuristic — that
                                         // mis-tagged EMS numbers like LM…CN as DPD. Dedup-aware.
-                                        addCustomTracking(item.tracking_number, 'Order Info', item.tracking_provider, item.date_shipped);
+                                        addCustomTracking(
+                                            item.tracking_number, 'AST', item.tracking_provider,
+                                            item.date_shipped, parcelItemsFromProducts(item.products_list),
+                                            String(item.status_shipped || '') === '2', false
+                                        );
                                     }
                                 });
                             }
@@ -1431,11 +1541,20 @@
                         });
                     }
 
-                    // 4. Local Shipping Log (for manually shipped orders not yet synced)
-                    if (order.shipping_log && order.shipping_log.tracking_number) {
+                    // 4. Local order-system parcel history. This is the source
+                    // of truth for split-item quantities and can contain many rows.
+                    if (Array.isArray(order.shipment_parcels)) {
+                        order.shipment_parcels.forEach(function (parcel) {
+                            addCustomTracking(
+                                parcel.tracking_number, '订单系统', parcel.carrier_slug,
+                                parcel.shipped_at, parcel.items || [],
+                                !!parcel.is_partial, !!parcel.is_reship
+                            );
+                        });
+                    } else if (order.shipping_log && order.shipping_log.tracking_number) {
                         addCustomTracking(order.shipping_log.tracking_number, 'Shipping Log', order.shipping_log.carrier_slug);
                     }
-                    function addCustomTracking(tn, sourceName, provider, time) {
+                    function addCustomTracking(tn, sourceName, provider, time, items, isPartial, isReship, explicitUrl) {
                         tn = String(tn || '').trim();
                         if (!tn) return;
                         // Resolve carrier from the explicit provider/slug first; fall back to a
@@ -1447,16 +1566,27 @@
                             return String(t.tracking_number).toLowerCase() === tn.toLowerCase();
                         });
                         if (existing) {
-                            if (provider) { existing.carrier_name = resolved.name; existing.carrier_url = resolved.url; }
+                            if (provider) {
+                                existing.provider = provider;
+                                existing.carrier_name = resolved.name;
+                                existing.carrier_url = explicitUrl || resolved.url;
+                            }
                             if (!existing.time && time) existing.time = time;
+                            existing.items = mergeParcelItems(existing.items, items);
+                            existing.is_partial = existing.is_partial || !!isPartial;
+                            existing.is_reship = existing.is_reship || !!isReship;
                             return;
                         }
                         allTracking.push({
                             tracking_number: tn,
+                            provider: provider || '',
                             carrier_name: resolved.name,
-                            carrier_url: resolved.url,
+                            carrier_url: explicitUrl || resolved.url,
                             time: time || null,
-                            source: sourceName
+                            source: sourceName,
+                            items: mergeParcelItems([], items),
+                            is_partial: !!isPartial,
+                            is_reship: !!isReship
                         });
                     }
 
@@ -1499,23 +1629,36 @@
 
                     if (allTracking.length > 0) {
                         html += '<div class="col-12">';
-                        html += '<div class="info-card" style="border-color: rgba(16, 185, 129, 0.3);"><div class="card-header" style="background: linear-gradient(90deg, rgba(16, 185, 129, 0.15) 0%, transparent 100%);"><h6 style="color: #34d399;"><i class="bi bi-geo-alt-fill me-2"></i>运单追踪</h6></div>';
+                        html += '<div class="info-card" style="border-color: rgba(16, 185, 129, 0.3);"><div class="card-header d-flex align-items-center justify-content-between" style="background: linear-gradient(90deg, rgba(16, 185, 129, 0.15) 0%, transparent 100%);"><h6 class="mb-0" style="color: #34d399;"><i class="bi bi-geo-alt-fill me-2"></i>运单追踪</h6><span class="badge bg-success bg-opacity-25 text-success">共 ' + allTracking.length + ' 个包裹</span></div>';
                         html += '<div class="card-body">';
-                        html += '<button class="btn btn-sm btn-success mb-2" onclick="queryCarrier(\'' + order.id + '\', \'' + (order.number || '') + '\')"><i class="bi bi-truck me-1"></i>查物流（实时中文轨迹）</button>';
-                        allTracking.forEach(function (t) {
-                            html += '<div class="mb-2 p-2 rounded" style="background: rgba(16, 185, 129, 0.1);">';
-                            html += '<div><strong>运单号:</strong> <span class="text-info">' + t.tracking_number + '</span></div>';
-                            html += '<div><strong>物流商:</strong> ' + t.carrier_name + '</div>';
-                            if (t.time) {
-                                var d = new Date(parseInt(t.time) * 1000);
-                                if (!isNaN(d.getTime())) {
-                                    html += '<div><strong>发货日期:</strong> ' + d.toLocaleDateString('zh-CN') + '</div>';
-                                }
+                        allTracking.forEach(function (t, index) {
+                            var dateText = shipmentDate(t.time);
+                            var parcelStatus = t.is_reship ? '补发包裹' : (t.is_partial ? '部分发货' : (allTracking.length > 1 ? '最终批次' : '已发货'));
+                            var parcelBadge = t.is_reship ? 'bg-warning text-dark' : (t.is_partial ? 'bg-info bg-opacity-25 text-info' : 'bg-success bg-opacity-25 text-success');
+                            html += '<div class="mb-3 p-3 rounded" style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16,185,129,0.18);">';
+                            html += '<div class="d-flex align-items-center justify-content-between mb-2"><strong>包裹 ' + (index + 1) + '</strong><span class="badge ' + parcelBadge + '">' + parcelStatus + '</span></div>';
+                            html += '<div><strong>运单号:</strong> <span class="text-info">' + trackingEsc(t.tracking_number) + '</span></div>';
+                            html += '<div><strong>物流商:</strong> ' + trackingEsc(t.carrier_name) + '</div>';
+                            if (dateText) {
+                                html += '<div><strong>发货日期:</strong> ' + dateText + '</div>';
                             }
+                            if (t.items && t.items.length) {
+                                html += '<div class="mt-2 pt-2 border-top border-success border-opacity-25"><strong class="small">本包裹商品:</strong>';
+                                t.items.forEach(function (item) {
+                                    html += '<div class="small mt-1 ms-2"><span class="text-light">' + trackingEsc(item.name) + '</span>' +
+                                        (item.sku ? ' <code class="ms-1">' + trackingEsc(item.sku) + '</code>' : '') +
+                                        ' <span class="text-warning">× ' + (parseInt(item.qty || 0, 10) || 0) + '</span></div>';
+                                });
+                                html += '</div>';
+                            } else if (allTracking.length > 1) {
+                                html += '<div class="small text-muted mt-2">该历史包裹未记录商品明细</div>';
+                            }
+                            html += '<div class="mt-2 d-flex flex-wrap gap-2">';
+                            html += '<button class="btn btn-sm btn-success" data-order-id="' + trackingEsc(order.id) + '" data-order-number="' + trackingEsc(order.number || '') + '" data-tracking-number="' + trackingEsc(t.tracking_number) + '" onclick="queryCarrier(this.dataset.orderId, this.dataset.orderNumber, this.dataset.trackingNumber)"><i class="bi bi-truck me-1"></i>实时中文轨迹</button>';
                             if (t.carrier_url) {
-                                html += '<div class="mt-1"><a href="' + t.carrier_url + '" target="_blank" class="btn btn-sm btn-outline-success"><i class="bi bi-box-arrow-up-right me-1"></i>查询物流</a></div>';
+                                html += '<a href="' + trackingEsc(t.carrier_url) + '" target="_blank" rel="noopener" class="btn btn-sm btn-outline-success"><i class="bi bi-box-arrow-up-right me-1"></i>物流商官网</a>';
                             }
-                            html += '</div>';
+                            html += '</div></div>';
                         });
                         html += '</div></div></div>';
                     }
@@ -1530,6 +1673,19 @@
                     console.error(err);
                     document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25">加载失败: ' + err.message + '</div>';
                 });
+        }
+
+        function manualResendOrderNotification(orderId, jobId) {
+            if (!window.confirm('确认创建一条有审计记录的人工重发任务？不会绕过企业微信发送开关。')) return;
+            fetch('/api/order/' + encodeURIComponent(orderId) + '/notifications/' + encodeURIComponent(jobId) + '/resend', {
+                method: 'POST',
+                headers: {'X-Requested-With': 'XMLHttpRequest'}
+            }).then(function(response) {
+                return response.json().then(function(body) { return {ok: response.ok, body: body}; });
+            }).then(function(result) {
+                if (!result.ok) throw new Error(result.body.error || '重发任务创建失败');
+                showOrderDetail(orderId);
+            }).catch(function(error) { window.alert(error.message); });
         }
 
         // Load (or refresh) the customer email log for an order. The data
@@ -1573,8 +1729,9 @@
                         var resp = e.response ? '<div class="small text-muted mt-1" style="word-break:break-word;">' + e.response + '</div>' : '';
                         // Make the whole row clickable → open the email body modal.
                         // We use cursor:pointer + a subtle hover via inline JS to keep it self-contained.
+                        var encodedOrderId = encodeURIComponent(String(orderId));
                         var clickAttr = e.id
-                            ? 'role="button" style="cursor:pointer" onclick="showEmailDetail({order:' + orderId + ',logId:' + e.id + '})" title="点击查看邮件正文"'
+                            ? 'role="button" style="cursor:pointer" onclick="showEmailDetail({order:decodeURIComponent(\'' + encodedOrderId + '\'),logId:' + e.id + '})" title="点击查看邮件正文"'
                             : 'style="opacity:0.7"';
                         var openIcon = e.id ? '<i class="bi bi-box-arrow-up-right text-muted ms-2" style="font-size:11px;"></i>' : '';
                         return '<div class="d-flex mb-2 pb-2 border-bottom border-secondary border-opacity-25" ' + clickAttr + '>'
@@ -1793,18 +1950,23 @@
         //   showEmailDetail({order: orderId, logId: X}) — order modal context
         //   showEmailDetail({site:  siteId,  logId: X}) — customer modal context
         // Backward-compat: showEmailDetail(orderId, logId) — same as order mode.
+        function escapeEmailHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
         function showEmailDetail(scopeOrOrderId, logIdOrUndef) {
             var url;
             if (typeof scopeOrOrderId === 'object' && scopeOrOrderId !== null) {
                 if (scopeOrOrderId.order) {
-                    url = '/api/order/' + scopeOrOrderId.order + '/emails/' + scopeOrOrderId.logId;
+                    url = '/api/order/' + encodeURIComponent(scopeOrOrderId.order) + '/emails/' + encodeURIComponent(scopeOrOrderId.logId);
                 } else if (scopeOrOrderId.site) {
-                    url = '/api/site/' + scopeOrOrderId.site + '/emails/' + scopeOrOrderId.logId;
+                    url = '/api/site/' + encodeURIComponent(scopeOrOrderId.site) + '/emails/' + encodeURIComponent(scopeOrOrderId.logId);
                 } else {
                     return;
                 }
             } else {
-                url = '/api/order/' + scopeOrOrderId + '/emails/' + logIdOrUndef;
+                url = '/api/order/' + encodeURIComponent(scopeOrOrderId) + '/emails/' + encodeURIComponent(logIdOrUndef);
             }
             var modalEl = document.getElementById('emailDetailModal');
             var bodyEl = document.getElementById('emailDetailBody');
@@ -1821,7 +1983,7 @@
                     }
                     var statusBadge = (e.status === 'sent')
                         ? '<span class="badge bg-success bg-opacity-25 text-success">已发送</span>'
-                        : '<span class="badge bg-danger bg-opacity-25 text-danger">' + (e.status || 'failed') + '</span>';
+                        : '<span class="badge bg-danger bg-opacity-25 text-danger">' + escapeEmailHtml(e.status || 'failed') + '</span>';
                     var when = (e.sent_at || '').replace('T', ' ').substring(0, 19);
                     var headersStr = '';
                     if (e.headers) {
@@ -1831,38 +1993,38 @@
                     }
                     var html = '';
                     html += '<div class="row g-2 mb-3">';
-                    html += '<div class="col-md-6"><strong>主题:</strong> <span style="color:#e2e8f0;">' + (e.subject || '(无主题)') + '</span></div>';
-                    html += '<div class="col-md-6 text-md-end">' + statusBadge + (e.plugin ? ' <span class="badge bg-secondary bg-opacity-25 text-light ms-1" style="font-size:10px;">' + e.plugin + '</span>' : '') + '</div>';
-                    html += '<div class="col-md-6"><strong>收件人:</strong> <span class="text-muted" style="word-break:break-all;">' + (e.to || '-') + '</span></div>';
-                    html += '<div class="col-md-6 text-md-end"><strong>发件人:</strong> <span class="text-muted">' + (e.from || '-') + '</span></div>';
-                    html += '<div class="col-md-6"><strong>发送时间:</strong> <span class="text-muted">' + when + '</span></div>';
-                    if (e.source) html += '<div class="col-md-6 text-md-end"><strong>SMTP:</strong> <span class="text-muted">' + e.source + '</span></div>';
+                    html += '<div class="col-md-6"><strong>主题:</strong> <span style="color:#e2e8f0;">' + escapeEmailHtml(e.subject || '(无主题)') + '</span></div>';
+                    html += '<div class="col-md-6 text-md-end">' + statusBadge + (e.plugin ? ' <span class="badge bg-secondary bg-opacity-25 text-light ms-1" style="font-size:10px;">' + escapeEmailHtml(e.plugin) + '</span>' : '') + '</div>';
+                    html += '<div class="col-md-6"><strong>收件人:</strong> <span class="text-muted" style="word-break:break-all;">' + escapeEmailHtml(e.to || '-') + '</span></div>';
+                    html += '<div class="col-md-6 text-md-end"><strong>发件人:</strong> <span class="text-muted">' + escapeEmailHtml(e.from || '-') + '</span></div>';
+                    html += '<div class="col-md-6"><strong>发送时间:</strong> <span class="text-muted">' + escapeEmailHtml(when) + '</span></div>';
+                    if (e.source) html += '<div class="col-md-6 text-md-end"><strong>SMTP:</strong> <span class="text-muted">' + escapeEmailHtml(e.source) + '</span></div>';
                     html += '</div>';
 
                     if (e.response) {
-                        html += '<div class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25 small" style="word-break:break-word;"><strong>响应/错误:</strong> ' + e.response + '</div>';
+                        html += '<div class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25 small" style="word-break:break-word;"><strong>响应/错误:</strong> ' + escapeEmailHtml(e.response) + '</div>';
                     }
 
-                    // Body — sandboxed iframe so any HTML/CSS in the email
-                    // is contained and can't run scripts or load remote
-                    // tracking pixels (sandbox without allow-scripts blocks both).
+                    // Body — sandbox blocks active capabilities; an injected CSP also
+                    // blocks remote images, fonts and tracking pixels.
                     if (e.body) {
-                        var srcdocEsc = String(e.body)
+                        var isolatedBody = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src \'unsafe-inline\'; font-src \'none\'; connect-src \'none\'; frame-src \'none\'">' + String(e.body);
+                        var srcdocEsc = isolatedBody
                             .replace(/&/g, '&amp;')
                             .replace(/"/g, '&quot;');
                         html += '<div class="mt-3"><strong>正文:</strong></div>';
                         html += '<div class="bg-white rounded mt-1" style="padding:0;">';
-                        html += '<iframe sandbox style="width:100%; min-height:480px; border:0; border-radius:4px;" srcdoc="' + srcdocEsc + '"></iframe>';
+                        html += '<iframe sandbox title="邮件正文安全预览" style="width:100%; min-height:480px; border:0; border-radius:4px;" srcdoc="' + srcdocEsc + '"></iframe>';
                         html += '</div>';
                         html += '<div class="text-end mt-2"><button class="btn btn-sm btn-outline-light" onclick="document.getElementById(\'emailRawBody\').classList.toggle(\'d-none\')"><i class="bi bi-code me-1"></i>查看 HTML 源码</button></div>';
-                        html += '<pre id="emailRawBody" class="d-none mt-2 p-2 bg-black text-light small rounded" style="max-height:300px; overflow:auto; white-space:pre-wrap; word-break:break-all;">' + String(e.body).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</pre>';
+                        html += '<pre id="emailRawBody" class="d-none mt-2 p-2 bg-black text-light small rounded" style="max-height:300px; overflow:auto; white-space:pre-wrap; word-break:break-all;">' + escapeEmailHtml(e.body) + '</pre>';
                     } else {
                         html += '<div class="text-muted small">该日志条目没有保存正文（部分插件只记录元数据）</div>';
                     }
 
                     if (headersStr) {
                         html += '<details class="mt-3"><summary class="text-info" style="cursor:pointer;">邮件头</summary>';
-                        html += '<pre class="mt-2 p-2 bg-black text-light small rounded" style="max-height:200px; overflow:auto; white-space:pre-wrap;">' + headersStr.replace(/</g,'&lt;') + '</pre>';
+                        html += '<pre class="mt-2 p-2 bg-black text-light small rounded" style="max-height:200px; overflow:auto; white-space:pre-wrap;">' + escapeEmailHtml(headersStr) + '</pre>';
                         html += '</details>';
                     }
 

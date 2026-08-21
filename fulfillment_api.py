@@ -7,7 +7,7 @@ import hmac
 import os
 from functools import wraps
 
-from flask import Blueprint, jsonify, render_template, request
+from flask import Blueprint, jsonify, redirect, render_template, request
 from flask_login import current_user, login_required
 
 from fulfillment_common import get_conn, json_dump, json_load, utcnow
@@ -15,11 +15,14 @@ from fulfillment_service import (
     DomainError,
     create_shipment,
     enqueue_job,
+    joint_dispatch_fulfillments,
+    joint_dispatch_group,
     mark_manual_review,
     plan_order,
     recompute_order_status,
     transition_fulfillment,
 )
+from inv_common import replenishment_metrics
 
 
 fulfillment_bp = Blueprint("fulfillment", __name__)
@@ -382,6 +385,8 @@ def _domain_error(exc: DomainError):
 @login_required
 @fulfillment_view_required
 def fulfillment_page():
+    if not _can_manage_inventory():
+        return redirect('/shipping')
     return render_template(
         "fulfillment.html",
         can_manage_fulfillment=_can_manage_inventory(),
@@ -506,16 +511,36 @@ def fulfillment_order_detail(order_id):
         fulfillments = conn.execute(query + " ORDER BY f.warehouse_id", params).fetchall()
         if not fulfillments:
             return jsonify({"error": "没有该订单的仓库权限"}), 403
+        shortage_rows = conn.execute(
+            '''SELECT name, sku_id, shortage_qty
+               FROM oms_order_items
+               WHERE order_id=? AND shortage_qty>0
+               ORDER BY line_index,id''',
+            (order_id,),
+        ).fetchall()
+        unmapped_units = sum(
+            int(row["shortage_qty"] or 0) for row in shortage_rows if not row["sku_id"]
+        )
+        stock_short_units = sum(
+            int(row["shortage_qty"] or 0) for row in shortage_rows if row["sku_id"]
+        )
         output = []
         for fulfillment in fulfillments:
             data = dict(fulfillment)
-            data["items"] = [dict(r) for r in conn.execute(
+            item_rows = conn.execute(
                 '''SELECT fi.*, oi.name AS order_item_name, oi.ordered_qty,
                           oi.shortage_qty, oi.cancelled_qty AS order_cancelled_qty
                    FROM oms_fulfillment_items fi JOIN oms_order_items oi ON oi.id=fi.order_item_id
                    WHERE fi.fulfillment_id=? ORDER BY fi.id''',
                 (fulfillment["id"],),
-            ).fetchall()]
+            ).fetchall()
+            data["items"] = []
+            for item_row in item_rows:
+                item = dict(item_row)
+                item["stock"] = replenishment_metrics(
+                    conn, fulfillment["warehouse_id"], item_row["sku_id"]
+                )
+                data["items"].append(item)
             shipments = []
             for shipment in conn.execute(
                 "SELECT * FROM oms_shipments WHERE fulfillment_id=? ORDER BY created_at",
@@ -531,7 +556,64 @@ def fulfillment_order_detail(order_id):
                 ).fetchall()]
                 shipments.append(parcel)
             data["shipments"] = shipments
+            manual_statuses = {"ready_to_pick", "picking", "packed", "accepted"}
+            data["can_manual_ship"] = (
+                fulfillment["mode"] == "internal"
+                and fulfillment["status"] in manual_statuses
+            )
+            if fulfillment["mode"] != "internal":
+                data["manual_ship_block_reason"] = "该履约单由外部 WMS 处理，不能人工录入发货"
+            elif fulfillment["status"] == "stock_shortage":
+                if unmapped_units:
+                    data["manual_ship_block_reason"] = (
+                        f"订单还有 {unmapped_units} 件商品未建立仓库 SKU 映射，请先完成映射并重新分仓"
+                    )
+                elif stock_short_units:
+                    data["manual_ship_block_reason"] = "该仓库存不足，请补货或人工调整后重新分仓"
+                else:
+                    data["manual_ship_block_reason"] = "分仓结果需要刷新，请重新分仓后再发货"
+            elif fulfillment["status"] in {"shipped", "delivered"}:
+                data["manual_ship_block_reason"] = "该仓包裹已经发货"
+            elif fulfillment["status"] not in manual_statuses:
+                data["manual_ship_block_reason"] = f"当前状态 {fulfillment['status']} 暂不能发货"
+            else:
+                data["manual_ship_block_reason"] = None
             output.append(data)
+        # Warehouses can keep separate stock ledgers while sharing one physical
+        # packing desk.  Only pristine, fully visible groups are merged here;
+        # historical orders that already started split shipping remain intact.
+        by_id = {row["id"]: row for row in output}
+        consumed = set()
+        merged_output = []
+        for data in output:
+            if data["id"] in consumed:
+                continue
+            members = joint_dispatch_fulfillments(conn, data["id"], pristine_only=True)
+            visible_members = [by_id[row["id"]] for row in members if row["id"] in by_id]
+            if len(visible_members) != len(members) or len(visible_members) < 2:
+                merged_output.append(data)
+                consumed.add(data["id"])
+                continue
+            group = joint_dispatch_group(conn, data["warehouse_id"])
+            primary = dict(visible_members[0])
+            primary["dispatch_group"] = group["key"] if group else "joint"
+            primary["dispatch_group_label"] = group["label"] if group else "联合发货"
+            primary["dispatch_fulfillment_ids"] = [row["id"] for row in visible_members]
+            primary["warehouse_name"] = " + ".join(row["warehouse_name"] for row in visible_members)
+            primary["items"] = []
+            for member in visible_members:
+                for item in member["items"]:
+                    merged_item = dict(item)
+                    merged_item["source_warehouse_name"] = member["warehouse_name"]
+                    primary["items"].append(merged_item)
+            primary["can_manual_ship"] = all(row["can_manual_ship"] for row in visible_members)
+            primary["manual_ship_block_reason"] = next(
+                (row["manual_ship_block_reason"] for row in visible_members if row["manual_ship_block_reason"]),
+                None,
+            )
+            merged_output.append(primary)
+            consumed.update(row["id"] for row in visible_members)
+        output = merged_output
         order = conn.execute(
             "SELECT id, number, status, source, date_created FROM orders WHERE id=?", (order_id,)
         ).fetchone()
@@ -591,7 +673,34 @@ def api_create_shipment(fulfillment_id):
     body = request.get_json(silent=True) or {}
     conn = get_conn()
     try:
-        _check_fulfillment_permission(conn, fulfillment_id, "can_ship")
+        members = joint_dispatch_fulfillments(conn, fulfillment_id, pristine_only=True)
+        for fulfillment in members:
+            _check_fulfillment_permission(conn, fulfillment["id"], "can_ship")
+            if fulfillment["mode"] != "internal":
+                raise DomainError(
+                    "外部 WMS 履约单不能由发货员手工录入运单",
+                    "manual_shipment_not_allowed",
+                )
+        allowed_statuses = {"ready_to_pick", "picking", "packed", "accepted"}
+        blocked = next((row for row in members if row["status"] not in allowed_statuses), None)
+        if blocked:
+            fulfillment = blocked
+            if fulfillment["status"] == "stock_shortage":
+                unresolved = conn.execute(
+                    '''SELECT COALESCE(SUM(shortage_qty),0) AS qty
+                       FROM oms_order_items
+                       WHERE order_id=? AND shortage_qty>0 AND sku_id IS NULL''',
+                    (fulfillment["order_id"],),
+                ).fetchone()["qty"]
+                message = (
+                    f"订单还有 {int(unresolved)} 件商品未建立仓库 SKU 映射，请先完成映射并重新分仓"
+                    if unresolved
+                    else "该仓库存不足，请补货或人工调整后重新分仓"
+                )
+            else:
+                message = f"当前履约状态 {fulfillment['status']} 不能录入发货"
+            raise DomainError(message, "fulfillment_not_shippable")
+        fulfillment = members[0]
         shipment = create_shipment(
             conn,
             fulfillment_id,
@@ -601,8 +710,22 @@ def api_create_shipment(fulfillment_id):
             label_url=body.get("label_url"),
             tracking_source="internal_warehouse",
             actor=_actor(),
+            commit=False,
         )
-        return jsonify(shipment)
+        state = recompute_order_status(
+            conn, fulfillment["order_id"], actor=_actor(), commit=False
+        )
+        conn.commit()
+        return jsonify({
+            "success": True,
+            "message": (
+                "联合发货运单已录入，各仓库存已分别扣减；客户通知和 WooCommerce 同步已进入队列"
+                if shipment.get("joint_dispatch")
+                else "运单已录入，库存已扣减；客户通知和 WooCommerce 同步已进入队列"
+            ),
+            "shipment": shipment,
+            "order_state": state,
+        })
     except DomainError as exc:
         conn.rollback()
         return _domain_error(exc)

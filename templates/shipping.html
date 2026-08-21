@@ -28,7 +28,7 @@
             <button class="btn btn-success" id="exportAustraliaBtn" title="按附件的地址拆分样式，导出当前筛选条件下的澳洲已发货包裹">
                 <i class="bi bi-file-earmark-excel me-1"></i> 导出澳洲已发货
             </button>
-            <button class="btn btn-outline-success" id="exportAustraliaPendingBtn" title="按同样格式导出当前筛选条件下的澳洲未发货订单，运输单号留空">
+            <button class="btn btn-outline-success" id="exportAustraliaPendingBtn" title="按拣货表头导出当前筛选条件下的澳洲未发货订单；同一订单合并展示，口味和数量逐行保留">
                 <i class="bi bi-file-earmark-excel me-1"></i> 导出澳洲未发货
             </button>
             <a href="/au-orders" target="_blank" class="btn btn-outline-info" title="按腾讯表格样式查看全部澳洲订单（只读表格）">
@@ -93,6 +93,29 @@
                     <span class="badge bg-warning text-dark d-block mb-1" id="pendingCount">待发货: 0</span>
                     <span class="badge bg-info d-block mb-1" id="shippedCount">已发货: 0</span>
                     <span class="badge bg-secondary d-block" id="outcomeCount">待确认: 0</span>
+                </div>
+            </div>
+            <div class="row align-items-center g-3 mt-1 pt-2 border-top border-secondary border-opacity-25">
+                <div class="col-lg-7 col-md-8">
+                    <div class="input-group input-group-sm">
+                        <span class="input-group-text bg-secondary border-secondary text-white">
+                            <i class="bi bi-box-seam me-1"></i>待发货产品
+                        </span>
+                        <div class="position-relative flex-grow-1 pending-product-picker" id="pendingProductPicker">
+                            <input type="search" class="form-control bg-dark text-white border-secondary w-100"
+                                id="pendingProductFilter" autocomplete="off" aria-autocomplete="list"
+                                aria-controls="pendingProductMenu" aria-expanded="false"
+                                placeholder="输入至少 2 个字符搜索品牌 / 型号 / 口味">
+                            <div class="pending-product-menu d-none" id="pendingProductMenu" role="listbox"></div>
+                        </div>
+                        <button class="btn btn-primary" type="button" id="applyPendingProductBtn">
+                            <i class="bi bi-search me-1"></i>查看
+                        </button>
+                        <button class="btn btn-outline-light" type="button" id="clearPendingProductBtn">清除</button>
+                    </div>
+                </div>
+                <div class="col-lg-5 col-md-4 text-md-end">
+                    <span class="text-white small" id="pendingProductStats">全部产品：等待加载…</span>
                 </div>
             </div>
         </div>
@@ -333,6 +356,14 @@
                     <label class="form-label text-white-50">客户</label>
                     <div id="shipCustomerInfo" class="text-white"></div>
                 </div>
+                <div id="shipFulfillmentBlock" class="d-none mb-3">
+                    <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 text-light mb-2">
+                        <div class="fw-bold"><i class="bi bi-box-seam me-1"></i>本次发货仓库</div>
+                        <select id="shipFulfillmentSelect" class="form-select form-select-sm bg-dark text-white border-secondary mt-2"></select>
+                        <div id="shipFulfillmentDetail" class="small mt-2"></div>
+                    </div>
+                    <div id="shipFulfillmentWarning"></div>
+                </div>
                 <div class="mb-3">
                     <label class="form-label text-white-50">物流商 *</label>
                     <select class="form-select bg-dark text-white border-secondary" id="shipCarrier" required>
@@ -357,6 +388,19 @@
                     <label class="form-check-label text-white-50" for="shipSplitMode">
                         分批发货（本单分多个包裹寄出，可多次填运单号）
                     </label>
+                </div>
+                <div id="shipItemsBlock" class="d-none mb-3">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <label class="form-label text-white-50 mb-0">本批发出的商品数量</label>
+                        <button type="button" class="btn btn-sm btn-outline-info" id="shipFillRemainingBtn">填入全部剩余</button>
+                    </div>
+                    <div class="table-responsive border border-secondary border-opacity-25 rounded">
+                        <table class="table table-dark table-sm align-middle mb-0">
+                            <thead><tr><th>商品</th><th class="text-center">已发</th><th class="text-center">剩余</th><th style="width:95px">本批</th></tr></thead>
+                            <tbody id="shipItemsBody"></tbody>
+                        </table>
+                    </div>
+                    <small class="text-warning d-block mt-1">分批发货必须准确填写本包裹商品；系统会阻止超发或遗漏后直接完成。</small>
                 </div>
                 <div class="form-check mb-3">
                     <input class="form-check-input" type="checkbox" id="shipSendEmail" checked>
@@ -634,6 +678,7 @@
         </div>
     </div>
 
+    <script src="{{ url_for('static', filename='js/shipping_product_filter_compact1.js') }}"></script>
     <script>
         // Shipping EDIT permission. View-only users (can_view_shipping) see all
         // lists/tracking/查物流/print/export but no action controls. Every action
@@ -646,6 +691,77 @@
             _roStyle.textContent = '.ship-readonly .ship-action{display:none !important;}';
             document.head.appendChild(_roStyle);
         }
+        let pendingProductChoices = [];
+        let pendingProductActiveIndex = -1;
+
+        function hidePendingProductMenu() {
+            const menu = document.getElementById('pendingProductMenu');
+            const input = document.getElementById('pendingProductFilter');
+            menu.classList.add('d-none');
+            menu.replaceChildren();
+            input.setAttribute('aria-expanded', 'false');
+            pendingProductActiveIndex = -1;
+        }
+
+        function setPendingProductActive(index) {
+            const options = Array.from(document.querySelectorAll('#pendingProductMenu .pending-product-option'));
+            if (!options.length) return;
+            pendingProductActiveIndex = (index + options.length) % options.length;
+            options.forEach((option, optionIndex) => {
+                option.classList.toggle('active', optionIndex === pendingProductActiveIndex);
+            });
+            options[pendingProductActiveIndex].scrollIntoView({ block: 'nearest' });
+        }
+
+        function choosePendingProduct(name) {
+            document.getElementById('pendingProductFilter').value = name;
+            hidePendingProductMenu();
+            loadOrders();
+        }
+
+        function renderPendingProductMenu() {
+            const input = document.getElementById('pendingProductFilter');
+            const menu = document.getElementById('pendingProductMenu');
+            const matches = ShippingProductFilter.searchOptions(pendingProductChoices, input.value, 8);
+            menu.replaceChildren();
+            pendingProductActiveIndex = -1;
+
+            if (input.value.trim().length < 2) {
+                hidePendingProductMenu();
+                return;
+            }
+
+            if (!matches.length) {
+                const empty = document.createElement('div');
+                empty.className = 'px-3 py-2 text-white-50 small';
+                empty.textContent = '未找到匹配的待发货产品';
+                menu.appendChild(empty);
+            } else {
+                matches.forEach(product => {
+                    const option = document.createElement('button');
+                    option.type = 'button';
+                    option.className = 'pending-product-option';
+                    option.setAttribute('role', 'option');
+
+                    const name = document.createElement('span');
+                    name.className = 'pending-product-option-name';
+                    name.textContent = product.name;
+
+                    const count = document.createElement('span');
+                    count.className = 'pending-product-option-count';
+                    count.textContent = `${product.units} 支 / ${product.orderCount} 单`;
+
+                    option.append(name, count);
+                    option.addEventListener('mousedown', event => event.preventDefault());
+                    option.addEventListener('click', () => choosePendingProduct(product.name));
+                    menu.appendChild(option);
+                });
+            }
+
+            menu.classList.remove('d-none');
+            input.setAttribute('aria-expanded', 'true');
+        }
+
         document.addEventListener('DOMContentLoaded', function () {
             // Initialize date pickers
             var dateConfig = {
@@ -672,6 +788,43 @@
             document.getElementById('searchInput').addEventListener('keypress', function (e) {
                 if (e.key === 'Enter') loadOrders();
             });
+            const pendingProductInput = document.getElementById('pendingProductFilter');
+            pendingProductInput.addEventListener('input', renderPendingProductMenu);
+            pendingProductInput.addEventListener('focus', renderPendingProductMenu);
+            pendingProductInput.addEventListener('keydown', function (e) {
+                const visibleOptions = document.querySelectorAll('#pendingProductMenu .pending-product-option');
+                if (e.key === 'ArrowDown' && visibleOptions.length) {
+                    e.preventDefault();
+                    setPendingProductActive(pendingProductActiveIndex + 1);
+                } else if (e.key === 'ArrowUp' && visibleOptions.length) {
+                    e.preventDefault();
+                    setPendingProductActive(pendingProductActiveIndex - 1);
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (pendingProductActiveIndex >= 0 && visibleOptions[pendingProductActiveIndex]) {
+                        visibleOptions[pendingProductActiveIndex].click();
+                    } else {
+                        hidePendingProductMenu();
+                        loadOrders();
+                    }
+                } else if (e.key === 'Escape') {
+                    hidePendingProductMenu();
+                }
+            });
+            document.addEventListener('click', function (e) {
+                if (!document.getElementById('pendingProductPicker').contains(e.target)) {
+                    hidePendingProductMenu();
+                }
+            });
+            document.getElementById('applyPendingProductBtn').addEventListener('click', function () {
+                hidePendingProductMenu();
+                loadOrders();
+            });
+            document.getElementById('clearPendingProductBtn').addEventListener('click', function () {
+                document.getElementById('pendingProductFilter').value = '';
+                hidePendingProductMenu();
+                loadOrders();
+            });
 
             // Tab change - reload data
             document.querySelectorAll('#shippingTabs a').forEach(tab => {
@@ -685,6 +838,14 @@
             // Toggling 分批发货 swaps the single button for the dual buttons.
             document.getElementById('shipSplitMode').addEventListener('change', function () {
                 setShipMode(this.checked);
+            });
+            document.getElementById('shipFillRemainingBtn').addEventListener('click', function () {
+                document.querySelectorAll('.ship-item-qty').forEach(input => {
+                    input.value = input.dataset.remaining || '0';
+                });
+            });
+            document.getElementById('shipFulfillmentSelect').addEventListener('change', function () {
+                renderFulfillmentShipOption(this.value);
             });
 
             // Big-order acknowledgment gates the ship buttons
@@ -858,13 +1019,23 @@
             fetch(`/api/shipping/pending?${params.toString()}`)
                 .then(res => res.json())
                 .then(orders => {
-                    document.getElementById('pendingCount').textContent = `待发货: ${orders.length}`;
+                    const productInput = document.getElementById('pendingProductFilter');
+                    const productOptions = ShippingProductFilter.productOptions(orders);
+                    pendingProductChoices = productOptions;
+                    hidePendingProductMenu();
+
+                    const productResult = ShippingProductFilter.summarize(orders, productInput.value);
+                    const visibleOrders = productResult.orders;
+                    document.getElementById('pendingCount').textContent = `待发货: ${productResult.orderCount} 单 / ${productResult.units} 支`;
+                    document.getElementById('pendingProductStats').textContent = productResult.query
+                        ? `“${productResult.query}”：${productResult.orderCount} 个订单 · ${productResult.units} 支待发货${productResult.exactMatch ? '' : ' · 模糊匹配'}`
+                        : `全部产品：${productResult.productCount} 种 · ${productResult.orderCount} 个订单 · ${productResult.units} 支待发货`;
                     const tbody = document.getElementById('pendingOrdersBody');
-                    if (orders.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">暂无待发货订单</td></tr>';
+                    if (visibleOrders.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">没有符合该产品条件的待发货订单</td></tr>';
                         return;
                     }
-                    tbody.innerHTML = orders.map(o => {
+                    tbody.innerHTML = visibleOrders.map(o => {
                     // High-risk rows: stronger tint to grab attention even when
                     // it's not also a "big order". Falls back to the big-order
                     // tint, then no tint.
@@ -879,7 +1050,7 @@
                     return `
                 <tr data-editsrc="${o.source || ''}"${rowStyle}>
                     <td class="ps-3">
-                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : ''}${o.has_shortage ? ' <span class="badge bg-danger"><i class="bi bi-exclamation-octagon-fill me-1"></i>缺货</span>' : ''}${o.manual_review ? ` <span class="badge bg-danger" title="${o.manual_reason || ''}">人工处理</span>` : ''}</div>
+                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.shipment_sync_pending ? ' <span class="badge bg-danger"><i class="bi bi-cloud-slash me-1"></i>发货同步失败</span>' : (o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : '')}${o.has_shortage ? ' <span class="badge bg-danger"><i class="bi bi-exclamation-octagon-fill me-1"></i>缺货</span>' : ''}${o.manual_review ? ` <span class="badge bg-danger" title="${o.manual_reason || ''}">人工处理</span>` : ''}</div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
                         ${o.fulfillment_warehouses && o.fulfillment_warehouses.length ? `<small class="d-block text-warning"><i class="bi bi-boxes me-1"></i>${o.fulfillment_warehouses.join(' + ')}</small>` : ''}
                         <small class="text-muted d-block"><i class="bi bi-calendar3 me-1"></i>下单 ${o.date_created ? o.date_created.replace('T', ' ').substring(0, 16) : '-'}</small>
@@ -966,7 +1137,7 @@
                         <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="printLabel('${o.id}')" title="打印">
                             <i class="bi bi-printer"></i>
                         </a>
-                        ${o.fulfillment_status ? `<a class="btn btn-sm btn-warning px-3" href="/fulfillment?search=${encodeURIComponent(o.number)}"><i class="bi bi-boxes me-1"></i>多仓处理</a>` : `<button class="ship-action btn btn-sm ${o.parcels_shipped ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal("${o.id}", ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])})'><i class="bi bi-truck me-1"></i>${o.parcels_shipped ? '继续发货' : '发货'}</button>`}
+                        <button class="ship-action btn btn-sm ${o.fulfillment_status || o.parcels_shipped || o.shipment_sync_pending ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal("${o.id}", ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source_url || o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])}, ${JSON.stringify(encodeURIComponent(JSON.stringify(o.products || [])))}, ${JSON.stringify(o.fulfillment_status || "")}, ${JSON.stringify(o.pending_shipment || null)})'><i class="bi bi-truck me-1"></i>${o.fulfillment_status ? '发货' : (o.shipment_sync_pending ? '重试同步' : (o.parcels_shipped ? '继续发货' : '发货'))}</button>
                     </td>
                 </tr>
             `;
@@ -1385,12 +1556,39 @@
             runConfirmBatch(cutoffIds.slice(), `${date} 之前的历史遗留单（一刀切）`);
         }
 
-        function openShipModal(orderId, orderNumber, customerName, customerAddress, source, isBigOrder, bigOrderReasons, warehouseName, customerRisk, parcels) {
+        let _shipProducts = [];
+        let _shipParcels = [];
+        let _shipFulfillments = [];
+        let _shipFulfillmentId = null;
+        let _shipFulfillmentLoading = false;
+        let _shipUsesFulfillment = false;
+        let _shipSource = '';
+
+        function shipEscape(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function openShipModal(orderId, orderNumber, customerName, customerAddress, source, isBigOrder, bigOrderReasons, warehouseName, customerRisk, parcels, products, fulfillmentStatus, pendingShipment) {
             document.getElementById('shipOrderId').value = orderId;
             document.getElementById('shipOrderNumber').value = '#' + orderNumber;
+            _shipSource = source || '';
+            _shipFulfillments = [];
+            _shipFulfillmentId = null;
+            _shipFulfillmentLoading = false;
+            _shipUsesFulfillment = false;
+            document.getElementById('shipFulfillmentBlock').classList.add('d-none');
+            document.getElementById('shipFulfillmentDetail').innerHTML = '';
+            document.getElementById('shipFulfillmentWarning').innerHTML = '';
             // Surface the warehouse in the modal so the shipper sees where the
             // goods are fulfilled from (drives the default carrier choice).
             const whHint = warehouseName ? `<small class="text-info d-block">出库: ${warehouseName}</small>` : '';
+            pendingShipment = pendingShipment || null;
+            const syncWarning = pendingShipment
+                ? '<div class="alert alert-danger py-2 mt-2 mb-0"><b>上次发货未同步到站点。</b>请核对预填运单号后重试；这不是分批发货。</div>'
+                : '';
             // Surface the prior-freeloader risk as a prominent banner BEFORE
             // the shipper can pick a carrier — they should pause and verify
             // the order before sending a known scammer more goods.
@@ -1400,24 +1598,116 @@
         <div class="fw-bold">${customerName}</div>
         <small class="text-muted">${customerAddress}</small>
         ${whHint}
+        ${syncWarning}
     `;
-            document.getElementById('shipTrackingNumber').value = '';
+            document.getElementById('shipTrackingNumber').value = pendingShipment ? (pendingShipment.tracking_number || '') : '';
             document.getElementById('shipSendEmail').checked = true;
+            document.getElementById('shipSendEmail').disabled = false;
 
             // Split-shipment (分批发货) state. If the order already has parcels
             // it's a continuation: force split mode and hide the toggle so the
             // shipper can only 继续/完成 (never accidentally overwrite history).
             parcels = parcels || [];
+            try {
+                _shipProducts = typeof products === 'string'
+                    ? JSON.parse(decodeURIComponent(products)) : (products || []);
+            } catch (_) {
+                _shipProducts = [];
+            }
+            _shipParcels = parcels;
             renderShipParcels(parcels);
+            renderShipItems(_shipProducts, _shipParcels);
             const hasParcels = parcels.length > 0;
             const splitChk = document.getElementById('shipSplitMode');
             splitChk.checked = hasParcels;
-            document.getElementById('shipSplitModeWrap').classList.toggle('d-none', hasParcels);
-            setShipMode(hasParcels);
+            document.getElementById('shipSplitModeWrap').classList.toggle('d-none', hasParcels || !!pendingShipment);
+            setShipMode(hasParcels && !pendingShipment);
 
             applyBigOrderGate(isBigOrder, bigOrderReasons);
-            loadCarriersForSite(source, warehouseName || '');
+            loadCarriersForSite(source, warehouseName || '', 'shipCarrier', pendingShipment ? (pendingShipment.carrier_slug || '') : '');
             bootstrap.Modal.getOrCreateInstance(document.getElementById('shipModal')).show();
+            if (fulfillmentStatus) {
+                _shipUsesFulfillment = true;
+                _shipFulfillmentLoading = true;
+                document.getElementById('shipFulfillmentBlock').classList.remove('d-none');
+                document.getElementById('shipFulfillmentDetail').innerHTML = '<span class="text-white-50"><span class="spinner-border spinner-border-sm me-1"></span>正在读取分仓结果...</span>';
+                document.getElementById('shipSplitModeWrap').classList.add('d-none');
+                document.getElementById('shipSplitMode').checked = false;
+                document.getElementById('shipSendEmail').checked = true;
+                document.getElementById('shipSendEmail').disabled = true;
+                setShipMode(false);
+                updateShipBtnState();
+                loadFulfillmentShipOptions(orderId);
+            }
+        }
+
+        async function loadFulfillmentShipOptions(orderId) {
+            const detail = document.getElementById('shipFulfillmentDetail');
+            const warning = document.getElementById('shipFulfillmentWarning');
+            try {
+                const response = await fetch('/api/fulfillment/order/' + encodeURIComponent(orderId));
+                let data = null;
+                try { data = await response.json(); } catch (_) {}
+                if (!response.ok) throw new Error((data && data.error) || `HTTP ${response.status}`);
+                _shipFulfillments = data.fulfillments || [];
+                const select = document.getElementById('shipFulfillmentSelect');
+                select.innerHTML = _shipFulfillments.map(f => {
+                    const suffix = f.can_manual_ship ? '待发货' : (f.manual_ship_block_reason || f.status);
+                    const name = f.dispatch_group_label || f.warehouse_name || '未命名仓库';
+                    return `<option value="${shipEscape(f.id)}">${shipEscape(name)} · ${shipEscape(suffix)}</option>`;
+                }).join('');
+                select.disabled = _shipFulfillments.length <= 1;
+                const first = _shipFulfillments.find(f => f.can_manual_ship) || _shipFulfillments[0];
+                if (!first) throw new Error('当前账号没有可见的履约仓库');
+                select.value = first.id;
+                renderFulfillmentShipOption(first.id);
+            } catch (error) {
+                _shipFulfillmentId = null;
+                detail.innerHTML = '';
+                warning.innerHTML = `<div class="alert alert-danger py-2 mb-0">读取分仓失败：${shipEscape(error.message || error)}</div>`;
+            } finally {
+                _shipFulfillmentLoading = false;
+                updateShipBtnState();
+            }
+        }
+
+        function renderFulfillmentShipOption(fulfillmentId) {
+            const f = _shipFulfillments.find(row => String(row.id) === String(fulfillmentId));
+            const detail = document.getElementById('shipFulfillmentDetail');
+            const warning = document.getElementById('shipFulfillmentWarning');
+            if (!f) {
+                _shipFulfillmentId = null;
+                detail.innerHTML = '';
+                warning.innerHTML = '<div class="alert alert-danger py-2 mb-0">履约仓库不存在</div>';
+                updateShipBtnState();
+                return;
+            }
+            _shipFulfillmentId = f.can_manual_ship ? f.id : null;
+            const rows = (f.items || []).map(item => {
+                const remaining = Math.max(0, Number(item.allocated_qty || 0) - Number(item.fulfilled_qty || 0) - Number(item.cancelled_qty || 0));
+                const stock = item.stock || {};
+                const stockText = stock.managed_transfer
+                    ? `<span class="${stock.is_low_stock ? 'text-warning fw-bold' : 'text-success'}">仓库可用 ${stock.available}</span>`
+                    : '<span class="text-muted">合作仓人工备货</span>';
+                const source = item.source_warehouse_name
+                    ? `<span class="badge bg-secondary bg-opacity-50 ms-1">${shipEscape(item.source_warehouse_name)}</span>` : '';
+                return `<tr><td>${shipEscape(item.order_item_name || item.name_snapshot || item.sku_code_snapshot)}${source}</td><td class="text-center fw-bold">${remaining}</td><td class="text-end">${stockText}</td></tr>`;
+            }).join('');
+            const dispatchTitle = f.dispatch_group_label || f.warehouse_name || '';
+            const dispatchHint = f.dispatch_group
+                ? ' · 联合装箱，只需录入一个运单号；库存仍按来源仓分别扣减'
+                : ' · 只发下列商品';
+            detail.innerHTML = `<div class="mb-1"><b>${shipEscape(dispatchTitle)}</b>${dispatchHint}</div><div class="table-responsive"><table class="table table-dark table-sm mb-0"><thead><tr><th>商品</th><th class="text-center">本包数量</th><th class="text-end">库存</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+            const low = (f.items || []).filter(item => item.stock && item.stock.managed_transfer && item.stock.is_low_stock);
+            if (!f.can_manual_ship) {
+                warning.innerHTML = `<div class="alert alert-danger py-2 mb-0"><i class="bi bi-exclamation-triangle-fill me-1"></i>${shipEscape(f.manual_ship_block_reason || '该履约单暂不能发货')}</div>`;
+            } else if (low.length) {
+                warning.innerHTML = `<div class="alert alert-warning py-2 mb-0"><b>库存不足提醒：</b>${low.map(item => `${shipEscape(item.sku_code_snapshot || item.name_snapshot)} 可用 ${item.stock.available}，建议补 ${item.stock.suggested_replenishment}`).join('；')}</div>`;
+            } else {
+                warning.innerHTML = '<div class="small text-success"><i class="bi bi-check-circle me-1"></i>录入后将自动扣减该仓库存，并同步 WooCommerce / AST 与客户邮件。</div>';
+            }
+            loadCarriersForSite(_shipSource, f.warehouse_name || '');
+            updateShipBtnState();
         }
 
         // Render the already-shipped parcels list inside the modal.
@@ -1452,11 +1742,43 @@
             block.classList.remove('d-none');
         }
 
+        function renderShipItems(products, parcels) {
+            const body = document.getElementById('shipItemsBody');
+            const shipped = {};
+            (parcels || []).forEach(parcel => {
+                (parcel.items || []).forEach(item => {
+                    const key = String(item.item_id || '');
+                    shipped[key] = (shipped[key] || 0) + Number(item.qty || 0);
+                });
+            });
+            body.innerHTML = (products || []).map(product => {
+                const key = String(product.item_id || '');
+                const ordered = Number(product.quantity || 0);
+                const sent = shipped[key] || 0;
+                const remaining = Math.max(ordered - sent, 0);
+                return `<tr>
+                    <td class="small">${shipEscape(product.name || `商品行 ${key}`)}</td>
+                    <td class="text-center text-info">${sent}</td>
+                    <td class="text-center text-warning">${remaining}</td>
+                    <td><input type="number" min="0" max="${remaining}" value="0"
+                        class="form-control form-control-sm bg-dark text-white border-secondary ship-item-qty"
+                        data-item-id="${shipEscape(key)}" data-remaining="${remaining}" ${remaining ? '' : 'disabled'}></td>
+                </tr>`;
+            }).join('') || '<tr><td colspan="4" class="text-danger small">订单缺少可发货商品行，请联系管理员。</td></tr>';
+        }
+
+        function collectShippedItems() {
+            return Array.from(document.querySelectorAll('.ship-item-qty'))
+                .map(input => ({ item_id: input.dataset.itemId, qty: Number(input.value || 0) }))
+                .filter(item => Number.isInteger(item.qty) && item.qty > 0);
+        }
+
         // Swap between the single-shipment button and the dual split buttons.
         function setShipMode(split) {
             document.getElementById('confirmShipBtn').classList.toggle('d-none', split);
             document.getElementById('shipContinueBtn').classList.toggle('d-none', !split);
             document.getElementById('shipFinalBtn').classList.toggle('d-none', !split);
+            document.getElementById('shipItemsBlock').classList.toggle('d-none', !split);
             updateShipBtnState();
         }
 
@@ -1477,7 +1799,8 @@
         }
 
         function updateShipBtnState() {
-            const disabled = !document.getElementById('bigOrderAck').checked;
+            const fulfillmentBlocked = _shipFulfillmentLoading || (_shipUsesFulfillment && !_shipFulfillmentId);
+            const disabled = !document.getElementById('bigOrderAck').checked || fulfillmentBlocked;
             ['confirmShipBtn', 'shipContinueBtn', 'shipFinalBtn'].forEach(id => {
                 const b = document.getElementById(id);
                 if (b) b.disabled = disabled;
@@ -1491,7 +1814,25 @@
         // warehouseName: if given, we pick the default selection based on it
         // ("国内发*" → EMS, "澳洲仓*" → Australia Post, etc). The full list of
         // carriers is still shown so the shipper can manually override.
-        function loadCarriersForSite(source, warehouseName, selectId = 'shipCarrier') {
+        function fetchCarrierList(url) {
+            return fetch(url).then(async response => {
+                let payload = null;
+                try {
+                    payload = await response.json();
+                } catch (_) {
+                    // The status check below supplies a useful HTTP error.
+                }
+                if (!response.ok) {
+                    throw new Error((payload && payload.error) || `HTTP ${response.status}`);
+                }
+                if (!Array.isArray(payload)) {
+                    throw new Error('物流商响应格式错误');
+                }
+                return payload;
+            });
+        }
+
+        function loadCarriersForSite(source, warehouseName, selectId = 'shipCarrier', preferredSlug = '') {
             const sel = document.getElementById(selectId);
             sel.innerHTML = '<option value="">加载中...</option>';
             sel.disabled = true;
@@ -1500,21 +1841,24 @@
                 ? `/api/shipping/carriers-for-site?source=${encodeURIComponent(source)}`
                 : '/api/shipping/carriers';
 
-            fetch(url)
-                .then(r => r.json())
+            fetchCarrierList(url)
                 .then(carriers => {
                     sel.disabled = false;
-                    if (!Array.isArray(carriers) || carriers.length === 0) {
+                    if (carriers.length === 0) {
                         // Site has no shipping history yet — fall back to global list
-                        return fetch('/api/shipping/carriers').then(r => r.json()).then(globalList => {
-                            renderCarrierOptions(sel, globalList, true, warehouseName);
+                        return fetchCarrierList('/api/shipping/carriers').then(globalList => {
+                            renderCarrierOptions(sel, globalList, true, warehouseName, preferredSlug);
                         });
                     }
-                    renderCarrierOptions(sel, carriers, false, warehouseName);
+                    renderCarrierOptions(sel, carriers, false, warehouseName, preferredSlug);
                 })
-                .catch(() => {
-                    sel.disabled = false;
-                    sel.innerHTML = '<option value="">加载失败 — 请手动输入</option>';
+                .catch(error => {
+                    sel.innerHTML = '';
+                    const option = document.createElement('option');
+                    option.value = '';
+                    option.textContent = `加载失败：${error.message || '未知错误'}`;
+                    sel.appendChild(option);
+                    sel.disabled = true;
                 });
         }
 
@@ -1533,7 +1877,7 @@
             return '';
         }
 
-        function renderCarrierOptions(sel, carriers, isFallback, warehouseName) {
+        function renderCarrierOptions(sel, carriers, isFallback, warehouseName, preferredSlug = '') {
             const opts = ['<option value="">选择物流商</option>'];
             carriers.forEach(c => {
                 const hint = c.usage_count
@@ -1549,7 +1893,9 @@
             // Prefer warehouse-based default. Fall back to single-option auto-select.
             const slugs = carriers.map(c => c.slug);
             const defaultSlug = defaultCarrierForWarehouse(warehouseName, slugs);
-            if (defaultSlug) {
+            if (preferredSlug && slugs.indexOf(preferredSlug) >= 0) {
+                sel.value = preferredSlug;
+            } else if (defaultSlug) {
                 sel.value = defaultSlug;
             } else if (carriers.length === 1) {
                 sel.value = carriers[0].slug;
@@ -1558,6 +1904,11 @@
 
         // For orders already in on-hold status but without tracking
         function openShipModalForExisting(orderId, orderNumber, customerName) {
+            _shipFulfillments = [];
+            _shipFulfillmentId = null;
+            _shipFulfillmentLoading = false;
+            _shipUsesFulfillment = false;
+            document.getElementById('shipFulfillmentBlock').classList.add('d-none');
             document.getElementById('shipOrderId').value = orderId;
             document.getElementById('shipOrderNumber').value = '#' + orderNumber;
             document.getElementById('shipCustomerInfo').innerHTML = `
@@ -1567,6 +1918,7 @@
             document.getElementById('shipCarrier').value = '';
             document.getElementById('shipTrackingNumber').value = '';
             document.getElementById('shipSendEmail').checked = false; // 不默认发邮件，因为可能已经通知过
+            document.getElementById('shipSendEmail').disabled = false;
             // Correction/backfill is always single-shipment.
             renderShipParcels([]);
             document.getElementById('shipSplitMode').checked = false;
@@ -1590,8 +1942,23 @@
                 return;
             }
 
+            if (_shipUsesFulfillment && !_shipFulfillmentId) {
+                alert('当前分仓履约不能发货，请先处理缺货或外部 WMS 状态');
+                return;
+            }
+
+            if (_shipFulfillmentId) {
+                shipFulfillmentOrder(carrier, trackingNumber);
+                return;
+            }
+
             const newParcel = (mode === 'continue' || mode === 'final');
             const moreBatches = (mode === 'continue');
+            const shippedItems = newParcel ? collectShippedItems() : [];
+            if (newParcel && shippedItems.length === 0) {
+                alert('请选择本批实际发出的商品数量');
+                return;
+            }
 
             // Disable every action button + spin the one that was clicked.
             const btnIds = ['confirmShipBtn', 'shipContinueBtn', 'shipFinalBtn'];
@@ -1619,7 +1986,8 @@
                     tracking_number: trackingNumber,
                     send_email: sendEmail,
                     new_parcel: newParcel,
-                    more_batches: moreBatches
+                    more_batches: moreBatches,
+                    shipped_items: shippedItems
                 })
             })
                 .then(res => res.json())
@@ -1632,6 +2000,13 @@
                             const carrierSel = document.getElementById('shipCarrier');
                             const carrierName = carrierSel.options[carrierSel.selectedIndex] ? carrierSel.options[carrierSel.selectedIndex].text : carrier;
                             appendShipParcel(carrierName, trackingNumber);
+                            _shipParcels.push({
+                                carrier_name: carrierName,
+                                tracking_number: trackingNumber,
+                                items: shippedItems,
+                                is_partial: true
+                            });
+                            renderShipItems(_shipProducts, _shipParcels);
                             document.getElementById('shipTrackingNumber').value = '';
                             document.getElementById('shipTrackingNumber').focus();
                             showToast(data.message, 'success');
@@ -1650,6 +2025,42 @@
                     restore();
                     alert('请求失败: ' + err);
                 });
+        }
+
+        async function shipFulfillmentOrder(carrier, trackingNumber) {
+            const btnIds = ['confirmShipBtn', 'shipContinueBtn', 'shipFinalBtn'];
+            const button = document.getElementById('confirmShipBtn');
+            const original = button.innerHTML;
+            btnIds.forEach(id => { const el = document.getElementById(id); if (el) el.disabled = true; });
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>处理中...';
+            const carrierSelect = document.getElementById('shipCarrier');
+            const carrierName = carrierSelect.options[carrierSelect.selectedIndex]
+                ? carrierSelect.options[carrierSelect.selectedIndex].text.replace(/ · .*$/, '')
+                : carrier;
+            try {
+                const response = await fetch(`/api/fulfillment/${encodeURIComponent(_shipFulfillmentId)}/shipment`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        tracking_number: trackingNumber,
+                        carrier_slug: carrier,
+                        carrier_name: carrierName
+                    })
+                });
+                let data = null;
+                try { data = await response.json(); } catch (_) {}
+                if (!response.ok || !data || !data.success) {
+                    throw new Error((data && data.error) || `HTTP ${response.status}`);
+                }
+                bootstrap.Modal.getInstance(document.getElementById('shipModal')).hide();
+                showToast(data.message || '发货成功', 'success');
+                loadOrders();
+            } catch (error) {
+                alert('发货失败: ' + (error.message || error));
+            } finally {
+                button.innerHTML = original;
+                updateShipBtnState();
+            }
         }
 
         // ---- 补发货 (re-shipment) ----
@@ -2441,6 +2852,58 @@
         }
 
         /* Product Item Styling - Matching Orders List Structure */
+        .pending-product-picker {
+            min-width: 0;
+        }
+
+        .pending-product-menu {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            width: min(760px, 100%);
+            max-height: 284px;
+            overflow-y: auto;
+            z-index: 1080;
+            padding: 4px;
+            border: 1px solid rgba(148, 163, 184, 0.45);
+            border-radius: 8px;
+            background: #111827;
+            box-shadow: 0 14px 36px rgba(0, 0, 0, 0.45);
+        }
+
+        .pending-product-option {
+            width: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 8px 10px;
+            border: 0;
+            border-radius: 6px;
+            background: transparent;
+            color: #e2e8f0;
+            text-align: left;
+        }
+
+        .pending-product-option:hover,
+        .pending-product-option.active {
+            background: rgba(102, 126, 234, 0.24);
+            color: #fff;
+        }
+
+        .pending-product-option-name {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .pending-product-option-count {
+            flex-shrink: 0;
+            color: #94a3b8;
+            font-size: 0.82rem;
+        }
+
         .product-item {
             display: flex;
             align-items: center;

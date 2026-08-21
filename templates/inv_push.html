@@ -1,23 +1,23 @@
 {% extends "base.html" %}
-{% block title %}库存下推/对账 - 苍赋管理系统{% endblock %}
+{% block title %}Woo库存同步 - 苍赋管理系统{% endblock %}
 {% block content %}
 <div class="container-fluid py-4">
-  <h5 class="text-light mb-3"><i class="bi bi-cloud-upload me-2"></i>库存下推 / 对账
-    <span class="text-white-50 small ms-2">可用 = 现存 − 预留,按市场服务仓汇总后推送各站 WC</span></h5>
+  <h5 class="text-light mb-3"><i class="bi bi-cloud-upload me-2"></i>Woo库存同步
+    <span class="text-white-50 small ms-2">仅同步维护真实数量的仓库；人工合作仓不会参与</span></h5>
 
   <div class="alert alert-secondary bg-dark border-secondary text-white-50 small py-2">
-    <i class="bi bi-info-circle me-1"></i>下推复用 Product Manager 的库存写白名单(仅写 manage_stock / stock_quantity)。
-    定时下推请用 <code>inv_push_cron.py</code>(与拉单错峰)。本页"演练"只计算不写 WC。
+    <i class="bi bi-info-circle me-1"></i>这是管理员工具：把订单系统的可售库存同步到 WooCommerce（仅写 manage_stock / stock_quantity）。
+    金毅金谷等不维护数量的人工仓自动排除；“演练”只计算，不修改站点。
   </div>
 
   <div class="d-flex gap-2 mb-3 align-items-center">
     <select id="site" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:320px" onchange="loadStock()">
       <option value="">选择站点</option>{% for s in sites %}<option value="{{ s.id }}">{{ s.url }} ({{ s.country }})</option>{% endfor %}
     </select>
-    <button class="btn btn-sm btn-outline-info" onclick="loadStock()"><i class="bi bi-calculator"></i> 计算可发布</button>
+    <button class="btn btn-sm btn-outline-info" onclick="loadStock()"><i class="bi bi-calculator"></i> 计算可同步库存</button>
     {% if is_inv_admin %}
-    <button class="btn btn-sm btn-outline-light" onclick="push(true)"><i class="bi bi-play"></i> 演练下推</button>
-    <button class="btn btn-sm btn-danger" onclick="push(false)"><i class="bi bi-cloud-upload"></i> 真实下推 WC</button>
+    <button class="btn btn-sm btn-outline-light" onclick="push(true)"><i class="bi bi-play"></i> 同步演练</button>
+    <button class="btn btn-sm btn-danger" onclick="push(false)"><i class="bi bi-cloud-upload"></i> 同步到 Woo</button>
     {% endif %}
     <span id="msg" class="small text-info"></span>
   </div>

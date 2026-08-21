@@ -1,22 +1,72 @@
 {% extends "base.html" %}
-{% block title %}SKU 主档 - 苍赋管理系统{% endblock %}
+{% block title %}仓库 SKU 与站点映射 - 苍赋管理系统{% endblock %}
 {% block content %}
 <div class="container-fluid py-4">
   <div class="d-flex justify-content-between align-items-center mb-3">
-    <h5 class="text-light mb-0"><i class="bi bi-upc-scan me-2"></i>SKU 主档与站点映射
-      <span class="text-white-50 small ms-2">库存最小单位 · WC商品↔SKU · 订单解析</span></h5>
+    <h5 class="text-light mb-0"><i class="bi bi-diagram-3 me-2"></i>仓库 SKU 与站点映射
+      <span class="text-white-50 small ms-2">仓库商品 → 订单系统 SKU → WooCommerce 商品/变体</span></h5>
+  </div>
+
+  <div class="alert alert-secondary bg-dark border-secondary text-white-50 small py-2">
+    <i class="bi bi-shield-check me-1 text-success"></i>
+    先选择仓库，只显示该仓实际负责的 SKU。系统只自动绑定“SKU/条码完全一致”或“完整名称唯一一致”的商品；名称近似项必须人工确认，避免错仓发货。
   </div>
 
   <ul class="nav nav-tabs mb-3" role="tablist">
-    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tabSku">SKU 主档</button></li>
-    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabMap">站点映射</button></li>
+    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tabWarehouse">按仓库映射</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabSku">SKU 主档</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabMap">映射记录</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabUnmapped" onclick="scanUnmapped()">未映射发现</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabResolve">订单解析预览</button></li>
   </ul>
 
   <div class="tab-content">
+    <!-- 仓库优先映射 -->
+    <div class="tab-pane fade show active" id="tabWarehouse">
+      <div class="d-flex flex-wrap gap-2 mb-3 align-items-center">
+        <select id="warehouseMapWh" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:320px" onchange="loadMappingOverview()">
+          <option value="">选择有 SKU 的仓库</option>
+          {% for w in warehouses %}<option value="{{ w.id }}">{{ w.name }}（{{ w.sku_count }} 个 SKU）</option>{% endfor %}
+        </select>
+        <button class="btn btn-sm btn-outline-info" onclick="scanAllServingSites()"><i class="bi bi-radar"></i> 扫描全部服务站点</button>
+        <span id="mappingGlobalMsg" class="small text-info"></span>
+      </div>
+
+      <div class="card data-card mb-3"><div class="card-body p-0"><div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead><tr class="text-white-50 small"><th>服务站点</th><th>市场</th><th>已映射仓库SKU</th><th>该站已上架相关商品</th><th>状态</th><th>最近扫描</th><th class="text-end">操作</th></tr></thead>
+          <tbody id="mappingOverviewTb"><tr><td colspan="7" class="text-center text-white-50 py-4">请选择仓库</td></tr></tbody>
+        </table>
+      </div></div></div>
+
+      <div id="mappingDetailBox" class="d-none">
+        <div class="d-flex flex-wrap gap-2 mb-2 align-items-center bg-dark py-2" style="position:sticky;top:70px;z-index:20">
+          <h6 class="text-light mb-0 me-2"><i class="bi bi-shop me-1"></i><span id="mappingDetailSite"></span></h6>
+          <button class="btn btn-sm btn-outline-warning" onclick="scanCurrentSite()"><i class="bi bi-arrow-repeat"></i> 重新扫描该站</button>
+          <button class="btn btn-sm btn-success" id="safeAutoBtn" onclick="safeAutoMap()"><i class="bi bi-link-45deg"></i> 安全自动映射</button>
+          <button class="btn btn-sm btn-primary" id="batchConfirmBtn" onclick="confirmSelectedCandidates()"><i class="bi bi-check2-square"></i> 批量确认选中</button>
+          <select id="mappingStatusFilter" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:180px" onchange="renderMappingDetail()">
+            <option value="action">只看待处理</option><option value="all">全部仓库 SKU</option><option value="mapped">只看已映射</option>
+          </select>
+          <span id="mappingDetailMsg" class="small text-info"></span>
+        </div>
+        <div class="card data-card mb-3"><div class="card-body p-0"><div class="table-responsive">
+          <table class="table table-dark table-hover align-middle mb-0">
+            <thead><tr class="text-white-50 small"><th style="width:42px"><input class="form-check-input" type="checkbox" id="mappingSelectAll" onchange="toggleAllCandidates(this.checked)" title="全选当前候选"></th><th>仓库 SKU</th><th>仓库库存</th><th>该站商品/变体</th><th>识别结果</th><th class="text-end">操作</th></tr></thead>
+            <tbody id="mappingDetailTb"></tbody>
+          </table>
+        </div></div></div>
+        <div id="unresolvedCatalogBox" class="d-none">
+          <h6 class="text-warning"><i class="bi bi-exclamation-triangle me-1"></i>该站已上架但系统无法判断的商品</h6>
+          <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
+            <table class="table table-dark table-hover align-middle mb-0"><thead><tr class="text-white-50 small"><th>商品/变体</th><th>WC ID</th><th>WC SKU</th><th class="text-end">操作</th></tr></thead><tbody id="unresolvedCatalogTb"></tbody></table>
+          </div></div></div>
+        </div>
+      </div>
+    </div>
+
     <!-- SKU 主档 -->
-    <div class="tab-pane fade show active" id="tabSku">
+    <div class="tab-pane fade" id="tabSku">
       <div class="d-flex gap-2 mb-2">
         <input id="skuSearch" class="form-control form-control-sm bg-dark text-white border-secondary" style="max-width:280px" placeholder="搜索 编码/名称/条码" oninput="loadSkus()">
         {% if can_manage_inv %}<button class="btn btn-sm btn-primary" onclick="openSkuModal()"><i class="bi bi-plus-lg"></i> 新建 SKU</button>{% endif %}
@@ -213,7 +263,8 @@ function openMapModal(prefill){document.getElementById('mapModalTitle').textCont
   document.getElementById('mapSite').value='';document.getElementById('mapSkuChosen').textContent='未选';
   document.getElementById('mapSkuResults').innerHTML='';
   if(prefill){document.getElementById('mapSite').value=prefill.site_id||'';document.getElementById('mapPid').value=prefill.wc_product_id||'';
-    document.getElementById('mapWcSku').value=prefill.wc_sku||'';document.getElementById('mapRawName').value=prefill.name||'';}
+    document.getElementById('mapVid').value=prefill.wc_variation_id||0;document.getElementById('mapWcSku').value=prefill.wc_sku||'';document.getElementById('mapRawName').value=prefill.name||'';
+    if(prefill.sku_id){pickMapSku(prefill.sku_id,prefill.sku_code||'已选 SKU');}}
   new bootstrap.Modal('#mapModal').show();}
 let mapSkuTimer;
 async function searchMapSku(){clearTimeout(mapSkuTimer);mapSkuTimer=setTimeout(async()=>{
@@ -232,9 +283,64 @@ async function saveMap(){
   if(!body.sku_id){alert('请选择目标 SKU');return;}
   const r=await fetch('/api/inv/sku-maps',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json();if(!r.ok){alert(j.error||'保存失败');return;}
-  bootstrap.Modal.getInstance('#mapModal').hide();loadMaps();
+  bootstrap.Modal.getInstance('#mapModal').hide();loadMaps();loadMappingOverview();if(window._mappingSiteId)loadMappingDetail();
 }
 async function delMap(id){if(!confirm('删除该映射?'))return;await fetch(`/api/inv/sku-maps/${id}`,{method:'DELETE'});loadMaps();}
+
+// ---- 仓库优先映射 ----
+window._mappingOverview=[];window._mappingDetail=null;window._mappingSiteId=null;window._mappingSiteUrl='';window._mappingWarehouseId=null;window._selectedCandidateIds=new Set();
+const READY_LABELS={not_scanned:['未扫描','secondary'],scan_failed:['扫描失败','danger'],not_listed:['该站未上架','secondary'],ready:['已就绪','success'],action_needed:['待映射','warning']};
+async function apiJson(url,options){const r=await fetch(url,options);const txt=await r.text();let j;try{j=JSON.parse(txt);}catch(e){throw new Error(`接口返回异常（HTTP ${r.status}）`);}if(!r.ok)throw new Error(j.error||`请求失败（HTTP ${r.status}）`);return j;}
+function currentWarehouse(){return Number(document.getElementById('warehouseMapWh').value||0);}
+async function loadMappingOverview(){
+  const wid=currentWarehouse(),tb=document.getElementById('mappingOverviewTb'),changed=window._mappingWarehouseId!==wid;window._mappingWarehouseId=wid;
+  if(changed){window._mappingSiteId=null;document.getElementById('mappingDetailBox').classList.add('d-none');}
+  if(!wid){tb.innerHTML='<tr><td colspan="7" class="text-center text-white-50 py-4">请选择仓库</td></tr>';return;}
+  tb.innerHTML='<tr><td colspan="7" class="text-center text-white-50 py-4"><span class="spinner-border spinner-border-sm"></span> 加载中...</td></tr>';
+  try{const j=await apiJson('/api/inv/mapping/overview/'+wid);window._mappingOverview=j.sites||[];renderMappingOverview();}
+  catch(e){tb.innerHTML=`<tr><td colspan="7" class="text-center text-danger py-4">${esc(e.message)}</td></tr>`;}
+}
+function renderMappingOverview(){
+  const tb=document.getElementById('mappingOverviewTb'),rows=window._mappingOverview||[];
+  if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="text-center text-white-50 py-4">该仓库尚未配置服务市场</td></tr>';return;}
+  tb.innerHTML=rows.map(s=>{const meta=READY_LABELS[s.readiness]||READY_LABELS.not_scanned;
+    let products=s.scan?`${s.mapped_catalog_count}/${s.catalog_count} 已映射`:'尚未读取';
+    if(s.exact_candidate_count)products+=` · <span class="text-success">${s.exact_candidate_count} 可安全匹配</span>`;
+    if(s.review_candidate_count)products+=` · <span class="text-warning">${s.review_candidate_count} 待确认</span>`;
+    if(s.unresolved_count)products+=` · <span class="text-danger">${s.unresolved_count} 无法识别</span>`;
+    return `<tr><td><button class="btn btn-link btn-sm p-0 text-info text-decoration-none" onclick="chooseMappingSiteById(${s.id})">${esc(s.url)}</button><div class="small text-white-50">${esc(s.manager||'')}</div></td>
+      <td>${esc(s.country||'')}</td><td>${s.mapped_sku_count} 个</td><td class="small">${products}</td>
+      <td><span class="badge bg-${meta[1]}">${meta[0]}</span></td><td class="small text-white-50">${esc(s.scan?.finished_at||s.scan?.started_at||'从未')}</td>
+      <td class="text-end"><button class="btn btn-sm btn-outline-warning me-1" onclick="scanSite(${s.id})"><i class="bi bi-arrow-repeat"></i> 扫描</button><button class="btn btn-sm btn-outline-info" onclick="chooseMappingSiteById(${s.id})">查看</button></td></tr>`}).join('');
+}
+function chooseMappingSiteById(id){const site=(window._mappingOverview||[]).find(x=>Number(x.id)===Number(id));if(site)chooseMappingSite(site.id,site.url);}
+async function chooseMappingSite(id,url){window._mappingSiteId=id;window._mappingSiteUrl=url;document.getElementById('mappingDetailSite').textContent=url;document.getElementById('mappingDetailBox').classList.remove('d-none');await loadMappingDetail();document.getElementById('mappingDetailBox').scrollIntoView({behavior:'smooth',block:'start'});}
+async function loadMappingDetail(){const wid=currentWarehouse(),sid=window._mappingSiteId;if(!wid||!sid)return;const tb=document.getElementById('mappingDetailTb');tb.innerHTML='<tr><td colspan="6" class="text-center text-white-50 py-3">加载中...</td></tr>';
+  try{window._mappingDetail=await apiJson(`/api/inv/mapping/detail?warehouse_id=${wid}&site_id=${sid}`);window._selectedCandidateIds=new Set((window._mappingDetail.site_products||[]).filter(p=>!p.map_id&&p.candidate_sku_id).map(p=>Number(p.id)));renderMappingDetail();}catch(e){tb.innerHTML=`<tr><td colspan="6" class="text-center text-danger py-3">${esc(e.message)}</td></tr>`;}}
+function renderMappingDetail(){const data=window._mappingDetail;if(!data)return;const filter=document.getElementById('mappingStatusFilter').value;let rows=data.skus||[];
+  if(filter==='action')rows=rows.filter(x=>x.status!=='mapped'&&(x.candidates||[]).length);else if(filter==='mapped')rows=rows.filter(x=>x.status==='mapped');
+  const tb=document.getElementById('mappingDetailTb');
+  tb.innerHTML=rows.length?rows.map(s=>{const mappings=s.mappings||[],cands=s.candidates||[];let product='<span class="text-white-50">该站扫描范围内未发现此 SKU</span>',status='<span class="badge bg-secondary">未上架/未发现</span>',action='',selector='<span class="text-white-50">—</span>';
+    if(mappings.length){product=mappings.map(m=>`#${m.wc_product_id}${m.wc_variation_id?('/'+m.wc_variation_id):''} · ${esc(m.wc_sku||m.raw_name||'')}`).join('<br>');status='<span class="badge bg-success">已映射</span>';action=mappings.map(m=>`<button class="btn btn-sm btn-outline-danger" onclick="delMapAndRefresh(${m.id})">解绑</button>`).join(' ');}
+    else if(cands.length){const c=cands[0];selector=`<input class="form-check-input mapping-candidate-check" type="checkbox" ${window._selectedCandidateIds.has(Number(c.id))?'checked':''} onchange="toggleCandidate(${c.id},this.checked)" aria-label="选择 ${esc(s.sku_code)}">`;product=`${esc(c.name)}<div class="small text-white-50">#${c.wc_product_id}${c.wc_variation_id?('/'+c.wc_variation_id):''} · ${esc(c.wc_sku||'无 WC SKU')}</div>`;const safe=['exact_sku','exact_name'].includes(c.match_method);status=safe?'<span class="badge bg-success">唯一精确候选</span>':'<span class="badge bg-warning text-dark">名称候选·需确认</span>';action=`<button class="btn btn-sm btn-outline-primary" onclick="openCandidateById(${c.id},${s.id})">单条核对</button>`;}
+    return `<tr><td class="text-center">${selector}</td><td><code class="text-info">${esc(s.sku_code)}</code><div class="small">${esc(s.name)}</div></td><td><span class="${s.available>0?'text-success':'text-danger'}">可用 ${s.available}</span><div class="small text-white-50">现存 ${s.on_hand} / 预留 ${s.reserved}</div></td><td>${product}</td><td>${status}</td><td class="text-end">${action}</td></tr>`}).join(''):'<tr><td colspan="6" class="text-center text-white-50 py-4">当前筛选下没有记录</td></tr>';
+  const unresolved=(data.site_products||[]).filter(p=>!p.map_id&&!p.candidate_sku_id),box=document.getElementById('unresolvedCatalogBox'),utb=document.getElementById('unresolvedCatalogTb');box.classList.toggle('d-none',!unresolved.length);
+  utb.innerHTML=unresolved.map(p=>`<tr><td>${esc(p.name)}</td><td>#${p.wc_product_id}${p.wc_variation_id?('/'+p.wc_variation_id):''}</td><td>${esc(p.wc_sku||'')}</td><td class="text-end"><button class="btn btn-sm btn-outline-primary" onclick="openCandidateById(${p.id},null)">人工选择 SKU</button></td></tr>`).join('');
+  const exact=(data.site_products||[]).filter(p=>!p.map_id&&['exact_sku','exact_name'].includes(p.match_method)).length;document.getElementById('safeAutoBtn').disabled=!exact;document.getElementById('safeAutoBtn').innerHTML=`<i class="bi bi-link-45deg"></i> 安全自动映射${exact?('（'+exact+'）'):''}`;
+  updateBatchControls();
+}
+function openCandidateMap(p,skuId,skuCode){openMapModal({site_id:window._mappingSiteId,wc_product_id:p.wc_product_id,wc_variation_id:p.wc_variation_id,wc_sku:p.wc_sku,name:p.name,sku_id:skuId,sku_code:skuCode});}
+function openCandidateById(catalogId,skuId){const p=(window._mappingDetail?.site_products||[]).find(x=>Number(x.id)===Number(catalogId));const sku=(window._mappingDetail?.skus||[]).find(x=>Number(x.id)===Number(skuId));if(p)openCandidateMap(p,sku?.id||null,sku?.sku_code||null);}
+function visibleCandidateIds(){const filter=document.getElementById('mappingStatusFilter').value;if(filter==='mapped')return [];return (window._mappingDetail?.skus||[]).filter(s=>(s.candidates||[]).length).map(s=>Number(s.candidates[0].id));}
+function toggleCandidate(id,checked){id=Number(id);if(checked)window._selectedCandidateIds.add(id);else window._selectedCandidateIds.delete(id);updateBatchControls();}
+function toggleAllCandidates(checked){visibleCandidateIds().forEach(id=>checked?window._selectedCandidateIds.add(id):window._selectedCandidateIds.delete(id));renderMappingDetail();}
+function updateBatchControls(){const visible=visibleCandidateIds(),selected=visible.filter(id=>window._selectedCandidateIds.has(id));const all=document.getElementById('mappingSelectAll'),btn=document.getElementById('batchConfirmBtn');if(all){all.checked=visible.length>0&&selected.length===visible.length;all.indeterminate=selected.length>0&&selected.length<visible.length;}if(btn){btn.disabled=!selected.length;btn.innerHTML=`<i class="bi bi-check2-square"></i> 批量确认选中${selected.length?('（'+selected.length+'）'):''}`;}}
+async function confirmSelectedCandidates(){const ids=visibleCandidateIds().filter(id=>window._selectedCandidateIds.has(id)),wid=currentWarehouse(),sid=window._mappingSiteId;if(!ids.length)return;if(!confirm(`将批量确认 ${ids.length} 条当前候选。系统按商品ID+变体ID精确映射，并保留逐条审计。继续吗？`))return;const btn=document.getElementById('batchConfirmBtn'),msg=document.getElementById('mappingDetailMsg');btn.disabled=true;msg.textContent='批量确认中...';try{const j=await apiJson('/api/inv/mapping/confirm-batch/'+sid,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({warehouse_id:wid,catalog_ids:ids})});msg.textContent=`批量确认完成：新增 ${j.created} 条，跳过 ${j.skipped} 条`;await loadMappingOverview();await loadMappingDetail();}catch(e){msg.textContent=e.message;updateBatchControls();}}
+async function scanSite(siteId){const wid=currentWarehouse();if(!wid)return;const msg=document.getElementById('mappingGlobalMsg');msg.textContent='正在只读扫描 Woo 商品...';try{const j=await apiJson('/api/inv/mapping/scan/'+siteId,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({warehouse_id:wid})});msg.textContent=`扫描完成：发现 ${j.total_products} 个相关商品/变体`;await loadMappingOverview();if(window._mappingSiteId===siteId)await loadMappingDetail();}catch(e){msg.textContent=e.message;await loadMappingOverview();}}
+async function scanCurrentSite(){if(window._mappingSiteId)await scanSite(window._mappingSiteId);}
+async function scanAllServingSites(){const wid=currentWarehouse();if(!wid){alert('请先选择仓库');return;}if(!window._mappingOverview.length)await loadMappingOverview();const rows=window._mappingOverview||[];if(!confirm(`将依次只读扫描 ${rows.length} 个服务站点，不会修改 WooCommerce。继续吗？`))return;for(let i=0;i<rows.length;i++){document.getElementById('mappingGlobalMsg').textContent=`扫描 ${i+1}/${rows.length}：${rows[i].url}`;await scanSite(rows[i].id);}document.getElementById('mappingGlobalMsg').textContent='全部服务站点扫描完成';}
+async function safeAutoMap(){const wid=currentWarehouse(),sid=window._mappingSiteId;if(!wid||!sid)return;if(!confirm('只会建立唯一精确匹配（WC SKU/条码完全一致，或完整名称唯一一致）。近似名称不会自动绑定。继续吗？'))return;const msg=document.getElementById('mappingDetailMsg');try{const j=await apiJson('/api/inv/mapping/auto/'+sid,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({warehouse_id:wid})});msg.textContent=`已新增 ${j.created} 条安全映射，跳过 ${j.skipped} 条冲突`;await loadMappingOverview();await loadMappingDetail();}catch(e){msg.textContent=e.message;}}
+async function delMapAndRefresh(id){if(!confirm('解绑该站点商品与仓库 SKU？'))return;await apiJson(`/api/inv/sku-maps/${id}`,{method:'DELETE'});await loadMappingOverview();await loadMappingDetail();loadMaps();}
 
 // ---- 未映射发现 ----
 async function scanUnmapped(){
@@ -263,5 +369,6 @@ async function resolveOrder(){
 }
 
 loadSkus();loadMaps();
+if(document.getElementById('warehouseMapWh').options.length===2){document.getElementById('warehouseMapWh').selectedIndex=1;loadMappingOverview();}
 </script>
 {% endblock %}

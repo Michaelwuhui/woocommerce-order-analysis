@@ -23,7 +23,10 @@ inv_report_bp = Blueprint('inv_report', __name__)
 @inv_view_required
 def reports_page():
     conn = get_conn()
-    warehouses = conn.execute('SELECT id, name, code FROM warehouses WHERE is_active=1 ORDER BY name').fetchall()
+    sc, sp = warehouse_scope_clause('id')
+    warehouses = conn.execute(
+        'SELECT id, name, code FROM warehouses WHERE is_active=1' + sc + ' ORDER BY name', sp
+    ).fetchall()
     conn.close()
     return render_template('inv_reports.html', warehouses=[dict(w) for w in warehouses])
 

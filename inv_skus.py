@@ -17,25 +17,45 @@ import json
 from flask import Blueprint, render_template, request, jsonify
 from flask_login import login_required
 
-from inv_common import get_conn, inv_view_required, inv_manage_required
+from inv_common import (
+    current_operator,
+    get_conn,
+    inv_view_required,
+    inv_manage_required,
+    visible_warehouse_ids,
+)
 import inv_resolver
+import inv_mapping_service
 
 inv_sku_bp = Blueprint('inv_sku', __name__)
+
+
+def _mapping_scope_allowed(conn, warehouse_id, site_id=None):
+    warehouses = inv_mapping_service.warehouse_rows(conn, visible_warehouse_ids())
+    if warehouse_id not in {int(row['id']) for row in warehouses}:
+        return False
+    if site_id is None:
+        return True
+    return site_id in {
+        int(row['id']) for row in inv_mapping_service.serving_sites(conn, warehouse_id)
+    }
 
 
 # ───────────────────────────── 页面 ─────────────────────────────
 
 @inv_sku_bp.route('/inventory/skus')
 @login_required
-@inv_view_required
+@inv_manage_required
 def skus_page():
     conn = get_conn()
     sites = conn.execute('SELECT id, url, country, manager FROM sites ORDER BY country, url').fetchall()
     brands = conn.execute('SELECT id, name FROM brands ORDER BY name').fetchall()
+    warehouses = inv_mapping_service.warehouse_rows(conn, visible_warehouse_ids())
     conn.close()
     return render_template('inv_skus.html',
                            sites=[dict(s) for s in sites],
-                           brands=[dict(b) for b in brands])
+                           brands=[dict(b) for b in brands],
+                           warehouses=warehouses)
 
 
 # ─────────────────────────── SKU 主档 API ───────────────────────────
@@ -47,6 +67,7 @@ def list_skus():
     """列出 SKU(可 ?q= 模糊搜 code/name/barcode;?active=1 仅启用)。"""
     q = (request.args.get('q') or '').strip()
     active = request.args.get('active')
+    warehouse_id = request.args.get('warehouse_id')
     conn = get_conn()
     sql = '''SELECT s.*, b.name AS brand_name, se.name AS series_name,
                     (SELECT COUNT(*) FROM inv_site_sku_map m WHERE m.sku_id=s.id) AS map_count
@@ -59,6 +80,10 @@ def list_skus():
         params += [f'%{q}%', f'%{q}%', f'%{q}%']
     if active == '1':
         sql += ' AND s.is_active = 1'
+    if warehouse_id:
+        sql += ''' AND EXISTS (SELECT 1 FROM oms_sku_warehouses sw
+                               WHERE sw.sku_id=s.id AND sw.warehouse_id=? AND sw.is_enabled=1)'''
+        params.append(warehouse_id)
     sql += ' ORDER BY s.is_active DESC, s.sku_code'
     rows = conn.execute(sql, params).fetchall()
     conn.close()
@@ -200,12 +225,19 @@ def create_sku_map():
         return jsonify({'error': '每件折合数量必须是正整数'}), 400
     conn = get_conn()
     try:
-        conn.execute('''INSERT INTO inv_site_sku_map
+        cursor = conn.execute('''INSERT INTO inv_site_sku_map
             (site_id, wc_product_id, wc_variation_id, wc_sku, raw_name, sku_id, qty_per_item)
             VALUES (?,?,?,?,?,?,?)''',
             (site_id, wc_product_id, wc_variation_id, wc_sku, raw_name, sku_id, qty_per_item))
+        uid, uname = current_operator()
+        replan = inv_mapping_service.replan_shortage_orders_for_mappings(
+            conn, int(site_id), [{
+                'wc_product_id': wc_product_id,
+                'wc_variation_id': wc_variation_id,
+            }], operator_id=uid, operator_name=uname,
+        )
         conn.commit()
-        return jsonify({'success': True, 'id': conn.execute('SELECT last_insert_rowid()').fetchone()[0]})
+        return jsonify({'success': True, 'id': cursor.lastrowid, 'replan': replan})
     except Exception as e:
         if 'UNIQUE' in str(e):
             return jsonify({'error': '该站点的此商品(product+variation)已映射'}), 400
@@ -354,5 +386,125 @@ def unmapped_products():
                 agg[key]['qty'] += int(it.get('quantity') or 0)
         out = sorted(agg.values(), key=lambda x: -x['count'])
         return jsonify({'scanned_orders': scanned, 'unmapped_count': len(out), 'items': out[:300]})
+    finally:
+        conn.close()
+
+
+# ───────────────────── 仓库优先的站点映射工作台 ─────────────────────
+
+@inv_sku_bp.route('/api/inv/mapping/warehouses', methods=['GET'])
+@login_required
+@inv_manage_required
+def mapping_warehouses():
+    conn = get_conn()
+    try:
+        return jsonify(inv_mapping_service.warehouse_rows(conn, visible_warehouse_ids()))
+    finally:
+        conn.close()
+
+
+@inv_sku_bp.route('/api/inv/mapping/overview/<int:warehouse_id>', methods=['GET'])
+@login_required
+@inv_manage_required
+def mapping_overview(warehouse_id):
+    conn = get_conn()
+    try:
+        if not _mapping_scope_allowed(conn, warehouse_id):
+            return jsonify({'error': '仓库不存在或不可见'}), 404
+        return jsonify({
+            'warehouse_id': warehouse_id,
+            'sites': inv_mapping_service.mapping_overview(conn, warehouse_id),
+        })
+    finally:
+        conn.close()
+
+
+@inv_sku_bp.route('/api/inv/mapping/detail', methods=['GET'])
+@login_required
+@inv_manage_required
+def mapping_detail():
+    try:
+        warehouse_id = int(request.args.get('warehouse_id') or 0)
+        site_id = int(request.args.get('site_id') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': '仓库与站点参数无效'}), 400
+    if not warehouse_id or not site_id:
+        return jsonify({'error': '仓库与站点为必填项'}), 400
+    conn = get_conn()
+    try:
+        if not _mapping_scope_allowed(conn, warehouse_id, site_id):
+            return jsonify({'error': '站点不在该仓库的服务范围内'}), 400
+        return jsonify(inv_mapping_service.mapping_detail(conn, warehouse_id, site_id))
+    finally:
+        conn.close()
+
+
+@inv_sku_bp.route('/api/inv/mapping/scan/<int:site_id>', methods=['POST'])
+@login_required
+@inv_manage_required
+def mapping_scan(site_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        warehouse_id = int(data.get('warehouse_id') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': '仓库参数无效'}), 400
+    conn = get_conn()
+    try:
+        if not _mapping_scope_allowed(conn, warehouse_id, site_id):
+            return jsonify({'error': '站点不在该仓库的服务范围内'}), 400
+        result = inv_mapping_service.scan_site_catalog(conn, site_id, warehouse_id)
+        return jsonify({'success': True, **result})
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    finally:
+        conn.close()
+
+
+@inv_sku_bp.route('/api/inv/mapping/auto/<int:site_id>', methods=['POST'])
+@login_required
+@inv_manage_required
+def mapping_auto(site_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        warehouse_id = int(data.get('warehouse_id') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': '仓库参数无效'}), 400
+    conn = get_conn()
+    try:
+        if not _mapping_scope_allowed(conn, warehouse_id, site_id):
+            return jsonify({'error': '站点不在该仓库的服务范围内'}), 400
+        uid, uname = current_operator()
+        result = inv_mapping_service.apply_safe_mappings(
+            conn, site_id, warehouse_id, operator_id=uid, operator_name=uname
+        )
+        return jsonify({'success': True, **result})
+    finally:
+        conn.close()
+
+
+@inv_sku_bp.route('/api/inv/mapping/confirm-batch/<int:site_id>', methods=['POST'])
+@login_required
+@inv_manage_required
+def mapping_confirm_batch(site_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        warehouse_id = int(data.get('warehouse_id') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': '仓库参数无效'}), 400
+    catalog_ids = data.get('catalog_ids')
+    if not isinstance(catalog_ids, list) or not catalog_ids:
+        return jsonify({'error': '请选择至少一条候选映射'}), 400
+    conn = get_conn()
+    try:
+        if not _mapping_scope_allowed(conn, warehouse_id, site_id):
+            return jsonify({'error': '站点不在该仓库的服务范围内'}), 400
+        uid, uname = current_operator()
+        result = inv_mapping_service.confirm_mapping_candidates(
+            conn, site_id, warehouse_id, catalog_ids,
+            operator_id=uid, operator_name=uname,
+        )
+        return jsonify({'success': True, **result})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     finally:
         conn.close()

@@ -1,0 +1,820 @@
+{% extends "base.html" %}
+{% block title %}订单群通知{% endblock %}
+{% block content %}
+<style>
+  .notify-panel { background: rgba(22, 27, 34, .86); border: 1px solid rgba(148, 163, 184, .25); }
+  .notify-kpi { min-height: 112px; }
+  .notify-label { color: #94a3b8; font-size: .78rem; letter-spacing: .04em; text-transform: uppercase; }
+  .notify-value { color: #f8fafc; font-size: 1.35rem; font-weight: 700; }
+  .notify-help { color: #94a3b8; font-size: .84rem; }
+  .notify-subtitle { color: #cbd5e1; }
+  .notify-preview-image { width: min(100%, 540px); height: auto; border-radius: .75rem; border: 1px solid #475569; background: #fff; }
+  .notify-steps { counter-reset: notify-step; }
+  .notify-step { position: relative; padding-left: 2.4rem; min-height: 2rem; }
+  .notify-step::before { counter-increment: notify-step; content: counter(notify-step); position: absolute; left: 0; top: -.15rem; width: 1.7rem; height: 1.7rem; border-radius: 50%; display: grid; place-items: center; background: #2563eb; color: #fff; font-weight: 700; font-size: .8rem; }
+  .notify-table td { vertical-align: middle; }
+  .notify-secret-ok { color: #34d399; }
+  .notify-secret-missing { color: #fbbf24; }
+</style>
+
+<div class="container-fluid py-3">
+  <div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-3">
+    <div>
+      <h3 class="mb-1"><i class="bi bi-image me-2"></i>订单群通知控制台</h3>
+      <div class="notify-subtitle">配置路由、用真实订单安全预览，并查看任务记录。</div>
+    </div>
+    <div class="d-flex gap-2 flex-wrap">
+      <span class="badge text-bg-primary px-3 py-2"><i class="bi bi-shield-lock me-1"></i>仅超级管理员</span>
+      {% if control.enabled and control.production_send_enabled %}
+      <span class="badge text-bg-success px-3 py-2"><i class="bi bi-broadcast me-1"></i>正式自动发送运行中</span>
+      {% else %}
+      <span class="badge text-bg-warning px-3 py-2"><i class="bi bi-lock-fill me-1"></i>正式发送未启用</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="alert alert-info border-info bg-info bg-opacity-10 text-light mb-3" role="alert">
+    <div class="fw-semibold mb-2">现在可以这样使用</div>
+    <div class="row g-2 notify-steps">
+      <div class="col-lg-3 notify-step">先在下方选一笔真实订单，生成脱敏图片预览。</div>
+      <div class="col-lg-3 notify-step">新增一个通知目标，并限定站点、仓库或配送方式。</div>
+      <div class="col-lg-3 notify-step">{% if control.enabled and control.production_send_enabled %}当前按已批准的生产目标自动发送新订单。{% else %}确认预览后，可启用自动制卡；未授权时不会发群。{% endif %}</div>
+      <div class="col-lg-3 notify-step">{% if control.enabled and control.production_send_enabled %}失败任务自动重试；重试耗尽或结果不确定时在本页告警。{% else %}企业微信群正式发送需另行授权并在服务器注入密钥。{% endif %}</div>
+    </div>
+  </div>
+
+  <div id="notifyMessage" class="alert d-none" role="alert"></div>
+
+  {% if control.exception_count %}
+  <div class="alert {{ 'alert-danger' if control.dead_letter_count or control.manual_review_count else 'alert-warning' }} border-opacity-50 mb-3" role="alert">
+    <div class="fw-semibold"><i class="bi bi-exclamation-triangle me-1"></i>当前有 {{ control.exception_count }} 个通知任务需要关注</div>
+    <div class="small mt-1">
+      <a class="alert-link me-3" href="{{ url_for('order_notification.notification_dashboard', status='RETRY_WAIT') }}">重试中 {{ control.retry_count }}</a>
+      <a class="alert-link me-3" href="{{ url_for('order_notification.notification_dashboard', status='MANUAL_REVIEW') }}">人工核查 {{ control.manual_review_count }}</a>
+      <a class="alert-link" href="{{ url_for('order_notification.notification_dashboard', status='DEAD_LETTER') }}">死信 {{ control.dead_letter_count }}</a>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="row g-3 mb-3">
+    <div class="col-6 col-xl-3">
+      <div class="card notify-panel notify-kpi h-100"><div class="card-body">
+        <div class="notify-label">自动制卡</div>
+        <div class="notify-value" id="kpiMode">{{ '自动发送' if control.enabled and control.production_send_enabled else '只预览' if control.enabled else '关闭' }}</div>
+        <div class="notify-help">{{ '按已批准生产目标执行' if control.enabled and control.production_send_enabled else '不会自动发送到群' }}</div>
+      </div></div>
+    </div>
+    <div class="col-6 col-xl-3">
+      <div class="card notify-panel notify-kpi h-100"><div class="card-body">
+        <div class="notify-label">正式群发送</div>
+        <div class="notify-value {{ 'text-success' if control.production_send_enabled else 'text-warning' }}">{{ '运行中' if control.production_send_enabled else '服务端锁定' }}</div>
+        <div class="notify-help">当前值：{{ '开' if control.production_send_enabled else '关' }}</div>
+      </div></div>
+    </div>
+    <div class="col-6 col-xl-3">
+      <div class="card notify-panel notify-kpi h-100"><div class="card-body">
+        <div class="notify-label">启用目标</div>
+        <div class="notify-value" id="kpiTargets">{{ control.enabled_target_count }}</div>
+        <div class="notify-help">共 {{ control.targets|length }} 个目标</div>
+      </div></div>
+    </div>
+    <div class="col-6 col-xl-3">
+      <div class="card notify-panel notify-kpi h-100"><div class="card-body">
+        <div class="notify-label">待处理队列</div>
+        <div class="notify-value">{{ control.queue_count }}</div>
+        <div class="notify-help">审计记录 {{ control.audit_count }} 条</div>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="row g-3 mb-3">
+    <div class="col-xl-6">
+      <div class="card notify-panel h-100">
+        <div class="card-header bg-transparent border-secondary d-flex justify-content-between align-items-center">
+          <div><i class="bi bi-eye me-2"></i><span class="fw-semibold">真实订单安全预览</span></div>
+          <span class="badge text-bg-success">不入队 · 不发送</span>
+        </div>
+        <div class="card-body">
+          <form id="previewForm" class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label" for="previewSite">站点筛选</label>
+              <select class="form-select bg-dark text-light border-secondary" id="previewSite">
+                <option value="">全部站点</option>
+                {% for site in control.sites %}
+                <option value="{{ site.url }}">{{ site.country or '—' }} · {{ site.url|replace('https://','')|replace('http://','') }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="previewStatus">订单状态</label>
+              <select class="form-select bg-dark text-light border-secondary" id="previewStatus">
+                <option value="new" selected>新订单（智能，默认）</option>
+                <option value="all">全部状态</option>
+                {% for status in control.preview_order_statuses %}
+                <option value="{{ status }}">状态：{{ status }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-12">
+              <label class="form-label" for="previewOrderSearch">搜索订单</label>
+              <div class="input-group">
+                <input class="form-control bg-dark text-light border-secondary" type="search" id="previewOrderSearch" maxlength="128" placeholder="输入订单号或内部 ID，例如 11510">
+                <button class="btn btn-outline-info" id="previewOrderSearchButton" type="button"><i class="bi bi-search me-1"></i>查找</button>
+              </div>
+            </div>
+            <div class="col-12">
+              <label class="form-label" for="recentOrder">最近订单 / 搜索结果</label>
+              <select class="form-select bg-dark text-light border-secondary" id="recentOrder">
+                <option value="">选择订单，或在下面直接输入内部订单 ID</option>
+                {% for order in control.recent_orders %}
+                <option value="{{ order.id }}">#{{ order.number or order.id }} · {{ order.status }} · {{ 'COD' if order.payment_method|lower == 'cod' else '非 COD' }} · {{ order.source|replace('https://','')|replace('http://','') }}</option>
+                {% endfor %}
+              </select>
+              <div class="notify-help mt-1" id="previewOrderSearchHelp" role="status" aria-live="polite">当前显示全部站点最近 {{ control.recent_orders|length }} 笔智能新订单：包含 processing/offline 和 COD pending，不包含已发货或待支付的 on-hold。</div>
+            </div>
+            <div class="col-12">
+              <label class="form-label" for="previewSource">预览来源</label>
+              <select class="form-select bg-dark text-light border-secondary" id="previewSource">
+                <option value="email" selected>真实邮件原稿（FluentSMTP，推荐）</option>
+                <option value="system_card">系统脱敏卡片（备用）</option>
+              </select>
+              <div class="notify-help mt-1" id="previewSourceHelp">显示实际发给管理员的新订单邮件，含客户资料；仅超级管理员可见。</div>
+            </div>
+            <div class="col-md-7">
+              <label class="form-label" for="previewOrderId">已选内部订单 ID（也可直接输入）</label>
+              <input class="form-control bg-dark text-light border-secondary" id="previewOrderId" required maxlength="128" placeholder="例如 3-11510">
+            </div>
+            <div class="col-md-5">
+              <label class="form-label" for="previewEvent">图片类型</label>
+              <select class="form-select bg-dark text-light border-secondary" id="previewEvent">
+                <option value="ORDER_READY">新订单</option>
+                <option value="ORDER_UPDATED">订单变更</option>
+                <option value="ORDER_CANCELLED">停止处理</option>
+                <option value="ORDER_HOLD">暂停处理</option>
+              </select>
+            </div>
+            <div class="col-12 d-flex align-items-center gap-3">
+              <button class="btn btn-primary" id="previewButton" type="submit"><i class="bi bi-image me-1"></i>生成预览</button>
+              <span class="notify-help" id="previewPrivacyNote">只读取并渲染现有邮件日志，不触发 WooCommerce 重发邮件。</span>
+            </div>
+          </form>
+          <div id="previewMeta" class="alert alert-secondary d-none mt-3 mb-2"></div>
+          <div id="previewImages" class="d-grid gap-3 justify-items-center"></div>
+          <div id="testSendPanel" class="alert alert-warning d-none mt-3 mb-0">
+            <div class="fw-semibold mb-2"><i class="bi bi-send-check me-1"></i>发送当前预览到隔离测试群</div>
+            <div class="row g-2 align-items-end">
+              <div class="col-md-7">
+                <label class="form-label" for="testSendTarget">隔离测试目标</label>
+                <select class="form-select bg-dark text-light border-secondary" id="testSendTarget"></select>
+              </div>
+              <div class="col-md-5">
+                <button class="btn btn-warning w-100" id="testSendButton" type="button" disabled>
+                  <i class="bi bi-send me-1"></i>发送到测试群
+                </button>
+              </div>
+            </div>
+            <div class="small mt-2" id="testSendHelp">必须先配置已注入密钥的隔离测试目标，并由服务器开启测试发送窗口。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-xl-6">
+      <div class="card notify-panel h-100">
+        <div class="card-header bg-transparent border-secondary">
+          <i class="bi bi-sliders me-2"></i><span class="fw-semibold">制卡规则</span>
+        </div>
+        <div class="card-body">
+          <form id="configForm" class="row g-3">
+            <div class="col-12">
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" role="switch" id="configEnabled" {% if control.enabled %}checked{% endif %}>
+                <label class="form-check-label fw-semibold" for="configEnabled">自动生成通知图片</label>
+              </div>
+              <div class="notify-help">开启后只制卡/预览；测试发送和正式发送开关均保持锁定。</div>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="configDebounce">合并等待（秒）</label>
+              <input class="form-control bg-dark text-light border-secondary" type="number" id="configDebounce" min="0" max="600" value="{{ control.debounce_seconds }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="configRetention">图片保留（天）</label>
+              <input class="form-control bg-dark text-light border-secondary" type="number" id="configRetention" min="1" max="365" value="{{ control.retention_days }}">
+            </div>
+            <div class="col-12">
+              <label class="form-label" for="configRenderSource">新订单自动制图来源</label>
+              <select class="form-select bg-dark text-light border-secondary" id="configRenderSource">
+                <option value="email" {% if control.render_source == 'email' %}selected{% endif %}>FluentSMTP 管理员新订单邮件（推荐）</option>
+                <option value="system_card" {% if control.render_source == 'system_card' %}selected{% endif %}>系统脱敏卡片（备用）</option>
+              </select>
+              <div class="notify-help mt-1">订单变更、取消和暂停仍使用状态卡片，避免拿旧邮件冒充最新状态。</div>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="readyStatuses">可处理状态</label>
+              <input class="form-control bg-dark text-light border-secondary" id="readyStatuses" value="{{ control.policy.ready_statuses|join(', ') }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="cancelStatuses">取消状态</label>
+              <input class="form-control bg-dark text-light border-secondary" id="cancelStatuses" value="{{ control.policy.cancel_statuses|join(', ') }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="holdStatuses">暂停状态</label>
+              <input class="form-control bg-dark text-light border-secondary" id="holdStatuses" value="{{ control.policy.hold_statuses|join(', ') }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="excludedStatuses">排除状态</label>
+              <input class="form-control bg-dark text-light border-secondary" id="excludedStatuses" value="{{ control.policy.excluded_statuses|join(', ') }}">
+            </div>
+            <div class="col-12">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="allowCodHold" {% if control.policy.allow_site_cod_on_hold %}checked{% endif %}>
+                <label class="form-check-label" for="allowCodHold">允许站点规则把 COD 的 on-hold 订单视为可处理</label>
+              </div>
+            </div>
+            <div class="col-12">
+              <div class="notify-help mb-2">触发“订单变更”的字段</div>
+              <div class="d-flex flex-wrap gap-3" id="updatedFields">
+                {% for field in ['status','warehouse_id','shipping_method','payment_method','currency','total','recipient','items','customer_note'] %}
+                <div class="form-check"><input class="form-check-input updated-field" type="checkbox" value="{{ field }}" id="field-{{ field }}" {% if field in control.policy.updated_fields %}checked{% endif %}><label class="form-check-label" for="field-{{ field }}">{{ field }}</label></div>
+                {% endfor %}
+              </div>
+            </div>
+            <div class="col-12">
+              <button class="btn btn-outline-primary" type="submit"><i class="bi bi-save me-1"></i>保存制卡规则</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card notify-panel mb-3">
+    <div class="card-header bg-transparent border-secondary d-flex flex-wrap justify-content-between align-items-center gap-2">
+      <div><i class="bi bi-diagram-3 me-2"></i><span class="fw-semibold">通知目标与路由</span></div>
+      <span class="notify-help">优先级：具体站点 &gt; 国家 &gt; 负责人 &gt; 仓库 &gt; 配送方式 &gt; 总群兜底。</span>
+    </div>
+    <div class="card-body border-bottom border-secondary">
+      {% if not control.managed_webhook_ready %}
+      <div class="alert alert-warning py-2" id="webhookMasterWarning">
+        服务器尚未配置 Webhook 加密主密钥；现有环境变量目标仍可使用，但前端新增或更换 Webhook 暂不可用。
+      </div>
+      {% endif %}
+      <form id="targetForm" class="row g-3">
+        <input type="hidden" id="targetId">
+        <div class="col-md-4 col-xl-3">
+          <label class="form-label" for="targetName">目标名称</label>
+          <input class="form-control bg-dark text-light border-secondary" id="targetName" maxlength="120" required placeholder="例如 波兰仓订单群">
+        </div>
+        <div class="col-md-4 col-xl-2">
+          <label class="form-label" for="targetChannel">发送方式</label>
+          <select class="form-select bg-dark text-light border-secondary" id="targetChannel">
+            <option value="MANUAL_WECHAT">人工下载转发</option>
+            <option value="WECOM_BOT">企业微信群机器人</option>
+            <option value="FAKE">系统测试（不联网）</option>
+          </select>
+        </div>
+        <div class="col-md-4 col-xl-2">
+          <label class="form-label" for="targetEnvironment">环境</label>
+          <select class="form-select bg-dark text-light border-secondary" id="targetEnvironment">
+            <option value="test">隔离测试</option>
+            <option value="production">正式环境</option>
+          </select>
+        </div>
+        <div class="col-md-4 col-xl-2">
+          <label class="form-label" for="targetCountry">国家</label>
+          <select class="form-select bg-dark text-light border-secondary" id="targetCountry">
+            <option value="">全部国家</option>
+            {% for country in control.countries %}<option value="{{ country.code }}">{{ country.code }}（{{ country.site_count }} 个站点）</option>{% endfor %}
+          </select>
+          <div class="notify-help">选择国家后，将覆盖该国家内符合其余条件的所有站点。</div>
+        </div>
+        <div class="col-md-6 col-xl-3">
+          <label class="form-label" for="targetStore">站点</label>
+          <select class="form-select bg-dark text-light border-secondary" id="targetStore">
+            <option value="">全部站点</option>
+            {% for site in control.sites %}<option value="{{ site.url }}">{{ site.country or '—' }} · {{ site.url|replace('https://','')|replace('http://','') }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-md-6 col-xl-3">
+          <label class="form-label" for="targetManagers">站点负责人（可多选）</label>
+          <select class="form-select bg-dark text-light border-secondary" id="targetManagers" multiple size="5">
+            {% for manager in control.managers %}<option value="{{ manager.name }}">{{ manager.name }}（{{ manager.site_count }} 个站点）</option>{% endfor %}
+          </select>
+          <div class="d-flex flex-wrap gap-2 mt-2">
+            <button class="btn btn-sm btn-outline-secondary" id="targetManagersSelectAll" type="button">全选当前负责人</button>
+            <button class="btn btn-sm btn-outline-secondary" id="targetManagersClear" type="button">清空</button>
+          </div>
+          <div class="form-check mt-2"><input class="form-check-input" type="checkbox" id="targetAllManagers"><label class="form-check-label" for="targetAllManagers">覆盖全部负责人（含以后新增）</label></div>
+          <div class="notify-help" id="targetManagerHelp">请选择至少一位负责人，或勾选覆盖全部。</div>
+        </div>
+        <div class="col-md-6 col-xl-2">
+          <label class="form-label" for="targetWarehouse">仓库</label>
+          <select class="form-select bg-dark text-light border-secondary" id="targetWarehouse">
+            <option value="">全部仓库</option>
+            {% for warehouse in control.warehouses %}<option value="{{ warehouse.id }}">{{ warehouse.country or '—' }} · {{ warehouse.name }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-md-5 col-xl-3">
+          <label class="form-label" for="targetShipping">配送方式（精确匹配，可留空）</label>
+          <input class="form-control bg-dark text-light border-secondary" id="targetShipping" maxlength="160" placeholder="例如 InPost Paczkomat">
+        </div>
+        <div class="col-md-5 col-xl-4 d-none" id="targetSecretGroup">
+          <label class="form-label" for="targetWebhook">企业微信群 Webhook</label>
+          <input class="form-control bg-dark text-light border-secondary" type="password" id="targetWebhook" maxlength="2048" autocomplete="new-password" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…">
+          <div class="notify-help" id="targetWebhookHelp">提交后由服务器加密保存；页面不会回显完整地址。</div>
+        </div>
+        <div class="col-md-2 col-xl-2">
+          <label class="form-label" for="targetRate">每分钟上限</label>
+          <input class="form-control bg-dark text-light border-secondary" type="number" id="targetRate" min="1" max="15" value="15">
+        </div>
+        <div class="col-md-3 col-xl-2 d-flex align-items-end pb-2">
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="targetEnabled" checked><label class="form-check-label" for="targetEnabled">启用路由</label></div>
+        </div>
+        <div class="col-md-5 col-xl-3 d-flex flex-column justify-content-end pb-2">
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="targetCopyToFallback"><label class="form-check-label" for="targetCopyToFallback">同时抄送总群</label></div>
+          <div class="notify-help" id="targetCopyToFallbackHelp">主路由发送后，再向同环境的全部站点兜底群发送一次。</div>
+        </div>
+        <div class="col-12 d-flex gap-2">
+          <button class="btn btn-primary" type="submit"><i class="bi bi-plus-circle me-1"></i><span id="targetSubmitText">新增目标</span></button>
+          <button class="btn btn-outline-secondary d-none" id="targetCancelEdit" type="button">取消编辑</button>
+        </div>
+      </form>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-dark table-hover notify-table mb-0">
+        <thead><tr><th>目标</th><th>方式 / 环境</th><th>路由范围</th><th>密钥状态</th><th>限速</th><th>状态</th><th class="text-end">操作</th></tr></thead>
+        <tbody id="targetTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card notify-panel">
+    <div class="card-header bg-transparent border-secondary d-flex flex-wrap justify-content-between align-items-center gap-2">
+      <div><i class="bi bi-clock-history me-2"></i><span class="fw-semibold">通知任务记录</span></div>
+      <div class="d-flex flex-wrap gap-2">
+        {% for status, count in counters.items() %}
+        <a class="btn btn-sm {{ 'btn-primary' if selected_status == status else 'btn-outline-secondary' }}" href="{{ url_for('order_notification.notification_dashboard', status=status) }}">{{ status }} {{ count }}</a>
+        {% endfor %}
+        <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('order_notification.notification_dashboard') }}">全部</a>
+      </div>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-dark table-hover align-middle mb-0">
+        <thead><tr><th>订单</th><th>事件</th><th>状态</th><th>目标</th><th>模板</th><th>时间</th><th>失败摘要</th><th>预览</th></tr></thead>
+        <tbody>
+          {% for job in jobs %}
+          <tr class="{{ 'table-danger' if job.status in ['DEAD_LETTER','MANUAL_REVIEW'] else 'table-warning' if job.status == 'RETRY_WAIT' else '' }}">
+            <td><code>{{ job.order_id }}</code><div class="small text-muted">{{ job.store_id }}</div></td>
+            <td>{{ job.event_type }}</td>
+            <td>
+              <span class="badge {{ 'bg-success' if job.status == 'SENT' else 'bg-danger' if job.status in ['DEAD_LETTER','MANUAL_REVIEW'] else 'bg-warning text-dark' if job.status in ['RETRY_WAIT','READY_TO_SEND'] else 'bg-secondary' }}">{{ job.status }}</span>
+              {% if job.queue_status %}<div class="small text-muted mt-1">队列 {{ job.queue_status }} · {{ job.queue_attempts }}/{{ job.queue_max_attempts }}</div>{% endif %}
+              {% if job.status == 'RETRY_WAIT' and job.next_retry_at %}<div class="small text-muted">下次：{{ job.next_retry_at }}</div>{% endif %}
+            </td>
+            <td>{{ job.target_name or '路由待处理' }}<div class="small text-muted">{{ job.channel_type or '' }}</div></td>
+            <td>{{ job.template_version }}</td>
+            <td class="small">{{ job.created_at }}{% if job.sent_at %}<br>接口接受：{{ job.sent_at }}{% endif %}</td>
+            <td><code>{{ job.last_error_code or '' }}</code><div class="small text-muted">{{ job.last_error_summary or '' }}</div></td>
+            <td>{% if job.image_bytes %}<a class="btn btn-sm btn-outline-info" href="{{ url_for('order_notification.notification_image', job_id=job.id, page=1) }}" target="_blank" rel="noopener">图片</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          </tr>
+          {% else %}<tr><td colspan="8" class="text-center text-muted py-5">暂无通知任务。可先使用上方“真实订单安全预览”。</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script id="notificationControlData" type="application/json">{{ control|tojson }}</script>
+<script>
+(() => {
+  'use strict';
+  const state = JSON.parse(document.getElementById('notificationControlData').textContent);
+  const byId = id => document.getElementById(id);
+  const message = (text, type = 'success') => {
+    const box = byId('notifyMessage');
+    box.className = `alert alert-${type}`;
+    box.textContent = text;
+    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  };
+  const errorText = code => ({
+    sending_locked: '发送开关由服务端锁定，本页面不能开启。',
+    route_ambiguous: '此路由与现有目标覆盖了相同负责人，请调整负责人或路由范围。',
+    manager_invalid: '所选站点负责人不存在，请刷新页面后重试。',
+    manager_scope_invalid: '负责人覆盖方式无效。',
+    manager_names_invalid: '负责人选择数据无效。',
+    manager_selection_required: '请至少选择一位负责人，或勾选覆盖全部负责人。',
+    store_manager_mismatch: '所选站点不属于该负责人，请修正路由范围。',
+    country_invalid: '所选国家不存在可用站点，请刷新页面后重试。',
+    store_country_mismatch: '所选站点不属于该国家，请修正路由范围。',
+    copy_to_fallback_invalid: '抄送总群开关值无效。',
+    fallback_cannot_copy_to_itself: '全部站点兜底群不能再抄送给自己。',
+    fallback_route_missing: '当前环境没有启用的“全部站点＋全部负责人”总群，请先创建或启用总群。',
+    fallback_route_ambiguous: '当前环境存在多个总群候选，无法确定抄送目标。',
+    fallback_target_in_use: '该总群正在被其他目标用于抄送，请先关闭这些目标的“同时抄送总群”。',
+    webhook_required: '企业微信群机器人必须填写 Webhook。',
+    webhook_master_key_missing: '服务器尚未配置 Webhook 加密主密钥。',
+    webhook_master_key_invalid: '服务器 Webhook 加密主密钥格式无效。',
+    webhook_decrypt_failed: '已保存的 Webhook 无法解密，请重新填写。',
+    secret_ref_invalid: '企业微信目标必须填写合规的服务器环境变量名。',
+    test_secret_ref_must_be_isolated: '测试环境变量名必须包含 TEST。',
+    production_cannot_use_test_secret: '正式环境不能使用带 TEST 的变量名。',
+    status_groups_overlap: '同一个订单状态不能同时出现在多个规则组。',
+    preview_too_many_pages: '该订单图片超过 5 页，请缩小订单后再预览。',
+    order_not_found: '没有找到该订单。',
+    admin_new_order_email_not_found: '没有找到该订单已成功发送的管理员新订单邮件。',
+    email_body_missing: '邮件日志存在，但没有保存邮件正文。',
+    email_log_credentials_missing: '该站点没有可用的邮件日志只读凭据。',
+    email_log_unavailable: '暂时无法连接站点邮件日志，请稍后重试。',
+    email_log_list_failed: '站点邮件日志列表读取失败。',
+    email_log_detail_failed: '站点邮件正文读取失败。',
+    email_log_order_mismatch: '邮件正文与所选订单不匹配，已拒绝渲染。',
+    email_log_type_mismatch: '找到的邮件不是管理员新订单通知，已拒绝渲染。',
+    customer_email_rejected: '找到的是客户收件邮件，已拒绝用于群通知。',
+    playwright_missing: '服务器尚未安装邮件渲染组件 Playwright。',
+    chromium_missing: '服务器尚未配置可用的 Chromium。',
+    beautifulsoup_missing: '服务器尚未安装邮件安全净化组件。',
+    email_source_only_supports_new_order: '真实邮件原稿目前只用于新订单。',
+    render_source_invalid: '新订单制图来源无效。',
+    order_search_query_too_long: '订单搜索内容过长。',
+    order_search_site_invalid: '所选站点无效或无权查看。',
+    order_search_status_invalid: '订单状态筛选值无效。',
+    test_send_flag_off: '服务器尚未开启隔离测试发送窗口。',
+    test_send_confirmation_required: '必须明确确认后才能发送到测试群。',
+    preview_id_invalid: '当前预览已失效，请重新生成后再发送。',
+    test_target_missing: '隔离测试目标不存在或已停用。',
+    test_target_required: '只允许发送到隔离测试目标。',
+    test_target_channel_invalid: '隔离测试目标必须使用企业微信群机器人。',
+    test_target_scope_mismatch: '该测试目标的站点、负责人、仓库或配送范围与订单不匹配。',
+    secret_missing: '测试目标的 Webhook 尚未注入服务器。',
+    webhook_invalid: '服务器中的企业微信 Webhook 格式无效。',
+    target_delete_confirmation_required: '删除目标前必须明确确认。',
+    target_has_active_jobs: '该目标仍有处理中任务，请等待任务结束或先停用。',
+    target_missing: '通知目标不存在或已经删除。',
+    target_deleted: '通知目标已经删除，不能继续编辑。',
+    test_message_confirmation_required: '发送测试消息前必须明确确认。',
+    test_message_rate_limited: '测试消息操作过于频繁，请十秒后重试。',
+    order_not_ready_for_test: '该订单当前不属于可发送的新订单状态。'
+  }[code] || code || '操作失败');
+  async function api(url, options = {}) {
+    const init = { credentials: 'same-origin', ...options };
+    init.headers = { ...(options.headers || {}) };
+    if (init.method && init.method !== 'GET') {
+      init.headers['X-Requested-With'] = 'XMLHttpRequest';
+      init.headers['Content-Type'] = 'application/json';
+    }
+    const response = await fetch(url, init);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      if (!body.error && [502, 503, 504].includes(response.status)) {
+        throw new Error('预览服务暂时不可用（网关错误），请稍后重试或联系管理员查看服务日志。');
+      }
+      throw new Error(errorText(body.error));
+    }
+    return body;
+  }
+  const csv = id => byId(id).value.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+  const managerSiteCounts = new Map((state.managers || []).map(item => [item.name, item.site_count]));
+  const routeLabel = target => {
+    const managerNames = target.manager_names || [];
+    const manager = target.manager_scope === 'selected'
+      ? `负责人 ${managerNames.map(name => `${name}（${managerSiteCounts.get(name) || 0}站）`).join('、')}`
+      : '全部负责人';
+    const route = [target.store_id || '全部站点', target.country_code ? `国家 ${target.country_code}` : '全部国家', manager, target.warehouse_id ? `仓库 ${target.warehouse_id}` : '全部仓库', target.shipping_method || '全部配送'].join(' / ');
+    return target.copy_to_fallback ? `${route} / 同时抄送总群` : route;
+  };
+  const targetCoversManager = (target, managerName) => target.manager_scope !== 'selected' || (target.manager_names || []).includes(managerName);
+  let currentPreview = null;
+
+  function updateKpis() {
+    byId('kpiMode').textContent = state.enabled ? (state.production_send_enabled ? '自动发送' : '只预览') : '关闭';
+    byId('kpiTargets').textContent = state.targets.filter(item => Boolean(item.enabled)).length;
+  }
+  function addCell(row, text, className = '') {
+    const cell = document.createElement('td');
+    cell.textContent = text;
+    if (className) cell.className = className;
+    row.appendChild(cell);
+    return cell;
+  }
+  function renderTargets() {
+    const body = byId('targetTableBody');
+    body.replaceChildren();
+    if (!state.targets.length) {
+      const row = document.createElement('tr');
+      const cell = addCell(row, '暂无目标。建议先新增“人工下载转发”目标完成闭环验证。', 'text-center text-muted py-4');
+      cell.colSpan = 7;
+      body.appendChild(row);
+      return;
+    }
+    state.targets.forEach(target => {
+      const row = document.createElement('tr');
+      addCell(row, target.name);
+      const channel = addCell(row, target.channel_type);
+      const env = document.createElement('div'); env.className = 'small text-muted'; env.textContent = target.environment; channel.appendChild(env);
+      addCell(row, routeLabel(target), 'small');
+      let secret = '不需要'; let secretClass = 'text-muted';
+      if (target.channel_type === 'WECOM_BOT') {
+        const identity = target.secret_source === 'managed'
+          ? `加密保存 · #${target.webhook_fingerprint || '未知'}`
+          : target.secret_ref_name ? `环境变量 · ${target.secret_ref_name}` : '未配置';
+        secret = `${identity} · ${target.secret_available ? '可用' : '不可用'}`;
+        secretClass = target.secret_available ? 'notify-secret-ok small' : 'notify-secret-missing small';
+      }
+      addCell(row, secret, secretClass);
+      addCell(row, `${target.rate_limit_per_minute}/分钟`);
+      const status = addCell(row, target.enabled ? '启用' : '停用', target.enabled ? 'text-success' : 'text-muted');
+      const actions = document.createElement('td'); actions.className = 'text-end text-nowrap';
+      const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'btn btn-sm btn-outline-info me-2'; edit.textContent = '编辑'; edit.addEventListener('click', () => editTarget(target));
+      const toggle = document.createElement('button'); toggle.type = 'button'; toggle.className = `btn btn-sm ${target.enabled ? 'btn-outline-warning' : 'btn-outline-success'}`; toggle.textContent = target.enabled ? '停用' : '启用'; toggle.addEventListener('click', () => toggleTarget(target));
+      actions.append(edit, toggle);
+      if (target.channel_type === 'WECOM_BOT') {
+        const test = document.createElement('button'); test.type = 'button'; test.className = 'btn btn-sm btn-outline-primary ms-2'; test.textContent = '测试消息'; test.disabled = !target.secret_available; test.addEventListener('click', () => testTargetWebhook(target)); actions.appendChild(test);
+      }
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'btn btn-sm btn-outline-danger ms-2'; remove.textContent = '删除'; remove.addEventListener('click', () => deleteTarget(target)); actions.appendChild(remove);
+      row.appendChild(actions); body.appendChild(row);
+    });
+    refreshTestSendPanel();
+  }
+
+  function refreshTestSendPanel() {
+    const panel = byId('testSendPanel');
+    if (!currentPreview) {
+      panel.classList.add('d-none');
+      return;
+    }
+    panel.classList.remove('d-none');
+    const routing = currentPreview.routing || {};
+    const candidates = state.targets.filter(target =>
+      Boolean(target.enabled)
+      && target.environment === 'test'
+      && target.channel_type === 'WECOM_BOT'
+      && Boolean(target.secret_available)
+      && (!target.store_id || target.store_id === routing.store_id)
+      && targetCoversManager(target, routing.manager_name)
+      && (!target.warehouse_id || Number(target.warehouse_id) === Number(routing.warehouse_id))
+      && (!target.shipping_method || String(target.shipping_method).toLowerCase() === String(routing.shipping_method || '').toLowerCase())
+    );
+    const select = byId('testSendTarget');
+    select.replaceChildren();
+    candidates.forEach(target => {
+      const option = document.createElement('option');
+      option.value = target.id;
+      option.textContent = `${target.name} · ${routeLabel(target)}`;
+      select.appendChild(option);
+    });
+    const button = byId('testSendButton');
+    const alreadyQueued = Boolean(currentPreview.testSendQueued);
+    button.disabled = alreadyQueued || !state.test_send_enabled || !candidates.length;
+    if (alreadyQueued) {
+      byId('testSendHelp').textContent = `测试任务 ${currentPreview.testSendJobId} 已创建；请在下方任务记录查看结果。`;
+    } else if (!candidates.length) {
+      byId('testSendHelp').textContent = '没有与当前订单路由匹配、已注入 Webhook 的隔离测试目标。';
+    } else if (!state.test_send_enabled) {
+      byId('testSendHelp').textContent = '目标已就绪，但服务器测试发送开关仍关闭；当前不会向群发送。';
+    } else {
+      byId('testSendHelp').textContent = currentPreview.source === 'email'
+        ? '将发送含客户资料的真实邮件截图；仅可发送到已确认的内部测试群。'
+        : '将发送系统脱敏卡片到隔离测试群。';
+    }
+  }
+  const selectedManagerNames = () => Array.from(byId('targetManagers').selectedOptions).map(option => option.value);
+  function refreshCopyToFallbackControl() {
+    const isFallback = !byId('targetStore').value
+      && !byId('targetCountry').value
+      && byId('targetAllManagers').checked
+      && !byId('targetWarehouse').value
+      && !byId('targetShipping').value.trim();
+    const control = byId('targetCopyToFallback');
+    control.disabled = isFallback;
+    if (isFallback) control.checked = false;
+    byId('targetCopyToFallbackHelp').textContent = isFallback
+      ? '当前目标本身就是总群兜底路由，不会重复抄送。'
+      : `开启后将额外发送到${byId('targetEnvironment').value === 'production' ? '正式环境' : '隔离测试环境'}的全部站点兜底群。`;
+  }
+  function managerSelectionChanged() {
+    const all = byId('targetAllManagers').checked;
+    const select = byId('targetManagers');
+    select.disabled = all;
+    byId('targetManagersSelectAll').disabled = all;
+    byId('targetManagersClear').disabled = all;
+    const selected = all ? (state.managers || []).length : selectedManagerNames().length;
+    byId('targetManagerHelp').textContent = all
+      ? '将覆盖当前及以后新增的全部负责人。'
+      : selected ? `已选择 ${selected} 位负责人。` : '请选择至少一位负责人，或勾选覆盖全部。';
+    refreshCopyToFallbackControl();
+  }
+  function channelChanged() {
+    const isWeCom = byId('targetChannel').value === 'WECOM_BOT';
+    const current = state.targets.find(item => item.id === byId('targetId').value);
+    const webhook = byId('targetWebhook');
+    byId('targetSecretGroup').classList.toggle('d-none', !isWeCom);
+    webhook.disabled = isWeCom && !state.managed_webhook_ready;
+    webhook.required = isWeCom && !Boolean(current && current.secret_configured);
+    byId('targetWebhookHelp').textContent = current && current.secret_configured
+      ? `已配置 ${current.secret_source === 'managed' ? `密文 #${current.webhook_fingerprint}` : `环境变量 ${current.secret_ref_name}`}；留空表示不修改。`
+      : state.managed_webhook_ready
+        ? '提交后由服务器加密保存；页面不会回显完整地址。'
+        : '服务器尚未配置加密主密钥，暂时不能从前端新增 Webhook。';
+  }
+  function resetTargetForm() {
+    byId('targetForm').reset(); byId('targetId').value = ''; byId('targetRate').value = '15'; byId('targetEnabled').checked = true;
+    Array.from(byId('targetManagers').options).forEach(option => { option.selected = false; });
+    byId('targetAllManagers').checked = false;
+    byId('targetCopyToFallback').checked = false;
+    byId('targetSubmitText').textContent = '新增目标'; byId('targetCancelEdit').classList.add('d-none'); managerSelectionChanged(); channelChanged();
+  }
+  function editTarget(target) {
+    byId('targetId').value = target.id; byId('targetName').value = target.name; byId('targetChannel').value = target.channel_type;
+    byId('targetEnvironment').value = target.environment; byId('targetCountry').value = target.country_code || ''; byId('targetStore').value = target.store_id || ''; byId('targetWarehouse').value = target.warehouse_id || '';
+    const names = new Set(target.manager_names || []); Array.from(byId('targetManagers').options).forEach(option => { option.selected = names.has(option.value); });
+    byId('targetAllManagers').checked = target.manager_scope !== 'selected';
+    byId('targetShipping').value = target.shipping_method || ''; byId('targetWebhook').value = ''; byId('targetRate').value = target.rate_limit_per_minute;
+    byId('targetEnabled').checked = Boolean(target.enabled); byId('targetCopyToFallback').checked = Boolean(target.copy_to_fallback); byId('targetSubmitText').textContent = '保存目标'; byId('targetCancelEdit').classList.remove('d-none'); managerSelectionChanged(); channelChanged();
+    byId('targetForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  function targetPayload(target = null) {
+    if (target) return { id: target.id, name: target.name, channel_type: target.channel_type, environment: target.environment, country_code: target.country_code, store_id: target.store_id, manager_scope: target.manager_scope, manager_names: target.manager_names, warehouse_id: target.warehouse_id, shipping_method: target.shipping_method, rate_limit_per_minute: target.rate_limit_per_minute, copy_to_fallback: Boolean(target.copy_to_fallback), enabled: !Boolean(target.enabled) };
+    const channel = byId('targetChannel').value; const webhook = byId('targetWebhook').value.trim(); const allManagers = byId('targetAllManagers').checked;
+    return { id: byId('targetId').value || undefined, name: byId('targetName').value.trim(), channel_type: channel, environment: byId('targetEnvironment').value, country_code: byId('targetCountry').value || null, store_id: byId('targetStore').value || null, manager_scope: allManagers ? 'all' : 'selected', manager_names: allManagers ? [] : selectedManagerNames(), warehouse_id: byId('targetWarehouse').value || null, shipping_method: byId('targetShipping').value.trim() || null, webhook_url: channel === 'WECOM_BOT' && webhook ? webhook : undefined, rate_limit_per_minute: Number(byId('targetRate').value), copy_to_fallback: byId('targetCopyToFallback').checked, enabled: byId('targetEnabled').checked };
+  }
+  async function saveTarget(payload) {
+    const saved = await api('/api/order-notifications/targets', { method: 'POST', body: JSON.stringify(payload) });
+    const index = state.targets.findIndex(item => item.id === saved.id);
+    if (index >= 0) state.targets[index] = saved; else state.targets.push(saved);
+    state.targets.sort((a, b) => `${a.environment}:${a.name}`.localeCompare(`${b.environment}:${b.name}`));
+    renderTargets(); updateKpis(); resetTargetForm(); return saved;
+  }
+  async function toggleTarget(target) {
+    try { await saveTarget(targetPayload(target)); message(`目标“${target.name}”已${target.enabled ? '停用' : '启用'}。`); } catch (error) { message(error.message, 'danger'); }
+  }
+  async function deleteTarget(target) {
+    if (!window.confirm(`确认删除通知目标“${target.name}”？\n系统会立即停用路由并清除已保存的 Webhook，但保留历史发送和审计记录。`)) return;
+    try {
+      await api(`/api/order-notifications/targets/${encodeURIComponent(target.id)}`, { method: 'DELETE', body: JSON.stringify({ confirmed: true }) });
+      state.targets = state.targets.filter(item => item.id !== target.id);
+      renderTargets(); updateKpis(); resetTargetForm(); message(`目标“${target.name}”已删除，Webhook 密文已清除。`);
+    } catch (error) { message(error.message, 'danger'); }
+  }
+  async function testTargetWebhook(target) {
+    if (!window.confirm(`确认向“${target.name}”发送一条不含订单和客户资料的连接测试消息？`)) return;
+    try {
+      await api(`/api/order-notifications/targets/${encodeURIComponent(target.id)}/test`, { method: 'POST', body: JSON.stringify({ confirmed: true }) });
+      message(`测试消息已成功发送到“${target.name}”。`);
+    } catch (error) { message(error.message, 'danger'); }
+  }
+
+  const storeHost = source => String(source || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+  const paymentKind = value => String(value || '').toLowerCase() === 'cod' ? 'COD' : '非 COD';
+  let orderSearchSequence = 0;
+  function renderPreviewOrders(orders, query = '', statusFilter = 'new') {
+    const select = byId('recentOrder');
+    select.replaceChildren();
+    byId('previewOrderId').value = '';
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = orders.length
+      ? '请选择一笔订单'
+      : '没有匹配订单，可调整筛选或直接输入内部订单 ID';
+    select.appendChild(placeholder);
+    orders.forEach(order => {
+      const option = document.createElement('option');
+      option.value = order.id;
+      option.textContent = `#${order.number || order.id} · ${order.status} · ${paymentKind(order.payment_method)} · ${storeHost(order.source)}`;
+      select.appendChild(option);
+    });
+    if (query && orders.length === 1) {
+      select.value = orders[0].id;
+      byId('previewOrderId').value = orders[0].id;
+    }
+    const siteOption = byId('previewSite').selectedOptions[0];
+    const siteLabel = siteOption && siteOption.value ? siteOption.textContent.trim() : '全部站点';
+    const statusOption = byId('previewStatus').selectedOptions[0];
+    const statusLabel = statusOption ? statusOption.textContent.trim() : '新订单（智能）';
+    byId('previewOrderSearchHelp').textContent = query && !orders.length && statusFilter === 'new'
+      ? `${siteLabel} · ${statusLabel}没有匹配结果；如需查历史订单，请切换到“全部状态”。`
+      : query
+        ? `${siteLabel} · ${statusLabel}找到 ${orders.length} 笔匹配订单。`
+        : `${siteLabel} · ${statusLabel}最近 ${orders.length} 笔订单。`;
+  }
+  async function loadPreviewOrders() {
+    const sequence = ++orderSearchSequence;
+    const button = byId('previewOrderSearchButton');
+    const query = byId('previewOrderSearch').value.trim();
+    const params = new URLSearchParams();
+    if (byId('previewSite').value) params.set('site', byId('previewSite').value);
+    params.set('status', byId('previewStatus').value);
+    if (query) params.set('q', query);
+    button.disabled = true;
+    button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>查找中';
+    try {
+      const result = await api(`/api/order-notifications/orders?${params.toString()}`);
+      if (sequence !== orderSearchSequence) return;
+      renderPreviewOrders(result.orders, result.query, result.status_filter);
+    } catch (error) {
+      message(error.message, 'danger');
+    } finally {
+      button.disabled = false;
+      button.innerHTML = '<i class="bi bi-search me-1"></i>查找';
+    }
+  }
+  byId('recentOrder').addEventListener('change', event => { if (event.target.value) byId('previewOrderId').value = event.target.value; });
+  byId('previewSite').addEventListener('change', loadPreviewOrders);
+  byId('previewStatus').addEventListener('change', loadPreviewOrders);
+  byId('previewOrderSearchButton').addEventListener('click', loadPreviewOrders);
+  byId('previewOrderSearch').addEventListener('keydown', event => {
+    if (event.key === 'Enter') { event.preventDefault(); loadPreviewOrders(); }
+  });
+  function previewSourceChanged() {
+    const isEmail = byId('previewSource').value === 'email';
+    byId('previewEvent').disabled = isEmail;
+    if (isEmail) byId('previewEvent').value = 'ORDER_READY';
+    byId('previewSourceHelp').textContent = isEmail
+      ? '显示实际发给管理员的新订单邮件，含客户资料；仅超级管理员可见。'
+      : '使用订单系统最新快照生成备用卡片，姓名和电话会脱敏。';
+    byId('previewPrivacyNote').textContent = isEmail
+      ? '只读取并渲染现有邮件日志，不触发 WooCommerce 重发邮件。'
+      : '备用卡片仅供核对，不读取邮件正文。';
+  }
+  byId('previewSource').addEventListener('change', previewSourceChanged);
+  byId('targetChannel').addEventListener('change', channelChanged);
+  byId('targetManagers').addEventListener('change', managerSelectionChanged);
+  byId('targetAllManagers').addEventListener('change', managerSelectionChanged);
+  byId('targetStore').addEventListener('change', refreshCopyToFallbackControl);
+  byId('targetCountry').addEventListener('change', refreshCopyToFallbackControl);
+  byId('targetWarehouse').addEventListener('change', refreshCopyToFallbackControl);
+  byId('targetShipping').addEventListener('input', refreshCopyToFallbackControl);
+  byId('targetEnvironment').addEventListener('change', refreshCopyToFallbackControl);
+  byId('targetManagersSelectAll').addEventListener('click', () => {
+    Array.from(byId('targetManagers').options).forEach(option => { option.selected = true; });
+    managerSelectionChanged();
+  });
+  byId('targetManagersClear').addEventListener('click', () => {
+    Array.from(byId('targetManagers').options).forEach(option => { option.selected = false; });
+    managerSelectionChanged();
+  });
+  byId('targetCancelEdit').addEventListener('click', resetTargetForm);
+  byId('targetForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    try { const saved = await saveTarget(targetPayload()); message(`目标“${saved.name}”已保存。`); } catch (error) { message(error.message, 'danger'); }
+  });
+  byId('previewForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const button = byId('previewButton'); button.disabled = true; button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>生成中';
+    currentPreview = null; byId('testSendPanel').classList.add('d-none');
+    byId('previewImages').replaceChildren(); byId('previewMeta').classList.add('d-none');
+    try {
+      const result = await api('/api/order-notifications/preview', { method: 'POST', body: JSON.stringify({ order_id: byId('previewOrderId').value.trim(), event_type: byId('previewEvent').value, source: byId('previewSource').value }) });
+      currentPreview = result;
+      const sourceLabel = result.source === 'email' ? `FluentSMTP 真实邮件原稿 · 日志 #${result.email.log_id}` : '系统脱敏卡片';
+      const meta = byId('previewMeta'); meta.textContent = `订单 #${result.order.number} · ${result.order.store} · ${sourceLabel} · 共 ${result.images.length} 页 · 未入队 · 未发送`; meta.classList.remove('d-none');
+      result.images.forEach(item => { const wrap = document.createElement('div'); wrap.className = 'text-center'; const label = document.createElement('div'); label.className = 'small text-muted mb-2'; label.textContent = `第 ${item.page} 页 · ${Math.round(item.bytes / 1024)} KB`; const image = document.createElement('img'); image.className = 'notify-preview-image'; image.src = item.data_url; image.alt = `订单通知预览第 ${item.page} 页`; wrap.append(label, image); byId('previewImages').appendChild(wrap); });
+      refreshTestSendPanel();
+      message('安全预览已生成；没有重发邮件、没有创建队列任务，也没有向任何群发送。');
+    } catch (error) { message(error.message, 'danger'); }
+    finally { button.disabled = false; button.innerHTML = '<i class="bi bi-image me-1"></i>生成预览'; }
+  });
+  byId('testSendButton').addEventListener('click', async () => {
+    if (!currentPreview) return;
+    const targetId = byId('testSendTarget').value;
+    const target = state.targets.find(item => item.id === targetId);
+    if (!target) return;
+    const privacy = currentPreview.source === 'email'
+      ? '\n该图片包含客户姓名、电话或地址等邮件原有资料。'
+      : '\n该图片使用系统脱敏卡片。';
+    if (!window.confirm(`确认把订单 #${currentPreview.order.number} 的当前预览发送到“${target.name}”？${privacy}\n此操作只创建一次隔离测试任务，不会开启自动群发。`)) return;
+    const button = byId('testSendButton');
+    button.disabled = true;
+    button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>正在入队';
+    try {
+      const result = await api('/api/order-notifications/test-send', {
+        method: 'POST',
+        body: JSON.stringify({
+          order_id: currentPreview.order.id,
+          target_id: targetId,
+          preview_id: currentPreview.preview_id,
+          source: currentPreview.source,
+          confirmed: true
+        })
+      });
+      currentPreview.testSendQueued = true;
+      currentPreview.testSendJobId = result.job_id;
+      refreshTestSendPanel();
+      message(result.duplicate
+        ? `该预览的测试任务已经存在：${result.job_id}。`
+        : `已创建隔离测试发送任务 ${result.job_id}；请在任务记录查看发送结果。`);
+    } catch (error) {
+      message(error.message, 'danger');
+      refreshTestSendPanel();
+    } finally {
+      button.innerHTML = '<i class="bi bi-send me-1"></i>发送到测试群';
+    }
+  });
+  byId('configForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const payload = { enabled: byId('configEnabled').checked, debounce_seconds: Number(byId('configDebounce').value), retention_days: Number(byId('configRetention').value), render_source: byId('configRenderSource').value, policy: { ready_statuses: csv('readyStatuses'), cancel_statuses: csv('cancelStatuses'), hold_statuses: csv('holdStatuses'), excluded_statuses: csv('excludedStatuses'), allow_site_cod_on_hold: byId('allowCodHold').checked, updated_fields: Array.from(document.querySelectorAll('.updated-field:checked')).map(item => item.value) } };
+    try { const result = await api('/api/order-notifications/config', { method: 'POST', body: JSON.stringify(payload) }); state.enabled = result.enabled; updateKpis(); message('制卡规则已保存；发送开关未改变。'); } catch (error) { message(error.message, 'danger'); }
+  });
+  renderTargets(); updateKpis(); managerSelectionChanged(); channelChanged(); previewSourceChanged();
+})();
+</script>
+{% endblock %}

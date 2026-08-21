@@ -228,9 +228,9 @@
     <div class="d-flex justify-content-between align-items-center mb-3">
         <h5 class="text-light mb-0">
             <i class="bi bi-list-ul me-2"></i>订单列表
-            <span class="badge bg-primary ms-2">{{ "{:,}".format(total) }} 条记录</span>
+            <span class="badge bg-primary ms-2">{{ "{:,}".format(listing_total) }} 条记录</span>
             {% if current_month %}
-            <span class="badge bg-info ms-2">{{ current_month }} ({{ orders|length }} 条)</span>
+            <span class="badge bg-info ms-2">{{ current_month }}（本页 {{ orders|length }} 条）</span>
             {% endif %}
         </h5>
         {% if current_user.is_authenticated and current_user.is_admin() %}
@@ -269,7 +269,7 @@
                         {% if displayed_totals and displayed_totals.order_count > 0 %}
                         <tr style="background: rgba(99,102,241,0.08); font-weight:600;">
                             <td colspan="6" class="text-end pe-3 align-middle">
-                                <span class="text-muted">本页合计</span>
+                                <span class="text-muted">{{ '筛选合计' if current_month == 'all' else '整月合计' }}</span>
                                 <span class="badge bg-info bg-opacity-25 text-info ms-2">{{ displayed_totals.order_count }} 单</span>
                                 {% if displayed_totals.undelivered_count > 0 %}
                                 <span class="badge ms-1" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);">含 {{ displayed_totals.undelivered_count }} 单未送达</span>
@@ -475,18 +475,40 @@
         </div>
     </div>
 
+    <!-- Server-side order pagination -->
+    {% if total_pages > 1 %}
+    <nav class="mt-4" aria-label="订单分页" data-order-pagination="true">
+        <div class="d-flex justify-content-center align-items-center flex-wrap gap-2">
+            <a class="btn btn-month {{ 'disabled' if page <= 1 }}"
+               href="{{ url_for('orders', page=1, per_page=per_page, month=current_month, source=current_filters.source, status=current_filters.status, date_from=current_filters.date_from, date_to=current_filters.date_to, search=current_filters.search, quick_date=current_filters.quick_date, manager=current_filters.manager, country=current_filters.country) }}">首页</a>
+            <a class="btn btn-month {{ 'disabled' if page <= 1 }}"
+               href="{{ url_for('orders', page=page-1, per_page=per_page, month=current_month, source=current_filters.source, status=current_filters.status, date_from=current_filters.date_from, date_to=current_filters.date_to, search=current_filters.search, quick_date=current_filters.quick_date, manager=current_filters.manager, country=current_filters.country) }}">上一页</a>
+            <span class="text-secondary px-2">第 {{ page }} / {{ total_pages }} 页</span>
+            <a class="btn btn-month {{ 'disabled' if page >= total_pages }}"
+               href="{{ url_for('orders', page=page+1, per_page=per_page, month=current_month, source=current_filters.source, status=current_filters.status, date_from=current_filters.date_from, date_to=current_filters.date_to, search=current_filters.search, quick_date=current_filters.quick_date, manager=current_filters.manager, country=current_filters.country) }}">下一页</a>
+            <a class="btn btn-month {{ 'disabled' if page >= total_pages }}"
+               href="{{ url_for('orders', page=total_pages, per_page=per_page, month=current_month, source=current_filters.source, status=current_filters.status, date_from=current_filters.date_from, date_to=current_filters.date_to, search=current_filters.search, quick_date=current_filters.quick_date, manager=current_filters.manager, country=current_filters.country) }}">末页</a>
+            <span class="text-secondary ms-2">每页</span>
+            {% for size in (20, 50, 100) %}
+            <a class="btn btn-month {{ 'active' if per_page == size }}"
+               href="{{ url_for('orders', page=1, per_page=size, month=current_month, source=current_filters.source, status=current_filters.status, date_from=current_filters.date_from, date_to=current_filters.date_to, search=current_filters.search, quick_date=current_filters.quick_date, manager=current_filters.manager, country=current_filters.country) }}">{{ size }}</a>
+            {% endfor %}
+        </div>
+    </nav>
+    {% endif %}
+
     <!-- Monthly Pagination -->
     {% if available_months|length > 0 %}
     <div class="mt-4">
         <div class="d-flex justify-content-center align-items-center flex-wrap gap-2">
             <span class="text-secondary me-2"><i class="bi bi-calendar3 me-1"></i>选择月份：</span>
             {% for month in available_months %}
-            <a href="?month={{ month }}&source={{ current_filters.source }}&status={{ current_filters.status }}&date_from={{ current_filters.date_from }}&date_to={{ current_filters.date_to }}&search={{ current_filters.search }}&quick_date={{ current_filters.quick_date }}&manager={{ current_filters.manager }}&country={{ current_filters.country }}"
+            <a href="?month={{ month }}&per_page={{ per_page }}&source={{ current_filters.source }}&status={{ current_filters.status }}&date_from={{ current_filters.date_from }}&date_to={{ current_filters.date_to }}&search={{ current_filters.search }}&quick_date={{ current_filters.quick_date }}&manager={{ current_filters.manager }}&country={{ current_filters.country }}"
                 class="btn btn-month {% if month == current_month %}active{% endif %}">
                 {{ month }}
             </a>
             {% endfor %}
-            <a href="?month=all&source={{ current_filters.source }}&status={{ current_filters.status }}&date_from={{ current_filters.date_from }}&date_to={{ current_filters.date_to }}&search={{ current_filters.search }}&quick_date={{ current_filters.quick_date }}&manager={{ current_filters.manager }}&country={{ current_filters.country }}"
+            <a href="?month=all&per_page={{ per_page }}&source={{ current_filters.source }}&status={{ current_filters.status }}&date_from={{ current_filters.date_from }}&date_to={{ current_filters.date_to }}&search={{ current_filters.search }}&quick_date={{ current_filters.quick_date }}&manager={{ current_filters.manager }}&country={{ current_filters.country }}"
                 class="btn btn-month btn-month-all {% if current_month == 'all' %}active{% endif %}">
                 <i class="bi bi-collection me-1"></i>全部
             </a>

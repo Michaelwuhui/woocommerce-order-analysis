@@ -25,7 +25,7 @@ import json
 from flask import Blueprint, render_template, request, jsonify
 from flask_login import login_required
 
-from inv_common import get_conn, inv_view_required, inv_admin_required, current_operator
+from inv_common import get_conn, inv_admin_required, current_operator
 import inv_allocator
 
 inv_push_bp = Blueprint('inv_push', __name__)
@@ -34,12 +34,38 @@ inv_push_bp = Blueprint('inv_push', __name__)
 # ───────────────────────── 计算可发布库存 ─────────────────────────
 
 def _serving_warehouses(conn, market):
-    """该市场的服务仓 id 列表。配置了路由→路由仓;否则→该国家活跃仓。"""
+    """Return quantity-authoritative serving warehouses only.
+
+    Manual partner warehouses deliberately do not maintain an OMS quantity
+    ledger and must never cause Woo stock to be overwritten with zero.
+    """
     cands = inv_allocator.candidate_warehouses(conn, market)
-    if cands:
-        return [c['warehouse_id'] for c in cands]
-    rows = conn.execute("SELECT id FROM warehouses WHERE country=? AND is_active=1", (market,)).fetchall()
-    return [r['id'] for r in rows]
+    ids = [int(c['warehouse_id']) for c in cands]
+    if not ids:
+        ids = [int(r['id']) for r in conn.execute(
+            "SELECT id FROM warehouses WHERE country=? AND is_active=1", (market,)
+        ).fetchall()]
+    if not ids:
+        return []
+    marks = ','.join('?' * len(ids))
+    rows = conn.execute(
+        f'''SELECT w.id,COALESCE(wi.inventory_authority,'local') AS inventory_authority,
+                   COALESCE(wi.config_json,'{{}}') AS config_json
+            FROM warehouses w LEFT JOIN oms_warehouse_integrations wi ON wi.warehouse_id=w.id
+            WHERE w.id IN ({marks}) AND w.is_active=1''', ids
+    ).fetchall()
+    result = []
+    for row in rows:
+        try:
+            config = json.loads(row['config_json'] or '{}')
+        except (TypeError, ValueError):
+            config = {}
+        authority = row['inventory_authority'] or 'local'
+        if authority == 'manual_partner' or config.get('requires_quantity_inventory') is False:
+            continue
+        if authority in ('local', 'external_wms'):
+            result.append({'warehouse_id': int(row['id']), 'authority': authority})
+    return result
 
 
 def compute_site_stock(conn, site_id):
@@ -48,20 +74,32 @@ def compute_site_stock(conn, site_id):
     if not site:
         return []
     market = (site['country'] or '').upper()
-    wh_ids = _serving_warehouses(conn, market)
+    warehouses = _serving_warehouses(conn, market)
+    wh_ids = [row['warehouse_id'] for row in warehouses]
     maps = conn.execute('''SELECT m.*, k.sku_code, k.name AS sku_name
                            FROM inv_site_sku_map m JOIN inv_skus k ON k.id=m.sku_id
                            WHERE m.site_id=? AND m.is_active=1''', (site_id,)).fetchall()
     out = []
     for m in maps:
         avail_sku = 0
-        if wh_ids:
-            q = ','.join('?' * len(wh_ids))
+        local_ids = [row['warehouse_id'] for row in warehouses if row['authority'] == 'local']
+        external_ids = [row['warehouse_id'] for row in warehouses if row['authority'] == 'external_wms']
+        if local_ids:
+            q = ','.join('?' * len(local_ids))
             r = conn.execute(
-                f'SELECT COALESCE(SUM(MAX(on_hand - reserved, 0)),0) AS a '
-                f'FROM inv_stock WHERE sku_id=? AND warehouse_id IN ({q})',
-                [m['sku_id']] + wh_ids).fetchone()
-            avail_sku = max(0, r['a'] or 0)
+                f'''SELECT COALESCE(SUM(MAX(st.on_hand - st.reserved, 0)),0) AS a
+                    FROM inv_stock st JOIN oms_sku_warehouses sw
+                      ON sw.warehouse_id=st.warehouse_id AND sw.sku_id=st.sku_id AND sw.is_enabled=1
+                    WHERE st.sku_id=? AND st.warehouse_id IN ({q})''',
+                [m['sku_id']] + local_ids).fetchone()
+            avail_sku += max(0, r['a'] or 0)
+        if external_ids:
+            q = ','.join('?' * len(external_ids))
+            r = conn.execute(
+                f'''SELECT COALESCE(SUM(MAX(available_quantity,0)),0) AS a
+                    FROM oms_external_stock WHERE sku_id=? AND warehouse_id IN ({q})''',
+                [m['sku_id']] + external_ids).fetchone()
+            avail_sku += max(0, r['a'] or 0)
         qpi = m['qty_per_item'] or 1
         publishable = avail_sku // qpi
         out.append({
@@ -76,7 +114,7 @@ def compute_site_stock(conn, site_id):
 
 # ───────────────────────── 下推 / 对账 ─────────────────────────
 
-def _put_stock(api_url, ck, cs, product_id, qty):
+def _put_stock(api_url, ck, cs, product_id, variation_id, qty):
     """复用 Product Manager 的白名单 PUT 把单个商品库存写到 WC。返回 (ok, error)。"""
     import requests as req
     from app import _build_product_update_payload, _parse_wc_response
@@ -84,7 +122,10 @@ def _put_stock(api_url, ck, cs, product_id, qty):
     if err:
         return False, err
     try:
-        resp = req.put(f'{api_url}/wp-json/wc/v3/products/{product_id}',
+        resource = f'{api_url}/wp-json/wc/v3/products/{product_id}'
+        if variation_id:
+            resource += f'/variations/{variation_id}'
+        resp = req.put(resource,
                        auth=(ck, cs), json=payload, timeout=90,
                        headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0',
                                 'Content-Type': 'application/json', 'Accept': 'application/json'})
@@ -120,7 +161,9 @@ def push_site(conn, site_id, dry_run=True, only_changed=True):
     for it in items:
         status, err = 'dry', None
         if not dry_run:
-            ok, err = _put_stock(api_url, ck, cs, it['wc_product_id'], it['publishable'])
+            ok, err = _put_stock(
+                api_url, ck, cs, it['wc_product_id'], it['wc_variation_id'], it['publishable']
+            )
             status = 'ok' if ok else 'error'
             if ok:
                 result['ok'] += 1
@@ -141,7 +184,7 @@ def push_site(conn, site_id, dry_run=True, only_changed=True):
 
 @inv_push_bp.route('/inventory/push')
 @login_required
-@inv_view_required
+@inv_admin_required
 def push_page():
     conn = get_conn()
     sites = conn.execute('SELECT id, url, country FROM sites ORDER BY country, url').fetchall()
@@ -151,7 +194,7 @@ def push_page():
 
 @inv_push_bp.route('/api/inv/site-stock/<int:site_id>', methods=['GET'])
 @login_required
-@inv_view_required
+@inv_admin_required
 def api_site_stock(site_id):
     """对账视图:某站点各商品的本系统可发布库存(不写库、不连 WC)。"""
     conn = get_conn()
@@ -177,7 +220,7 @@ def api_push_site(site_id):
 
 @inv_push_bp.route('/api/inv/push-logs', methods=['GET'])
 @login_required
-@inv_view_required
+@inv_admin_required
 def api_push_logs():
     site_id = request.args.get('site_id')
     try:

@@ -6,9 +6,10 @@ inv_orders.py — 模块 5:卖出扣减 + 订单联动(幂等处理器)。
 重复执行结果一致(不会重复扣减)。
 
 状态机(订单状态 → 目标库存效果):
-  RESERVE(已付待发) : processing / on-hold        → 预留 reserved
+  RESERVE(仍有待发) : processing / on-hold /
+                     partial-shipped               → 保留 reserved
   SHIP(已出库)      : shipped / completed /
-                       delivered / partial-shipped → 出库 deduct(扣 on_hand + FEFO 批次)
+                       delivered                   → 出库 deduct(扣 on_hand + FEFO 批次)
   CLEAR(无效/退回)  : cancelled / failed /
                        refunded / checkout-draft /
                        cheat / offline             → 释放预留 或 退货入库(视当前状态)
@@ -37,8 +38,8 @@ import inv_allocator
 inv_ord_bp = Blueprint('inv_ord', __name__)
 
 # 订单状态 → 目标效果
-RESERVE_STATUSES = {'processing', 'on-hold'}
-SHIP_STATUSES = {'shipped', 'completed', 'delivered', 'partial-shipped'}
+RESERVE_STATUSES = {'processing', 'on-hold', 'partial-shipped'}
+SHIP_STATUSES = {'shipped', 'completed', 'delivered'}
 CLEAR_STATUSES = {'cancelled', 'failed', 'refunded', 'checkout-draft', 'cheat', 'offline'}
 
 

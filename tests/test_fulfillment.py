@@ -20,7 +20,10 @@ from inv_migrations import (
     down_010,
     down_011,
     down_012,
+    down_017,
+    down_018,
     up_001,
+    up_005,
     up_006,
     up_007,
     up_008,
@@ -28,7 +31,10 @@ from inv_migrations import (
     up_010,
     up_011,
     up_012,
+    up_017,
+    up_018,
 )
+from inv_common import record_movement, replenishment_metrics
 from fulfillment_woocommerce import _all_order_shipments, _ast_items, _customer_note_body
 
 
@@ -246,6 +252,206 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.assertEqual("stock_shortage", result["aggregate_status"])
         self.assertTrue(result["shortages"])
         self.assertEqual([], self.allocations("managed-legacy-map"))
+
+    def test_jyjg_transit_warehouse_uses_finite_reserved_stock(self):
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES ('oms_managed_product_isolation_enabled','1')"
+        )
+        up_017(self.db)
+        warehouse_id = self.db.execute(
+            "SELECT id FROM warehouses WHERE code='PL-JYJG-TRANSIT'"
+        ).fetchone()[0]
+        self.assertEqual(
+            (59, 590, 0),
+            tuple(self.db.execute(
+                """SELECT COUNT(*),SUM(on_hand),SUM(reserved)
+                   FROM inv_stock WHERE warehouse_id=?""",
+                (warehouse_id,),
+            ).fetchone()),
+        )
+
+        self.add_order(
+            "transit-first", "CZ", 7, product_id=901, sku="",
+            name="Fumot Leopard 40000 Puffs - Cola Ice",
+        )
+        first = plan_order(self.db, "transit-first")
+        self.assertFalse(first["shortages"])
+        self.assertEqual(
+            [{"warehouse_id": warehouse_id, "qty": 7}],
+            self.allocations("transit-first"),
+        )
+        self.assertEqual("noop", plan_order(self.db, "transit-first")["action"])
+
+        self.add_order(
+            "transit-second", "HU", 4, product_id=902, sku="",
+            name="Fumot Leopard 40000 Puffs - Cola Ice",
+        )
+        second = plan_order(self.db, "transit-second")
+        self.assertEqual("stock_shortage", second["aggregate_status"])
+        self.assertEqual(1, second["shortages"][0]["qty"])
+        self.assertEqual(
+            [{"warehouse_id": warehouse_id, "qty": 3}],
+            self.allocations("transit-second"),
+        )
+        stock = self.db.execute(
+            """SELECT st.on_hand,st.reserved
+               FROM inv_stock st JOIN inv_skus s ON s.id=st.sku_id
+               WHERE st.warehouse_id=? AND s.sku_code='40K-CI'""",
+            (warehouse_id,),
+        ).fetchone()
+        self.assertEqual((10, 10), tuple(stock))
+
+        first_fulfillment = self.db.execute(
+            "SELECT id FROM oms_fulfillments WHERE order_id='transit-first' AND status!='superseded'"
+        ).fetchone()[0]
+        transition_fulfillment(self.db, first_fulfillment, "cancelled")
+        self.assertEqual("planned", plan_order(self.db, "transit-second")["action"])
+        self.assertEqual(
+            [{"warehouse_id": warehouse_id, "qty": 4}],
+            self.allocations("transit-second"),
+        )
+        stock = self.db.execute(
+            """SELECT st.on_hand,st.reserved
+               FROM inv_stock st JOIN inv_skus s ON s.id=st.sku_id
+               WHERE st.warehouse_id=? AND s.sku_code='40K-CI'""",
+            (warehouse_id,),
+        ).fetchone()
+        self.assertEqual((10, 4), tuple(stock))
+
+    def test_jyjg_transit_shipment_deducts_once_and_rollback_disables_new_routing(self):
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES ('oms_managed_product_isolation_enabled','1')"
+        )
+        up_017(self.db)
+        warehouse_id = self.db.execute(
+            "SELECT id FROM warehouses WHERE code='PL-JYJG-TRANSIT'"
+        ).fetchone()[0]
+        self.add_order(
+            "transit-ship", "PL", 2, product_id=903, sku="",
+            name="Fumot RandM Tornado 9000 Puffs - Grape",
+        )
+        result = plan_order(self.db, "transit-ship")
+        shipment = create_shipment(
+            self.db,
+            result["fulfillment_ids"][0],
+            "Z-TRANSIT-001",
+            carrier_slug="packeta",
+        )
+        duplicate = create_shipment(
+            self.db,
+            result["fulfillment_ids"][0],
+            "Z-TRANSIT-001",
+            carrier_slug="packeta",
+        )
+        self.assertEqual(shipment["id"], duplicate["id"])
+        stock = self.db.execute(
+            """SELECT st.on_hand,st.reserved
+               FROM inv_stock st JOIN inv_skus s ON s.id=st.sku_id
+               WHERE st.warehouse_id=? AND s.sku_code='9K-G'""",
+            (warehouse_id,),
+        ).fetchone()
+        self.assertEqual((8, 0), tuple(stock))
+        self.assertEqual(
+            1,
+            self.db.execute(
+                """SELECT COUNT(*) FROM inv_movements
+                   WHERE warehouse_id=? AND movement_type='sale_out'""",
+                (warehouse_id,),
+            ).fetchone()[0],
+        )
+
+        down_017(self.db)
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT is_active FROM warehouses WHERE id=?", (warehouse_id,)
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            8,
+            self.db.execute(
+                """SELECT st.on_hand FROM inv_stock st JOIN inv_skus s ON s.id=st.sku_id
+                   WHERE st.warehouse_id=? AND s.sku_code='9K-G'""",
+                (warehouse_id,),
+            ).fetchone()[0],
+        )
+
+    def test_jyjg_replenishment_warning_lifecycle(self):
+        up_005(self.db)
+        up_017(self.db)
+        warehouse_id = self.db.execute(
+            "SELECT id FROM warehouses WHERE code='PL-JYJG-TRANSIT'"
+        ).fetchone()[0]
+        sku_id = self.db.execute(
+            "SELECT id FROM inv_skus WHERE sku_code='40K-CI'"
+        ).fetchone()[0]
+
+        record_movement(
+            self.db, warehouse_id=warehouse_id, sku_id=sku_id,
+            movement_type="reserve", reserved_delta=7,
+            ref_type="test", ref_id="low-stock",
+        )
+        metrics = replenishment_metrics(self.db, warehouse_id, sku_id)
+        notice = self.db.execute(
+            "SELECT * FROM inv_notifications WHERE dedup_key=? AND status='unread'",
+            (f"restock:{warehouse_id}:{sku_id}",),
+        ).fetchone()
+        self.assertEqual(3, metrics["available"])
+        self.assertEqual(7, metrics["suggested_replenishment"])
+        self.assertIn("建议补 7 支", notice["body"])
+
+        record_movement(
+            self.db, warehouse_id=warehouse_id, sku_id=sku_id,
+            movement_type="release", reserved_delta=-7,
+            ref_type="test", ref_id="restocked",
+        )
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM inv_notifications WHERE dedup_key=? AND status='unread'",
+            (f"restock:{warehouse_id}:{sku_id}",),
+        ).fetchone())
+
+    def test_manual_shipper_scope_migration_roundtrip(self):
+        up_017(self.db)
+        warehouse_id = self.db.execute(
+            "SELECT id FROM warehouses WHERE code='PL-JYJG-TRANSIT'"
+        ).fetchone()[0]
+        self.db.execute(
+            "INSERT INTO users (id,username,name) VALUES (10,'jinyi','金毅')"
+        )
+        self.db.execute("CREATE TABLE partners (id INTEGER PRIMARY KEY, name TEXT)")
+        self.db.execute("INSERT INTO partners (id,name) VALUES (1,'金谷金毅（波兰）')")
+        self.db.commit()
+
+        up_018(self.db)
+        permission = self.db.execute(
+            """SELECT can_view,can_pick,can_pack,can_ship,can_cancel
+               FROM oms_warehouse_user_permissions WHERE user_id=10 AND warehouse_id=?""",
+            (warehouse_id,),
+        ).fetchone()
+        self.assertEqual((1, 0, 0, 1, 0), tuple(permission))
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT partner_id FROM inv_warehouse_ext WHERE warehouse_id=?",
+                (warehouse_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            ("3", "10"),
+            tuple(row[0] for row in self.db.execute(
+                "SELECT value FROM settings WHERE key IN ('inv_jyjg_reorder_point','inv_jyjg_target_stock') ORDER BY key"
+            ).fetchall()),
+        )
+
+        down_018(self.db)
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM oms_warehouse_user_permissions WHERE user_id=10 AND warehouse_id=?",
+            (warehouse_id,),
+        ).fetchone())
+        self.assertIsNone(self.db.execute(
+            "SELECT partner_id FROM inv_warehouse_ext WHERE warehouse_id=?",
+            (warehouse_id,),
+        ).fetchone()[0])
 
     def test_managed_family_matching_is_exact_enough(self):
         self.db.execute(
@@ -803,6 +1009,19 @@ class FulfillmentDomainTests(unittest.TestCase):
         self.set_stock(pl=1, hu=5)
         self.add_order("ast-1", "PL", 3)
         plan_order(self.db, "ast-1")
+        order_item = self.db.execute(
+            "SELECT id, raw_json FROM oms_order_items WHERE order_id='ast-1'"
+        ).fetchone()
+        raw_item = json.loads(order_item["raw_json"])
+        raw_item.update({
+            "product_id": 13792,
+            "variation_id": 13794,
+            "sku": "WATERMELON-ICE",
+        })
+        self.db.execute(
+            "UPDATE oms_order_items SET raw_json=? WHERE id=?",
+            (json.dumps(raw_item), order_item["id"]),
+        )
         fulfillments = self.db.execute(
             "SELECT id,warehouse_id,status FROM oms_fulfillments WHERE order_id='ast-1' ORDER BY warehouse_id"
         ).fetchall()
@@ -816,7 +1035,12 @@ class FulfillmentDomainTests(unittest.TestCase):
         )
         shipments = _all_order_shipments(self.db, "ast-1", 1)
         self.assertEqual(["PL-SHIPPED"], [s["tracking_number"] for s in shipments])
-        self.assertEqual(1, len(_ast_items(shipments)))
+        partial_items = _ast_items(shipments)
+        self.assertEqual(1, len(partial_items))
+        self.assertEqual("2", partial_items[0]["status_shipped"])
+        self.assertEqual("13794", partial_items[0]["products_list"][0]["product"])
+        self.assertEqual("WATERMELON-ICE", partial_items[0]["products_list"][0]["sku"])
+        self.assertEqual("1", _ast_items(shipments, final=True)[0]["status_shipped"])
 
     def test_ast_hungary_packeta_uses_expressone_custom_link(self):
         self.db.execute(

@@ -47,6 +47,85 @@ def _flag_enabled(conn, key):
     return bool(row and str(row[0]).strip().lower() in {'1', 'true', 'yes', 'on'})
 
 
+LEGACY_TERMINAL_ORDER_STATUSES = {
+    'shipped', 'completed', 'cancelled', 'refunded', 'failed', 'trash'
+}
+
+
+def reconcile_legacy_terminal_shortages(conn, candidates):
+    """Clear stale shortage flags after a legacy/manual order has terminated.
+
+    The legacy shipping/Woo status path predates ``oms_fulfillments``. A
+    managed-product order could therefore be marked short first, then shipped
+    manually, leaving the order list with contradictory badges. Only orders
+    without a live OMS fulfillment are reconciled; started multi-warehouse
+    work remains authoritative and is never hidden by a Woo status update.
+    """
+
+    table_names = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    required = {'oms_order_fulfillment_state', 'oms_order_items', 'oms_fulfillments'}
+    if not required.issubset(table_names):
+        return 0
+    reconciled = 0
+    for item in candidates or []:
+        status = str(item.get('status') or '').strip().lower()
+        order_id = item.get('order_id')
+        if status not in LEGACY_TERMINAL_ORDER_STATUSES or not order_id:
+            continue
+        state = conn.execute(
+            '''SELECT aggregate_status,has_shortage,manual_review,manual_reason
+               FROM oms_order_fulfillment_state
+               WHERE order_id=? AND aggregate_status='stock_shortage'
+                 AND has_shortage=1
+                 AND NOT EXISTS (
+                   SELECT 1 FROM oms_fulfillments f
+                   WHERE f.order_id=?
+                     AND f.status NOT IN ('superseded','cancelled')
+                 )''',
+            (order_id, order_id),
+        ).fetchone()
+        if not state:
+            continue
+        target = 'delivered' if status == 'completed' else (
+            'cancelled' if status in {'cancelled', 'refunded', 'failed', 'trash'}
+            else 'shipped'
+        )
+        conn.execute(
+            '''UPDATE oms_order_fulfillment_state
+               SET aggregate_status=?,has_shortage=0,manual_review=0,
+                   manual_reason=NULL,updated_at=CURRENT_TIMESTAMP
+               WHERE order_id=?''',
+            (target, order_id),
+        )
+        conn.execute(
+            '''UPDATE oms_order_items
+               SET shortage_qty=0,updated_at=CURRENT_TIMESTAMP
+               WHERE order_id=?''',
+            (order_id,),
+        )
+        if 'oms_domain_events' in table_names:
+            conn.execute(
+                '''INSERT INTO oms_domain_events
+                   (aggregate_type,aggregate_id,event_type,from_status,to_status,
+                    actor_type,reason,payload_json)
+                   VALUES ('order',?,'legacy_terminal_shortage_reconciled',?,?,
+                           'system',?,?)''',
+                (
+                    order_id,
+                    state[0],
+                    target,
+                    '订单已通过旧手工流程发货/终止，清理遗留缺货标记',
+                    json.dumps({'woo_status': status}, ensure_ascii=False),
+                ),
+            )
+        reconciled += 1
+    return reconciled
+
+
 def _enqueue_fulfillment_plans(candidates):
     """Queue planning after the Woo order transaction has committed.
 
@@ -106,6 +185,17 @@ def _enqueue_fulfillment_plans(candidates):
         # Order sync remains authoritative and must not fail because the
         # optional fulfillment queue is unavailable during rollout.
         print(f"[fulfillment] enqueue skipped: {exc}")
+
+
+def _enqueue_order_notifications(candidates):
+    """Dark-launched order-card notifications after the authoritative commit."""
+    try:
+        from order_notification_service import enqueue_synced_orders
+
+        enqueue_synced_orders(candidates)
+    except Exception as exc:
+        # Notification availability must never break WooCommerce synchronization.
+        print(f"[order-notification] enqueue skipped: {type(exc).__name__}")
 
 # 线程局部存储，用于数据库连接复用
 _thread_local = threading.local()
@@ -277,8 +367,10 @@ def save_orders_to_db(orders_data, connection=None):
             })
 
         cursor.executemany(insert_query, processed_orders)
+        reconcile_legacy_terminal_shortages(connection, planning_candidates)
         connection.commit()
         _enqueue_fulfillment_plans(planning_candidates)
+        _enqueue_order_notifications(planning_candidates)
         
     except Exception as e:
         print(f"Error saving orders: {e}")
