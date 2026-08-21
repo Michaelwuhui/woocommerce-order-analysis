@@ -4,6 +4,7 @@ import unittest
 
 from order_shipments import (
     build_shipping_log_parcels,
+    detect_tracking_format_rows,
     extract_tracking_candidates,
     find_duplicate_tracking,
     partition_shipping_logs,
@@ -121,6 +122,23 @@ class OrderShipmentPresentationTests(unittest.TestCase):
         duplicate = find_duplicate_tracking(conn, "order-b", "DPD", "dpd-123")
         self.assertEqual("order-a", duplicate["order_id"])
         self.assertEqual("1001", duplicate["number"])
+
+    def test_newest_tracked_order_breaks_format_count_tie(self):
+        rows = [
+            {"meta_data": "[]", "line_items": "_vi_wot_order_item_tracking_data"},
+            {"meta_data": "_wc_shipment_tracking_items", "line_items": "[]"},
+        ]
+
+        self.assertEqual("villatheme", detect_tracking_format_rows(rows))
+
+    def test_format_majority_wins_over_newest_outlier(self):
+        rows = [
+            {"meta_data": "[]", "line_items": "_vi_wot_order_item_tracking_data"},
+            {"meta_data": "_wc_shipment_tracking_items", "line_items": "[]"},
+            {"meta_data": "_wc_shipment_tracking_items", "line_items": "[]"},
+        ]
+
+        self.assertEqual("ast", detect_tracking_format_rows(rows))
 
 
 if __name__ == "__main__":

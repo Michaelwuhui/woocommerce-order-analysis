@@ -113,6 +113,35 @@ def find_duplicate_tracking(conn: Any, order_id: Any, carrier_slug: str, trackin
     return _dict(row) if row else None
 
 
+def detect_tracking_format_rows(rows: Iterable[Any]) -> str:
+    """Choose the dominant tracking format, using the newest tracked row to break ties."""
+    counts = {"ast": 0, "villatheme": 0, "custom_lineitem": 0}
+    newest = None
+    for raw_row in rows or []:
+        row = _dict(raw_row)
+        meta_data = str(row.get("meta_data") or "")
+        line_items = str(row.get("line_items") or "")
+        kinds = []
+        if "_wc_shipment_tracking_items" in meta_data:
+            kinds.append("ast")
+        if "_vi_wot_order_item_tracking_data" in line_items:
+            kinds.append("villatheme")
+        elif '"key":"tracking_number"' in line_items or '"key": "tracking_number"' in line_items:
+            kinds.append("custom_lineitem")
+        if kinds and newest is None:
+            newest = kinds[0]
+        for kind in kinds:
+            counts[kind] += 1
+
+    highest = max(counts.values())
+    if not highest:
+        return "unknown"
+    winners = [kind for kind, count in counts.items() if count == highest]
+    if newest in winners:
+        return newest
+    return winners[0]
+
+
 def extract_tracking_candidates(
     meta_data: Any,
     line_items: Any,

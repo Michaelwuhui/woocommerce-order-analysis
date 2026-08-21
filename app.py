@@ -29,6 +29,7 @@ from shipment_split import (
 )
 from order_shipments import (
     build_shipping_log_parcels,
+    detect_tracking_format_rows,
     extract_tracking_candidates,
     find_duplicate_tracking,
     partition_shipping_logs,
@@ -17372,24 +17373,7 @@ def detect_site_tracking_format(conn, site_url):
         ORDER BY date_modified DESC LIMIT 10
     """, (site_url,)).fetchall()
 
-    ast = villa = custom = 0
-    for r in rows:
-        md = r['meta_data'] or ''
-        li = r['line_items'] or ''
-        if '_wc_shipment_tracking_items' in md:
-            ast += 1
-        if '_vi_wot_order_item_tracking_data' in li:
-            villa += 1
-        elif '"key":"tracking_number"' in li or '"key": "tracking_number"' in li:
-            custom += 1
-
-    if ast and ast >= max(villa, custom):
-        return 'ast'
-    if villa and villa >= custom:
-        return 'villatheme'
-    if custom:
-        return 'custom_lineitem'
-    return 'unknown'
+    return detect_tracking_format_rows(rows)
 
 
 def _carrier_tracking_url(carrier_slug, tracking_number, tracking_url_template=''):
