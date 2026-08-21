@@ -18530,6 +18530,7 @@ def get_carriers_for_site():
         carriers = [c for c in carriers if c['slug'] != 'packeta']
     required_slugs_by_country = {
         'AU': ('australia-post', 'ems'),
+        'PL': ('inpost', 'dpd'),
         'CZ': ('packeta',),
         'HU': ('packeta-hu',),
     }
