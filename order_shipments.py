@@ -98,6 +98,31 @@ def partition_shipping_logs(shipping_logs: Iterable[Any]) -> tuple[list[dict], l
     return confirmed, pending
 
 
+def is_pending_shipping_candidate(order: Any, shipping_logs: Iterable[Any]) -> bool:
+    """Return whether an order still belongs in the normal shipping queue.
+
+    A confirmed non-partial parcel means the order already had its final
+    shipment.  Status drift in WooCommerce must not turn that parcel into a
+    fake "continue shipping" action.  Pending-sync attempts stay visible so
+    operators can retry them, while delivered/returned outcomes leave this
+    queue and are handled by their dedicated workflows.
+    """
+    row = _dict(order)
+    if str(row.get("status") or "") not in {
+        "processing", "offline", "partial-shipped",
+    }:
+        return False
+    if any(bool(row.get(key)) for key in (
+        "is_undelivered", "is_problem_return", "delivery_confirmed",
+    )):
+        return False
+
+    confirmed, pending = partition_shipping_logs(shipping_logs)
+    if pending:
+        return True
+    return not any(not bool(parcel.get("is_partial")) for parcel in confirmed)
+
+
 def find_duplicate_tracking(conn: Any, order_id: Any, carrier_slug: str, tracking_number: str) -> dict | None:
     """Return another order already holding the same carrier/tracking pair."""
     row = conn.execute(

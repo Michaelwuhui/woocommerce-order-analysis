@@ -7,6 +7,7 @@ from order_shipments import (
     detect_tracking_format_rows,
     extract_tracking_candidates,
     find_duplicate_tracking,
+    is_pending_shipping_candidate,
     partition_shipping_logs,
 )
 
@@ -101,6 +102,34 @@ class OrderShipmentPresentationTests(unittest.TestCase):
 
         self.assertEqual(["OK-1", "LEGACY-1"], [row["tracking_number"] for row in confirmed])
         self.assertEqual(["WAIT-1"], [row["tracking_number"] for row in pending])
+
+    def test_full_shipment_status_drift_does_not_offer_continue_shipping(self):
+        order = {
+            "status": "processing",
+            "is_undelivered": 0,
+            "is_problem_return": 0,
+            "delivery_confirmed": 0,
+        }
+
+        self.assertFalse(is_pending_shipping_candidate(order, [
+            {"status": "shipped", "is_partial": 0},
+        ]))
+        self.assertTrue(is_pending_shipping_candidate(order, [
+            {"status": "shipped", "is_partial": 1},
+        ]))
+        self.assertTrue(is_pending_shipping_candidate(order, [
+            {"status": "pending_sync", "is_partial": 0},
+        ]))
+
+    def test_returned_order_never_returns_to_normal_shipping_queue(self):
+        order = {
+            "status": "processing",
+            "is_undelivered": 1,
+            "is_problem_return": 0,
+            "delivery_confirmed": 0,
+        }
+
+        self.assertFalse(is_pending_shipping_candidate(order, []))
 
     def test_duplicate_tracking_is_detected_only_on_another_order(self):
         conn = sqlite3.connect(":memory:")

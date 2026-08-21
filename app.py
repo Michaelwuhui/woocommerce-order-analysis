@@ -32,6 +32,7 @@ from order_shipments import (
     detect_tracking_format_rows,
     extract_tracking_candidates,
     find_duplicate_tracking,
+    is_pending_shipping_candidate,
     partition_shipping_logs,
 )
 from partner_site_scope import (
@@ -16847,7 +16848,8 @@ def get_pending_orders():
     query = '''
         SELECT o.id, o.number, o.status, o.total, o.currency, o.date_created,
                o.source, o.billing, o.shipping, o.line_items, o.meta_data, o.shipping_total, o.shipping_lines,
-               o.customer_note, o.warehouse_id,
+               o.customer_note, o.warehouse_id, o.is_undelivered,
+               o.is_problem_return, o.delivery_confirmed,
                s.manager,
                w.name as warehouse_name,
                n.note as latest_note, n.date_created as latest_note_date, n.author as latest_note_author
@@ -17011,6 +17013,7 @@ def get_pending_orders():
     order_ids = [o['id'] for o in orders]
     parcels_map = {}
     pending_shipments_map = {}
+    shipping_state_rows_map = {}
     if order_ids:
         ph = ','.join(['?'] * len(order_ids))
         for r in conn.execute(
@@ -17030,11 +17033,22 @@ def get_pending_orders():
                 'is_partial': bool(r['is_partial']),
                 'status': r['status'] or 'shipped',
             }
+            shipping_state_rows_map.setdefault(r['order_id'], []).append(shipment)
             confirmed, pending = partition_shipping_logs([shipment])
             if pending:
                 pending_shipments_map[r['order_id']] = pending[0]
             else:
                 parcels_map.setdefault(r['order_id'], []).append(confirmed[0])
+
+    # A full parcel is not a partial shipment merely because WooCommerce later
+    # drifted back to processing.  Returned/delivered outcomes also leave the
+    # ordinary shipping queue.  Pending-sync rows remain visible for retry.
+    orders = [
+        order for order in orders
+        if is_pending_shipping_candidate(
+            order, shipping_state_rows_map.get(order['id'], [])
+        )
+    ]
 
     # Build the risk index once (small scan over flagged orders only) and
     # reuse it for every row in this listing. Closing conn AFTER the build.
