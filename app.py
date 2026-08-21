@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 from functools import wraps
 
-from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session, send_file, make_response
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session, send_file, make_response, g
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from oid_utils import woo_post_id  # cross-site-safe WC post id for REST calls
 import blocklist  # customer blocklist: auto-cancel COD orders from blacklisted phones
@@ -55,6 +55,7 @@ from product_clone_jobs import (
     get_clone_job,
     init_product_clone_jobs,
 )
+from product_clone_sku import build_clone_sku, make_clone_suffix, normalize_clone_suffix
 from sync_runtime_status import (
     init_sync_runtime_status,
     load_sync_runtime_status,
@@ -1034,22 +1035,33 @@ def get_cny_rate(currency, year_month):
     Get CNY exchange rate for a currency in a specific month.
     Falls back to the most recent rate if not found for the specific month.
     Returns (rate, actual_year_month) or (None, None) if not found.
+    Results are cached for the current Flask request to avoid one SQLite
+    connection/query per rendered order.
     """
     if not currency or currency == 'CNY':
         return 1.0, year_month  # CNY to CNY is 1:1
-    
+
+    cache = getattr(g, '_cny_rate_cache', None)
+    if cache is None:
+        cache = g._cny_rate_cache = {}
+    cache_key = (currency, year_month)
+    if cache_key in cache:
+        return cache[cache_key]
+
     conn = get_db_connection()
-    
+
     # Try exact month first
     rate = conn.execute('''
         SELECT rate_to_cny, year_month FROM exchange_rates
         WHERE currency = ? AND year_month = ?
     ''', (currency, year_month)).fetchone()
-    
+
     if rate:
         conn.close()
-        return rate['rate_to_cny'], rate['year_month']
-    
+        result = (rate['rate_to_cny'], rate['year_month'])
+        cache[cache_key] = result
+        return result
+
     # Fall back to most recent rate before this month
     rate = conn.execute('''
         SELECT rate_to_cny, year_month FROM exchange_rates
@@ -1057,11 +1069,13 @@ def get_cny_rate(currency, year_month):
         ORDER BY year_month DESC
         LIMIT 1
     ''', (currency, year_month)).fetchone()
-    
+
     if rate:
         conn.close()
-        return rate['rate_to_cny'], rate['year_month']
-    
+        result = (rate['rate_to_cny'], rate['year_month'])
+        cache[cache_key] = result
+        return result
+
     # Fall back to any rate for this currency
     rate = conn.execute('''
         SELECT rate_to_cny, year_month FROM exchange_rates
@@ -1069,13 +1083,12 @@ def get_cny_rate(currency, year_month):
         ORDER BY year_month DESC
         LIMIT 1
     ''', (currency,)).fetchone()
-    
+
     conn.close()
-    
-    if rate:
-        return rate['rate_to_cny'], rate['year_month']
-    
-    return None, None
+
+    result = (rate['rate_to_cny'], rate['year_month']) if rate else (None, None)
+    cache[cache_key] = result
+    return result
 
 
 def convert_to_cny(amount, currency, year_month):
@@ -2104,8 +2117,15 @@ def orders():
     quick_date = request.args.get('quick_date', '')
     manager_filter = request.args.get('manager', '')
     country_filter = request.args.get('country', '')
-    page = int(request.args.get('page', 1))
-    per_page = 20
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        requested_per_page = int(request.args.get('per_page', 50))
+    except (TypeError, ValueError):
+        requested_per_page = 50
+    per_page = requested_per_page if requested_per_page in (20, 50, 100) else 50
     
     # Default to 'this_month' if no filters are active
     if not any([quick_date, date_from, date_to, search]):
@@ -2323,24 +2343,34 @@ def orders():
         elif available_months:
             current_month = available_months[0]  # Default to most recent month
     
-    # Get orders for the selected month (or all if month='all')
-    if current_month == 'all':
-        # Show all orders matching the filters (no month filter)
-        orders_query = f'SELECT * FROM orders {where_clause} ORDER BY date_created DESC'
-        orders_data = conn.execute(orders_query, params).fetchall()
-    elif current_month:
-        month_conditions = conditions.copy() if conditions else []
-        month_params = params.copy()
-        month_conditions.append("strftime('%Y-%m', date_created) = ?")
-        month_params.append(current_month)
-        month_where = ' WHERE ' + ' AND '.join(month_conditions)
-        
-        orders_query = f'SELECT * FROM orders {month_where} ORDER BY date_created DESC'
-        orders_data = conn.execute(orders_query, month_params).fetchall()
-    else:
-        orders_data = []
-    
-    # Get total count for display
+    # Build the listing scope separately from the summary scope. Month
+    # selection and "all" both remain server-paginated.
+    listing_conditions = conditions.copy()
+    listing_params = params.copy()
+    if current_month != 'all' and current_month:
+        listing_conditions.append('date_created >= ? AND date_created < ?')
+        month_start = current_month + '-01'
+        month_year, month_number = (int(part) for part in current_month.split('-', 1))
+        if month_number == 12:
+            next_month = f'{month_year + 1:04d}-01-01'
+        else:
+            next_month = f'{month_year:04d}-{month_number + 1:02d}-01'
+        listing_params.extend([month_start, next_month])
+
+    listing_where = ' WHERE ' + ' AND '.join(listing_conditions) if listing_conditions else ''
+    listing_total = conn.execute(
+        f'SELECT COUNT(*) FROM orders {listing_where}', listing_params
+    ).fetchone()[0]
+    total_pages = max(1, (listing_total + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    offset = (page - 1) * per_page
+    orders_query = f'''SELECT * FROM orders {listing_where}
+                       ORDER BY date_created DESC LIMIT ? OFFSET ?'''
+    orders_data = conn.execute(
+        orders_query, listing_params + [per_page, offset]
+    ).fetchall()
+
+    # Overall filtered count remains the value used by summary statistics.
     count_query = f'SELECT COUNT(*) FROM orders {where_clause}'
     total = conn.execute(count_query, params).fetchone()[0]
     
@@ -2494,8 +2524,10 @@ def orders():
         order['net_total'] = float(order['total'] or 0) - float(order.get('shipping_total') or 0)
         order['net_total_cny'] = round(order['net_total'] * rate, 2) if rate else None
 
-    # Aggregate column totals over the orders currently rendered (the
-    # selected month tab). Mirrors the math in the /monthly view + the
+    # Aggregate column totals over the complete selected-month/filter scope.
+    # This query deliberately uses listing_where without LIMIT/OFFSET: server-side
+    # pagination only bounds the detail rows and must never turn the sales summary
+    # into a current-page summary. Mirrors the math in the /monthly view + the
     # filter summary table at the top so all three numbers agree:
     #
     #   订单金额合计  = sum(total) over ALL orders (gross — includes undelivered)
@@ -2511,7 +2543,7 @@ def orders():
     # returned packages was inflating 净额合计 — those numbers should
     # never count as revenue, only their shipping cost is a real loss.
     displayed_totals = {
-        'order_count': len(processed_orders),
+        'order_count': 0,
         'undelivered_count': 0,
         'problem_return_count': 0,
         'product_count': 0,
@@ -2521,91 +2553,74 @@ def orders():
         'product_loss_cny': 0.0,
         'final_net_cny': 0.0,  # net minus shipping_loss/product_loss — matches monthly view
     }
-    # Mirrors _revenue_status_cond() in SQL — same exclusion list so the
-    # order-list totals row matches the filter-summary "净金额" column.
-    # Pre-load each site's cod_on_hold_is_shipped flag so we can replicate the
-    # SQL's EXISTS check in-memory without hitting the DB per order. The set
-    # contains the source URLs where on-hold IS treated as shipped (PL by
-    # default; admins can override per site in /settings).
-    on_hold_shipped_sources = {
-        r['url'] for r in conn.execute(
-            "SELECT url FROM sites WHERE cod_on_hold_is_shipped = 1"
-        ).fetchall()
-    }
-    def _is_revenue_order(o):
-        st = o.get('status') or ''
-        pm = (o.get('payment_method') or 'cod')
-        if st in ('failed', 'cancelled', 'checkout-draft', 'trash', 'cheat'):
-            return False
-        if st == 'pending' and pm != 'cod':
-            return False
-        if st == 'on-hold' and pm == 'bacs':
-            return False
-        if st == 'on-hold' and o.get('source') not in on_hold_shipped_sources:
-            # AU/AE etc — on-hold here means "received, waiting", not shipped.
-            return False
-        if o.get('is_undelivered'):
-            return False
-        if o.get('is_problem_return'):
-            return False
-        return True
+    monthly_totals_query = f'''
+        SELECT
+            COALESCE(currency, 'N/A') AS currency,
+            substr(date_created, 1, 7) AS order_month,
+            COUNT(*) AS order_count,
+            COALESCE(SUM(total), 0) AS amount,
+            COALESCE(SUM(shipping_total), 0) AS shipping,
+            COALESCE(SUM(CASE WHEN {_revenue_status_cond()}
+                              THEN COALESCE(total, 0) - COALESCE(shipping_total, 0)
+                              ELSE 0 END), 0) AS net,
+            COALESCE(SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1
+                              THEN 1 ELSE 0 END), 0) AS undelivered_count,
+            COALESCE(SUM(CASE WHEN COALESCE(is_problem_return, 0) = 1
+                              THEN 1 ELSE 0 END), 0) AS problem_return_count,
+            COALESCE(SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1
+                                   OR COALESCE(is_problem_return, 0) = 1
+                              THEN COALESCE(shipping_loss_amount, 0)
+                              ELSE 0 END), 0) AS shipping_loss,
+            COALESCE(SUM(CASE WHEN COALESCE(is_problem_return, 0) = 1
+                              THEN COALESCE(product_loss_amount, 0)
+                              ELSE 0 END), 0) AS product_loss,
+            COALESCE(SUM(COALESCE((
+                SELECT SUM(CAST(COALESCE(json_extract(item.value, '$.quantity'), 0) AS INTEGER))
+                FROM json_each(
+                    CASE WHEN json_valid(orders.line_items) THEN orders.line_items ELSE '[]' END
+                ) AS item
+            ), 0)), 0) AS product_count
+        FROM orders {listing_where}
+        GROUP BY COALESCE(currency, 'N/A'), substr(date_created, 1, 7)
+        ORDER BY COALESCE(currency, 'N/A'), substr(date_created, 1, 7)
+    '''
+    monthly_total_rows = conn.execute(monthly_totals_query, listing_params).fetchall()
 
-    for o in processed_orders:
-        cur = o.get('currency') or 'N/A'
+    for row in monthly_total_rows:
+        cur = row['currency'] or 'N/A'
         bucket = displayed_totals['by_currency'].setdefault(cur, {
             'amount': 0.0, 'shipping': 0.0, 'net': 0.0,
             'shipping_loss': 0.0, 'product_loss': 0.0,
             'undelivered_count': 0, 'problem_return_count': 0,
             'order_count': 0,
         })
-        bucket['order_count'] += 1
-        bucket['amount']   += float(o.get('total') or 0)
-        bucket['shipping'] += float(o.get('shipping_total') or 0)
-        displayed_totals['product_count'] += int(o.get('product_count') or 0)
+        row_order_count = int(row['order_count'] or 0)
+        row_undelivered = int(row['undelivered_count'] or 0)
+        row_problem_return = int(row['problem_return_count'] or 0)
+        row_amount = float(row['amount'] or 0)
+        row_shipping = float(row['shipping'] or 0)
+        row_net = float(row['net'] or 0)
+        row_shipping_loss = float(row['shipping_loss'] or 0)
+        row_product_loss = float(row['product_loss'] or 0)
 
-        rate = float(o.get('rate_to_cny') or 0)
+        bucket['order_count'] += row_order_count
+        bucket['amount'] += row_amount
+        bucket['shipping'] += row_shipping
+        bucket['net'] += row_net
+        bucket['shipping_loss'] += row_shipping_loss
+        bucket['product_loss'] += row_product_loss
+        bucket['undelivered_count'] += row_undelivered
+        bucket['problem_return_count'] += row_problem_return
+        displayed_totals['order_count'] += row_order_count
+        displayed_totals['product_count'] += int(row['product_count'] or 0)
+        displayed_totals['undelivered_count'] += row_undelivered
+        displayed_totals['problem_return_count'] += row_problem_return
 
-        if o.get('is_undelivered'):
-            # Undelivered: package came back, goods resellable, but carrier
-            # kept the shipping fee. Only the shipping_loss counts as a real
-            # impact — DON'T add net_total (would imply we earned the
-            # product revenue, which we didn't).
-            displayed_totals['undelivered_count'] += 1
-            bucket['undelivered_count'] += 1
-            loss = float(o.get('shipping_loss_amount') or 0)
-            bucket['shipping_loss'] += loss
-            if rate:
-                displayed_totals['shipping_loss_cny'] += loss * rate
-            # If the same order also has a problem-return marker, surface
-            # its product_loss too (shipping_loss already attributed above).
-            if o.get('is_problem_return'):
-                displayed_totals['problem_return_count'] += 1
-                bucket['problem_return_count'] += 1
-                p_loss = float(o.get('product_loss_amount') or 0)
-                bucket['product_loss'] += p_loss
-                if rate:
-                    displayed_totals['product_loss_cny'] += p_loss * rate
-        elif o.get('is_problem_return'):
-            # Problem return: package came back but contents were wrong/
-            # missing/damaged. Both shipping AND product value are lost.
-            displayed_totals['problem_return_count'] += 1
-            bucket['problem_return_count'] += 1
-            s_loss = float(o.get('shipping_loss_amount') or 0)
-            p_loss = float(o.get('product_loss_amount') or 0)
-            bucket['shipping_loss'] += s_loss
-            bucket['product_loss'] += p_loss
-            if rate:
-                displayed_totals['shipping_loss_cny'] += s_loss * rate
-                displayed_totals['product_loss_cny'] += p_loss * rate
-        elif _is_revenue_order(o):
-            # Successful (or pending delivery from a paid order) — its
-            # product revenue counts.
-            bucket['net'] += float(o.get('net_total') or 0)
-            if o.get('net_total_cny'):
-                displayed_totals['net_cny'] += float(o['net_total_cny'])
-        # else: failed / cancelled / awaiting-bank-transfer — money never
-        # came in, so contributes nothing. Per-row 净额 display still shows
-        # the would-be number but it's not summed here.
+        rate, _ = get_cny_rate(cur, row['order_month'] or current_month)
+        if rate:
+            displayed_totals['net_cny'] += row_net * rate
+            displayed_totals['shipping_loss_cny'] += row_shipping_loss * rate
+            displayed_totals['product_loss_cny'] += row_product_loss * rate
     displayed_totals['net_cny'] = round(displayed_totals['net_cny'], 2)
     displayed_totals['shipping_loss_cny'] = round(displayed_totals['shipping_loss_cny'], 2)
     displayed_totals['product_loss_cny'] = round(displayed_totals['product_loss_cny'], 2)
@@ -2735,7 +2750,11 @@ def orders():
                          },
                          available_months=available_months,
                          current_month=current_month,
-                         total=total)
+                         total=total,
+                         listing_total=listing_total,
+                         page=page,
+                         per_page=per_page,
+                         total_pages=total_pages)
 
 
 
@@ -8247,7 +8266,15 @@ def _clone_variations(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
             payload['weight'] = v['weight']
         if v.get('dimensions'):
             payload['dimensions'] = v['dimensions']
-        sku = (v.get('sku') or '').strip()
+        source_sku = (v.get('sku') or '').strip()
+        sku = source_sku
+        clone_as_new = options.get('collision_mode') == 'clone_as_new'
+        if clone_as_new:
+            sku = build_clone_sku(
+                source_sku,
+                options.get('clone_sku_suffix', ''),
+                fallback=f'VAR-{src_parent_id}-{v.get("id") or "UNKNOWN"}',
+            )
         if sku:
             payload['sku'] = sku
         if options.get('include_images') and v.get('image') and v['image'].get('src'):
@@ -8260,8 +8287,9 @@ def _clone_variations(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
             )
             new_v, err = _parse_wc_response(resp)
             if err:
-                # SKU collision? Retry without sku as a soft fallback
-                if sku and 'sku' in err.lower():
+                # Legacy clone mode may retry without a colliding SKU. Explicit
+                # clone-as-new mode must retain a unique SKU for every variant.
+                if sku and not clone_as_new and 'sku' in err.lower():
                     retry_payload = dict(payload)
                     retry_payload.pop('sku', None)
                     try:
@@ -8461,6 +8489,14 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
         return {'error': '源产品不存在'}
 
     warnings = []
+    options = dict(options or {})
+    clone_as_new = options.get('collision_mode') == 'clone_as_new'
+    if clone_as_new:
+        suffix = normalize_clone_suffix(options.get('clone_sku_suffix', ''))
+        if not suffix:
+            suffix = make_clone_suffix()
+        options['clone_sku_suffix'] = suffix
+        options['status_on_target'] = 'draft'
 
     # 2. Build base payload
     payload = {
@@ -8485,8 +8521,63 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
 
     # SKU
     src_sku = (src.get('sku') or '').strip()
-    if src_sku:
-        payload['sku'] = src_sku
+    target_sku = src_sku
+    if clone_as_new:
+        target_sku = build_clone_sku(
+            src_sku,
+            options['clone_sku_suffix'],
+            fallback=f'PRODUCT-{source_product_id}',
+        )
+    if target_sku:
+        payload['sku'] = target_sku
+
+        # A timed-out web request may already have created the target product.
+        # Reusing the exact target SKU makes retries safe. In normal mode the
+        # source SKU identifies an existing product; explicit clone-as-new mode
+        # uses the job's persisted unique suffix instead.
+        try:
+            existing_resp = req.get(
+                f'{tgt_url}/wp-json/wc/v3/products',
+                auth=(tgt_ck, tgt_cs), params={'sku': target_sku, 'per_page': 10},
+                timeout=30, headers=_WC_HEADERS,
+            )
+            existing_products, existing_err = _parse_wc_response(existing_resp)
+        except Exception as e:
+            existing_products, existing_err = None, str(e)
+        if not existing_err and isinstance(existing_products, list):
+            existing = next(
+                (p for p in existing_products
+                 if (p.get('sku') or '').strip().casefold() == target_sku.casefold()),
+                None,
+            )
+            if existing and existing.get('id'):
+                if clone_as_new:
+                    warnings.append(
+                        f'本次全新克隆 SKU "{target_sku}" 已存在于目标站产品 '
+                        f'#{existing["id"]}，已复用该草稿以避免任务重试重复创建'
+                    )
+                else:
+                    warnings.append(
+                        f'SKU "{src_sku}" 已存在于目标站产品 #{existing["id"]}，'
+                        '已跳过创建以避免重复'
+                    )
+                if options.get('include_images') and existing.get('status') == 'draft':
+                    try:
+                        _migrate_inline_images_after_clone(
+                            src, existing, src_url, tgt_url, tgt_ck, tgt_cs,
+                            existing['id'], warnings,
+                        )
+                    except Exception as e:
+                        warnings.append(f'现有草稿文案内图片修复异常：{e}')
+                return {
+                    'new_id': existing['id'],
+                    'name': existing.get('name'),
+                    'sku': existing.get('sku', ''),
+                    'permalink': existing.get('permalink', ''),
+                    'warnings': warnings,
+                    'skipped_existing': not clone_as_new,
+                    'resumed_existing_clone': clone_as_new,
+                }
 
         # A timed-out web request may already have created the target product.
         # Reusing the exact SKU makes retries safe and prevents unwanted -COPY
@@ -8565,8 +8656,8 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
     if attrs_out:
         payload['attributes'] = attrs_out
 
-    # 3. POST to target. Exact-SKU retries are intentionally never renamed to
-    #    -COPY: a collision is safer to report than to silently duplicate stock.
+    # 3. POST to target. Default mode never renames a colliding source SKU.
+    #    Explicit clone-as-new already supplied unique parent/variation SKUs.
     def _post_create(p):
         return req.post(
             f'{tgt_url}/wp-json/wc/v3/products',
@@ -8629,7 +8720,8 @@ def product_manager_clone():
         "product_ids": [9946, 9950, ...],
         "include_variations": true,
         "include_images": true,
-        "status_on_target": "draft"
+        "status_on_target": "draft",
+        "collision_mode": "skip_existing"
       }
     """
     data = request.get_json(silent=True) or {}
@@ -8657,9 +8749,17 @@ def product_manager_clone():
         'include_variations': bool(data.get('include_variations', True)),
         'include_images': bool(data.get('include_images', True)),
         'status_on_target': data.get('status_on_target') or 'draft',
+        'collision_mode': data.get('collision_mode') or 'skip_existing',
     }
     if options['status_on_target'] not in ('draft', 'pending', 'private', 'publish'):
         options['status_on_target'] = 'draft'
+    if options['collision_mode'] not in ('skip_existing', 'clone_as_new'):
+        options['collision_mode'] = 'skip_existing'
+    if options['collision_mode'] == 'clone_as_new':
+        # Duplicate public products are risky; full-new clones always enter a
+        # reviewable draft state and use a job-stable SKU namespace.
+        options['status_on_target'] = 'draft'
+        options['clone_sku_suffix'] = make_clone_suffix()
 
     conn = get_db_connection()
     try:
@@ -8722,7 +8822,10 @@ def product_manager():
         FROM sites
         WHERE consumer_key IS NOT NULL AND consumer_key != ''
           AND consumer_secret IS NOT NULL AND consumer_secret != ''
-        ORDER BY country, manager, url
+        ORDER BY
+            CASE WHEN trim(COALESCE(manager, '')) = '' THEN 1 ELSE 0 END,
+            manager COLLATE NOCASE,
+            url COLLATE NOCASE
     ''').fetchall()
 
     # Own-scoped product managers only see sites where they are the named manager.
@@ -9588,6 +9691,8 @@ def clean_sync_site(site_id):
                 remote_ids = set()
                 page = 1
                 per_page = 100
+                fetch_succeeded = True
+                fetch_error = None
                 
                 while True:
                     try:
@@ -9599,10 +9704,17 @@ def clean_sync_site(site_id):
                         })
                         
                         if response.status_code != 200:
+                            fetch_succeeded = False
+                            fetch_error = f'远程接口返回 HTTP {response.status_code}（第 {page} 页）'
                             SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] HTTP Error {response.status_code} on page {page}")
                             break
                         
                         data = response.json()
+                        if not isinstance(data, list):
+                            fetch_succeeded = False
+                            fetch_error = f'远程接口返回格式异常（第 {page} 页）'
+                            SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Invalid response format on page {page}")
+                            break
                         if not data:
                             break
                         
@@ -9613,10 +9725,23 @@ def clean_sync_site(site_id):
                         page += 1
                         
                     except Exception as e:
+                        fetch_succeeded = False
+                        fetch_error = str(e)
                         SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
                         break
                 
                 SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(remote_ids)} remote orders")
+
+                # A valid HTTP 200 + JSON list may legitimately contain zero
+                # orders.  Only transport/HTTP/format failures must block all
+                # mutations; otherwise a real empty shop can never be cleaned.
+                if not fetch_succeeded:
+                    SYNC_STATUS[status_id]['status'] = 'error'
+                    SYNC_STATUS[status_id]['message'] = f'获取远程订单失败，未执行任何清理：{fetch_error}'
+                    SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Fetch failed; skipped all local cleanup")
+                    return
+                if not remote_ids:
+                    SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Remote order list verified empty")
                 
                 # Always clean checkout-draft orders first (they are not returned by API)
                 conn = get_db_connection()
@@ -9639,34 +9764,33 @@ def clean_sync_site(site_id):
                     except Exception as e:
                         SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error deleting drafts: {str(e)}")
                 
-                if not remote_ids:
-                    if draft_deleted > 0:
-                        SYNC_STATUS[status_id]['status'] = 'success'
-                        SYNC_STATUS[status_id]['message'] = f'清理完成，删除了 {draft_deleted} 个草稿订单'
-                    else:
-                        SYNC_STATUS[status_id]['status'] = 'error'
-                        SYNC_STATUS[status_id]['message'] = '未获取到远程订单ID，跳过删除以避免误删'
-                    return
-                
                 # Get local order IDs - use trimmed URL and handle exact match
                 conn = get_db_connection()
                 local_orders = conn.execute('SELECT id FROM orders WHERE source = ?', (site_url,)).fetchall()
                 conn.close()
                 
                 local_ids = set(str(o['id']) for o in local_orders)
-                orphaned_ids = local_ids - remote_ids
+                local_woo_ids = {str(woo_post_id(order_id)) for order_id in local_ids}
+                orphaned_ids = local_woo_ids - remote_ids
                 
                 SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Local (source='{site_url}'): {len(local_ids)}, Orphaned: {len(orphaned_ids)}")
                 
                 if not orphaned_ids:
                     SYNC_STATUS[status_id]['status'] = 'success'
-                    SYNC_STATUS[status_id]['message'] = '没有需要清理的订单'
+                    if draft_deleted > 0:
+                        SYNC_STATUS[status_id]['message'] = f'清理完成，删除了 {draft_deleted} 个草稿订单'
+                    else:
+                        SYNC_STATUS[status_id]['message'] = '没有需要清理的订单'
                     return
                 
                 # 通过受保护的归档逻辑处理孤儿单（P0-a：先归档留底 + 大批量回滚保护，取代直接物理删除）
                 SYNC_STATUS[status_id]['message'] = f'正在处理 {len(orphaned_ids)} 个疑似已删除订单...'
                 try:
-                    removed = _get_woosync().archive_orphaned_orders(site_url, remote_ids)
+                    removed = _get_woosync().archive_orphaned_orders(
+                        site_url,
+                        remote_ids,
+                        allow_empty_remote=True,
+                    )
                     if removed == 0 and len(orphaned_ids) > 0:
                         SYNC_STATUS[status_id]['status'] = 'success'
                         SYNC_STATUS[status_id]['message'] = f'检测到 {len(orphaned_ids)} 个孤儿单、疑似站点回滚，已跳过删除并记录告警（数据已保留，未丢失）'
@@ -16560,7 +16684,9 @@ def get_big_order_thresholds(conn):
     """Read big-order alert thresholds from settings (with defaults).
 
     Returns (qty_threshold, amount_threshold) as floats. A threshold of 0
-    disables that dimension. Defaults: qty>=10 units, amount>=1500.
+    disables that dimension. The amount threshold is a PLN baseline and is
+    converted to the order currency before comparison. Defaults: qty>=10
+    units, amount>=1500 PLN equivalent.
     """
     rows = conn.execute(
         "SELECT key, value FROM settings "
@@ -16578,18 +16704,129 @@ def get_big_order_thresholds(conn):
     return qty, amount
 
 
-def evaluate_big_order(product_count, total, qty_threshold, amount_threshold):
+BIG_ORDER_AMOUNT_BASE_CURRENCY = 'PLN'
+
+
+def _get_big_order_rate_to_cny(conn, currency, year_month, rate_cache=None):
+    """Return the best available rate_to_cny for one currency/month.
+
+    This mirrors the application's exchange-rate fallback policy while using
+    the request's existing DB connection. ``rate_cache`` avoids repeated
+    queries when a shipping page contains many orders in the same currency.
+    """
+    currency = (currency or '').strip().upper()
+    if not currency:
+        return None
+    if currency == 'CNY':
+        return 1.0
+
+    cache_key = (currency, year_month)
+    if rate_cache is not None and cache_key in rate_cache:
+        return rate_cache[cache_key]
+
+    row = conn.execute(
+        """
+        SELECT rate_to_cny
+        FROM exchange_rates
+        WHERE UPPER(currency) = ? AND year_month = ?
+        LIMIT 1
+        """,
+        (currency, year_month),
+    ).fetchone()
+    if not row:
+        row = conn.execute(
+            """
+            SELECT rate_to_cny
+            FROM exchange_rates
+            WHERE UPPER(currency) = ? AND year_month <= ?
+            ORDER BY year_month DESC
+            LIMIT 1
+            """,
+            (currency, year_month),
+        ).fetchone()
+    if not row:
+        row = conn.execute(
+            """
+            SELECT rate_to_cny
+            FROM exchange_rates
+            WHERE UPPER(currency) = ?
+            ORDER BY year_month DESC
+            LIMIT 1
+            """,
+            (currency,),
+        ).fetchone()
+
+    try:
+        rate = float(row['rate_to_cny']) if row and row['rate_to_cny'] else None
+    except (TypeError, ValueError, IndexError, KeyError):
+        rate = None
+    if rate is not None and rate <= 0:
+        rate = None
+    if rate_cache is not None:
+        rate_cache[cache_key] = rate
+    return rate
+
+
+def get_big_order_native_amount_threshold(
+        conn, order_currency, order_date, base_amount_threshold,
+        rate_cache=None):
+    """Convert the PLN baseline threshold to an order's native currency.
+
+    Missing/invalid rates return ``None`` so amount-based classification is
+    skipped safely; the quantity rule remains active. This avoids comparing a
+    HUF/CZK/AUD nominal amount directly with a PLN threshold.
+    """
+    try:
+        base_amount_threshold = float(base_amount_threshold or 0)
+    except (TypeError, ValueError):
+        return None
+    if base_amount_threshold <= 0:
+        return 0.0
+
+    currency = (order_currency or '').strip().upper()
+    if not currency:
+        return None
+    if currency == BIG_ORDER_AMOUNT_BASE_CURRENCY:
+        return base_amount_threshold
+
+    year_month = str(order_date or '')[:7]
+    if len(year_month) != 7 or year_month[4:5] != '-':
+        year_month = datetime.now().strftime('%Y-%m')
+
+    order_rate = _get_big_order_rate_to_cny(
+        conn, currency, year_month, rate_cache)
+    base_rate = _get_big_order_rate_to_cny(
+        conn, BIG_ORDER_AMOUNT_BASE_CURRENCY, year_month, rate_cache)
+    if not order_rate or not base_rate:
+        return None
+    return base_amount_threshold * base_rate / order_rate
+
+
+def evaluate_big_order(product_count, total, qty_threshold, amount_threshold,
+                       currency='', base_amount_threshold=None):
     """Return (is_big, reasons[]) for an order given the thresholds.
 
-    Amount is compared against the order total in its own currency — a rough
-    trigger for a shipping-floor prompt, not an accounting figure.
+    ``amount_threshold`` is already converted to the order's native currency.
+    A missing rate is represented by ``None``/0 and disables only the amount
+    dimension; the quantity rule remains active.
     """
     reasons = []
     if qty_threshold and product_count >= qty_threshold:
         reasons.append(f"数量 {product_count} ≥ {int(qty_threshold)}")
     if amount_threshold and total >= amount_threshold:
         t = int(total) if float(total).is_integer() else round(total, 2)
-        reasons.append(f"金额 {t} ≥ {int(amount_threshold)}")
+        limit = int(round(amount_threshold))
+        currency = (currency or '').strip().upper()
+        suffix = f" {currency}" if currency else ''
+        if (currency and currency != BIG_ORDER_AMOUNT_BASE_CURRENCY
+                and base_amount_threshold):
+            base_value = (int(base_amount_threshold)
+                          if float(base_amount_threshold).is_integer()
+                          else round(base_amount_threshold, 2))
+            reasons.append(
+                f"金额 {t}{suffix} ≥ {limit}{suffix}（{base_value} PLN 等值）")
+        else:
+            reasons.append(f"金额 {t}{suffix} ≥ {limit}{suffix}")
     return (len(reasons) > 0, reasons)
 
 
@@ -16600,6 +16837,7 @@ def get_pending_orders():
     """Get orders pending or partially pending shipment."""
     conn = get_db_connection()
     qty_threshold, amount_threshold = get_big_order_thresholds(conn)
+    big_order_rate_cache = {}
 
     # Get filter parameters
     source_filter = request.args.get('source', '')
@@ -16801,6 +17039,18 @@ def get_pending_orders():
     # Build the risk index once (small scan over flagged orders only) and
     # reuse it for every row in this listing. Closing conn AFTER the build.
     risk_idx = _build_risk_index(conn)
+    # Resolve all currency thresholds while the request DB connection is
+    # still open. Result formatting below intentionally runs after close.
+    big_order_native_thresholds = {
+        order['id']: get_big_order_native_amount_threshold(
+            conn,
+            order['currency'],
+            order['date_created'],
+            amount_threshold,
+            big_order_rate_cache,
+        )
+        for order in orders
+    }
     conn.close()
 
     result = []
@@ -16835,8 +17085,15 @@ def get_pending_orders():
 
         product_count = sum(item.get('quantity', 1) for item in (line_items or []))
         order_total = float(order['total'] or 0)
+        native_amount_threshold = big_order_native_thresholds.get(order['id'])
         is_big_order, big_order_reasons = evaluate_big_order(
-            product_count, order_total, qty_threshold, amount_threshold)
+            product_count,
+            order_total,
+            qty_threshold,
+            native_amount_threshold,
+            currency=order['currency'],
+            base_amount_threshold=amount_threshold,
+        )
         customer_risk = _assess_customer_risk(billing, shipping_info, risk_idx, current_order_id=order['id'])
 
         result.append({
@@ -16846,6 +17103,10 @@ def get_pending_orders():
             'currency': order['currency'],
             'date_created': order['date_created'],
             'source': order['source'].replace('https://www.', '').replace('https://', ''),
+            # Keep the canonical URL for API calls. `source` above is display-only
+            # and cannot pass exact permission/site lookups after scheme/www are
+            # removed (for example e-cigarettak.com vs https://www.e-cigarettak.com).
+            'source_url': order['source'],
             'manager': order['manager'] or '',
             'customer_name': f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip(),
             'customer_email': billing.get('email', ''),
@@ -18000,7 +18261,8 @@ def ship_order():
                     '''INSERT INTO shipping_logs
                        (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial, status)
                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'pending_sync')''',
-                    (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id, current_items_json)
+                    (order_id, order['number'], order['source'], tracking_number,
+                     carrier_slug, current_user.id, current_items_json)
                 )
             conn.commit()
         # A failed reship must NOT stash/overwrite the original tracking row.
@@ -18502,6 +18764,43 @@ def detect_carriers_for_site(conn, site_url, lookback_orders=80):
     return out
 
 
+def _site_source_key(source):
+    """Normalize a site URL for safe identity comparison.
+
+    Site records remain stored and returned in their canonical form; this key
+    only lets older/cached clients resolve display forms without a scheme,
+    leading www, or a trailing slash.
+    """
+    value = (source or '').strip().lower()
+    if value.startswith('https://'):
+        value = value[8:]
+    elif value.startswith('http://'):
+        value = value[7:]
+    value = value.rstrip('/')
+    if value.startswith('www.'):
+        value = value[4:]
+    return value
+
+
+def _resolve_site_source(conn, requested_source, allowed_sources):
+    """Resolve a request value to one canonical, authorized sites.url value."""
+    requested_source = (requested_source or '').strip()
+    if allowed_sources is None:
+        candidates = [r['url'] for r in conn.execute('SELECT url FROM sites').fetchall()]
+    else:
+        candidates = list(allowed_sources)
+
+    if requested_source in candidates:
+        return requested_source
+
+    requested_key = _site_source_key(requested_source)
+    if not requested_key:
+        return None
+    matches = [url for url in candidates if _site_source_key(url) == requested_key]
+    # Never guess when two configured sites normalize to the same identity.
+    return matches[0] if len(matches) == 1 else None
+
+
 @app.route('/api/shipping/carriers-for-site')
 @login_required
 @shipping_view_required
@@ -18514,17 +18813,21 @@ def get_carriers_for_site():
     even when one of them has zero history — orders fulfilled from the China
     warehouse use EMS and must be selectable from the very first shipment.
     """
-    source = request.args.get('source', '').strip()
-    if not source:
+    requested_source = request.args.get('source', '').strip()
+    if not requested_source:
         return jsonify({'error': 'missing source'}), 400
 
     # Block probing of sites this user isn't authorized for — otherwise a
     # restricted user could pass any site URL here and learn its carriers.
     allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
-    if allowed_sources is not None and source not in allowed_sources:
-        return jsonify({'error': '无权访问该站点'}), 403
-
     conn = get_db_connection()
+    source = _resolve_site_source(conn, requested_source, allowed_sources)
+    if not source:
+        conn.close()
+        if allowed_sources is not None:
+            return jsonify({'error': '无权访问该站点'}), 403
+        return jsonify({'error': '站点不存在'}), 404
+
     carriers = detect_carriers_for_site(conn, source)
 
     # Augment with country-specific must-have carriers. Detected carriers keep
@@ -23827,6 +24130,12 @@ try:
     app.register_blueprint(order_notification_bp)
 except Exception as _e:
     app.logger.warning('订单图片通知模块未加载: %s', _e)
+
+try:
+    from mail_center_readonly_api import mail_center_readonly_bp
+    app.register_blueprint(mail_center_readonly_bp)
+except Exception as _e:
+    app.logger.warning('邮件中心订单只读 API 未加载: %s', _e)
 
 @app.context_processor
 def inject_inventory_perms():

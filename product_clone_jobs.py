@@ -214,5 +214,9 @@ def serialize_clone_job(row) -> dict:
         except (TypeError, ValueError, json.JSONDecodeError):
             raw[key.removesuffix("_json")] = default
         raw.pop(key, None)
+    successful_items = (raw.get("results") or {}).get("success") or []
+    skipped_count = sum(1 for item in successful_items if item.get("skipped_existing"))
+    raw["created_count"] = max(0, len(successful_items) - skipped_count)
+    raw["skipped_count"] = skipped_count
     raw["terminal"] = raw.get("status") in TERMINAL_STATUSES
     return raw

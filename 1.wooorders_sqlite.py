@@ -364,7 +364,7 @@ def record_sync_alert(connection, site_url, alert_type, detail):
         print(f"记录同步告警失败: {e}")
 
 
-def archive_orphaned_orders(site_url, remote_ids):
+def archive_orphaned_orders(site_url, remote_ids, allow_empty_remote=False):
     """处理"本地有、远程没有"的孤儿订单（P0-a 数据保护，取代原先的直接物理删除）。
 
     - 小批量（正常的人工删单/去重）：先归档到 orders_archive，再从 orders 删除，对应用透明。
@@ -372,6 +372,9 @@ def archive_orphaned_orders(site_url, remote_ids):
       并写入 sync_alerts 告警等待人工确认——这是"站点崩了也不丢最新订单"的核心保护。
 
     返回从 orders 实际移除（已归档）的订单数。
+
+    allow_empty_remote 只允许由已经验证 HTTP/JSON 请求成功的调用方设置；
+    默认仍把空集合视为不可信结果并拒绝删除。
     """
     local_ids = get_order_ids_from_db(site_url)
 
@@ -379,7 +382,8 @@ def archive_orphaned_orders(site_url, remote_ids):
         print(f"站点 {site_url} 本地无订单，跳过删除检查")
         return 0
 
-    if not remote_ids:
+    remote_ids = set(remote_ids or [])
+    if not remote_ids and not allow_empty_remote:
         print(f"未获取到远程订单ID，跳过删除以避免误删")
         return 0
 

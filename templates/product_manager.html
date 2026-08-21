@@ -373,6 +373,16 @@
                         克隆图片（目标站会从源 URL 下载，可能需要 1-2 分钟）
                     </label>
                 </div>
+                <div class="form-check mt-3 p-3 rounded border border-warning border-opacity-25"
+                     style="background:rgba(245,158,11,0.08);">
+                    <input class="form-check-input" type="checkbox" id="pmCloneAsNew">
+                    <label class="form-check-label text-warning" for="pmCloneAsNew">
+                        作为全新产品克隆（SKU 冲突时使用）
+                    </label>
+                    <div class="text-muted small mt-1">
+                        自动为父产品和全部变体生成唯一 SKU，并强制保存为草稿；目标站原产品不会被修改。
+                    </div>
+                </div>
                 <div id="pmCloneFeedback" class="mt-3"></div>
             </div>
             <div class="modal-footer border-top border-secondary border-opacity-25">
@@ -1805,6 +1815,8 @@
         $('pmCloneCount').textContent = productIds.length;
         $('pmCloneFeedback').innerHTML = '';
         $('pmCloneApplyBtn').dataset.productIds = JSON.stringify(productIds);
+        $('pmCloneAsNew').checked = false;
+        $('pmCloneStatus').disabled = false;
         populateCloneTargetPicker();
         bootstrap.Modal.getOrCreateInstance($('pmCloneModal')).show();
     }
@@ -1854,6 +1866,11 @@
         }
         if (!ids.length) return;
 
+        const cloneAsNew = $('pmCloneAsNew').checked;
+        if (cloneAsNew && !window.confirm('将使用全新 SKU 创建独立草稿，目标站原产品保持不变。确认继续？')) {
+            return;
+        }
+
         const payload = {
             source_site_id: parseInt(currentSiteId, 10),
             target_site_id: parseInt(targetId, 10),
@@ -1861,6 +1878,7 @@
             include_variations: $('pmCloneIncludeVariations').checked,
             include_images: $('pmCloneIncludeImages').checked,
             status_on_target: $('pmCloneStatus').value,
+            collision_mode: cloneAsNew ? 'clone_as_new' : 'skip_existing',
         };
 
         const applyBtn = $('pmCloneApplyBtn');
@@ -1886,15 +1904,23 @@
     }
 
     function showCloneResult(data) {
-        const succ = data.success_count || 0;
+        const successfulItems = data.results?.success || [];
+        const skipped = Number(data.skipped_count ?? successfulItems.filter(s => s.skipped_existing).length);
+        const created = Number(data.created_count ?? Math.max(0, Number(data.success_count || 0) - skipped));
         const fail = data.failed_count || (data.last_error ? 1 : 0);
         const targetUrl = (data.target_url || '').replace(/^https?:\/\/(www\.)?/, '');
         let html = `
             <div class="row g-3 mb-3">
                 <div class="col">
                     <div class="text-center p-3 rounded" style="background:rgba(34,197,94,0.15);">
-                        <div class="h3 text-success mb-0">${succ}</div>
-                        <small class="text-secondary">成功克隆</small>
+                        <div class="h3 text-success mb-0">${created}</div>
+                        <small class="text-secondary">新建</small>
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="text-center p-3 rounded" style="background:rgba(245,158,11,0.15);">
+                        <div class="h3 text-warning mb-0">${skipped}</div>
+                        <small class="text-secondary">已跳过</small>
                     </div>
                 </div>
                 <div class="col">
@@ -1911,13 +1937,14 @@
         }
 
         if (data.results?.success?.length) {
-            html += '<h6 class="text-light mt-3 mb-2">成功明细</h6><div style="max-height:240px;overflow-y:auto;">';
+            html += '<h6 class="text-light mt-3 mb-2">处理明细</h6><div style="max-height:240px;overflow-y:auto;">';
             data.results.success.forEach(s => {
                 const sku = s.sku ? `<code>${escapeHtml(s.sku)}</code>` : '';
                 const link = s.permalink ? `<a href="${s.permalink}" target="_blank" class="text-info">查看 <i class="bi bi-box-arrow-up-right"></i></a>` : '';
                 const warns = (s.warnings || []).map(w => `<div class="small ms-3" style="color:#fbbf24;">⚠ ${escapeHtml(w)}</div>`).join('');
-                html += `<div class="small text-success mb-2">
-                    ✓ #${s.source_id} → #${s.target_id} ${sku ? '· ' + sku : ''} ${link}
+                const skippedItem = Boolean(s.skipped_existing);
+                html += `<div class="small ${skippedItem ? 'text-warning' : 'text-success'} mb-2">
+                    ${skippedItem ? '↷ 已跳过' : '✓ 已新建'} #${s.source_id} → #${s.target_id} ${sku ? '· ' + sku : ''} ${link}
                     ${warns}
                 </div>`;
             });
@@ -1970,6 +1997,19 @@
     });
 
     $('pmCloneApplyBtn').addEventListener('click', applyClone);
+    $('pmCloneAsNew').addEventListener('change', (event) => {
+        if (event.target.checked) $('pmCloneStatus').value = 'draft';
+        $('pmCloneStatus').disabled = event.target.checked;
+    });
+
+    // Resume progress display after a refresh. The worker itself is independent
+    // of the browser, so this only restores observability and never resubmits.
+    const activeCloneJob = sessionStorage.getItem(ACTIVE_CLONE_JOB_KEY);
+    if (activeCloneJob) {
+        $('pmCloneApplyBtn').disabled = true;
+        $('pmCloneApplyBtn').innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>后台克隆中...';
+        pollCloneJob(activeCloneJob);
+    }
 
     // Resume progress display after a refresh. The worker itself is independent
     // of the browser, so this only restores observability and never resubmits.

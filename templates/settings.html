@@ -336,7 +336,7 @@
     <div class="card-body">
         <div class="alert alert-info bg-info bg-opacity-10 border-0 small mb-3 px-3 py-2">
             <i class="bi bi-info-circle me-1"></i>
-            达到任一阈值的待发货订单，会在发货页标记「大单」，并在发货时弹出操作清单（序列号 / 录像 / 称重 / 签收物流），需勾选确认后才能发货。任一项设为 0 即关闭该项判定。
+            达到任一阈值的待发货订单，会在发货页标记「大单」，并在发货时弹出操作清单（序列号 / 录像 / 称重 / 签收物流），需勾选确认后才能发货。金额阈值以 PLN 为基准，系统按订单月份的汇率自动换算为订单币种；任一项设为 0 即关闭该项判定。
         </div>
         <div class="row g-3">
             <div class="col-md-4">
@@ -346,7 +346,7 @@
                     placeholder="10">
             </div>
             <div class="col-md-4">
-                <label class="form-label text-white-50">金额阈值（订单金额 ≥，按订单货币原值）</label>
+                <label class="form-label text-white-50">金额阈值（PLN 基准，其他币种自动换算）</label>
                 <input type="number" min="0" step="0.01"
                     class="form-control bg-dark text-white border-secondary" id="bigOrderAmountThreshold"
                     placeholder="1500">
@@ -3027,7 +3027,7 @@
                                         progressBar.classList.remove('progress-bar-animated', 'bg-warning');
                                         progressBar.classList.add('bg-success');
                                         progressBar.style.width = '100%';
-                                        statusText.textContent = '清理同步完成！';
+                                        statusText.textContent = status.message || '清理同步完成！';
                                         statusText.classList.add('text-success');
                                         closeBtn.disabled = false;
                                         closeBtn.textContent = '完成并刷新';
@@ -3038,7 +3038,7 @@
                                         progressBar.classList.remove('progress-bar-animated', 'bg-warning');
                                         progressBar.classList.add('bg-danger');
                                         progressBar.style.width = '100%';
-                                        statusText.textContent = '清理同步出错';
+                                        statusText.textContent = status.message || '清理同步出错';
                                         statusText.classList.add('text-danger');
                                         closeBtn.disabled = false;
                                     }

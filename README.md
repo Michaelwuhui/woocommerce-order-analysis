@@ -1,540 +1,353 @@
-# WooCommerce 订单分析系统
+# Woo Analysis 订单与履约系统
 
-一个功能完整的 WooCommerce 订单数据同步和分析系统，提供多站点数据拉取、订单状态分析、客户分析、产品分析、销售报告生成等功能。
+当前版本：`2.0.0`（2026-08-21）
 
----
+Woo Analysis 是面向多 WooCommerce 独立站的内部订单运营系统。它把订单同步、订单分析、人工发货、库存映射、多仓履约、物流跟踪、客户通知、COD 分配与供应商对账集中在同一套数据和权限体系中。
 
-## 📋 目录
+本仓库不只是数据看板。`v2.0.0` 的核心变化是引入可审计的多仓履约领域模型，同时保留波兰人工合作仓“选择承运商 + 录入运单号”的简单操作体验。
 
-1. [功能特性](#-功能特性)
-2. [技术架构](#-技术架构)
-3. [项目结构](#-项目结构)
-4. [安装部署](#-安装部署)
-5. [配置说明](#️-配置说明)
-6. [使用指南](#-使用指南)
-7. [用户权限](#-用户权限)
-8. [API 接口](#-api-接口)
-9. [数据库结构](#-数据库结构)
-10. [常见问题](#-常见问题)
+> 本项目包含真实订单与外部系统集成能力。任何生产部署都必须使用仓库外的密钥文件、先备份 SQLite 数据库、先验证迁移，再开启 WMS 自动提交或客户通知。
 
----
+## v2.0.0 重点能力
 
-## 🚀 功能特性
+- 多 WooCommerce 站点增量同步、服务端分页、订单和客户分析。
+- `Order → Fulfillment → Shipment → TrackingEvent` 多仓履约模型。
+- 一个订单可拆到不同仓库，并分别拥有包裹、承运商和运单号。
+- 波兰人工合作仓与金毅金谷临时中转仓可组成“联合发货组”：前台只操作一次、客户只看到一个包裹，后台仍按仓扣减各自库存。
+- 临时中转仓只管理实际调拨库存，用完即缺货，不提供无限库存回退。
+- 仓库 SKU → 订单系统标准 SKU → WooCommerce 商品/变体的两级映射和批量确认。
+- WooCommerce AST/兼容插件的分批发货同步、站点语言客户备注和邮件通知。
+- InPost、DPD、Packeta，以及匈牙利 Packeta/Express One 末端派送查询适配。
+- 发货接口超时后的远端回读确认、本地 `pending_sync` 暂存、重复运单拦截和人工重试。
+- 匈牙利 WMS 与新波兰 WMS 的独立适配器、幂等任务、审计和安全开关。
+- 商品批量更新后远端回读验证，以及支持“作为全新商品克隆”的持久化后台任务。
+- 订单图片通知、企业微信目标配置和邮件中心只读订单接口。
 
-### 仪表板 (Dashboard)
-- **实时统计**: 总订单数、总销售额、平均订单金额、有效订单等核心指标
-- **多货币支持**: 支持 PLN、AUD、AED 等多种货币，自动换算为 CNY
-- **销售趋势图表**: 按日/月展示订单量和销售额趋势
-- **订单状态分布**: 饼图展示各状态订单占比
-- **网站统计**: 按网站维度统计销售数据
-- **最近订单**: 显示最新订单列表及客户信息
+## 系统边界与当前启用状态
 
-### 订单管理 (Orders)
-- **高级筛选**: 支持按网站、状态、日期范围、关键词筛选
-- **网站负责人筛选**: 按负责人快速筛选订单
-- **客户属性显示**: 在订单列表中显示客户等级和购买次数
-- **订单详情弹窗**: 点击订单号查看完整订单信息
-- **客户分析弹窗**: 点击客户名称查看客户画像
+| 能力 | 当前策略 |
+|---|---|
+| 波兰人工合作仓 | 生产使用；合作方不维护 OMS 数量库存，人工录入承运商和运单号 |
+| 金毅金谷临时中转仓 | 生产使用；只管理已调拨 SKU 的有限库存 |
+| 联合发货 | 波兰人工合作仓与临时中转仓可合并为一个物理包裹 |
+| 捷克/匈牙利人工发货 | 可由波兰合作方使用 Packeta；匈牙利长数字 PLC 单号走 Express One 查询 |
+| 匈牙利 WMS | 适配代码保留，路由与自动提交默认关闭，等待库存和受控联调 |
+| 新波兰 WMS | 独立适配器已具备；真实路由和自动提交受配置及 HTTP 风险开关保护 |
+| 客户运费 | 逐订单读取 WooCommerce `shipping_total`，不写死金额、不在分仓包裹间平均 |
+| 订单完成 | 所有未取消包裹妥投后，才允许聚合完成并同步 WooCommerce `completed` |
 
-### 月度统计 (Monthly)
-- **月度汇总**: 按月份统计订单和销售数据
-- **网站对比**: 对比不同网站的月度表现
-- **趋势分析**: 查看销售额和订单量的月度变化
+详细业务规则、状态机、COD 和 WMS 说明见 [MULTI_WAREHOUSE_FULFILLMENT.md](MULTI_WAREHOUSE_FULFILLMENT.md)。
 
-### 客户管理 (Customers)
-- **客户等级**: 自动计算客户等级 (VIP/优质/普通/新客/劣质)
-- **手动调整**: 支持手动设置客户等级
-- **购买历史**: 查看客户的完整购买记录
-- **消费分析**: 统计客户总消费、购买频率、常购商品
+## 架构概览
 
-### 产品分析 (Products)
-- **销量排行**: 按销量排序的产品列表
-- **品牌分析**: 按品牌统计销售数据
-- **口味/规格分析**: 支持按口味、puffs 数等维度分析
-- **产品映射**: 将原始产品名称映射为标准化名称
-
-### 系统设置 (Settings)
-- **网站管理**: 添加/编辑/删除 WooCommerce 网站
-- **数据同步**: 手动触发或设置自动同步
-- **汇率管理**: 配置各货币对 CNY 的汇率
-- **产品映射**: 管理产品名称标准化规则
-- **品牌管理**: 管理产品品牌分类
-
-### 用户管理 (Users)
-- **多用户支持**: 创建和管理多个用户账户
-- **权限控制**: 按网站分配访问权限
-- **角色管理**: 管理员和普通用户角色
-
----
-
-## 🏗 技术架构
-
-### 后端技术栈
-| 技术 | 用途 |
-|------|------|
-| **Python 3.8+** | 后端开发语言 |
-| **Flask** | Web 框架 |
-| **Flask-Login** | 用户认证 |
-| **SQLite3** | 数据库 |
-| **Gunicorn** | WSGI 服务器 |
-| **WooCommerce REST API** | 数据同步 |
-
-### 前端技术栈
-| 技术 | 用途 |
-|------|------|
-| **Bootstrap 5** | UI 框架 |
-| **Chart.js** | 图表可视化 |
-| **Bootstrap Icons** | 图标库 |
-| **Jinja2** | 模板引擎 |
-| **JavaScript (ES6)** | 前端交互 |
-
-### 系统架构图
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         用户浏览器                               │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │ HTTP/HTTPS
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Nginx 反向代理                              │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Gunicorn WSGI 服务器                          │
-│                    (systemd 管理)                                │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Flask 应用 (app.py)                         │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐            │
-│  │ 仪表板   │ │ 订单管理 │ │ 客户管理 │ │ 产品分析 │            │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘            │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐                         │
-│  │ 月度统计 │ │ 系统设置 │ │ 用户管理 │                         │
-│  └──────────┘ └──────────┘ └──────────┘                         │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-           ┌───────────────────┼───────────────────┐
-           ▼                   ▼                   ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│  SQLite 数据库   │ │ WooCommerce API │ │   自动同步任务   │
-│ (orders, sites, │ │  (多站点数据源)   │ │  (auto_sync.py) │
-│  users, etc.)   │ │                  │ │                 │
-└─────────────────┘ └─────────────────┘ └─────────────────┘
+```text
+浏览器
+  │
+Nginx / HTTPS
+  │
+Gunicorn + Flask (app.py)
+  ├── 订单、报表、客户、商品和权限
+  ├── 库存与仓库蓝图 (inv_*.py)
+  ├── 多仓履约 API (fulfillment_api.py)
+  ├── 发货、AST 与物流查询
+  └── 通知、商品克隆和只读集成 API
+  │
+SQLite (woocommerce_orders.db)
+  ├── WooCommerce REST API
+  ├── 履约后台任务 / 商品克隆任务
+  ├── 匈牙利 WMS / 新波兰 WMS（受开关控制）
+  ├── InPost / Track718 / Packeta / Express One
+  └── 客户邮件 / 企业微信通知
 ```
 
----
+### 主要模块
 
-## 📁 项目结构
+| 模块 | 作用 |
+|---|---|
+| `app.py` | Flask 主应用、订单/发货/商品/报表路由及兼容逻辑 |
+| `sync_utils.py`, `auto_sync.py` | WooCommerce 增量同步、断点和运行状态 |
+| `inv_*.py` | 仓库、SKU、映射、库存流水、批次、补货和对账 |
+| `fulfillment_service.py` | 分仓规划、状态转换、缺货、联合发货和聚合状态 |
+| `fulfillment_worker.py` | WMS 提交、跟踪、Woo 同步、重试和对账任务 |
+| `fulfillment_woocommerce.py` | Shipment 到 AST/WooCommerce 的幂等同步 |
+| `order_shipments.py` | 已确认包裹识别、重复运单与跟踪格式判断 |
+| `hungary_wms.py` | 匈牙利 WMS 适配器；不得复用于新波兰仓 |
+| `poland_wms.py` | 新波兰仓 SZ56T/华磊协议适配器 |
+| `carrier_tracking.py` | InPost、DPD、Packeta、Express One 和补充查询 |
+| `product_clone_*.py` | 可恢复的商品克隆任务、SKU 冲突处理和后台 Worker |
+| `order_notification_*.py` | 订单图片、目标路由、渲染、发送和审计 |
+| `mail_center_readonly_api.py` | 使用文件令牌保护的订单只读接口 |
+| `inv_migrations.py` | 库存与履约 schema 的可追踪迁移和回滚 |
 
-```
-woo-analysis/
-├── app.py                     # 主应用程序 (Flask 路由和业务逻辑)
-├── sync_utils.py              # 数据同步工具函数
-├── auto_sync.py               # 自动同步脚本
-├── requirements.txt           # Python 依赖
-│
-├── templates/                 # Jinja2 模板
-│   ├── base.html              # 基础布局模板 (导航栏、弹窗)
-│   ├── login.html             # 登录页面
-│   ├── dashboard.html         # 仪表板页面
-│   ├── orders.html            # 订单列表页面
-│   ├── monthly.html           # 月度统计页面
-│   ├── customers.html         # 客户管理页面
-│   ├── products.html          # 产品分析页面
-│   ├── settings.html          # 系统设置页面
-│   └── users.html             # 用户管理页面
-│
-├── static/                    # 静态资源
-│   └── css/                   # 样式文件
-│
-├── woocommerce_orders.db      # 主数据库文件
-├── auto_sync.log              # 同步日志
-├── gunicorn.log               # 服务日志
-│
-└── venv/                      # Python 虚拟环境
+## 履约领域模型
+
+```text
+Order
+  └── OrderItem
+        └── FulfillmentItem ──> Fulfillment（仓库责任）
+                                  └── Shipment（物理包裹）
+                                        ├── ShipmentItem
+                                        └── TrackingEvent
 ```
 
----
+- `Order` 是 WooCommerce 商业订单，不因分仓创建新的客户订单。
+- `Fulfillment` 表示某个仓库对当前订单版本承担的履约责任。
+- `FulfillmentItem` 固定订单行、SKU、数量和金额分配快照。
+- `Shipment` 表示真实包裹，一个订单允许多个包裹和多个运单号。
+- `oms_shipment_fulfillments` 允许一个联合发货包裹关联多个仓库履约单。
+- `TrackingEvent` 保存官方或第三方物流事件；重复事件去重，乱序事件不会使状态回退。
 
-## 📦 安装部署
+### 典型状态
 
-### 环境要求
+```text
+订单同步
+  → 待规划
+  → 已分仓 / 缺货 / 人工处理
+  → 待提交或人工待发货
+  → 已提交 WMS / 已发货
+  → 运输中
+  → 已妥投
+  → 全部包裹妥投后订单完成
+```
 
-- **操作系统**: Linux (推荐 Ubuntu 20.04+)
-- **Python**: 3.8 或更高版本
-- **Web 服务器**: Nginx (反向代理)
-- **进程管理**: systemd
+取消、缺货、部分失败或“一个仓已发货、另一个仓待取消”的订单进入人工处理，不自动跨仓换货，也不静默吞掉异常。
 
-### 第一步: 克隆项目
+## 分仓与联合发货规则
+
+1. 分仓以已确认的仓库 SKU 和 WooCommerce 商品/变体映射为依据。
+2. 专属仓商品缺货时醒目标记，等待人工换货、补货或取消决定。
+3. 波兰人工合作仓不依赖数量库存；临时中转仓必须有可用库存。
+4. 联合发货组内可以用一个运单发出一个订单的全部商品。
+5. 联合包裹只向 WooCommerce/客户同步一次，但每个仓库的库存流水分别记账。
+6. 已分配和已发货的历史订单不会因以后切换 WMS 路由而自动换仓，防止重复发货。
+
+## WooCommerce 与物流同步
+
+### 数据方向
+
+- WooCommerce → 本系统：订单、订单行、地址、币种、运费、支付/COD、状态、备注和站点来源。
+- 本系统 → WooCommerce：运单、承运商、包裹商品、发货状态、客户备注和最终完成状态。
+- WMS → 本系统：外部单号、面单、运单及轨迹；没有回调的接口由后台任务轮询。
+- 官方物流/第三方查询 → `TrackingEvent`：保存事件来源、时间和原始摘要。
+
+### 发货可靠性
+
+- 远端写入使用确定性业务编号或幂等键。
+- HTTP 超时不直接判定失败，先通过 WooCommerce/WMS 查询确认是否已写入。
+- 无法确认的首次发货可保存为 `pending_sync`，不会冒充已发货包裹。
+- 相同承运商和运单号不能重复用于其他订单。
+- AST 分批发货按包裹同步商品明细；联合发货只生成一个客户可见包裹。
+- 客户备注按站点语言输出波兰语、捷克语、匈牙利语或英语；无法识别时使用英语，不发送中文运营说明。
+
+## 权限模型
+
+权限同时作用于页面和 API，不能只依赖前端隐藏按钮。
+
+- 管理员：系统配置、用户、仓库、映射、任务恢复和审计。
+- 站点权限：普通用户只能访问被授权站点的订单、客户和商品。
+- 仓库行级权限：仓库员工只能查看和处理被授权仓库的履约单与库存。
+- 人工发货员：使用原有发货弹窗，看到本次发货仓提示，只录入承运商和运单号。
+- 管理型操作：库存调整、映射批量确认、WMS 配置、手工重试等使用独立权限。
+- 邮件中心只读 API：独立文件令牌、站点白名单和只读数据库连接，不复用 Web 登录态。
+
+## 数据库与迁移
+
+默认数据库是项目目录下的 `woocommerce_orders.db`。Worker 可通过 `OMS_DB_FILE`/`INV_DB_FILE` 指向同一数据库。
+
+基础订单表由主初始化脚本和应用启动过程维护；库存与履约表由 `inv_migrations.py` 管理。当前迁移版本到 `020 joint_dispatch_groups`。
 
 ```bash
-cd /www/wwwroot
-git clone <repository-url> woo-analysis
-cd woo-analysis
+# 查看迁移状态（只读）
+python inv_migrations.py status
+
+# 备份后应用全部待执行迁移
+python inv_migrations.py up
+
+# 仅回滚最近一个迁移；生产执行前必须同时准备代码回滚
+python inv_migrations.py down
 ```
 
-### 第二步: 创建虚拟环境
+迁移命令会生成数据库副本，但生产发布仍应先用 SQLite 在线备份脚本制作独立、校验过的备份。
+
+## 安装与本地运行
+
+### 要求
+
+- Linux 生产环境；Windows 可用于开发和测试。
+- Python 3.10+。
+- SQLite 3、Nginx、Gunicorn。
+- 订单邮件截图启用时需要 Playwright Chromium 和支持中日韩文字的字体。
+
+### 安装
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-```
-
-### 第三步: 安装依赖
-
-```bash
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+
+# 订单邮件精确渲染需要
+python -m playwright install chromium
 ```
 
-`requirements.txt` 内容：
-```
-flask
-flask-login
-gunicorn
-requests
-openpyxl
-```
-
-### 第四步: 初始化数据库
-
-> ⚠️ **重要**: 首次部署后，必须先初始化数据库才能正常访问前端页面！
-
-**4.1 创建数据库并初始化表结构**
-
-运行初始化脚本创建必要的数据库表：
+### 初始化
 
 ```bash
-# 激活虚拟环境
-source venv/bin/activate
-
-# 运行数据库初始化脚本 (创建表结构)
+# 仅用于新环境；不要在未备份的生产数据库上盲目执行
 python 1.wooorders_sqlite.py
+python inv_migrations.py status
+python inv_migrations.py up
 ```
 
-该脚本会创建 `woocommerce_orders.db` 数据库文件及所有必需的表。
-
-**4.2 初始化客户设置表 (可选)**
+### 启动开发服务
 
 ```bash
-python init_customer_settings.py
+python app.py
 ```
 
-> **注意**: 如果跳过此步骤直接启动服务，访问首页会报错，因为数据库表不存在。
-
-### 第五步: 配置 Gunicorn 服务
-
-创建 systemd 服务文件 `/etc/systemd/system/woo-analysis.service`:
-
-```ini
-[Unit]
-Description=WooCommerce Analysis Web App
-After=network.target
-
-[Service]
-User=www
-Group=www
-WorkingDirectory=/www/wwwroot/woo-analysis
-Environment="PATH=/www/wwwroot/woo-analysis/venv/bin"
-ExecStart=/www/wwwroot/woo-analysis/venv/bin/gunicorn --workers 4 --bind 127.0.0.1:5000 app:app
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-启动服务：
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable woo-analysis
-sudo systemctl start woo-analysis
-```
-
-### 第六步: 配置 Nginx
-
-在 Nginx 配置中添加：
-
-```nginx
-server {
-    listen 80;
-    server_name your-domain.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-重启 Nginx：
-```bash
-sudo systemctl reload nginx
-```
-
-### 第七步: 配置自动同步 (可选)
-
-添加 crontab 定时任务：
+生产环境使用 Nginx + Gunicorn，不使用 Flask debug server。后台任务分别运行：
 
 ```bash
-crontab -e
+python fulfillment_worker.py --idle-sleep 5
+python product_clone_worker.py --idle-sleep 2
+python auto_sync.py
 ```
 
-添加以下内容 (每小时同步一次):
-```
-0 * * * * cd /www/wwwroot/woo-analysis && /www/wwwroot/woo-analysis/venv/bin/python auto_sync.py >> auto_sync.log 2>&1
-```
+systemd 示例位于 `deploy/woo-fulfillment-worker.service` 和 `deploy/woo-product-clone-worker.service`。实际生产服务用户、可写目录和密钥读取权限应按主机环境收紧，示例中的路径不能直接视为通用安全配置。
 
----
+## 配置与密钥
 
-## ⚙️ 配置说明
+真实密钥不得提交到 Git。建议使用 `/etc/woo-analysis/*.env`，所有者为 `root:root`、权限 `0600`，并确保 Web 与相应 Worker 读取同一份配置。
 
-### 默认管理员账户
+| 变量 | 说明 |
+|---|---|
+| `OMS_DB_FILE`, `INV_DB_FILE` | 订单/履约数据库绝对路径 |
+| `WMS_BASE_URL`, `WMS_SALT` | 匈牙利 WMS 地址与签名密钥 |
+| `WMS_WEBHOOK_TOKEN` | WMS 回调独立令牌 |
+| `WMS_ALLOW_INSECURE_HTTP` | 明文 HTTP 风险开关，默认必须为 `0` |
+| `SZ56T_ORDER_BASE_URL`, `SZ56T_PRINT_BASE_URL` | 新波兰仓下单与打印服务地址 |
+| `SZ56T_USERNAME`, `SZ56T_PASSWORD` | 新波兰仓 API 账户 |
+| `SZ56T_CANCEL_AUTH` | 新波兰仓取消接口独立认证值 |
+| `SZ56T_ALLOW_INSECURE_HTTP` | 新波兰仓明文 HTTP 风险开关，默认必须为 `0` |
+| `ORDER_NOTIFICATION_EVENT_SECRET_REF` | 订单通知事件密钥的环境变量名 |
+| `ORDER_NOTIFICATION_WEBHOOK_MASTER_KEY` | 数据库内 Webhook 的加密主密钥 |
+| `ORDER_NOTIFICATION_IMAGE_DIR` | 私有订单图片目录，不得放在公开静态目录 |
+| `ORDER_NOTIFICATION_CHROMIUM_PATH` | Chromium 可执行文件路径 |
+| `MAIL_CENTER_ORDER_API_TOKEN_FILE` | 邮件中心 API 的只读令牌文件 |
+| `MAIL_CENTER_ORDER_DB_PATH` | 邮件中心只读数据库路径 |
+| `MAIL_CENTER_ORDER_ALLOWED_SITES` | 邮件中心允许访问的站点白名单 |
 
-首次安装后，使用以下账户登录：
+示例文件：
 
-| 用户名 | 密码 | 角色 |
-|--------|------|------|
-| admin | admin123 | 管理员 |
+- `deploy/fulfillment.env.example`
+- `deploy/order-notification.env.example`
+- `deploy/validate_wms_env.sh`
 
-> ⚠️ **重要**: 请在首次登录后立即修改密码！
+## 测试
 
-### 添加 WooCommerce 网站
+完整回归测试不访问真实 WMS，也不会创建真实发货单：
 
-1. 登录后进入 **设置** 页面
-2. 在 **网站管理** 区域点击 **添加网站**
-3. 填写以下信息：
-   - **网站 URL**: 例如 `https://www.your-store.com`
-   - **Consumer Key**: WooCommerce REST API Key
-   - **Consumer Secret**: WooCommerce REST API Secret
-   - **负责人**: 网站负责人姓名 (可选)
-4. 点击保存后，点击 **同步** 按钮拉取订单数据
-
-### 获取 WooCommerce API 密钥
-
-1. 登录 WordPress 后台
-2. 进入 **WooCommerce → 设置 → 高级 → REST API**
-3. 点击 **添加密钥**
-4. 权限选择 **只读** (Read)
-5. 点击生成并复制 Consumer Key 和 Consumer Secret
-
-### 汇率配置
-
-1. 进入 **设置 → 汇率管理**
-2. 为每种货币设置对 CNY 的汇率
-3. 支持按月份设置不同汇率
-
----
-
-## 📖 使用指南
-
-### 仪表板
-
-仪表板是系统的首页，展示核心业务指标：
-
-- **顶部卡片**: 显示总订单数、总销售额、平均订单金额、有效订单数
-- **筛选器**: 支持按时间范围、网站、负责人筛选数据
-- **趋势图表**: 展示订单量和销售额的历史趋势
-- **网站统计表**: 按网站和货币维度的详细统计
-- **最近订单**: 最新的 10 条订单，包含客户等级和购买次数
-
-### 订单列表
-
-订单列表页面支持详细的订单查询和分析：
-
-- **筛选功能**: 按网站、状态、日期、负责人、关键词筛选
-- **快捷日期**: 今天、昨天、本周、本月、上月、今年
-- **月份分页**: 按月份快速切换查看
-- **客户信息**: 显示客户等级徽章 (VIP/优质/普通/新客/劣质) 和购买次数
-
-### 客户等级说明
-
-系统自动根据以下因素计算客户等级：
-
-| 等级 | 条件 | 图标 |
-|------|------|------|
-| **VIP** | 高消费 + 高频购买 + 多次成功订单 | ⭐ 金色 |
-| **优质** | 较高消费或较高购买频率 | 💎 绿色 |
-| **普通** | 一般消费水平 | ✓ 蓝色 |
-| **新客** | 首次购买客户 | ✨ 青色 |
-| **劣质** | 手动标记的问题客户 | ✖ 红色 |
-
-> 管理员可以在客户详情弹窗中手动调整客户等级。
-
----
-
-## 🔐 用户权限
-
-### 角色说明
-
-| 角色 | 权限 |
-|------|------|
-| **管理员** (admin) | 可访问所有功能，包括用户管理和系统设置 |
-| **普通用户** (user) | 只能查看被分配权限的网站数据 |
-
-### 权限分配
-
-1. 进入 **用户管理** 页面
-2. 选择用户并点击 **编辑**
-3. 在 **网站权限** 中勾选允许访问的网站
-4. 保存更改
-
-> 普通用户只能看到被分配的网站的订单、客户、产品数据。
-
----
-
-## 🔌 API 接口
-
-### 订单详情
-
-```
-GET /api/order/<order_id>
-```
-
-返回指定订单的完整信息。
-
-### 客户详情
-
-```
-GET /api/customer/<email>
-```
-
-返回客户的分析数据，包括购买历史、消费统计、常购商品等。
-
-### 更新客户等级
-
-```
-POST /api/customer/quality
-Content-Type: application/json
-
-{
-    "email": "customer@example.com",
-    "quality": "vip"  // vip, good, normal, new, bad, auto
-}
-```
-
-### 同步网站数据
-
-```
-POST /api/sync/<site_id>
-```
-
-触发指定网站的数据同步。
-
----
-
-## 🗄 数据库结构
-
-### 主要表结构
-
-| 表名 | 说明 |
-|------|------|
-| `orders` | 订单数据 |
-| `sites` | 网站配置 |
-| `users` | 用户账户 |
-| `user_site_permissions` | 用户网站权限 |
-| `customer_settings` | 客户手动设置 |
-| `exchange_rates` | 汇率配置 |
-| `product_mappings` | 产品映射规则 |
-| `brands` | 品牌数据 |
-| `settings` | 系统设置 |
-
-### orders 表字段
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | INTEGER | 订单 ID (主键) |
-| number | TEXT | 订单号 |
-| status | TEXT | 订单状态 |
-| currency | TEXT | 货币 |
-| total | REAL | 订单总额 |
-| shipping_total | REAL | 运费 |
-| billing | TEXT | 账单信息 (JSON) |
-| shipping | TEXT | 收货信息 (JSON) |
-| line_items | TEXT | 订单商品 (JSON) |
-| date_created | TEXT | 创建时间 |
-| source | TEXT | 来源网站 |
-
----
-
-## ❓ 常见问题
-
-### Q: 同步数据时显示成功但没有订单?
-
-**A**: 可能原因：
-1. WooCommerce 网站上没有订单
-2. API 密钥权限不足
-3. 网站 URL 格式不正确 (应包含 `https://`)
-
-检查同步日志 `auto_sync.log` 获取详细信息。
-
-### Q: 用户只能看到部分网站?
-
-**A**: 检查用户权限设置。进入 **用户管理** 确认该用户被分配了正确的网站权限。
-
-### Q: 汇率显示为 `-`?
-
-**A**: 需要在 **设置 → 汇率管理** 中添加对应货币和月份的汇率。
-
-### Q: 如何重启服务?
-
-**A**: 使用以下命令：
 ```bash
-# 方式1: systemctl (推荐)
-sudo systemctl restart woo-analysis
-
-# 方式2: 发送 HUP 信号
-kill -HUP <gunicorn_master_pid>
+python -m pytest -q tests
 ```
 
-### Q: 如何查看服务日志?
+发布前最低检查：
 
-**A**: 
 ```bash
-# 应用日志
-tail -f /www/wwwroot/woo-analysis/gunicorn.log
+python -m py_compile app.py fulfillment_worker.py product_clone_worker.py
+python inv_migrations.py status
+git diff --check
+```
 
-# 同步日志
-tail -f /www/wwwroot/woo-analysis/auto_sync.log
+外部 WMS 的只读校验必须明确使用审计模式，并区分“网络/API 可访问”与“真实创建订单成功”：
 
-# systemd 日志
+```bash
+sudo deploy/validate_wms_env.sh
+```
+
+只有获得业务授权、确认收件数据和重复单处理方式后，才能进行一单受控创建联调。
+
+## 生产发布与回滚
+
+### 发布前
+
+1. 确认 `git status --short`，任何生产临时修改都必须先归档或合并，不能覆盖。
+2. 生成 SQLite 在线备份并执行 `PRAGMA integrity_check`。
+3. 记录当前 Git commit、服务状态、Worker 状态和关键配置开关。
+4. 在发布提交上执行完整测试和迁移状态检查。
+
+备份脚本只接受受限目录格式：
+
+```bash
+sudo sh deploy/backup_live_db.sh \
+  /www/backup/woo-analysis-pre-migration-YYYYMMDD-HHMMSS
+```
+
+### 发布
+
+1. 停止会写数据库的 Web/同步/履约 Worker。
+2. 部署已测试的固定 commit 或 tag，不直接部署未提交工作树。
+3. 应用数据库迁移，重新检查 `inv_migrations.py status`。
+4. 启动 Web 和 Worker，检查 systemd 日志。
+5. 验证登录、订单列表、权限隔离、待发货、发货弹窗、物流查询和 WooCommerce 回读。
+
+### 回滚
+
+- 代码回滚到发布前固定 commit。
+- 只有确认迁移的 `down` 不会破坏发布后的业务数据时才执行 schema 回滚。
+- 更安全的数据库回滚方式是停写后恢复发布前已校验备份；恢复前保留故障数据库用于审计。
+- 已提交到外部 WMS 或已通知客户的操作不能靠数据库回滚撤销，必须进入人工拦截、补偿和对账。
+
+## 运维排查
+
+### 页面提示返回 HTML、JSON 解析失败
+
+`Unexpected token '<'` 通常表示接口收到了登录页、WAF/代理错误页或服务器 5xx HTML，而不是 JSON。检查浏览器 Network 响应、登录会话、Nginx/Gunicorn 日志和接口权限；不能把 HTTP 200 单独当作业务成功。
+
+### 发货后仍显示“继续发货”
+
+先检查本地 `shipping_logs` 是否为 `pending_sync`，再查询 WooCommerce 是否已保存运单。系统会优先远端回读，确认成功后再将本地状态改为 `shipped`；禁止重复使用同一运单盲目提交。
+
+### 有库存但不能发货
+
+检查三个层次：订单商品是否映射到标准 SKU、该 SKU 是否映射到当前仓、可用量是否扣除了预留。联合发货还需确认两个仓属于同一联合发货组。人工合作仓与有限库存中转仓的库存规则不同。
+
+### 日志
+
+```bash
 journalctl -u woo-analysis -f
+journalctl -u woo-fulfillment-worker -f
+journalctl -u woo-product-clone-worker -f
 ```
 
----
+日志和外部请求审计不得输出密码、API Key、Cookie、完整授权头或客户敏感信息。
 
-## 📝 更新日志
+## 进一步文档
 
-### v2.0.0 (2024-12)
-- ✨ 全新 Web 界面
-- 🔐 用户认证和权限管理
-- 📊 仪表板和图表可视化
-- 👥 客户等级自动计算
-- 💱 多货币和汇率支持
-- 🏷️ 产品映射和品牌管理
+- [MULTI_WAREHOUSE_FULFILLMENT.md](MULTI_WAREHOUSE_FULFILLMENT.md)：多仓履约、COD、状态和 WMS 规则。
+- [INVENTORY.md](INVENTORY.md)：库存、SKU、批次、映射和对账。
+- [ORDER_IMAGE_NOTIFICATIONS.md](ORDER_IMAGE_NOTIFICATIONS.md)：订单图片通知设计与运行方式。
+- [OFFLINE_COMPANY_PROFIT_EXPORT.md](OFFLINE_COMPANY_PROFIT_EXPORT.md)：公司利润离线导出。
+- [todo-new-poland-warehouse.md](todo-new-poland-warehouse.md)：新波兰仓上线前置条件。
+- [todo-wms-go-live.md](todo-wms-go-live.md)：WMS 上线检查项。
 
-### v1.0.0 (2024-10)
-- 🚀 初始版本发布
-- 📦 多站点数据同步
-- 📑 Excel 报告导出
+## 已知边界
 
----
+- 当前数据库为 SQLite，适合内部单实例运营；扩展到多租户、高并发 SaaS 前需重做租户隔离、密钥管理、并发写入和灾备设计。
+- 主应用仍包含历史兼容代码，新增功能应优先放在独立服务模块，避免继续扩大 `app.py`。
+- 外部 WMS 存在明文 HTTP 地址时，系统默认拒绝请求；不能为了联调绕过安全开关后长期遗留。
+- WMS 适配器和单元测试通过不等于真实仓库已上线；生产可用必须有受控订单、面单、运单、仓库确认、Woo 回读和客户通知的端到端证据。
+- 仓储费、运输费和 COD 手续费按供应商月结对账，不应混入客户应付金额或订单商品收入。
 
-## 📄 许可证
+## 版本说明
 
-本项目采用 MIT 许可证。
+### 2.0.0 — 2026-08-21
 
----
+- 合并服务器已上线代码与本地开发分支，建立可追溯的生产快照。
+- 上线多仓履约、有限库存中转仓、联合发货和仓库行级权限。
+- 完善 Packeta/Express One、DPD、InPost 查询与发货失败恢复。
+- 增加仓库优先映射、批量确认、缺货重分仓和补货提醒。
+- 改进 WooCommerce 订单分页、空远端结果保护、商品更新回读和新商品克隆。
+- 增加订单通知、只读邮件中心接口及完整测试覆盖。
 
-## 🆘 技术支持
-
-如遇问题，请：
-1. 查看本文档的 **常见问题** 部分
-2. 检查日志文件获取错误信息
-3. 联系系统管理员
+本项目为内部业务系统。许可、分发和对外部署范围由项目所有者另行确定。
