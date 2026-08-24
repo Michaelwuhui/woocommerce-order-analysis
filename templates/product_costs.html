@@ -387,6 +387,7 @@ let brandsData = [];
 let seriesData = {};
 let productCombos = [];
 let warehousesData = {{ warehouses | tojson }};
+let reconUnmappedPartnerId = null;
 const CAN_EDIT_COSTS = {{ 'true' if can_edit_costs else 'false' }};
 // EDIT scope: null = unrestricted; array = whitelist of warehouse_ids the user can edit/delete
 const ALLOWED_WAREHOUSE_IDS = {{ allowed_warehouse_ids | tojson if allowed_warehouse_ids is not none else 'null' }};
@@ -458,6 +459,10 @@ document.addEventListener('DOMContentLoaded', function() {
     //   /product-costs?map=<raw_name>&country=...    (legacy)
     //     → open the brand/puffs/flavor mapping editor.
     var params = new URLSearchParams(window.location.search);
+    var deepPartnerId = parseInt(params.get('partner_id'), 10);
+    if (Number.isInteger(deepPartnerId) && deepPartnerId > 0) {
+        reconUnmappedPartnerId = deepPartnerId;
+    }
     var deepCountry = params.get('country');
     if (deepCountry) {
         var sel = document.getElementById('countryFilter');
@@ -472,6 +477,20 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             }
         }
+    }
+
+    if (params.get('unmapped') === '1') {
+        var deepMonth = params.get('year_month') || '';
+        if (/^\d{4}-\d{2}$/.test(deepMonth)) {
+            document.getElementById('unmappedMonth').value = deepMonth;
+        }
+        if (reconUnmappedPartnerId) {
+            document.getElementById('mlFull').checked = true;
+            document.querySelectorAll('input[name="matchLevel"]').forEach(function(input) {
+                input.disabled = true;
+            });
+        }
+        window.setTimeout(showUnmapped, 0);
     }
 
     var addCostFlag = params.get('add_cost');
@@ -929,7 +948,9 @@ async function showUnmapped() {
 async function loadUnmapped() {
     const month = document.getElementById('unmappedMonth').value;
     const country = document.getElementById('countryFilter').value;
-    const level = document.querySelector('input[name="matchLevel"]:checked').value;
+    const level = reconUnmappedPartnerId
+        ? 'full'
+        : document.querySelector('input[name="matchLevel"]:checked').value;
     if (!month) return;
     const tbody = document.getElementById('unmappedTableBody');
     const thead = document.getElementById('unmappedTableHead');
@@ -949,9 +970,43 @@ async function loadUnmapped() {
         thead.innerHTML = '<th>产品名称</th><th class="text-end">销量</th><th class="text-end">销售额</th><th>品牌</th><th>口数</th><th class="text-end">操作</th>';
     }
     try {
-        const res = await fetch(`/api/product-costs/unmapped?year_month=${month}&country=${country}&match_level=${level}`);
-        const data = await res.json();
-        document.getElementById('unmappedCount').textContent = data.length;
+        let data;
+        let countLabel;
+        if (reconUnmappedPartnerId) {
+            const [year, monthNumber] = month.split('-');
+            const res = await fetch(`/api/reconciliation/unmapped-products?partner_id=${reconUnmappedPartnerId}&year=${year}&month=${parseInt(monthNumber, 10)}`);
+            const payload = await res.json();
+            if (!res.ok || payload.error) throw new Error(payload.error || '加载失败');
+            if (!brandsData.length) await loadBrands();
+
+            data = [];
+            (payload.unmapped || []).forEach(group => {
+                const brandName = group.brand && group.brand !== 'Unknown' ? group.brand : null;
+                const brand = brandName
+                    ? brandsData.find(b => (b.name || '').toUpperCase() === brandName.toUpperCase())
+                    : null;
+                (group.products || []).forEach(product => {
+                    data.push({
+                        raw_name: product.name,
+                        brand_id: brand ? brand.id : null,
+                        brand_name: brandName,
+                        puff_count: group.puffs,
+                        flavor: group.flavor,
+                        total_qty: product.qty || 0,
+                        total_revenue: product.revenue || 0,
+                        sources: [],
+                    });
+                });
+            });
+            const totalQty = data.reduce((sum, product) => sum + product.total_qty, 0);
+            countLabel = `${data.length} 项 / ${totalQty} 件`;
+            hint.textContent = `来自合伙人对账的同一口径：仅显示该合伙人在 ${month} 未匹配成本的产品`;
+        } else {
+            const res = await fetch(`/api/product-costs/unmapped?year_month=${month}&country=${country}&match_level=${level}`);
+            data = await res.json();
+            countLabel = data.length;
+        }
+        document.getElementById('unmappedCount').textContent = countLabel;
         if (data.length === 0) {
             tbody.innerHTML = `<tr><td colspan="6" class="text-center text-success py-4"><i class="bi bi-check-circle me-2"></i>该粒度下所有产品已映射成本</td></tr>`;
             return;

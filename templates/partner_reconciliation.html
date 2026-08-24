@@ -1371,7 +1371,7 @@
                 <div id="reconUnmappedContent" style="display:none;">
                     <div class="mb-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
                         <span style="color:#cbd5e1;" id="reconUnmappedSummary"></span>
-                        <a href="/product-costs" target="_blank" class="btn btn-sm btn-outline-warning">
+                        <a id="reconUnmappedCostLink" href="/product-costs" target="_blank" class="btn btn-sm btn-outline-warning">
                             <i class="bi bi-gear me-1"></i>前往成本管理
                         </a>
                     </div>
@@ -3866,8 +3866,17 @@ async function showReconUnmappedDetail(opts = {}) {
 
     const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('reconUnmappedModal'));
     modal.show();
+    const period = `${y}-${String(m).padStart(2,'0')}`;
     const titleEl = document.getElementById('reconUnmappedTitle');
-    titleEl.textContent = `${y}-${String(m).padStart(2,'0')}`;
+    titleEl.textContent = period;
+    const costLink = document.getElementById('reconUnmappedCostLink');
+    const costLinkParams = new URLSearchParams({
+        unmapped: '1',
+        year_month: period,
+        partner_id: String(partnerId),
+        match_level: 'full',
+    });
+    costLink.href = `/product-costs?${costLinkParams}`;
     document.getElementById('reconUnmappedLoading').style.display = '';
     document.getElementById('reconUnmappedContent').style.display = 'none';
 
@@ -3876,6 +3885,9 @@ async function showReconUnmappedDetail(opts = {}) {
         const list = data.unmapped || [];
         const curr = data.currency || 'PLN';
         document.getElementById('reconUnmappedCurrLabel').textContent = curr;
+        const countries = [...new Set(list.map(u => u.country).filter(Boolean))];
+        if (countries.length === 1) costLinkParams.set('country', countries[0]);
+        costLink.href = `/product-costs?${costLinkParams}`;
 
         const totalQty = list.reduce((s, u) => s + (u.qty || 0), 0);
         const totalRev = list.reduce((s, u) => s + (u.revenue || 0), 0);
