@@ -476,6 +476,18 @@ def _compose_address(addr, sep=', '):
     return sep.join(p for p in parts if p)
 
 
+def _is_high_risk_shipping_postcode(value):
+    """Return whether a checkout postcode matches the 66-600 risk area.
+
+    WooCommerce sites and import plugins do not store Polish postcodes in one
+    consistent format, so match the digits after removing separators.  Keep
+    this warning deliberately exact: neighbouring 66-xxx postcodes must not be
+    labelled just because one postcode has a known theft/empty-return pattern.
+    """
+    normalized = ''.join(ch for ch in str(value or '') if ch.isdigit())
+    return normalized == '66600'
+
+
 # AU postcode -> expected state (Australia Post ranges). Checkout's state
 # dropdown is customer-chosen and never validated by WC, so e.g. Perth+6000
 # can arrive with state=ACT. Gray-zone ranges list every state they can
@@ -17087,6 +17099,10 @@ def get_pending_orders():
         addr = shipping_info if shipping_info and shipping_info.get('address_1') else billing
         meta_data = parse_json_field(order['meta_data'])
         custom_fields = extract_custom_billing_fields(meta_data)
+        high_risk_postcode = (
+            _is_high_risk_shipping_postcode(addr.get('postcode'))
+            or _is_high_risk_shipping_postcode(custom_fields.get('dpd_zip'))
+        )
 
         # Calculate customer address (Standard)
         customer_address = _compose_address(addr)
@@ -17139,6 +17155,7 @@ def get_pending_orders():
                 custom_fields.get('dpd_street', ''),
                 custom_fields.get('dpd_house', ''),
             ])).strip(),
+            'high_risk_postcode': '66-600' if high_risk_postcode else '',
             'state_mismatch': _au_state_mismatch(addr),
             'customer_inpost_id': custom_fields['customer_inpost_id'],
             'customer_social': custom_fields['customer_social'],

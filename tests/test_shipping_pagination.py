@@ -203,3 +203,33 @@ def test_shipping_template_renders_server_pagination_controls():
     assert "page: shippedPage" in template
     assert "const orders = data.orders || []" in template
     assert "loadOrders(page, true)" in template
+
+
+def test_high_risk_shipping_postcode_normalizes_common_formats():
+    tree = ast.parse((ROOT / "app.py").read_text(encoding="utf-8"))
+    helper_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_is_high_risk_shipping_postcode"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[helper_node], type_ignores=[]), "app.py", "exec"), namespace)
+    is_high_risk = namespace["_is_high_risk_shipping_postcode"]
+
+    assert is_high_risk("66-600")
+    assert is_high_risk("66600")
+    assert is_high_risk("66 600")
+    assert is_high_risk(" 66–600 ")
+    assert not is_high_risk("66-601")
+    assert not is_high_risk("66-60")
+    assert not is_high_risk(None)
+
+
+def test_shipping_template_renders_high_risk_postcode_warning():
+    template = (ROOT / "templates" / "shipping.html").read_text(encoding="utf-8")
+
+    assert "o.high_risk_postcode" in template
+    assert "高危邮编 ${o.high_risk_postcode}" in template
+    assert "白嫖风险地区 · 邮编 ${o.high_risk_postcode}" in template
+    assert "postcodeRiskBanner" in template

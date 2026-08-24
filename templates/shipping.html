@@ -1162,7 +1162,9 @@
                     // High-risk rows: stronger tint to grab attention even when
                     // it's not also a "big order". Falls back to the big-order
                     // tint, then no tint.
-                    const rowStyle = (o.has_shortage || o.manual_review)
+                    const rowStyle = o.high_risk_postcode
+                        ? ' style="background-color: rgba(220,53,69,0.32); outline: 3px solid #ff4d5e; outline-offset: -3px; box-shadow: inset 6px 0 0 #ff3045;"'
+                        : (o.has_shortage || o.manual_review)
                         ? ' style="background-color: rgba(220,53,69,0.28); outline: 2px solid rgba(220,53,69,0.7);"'
                         : (o.customer_risk && o.customer_risk.level === 'high')
                         ? ' style="background-color: rgba(220,53,69,0.18);"'
@@ -1173,7 +1175,7 @@
                     return `
                 <tr data-editsrc="${o.source || ''}"${rowStyle}>
                     <td class="ps-3">
-                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.shipment_sync_pending ? ' <span class="badge bg-danger"><i class="bi bi-cloud-slash me-1"></i>发货同步失败</span>' : (o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : '')}${o.has_shortage ? ' <span class="badge bg-danger"><i class="bi bi-exclamation-octagon-fill me-1"></i>缺货</span>' : ''}${o.manual_review ? ` <span class="badge bg-danger" title="${o.manual_reason || ''}">人工处理</span>` : ''}</div>
+                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.high_risk_postcode ? ` <span class="badge bg-danger border border-light" title="该邮编地区曾发生拒收退回后包裹内产品丢失"><i class="bi bi-shield-fill-exclamation me-1"></i>高危邮编 ${o.high_risk_postcode}</span>` : ''}${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.shipment_sync_pending ? ' <span class="badge bg-danger"><i class="bi bi-cloud-slash me-1"></i>发货同步失败</span>' : (o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : '')}${o.has_shortage ? ' <span class="badge bg-danger"><i class="bi bi-exclamation-octagon-fill me-1"></i>缺货</span>' : ''}${o.manual_review ? ` <span class="badge bg-danger" title="${o.manual_reason || ''}">人工处理</span>` : ''}</div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
                         ${o.fulfillment_warehouses && o.fulfillment_warehouses.length ? `<small class="d-block text-warning"><i class="bi bi-boxes me-1"></i>${o.fulfillment_warehouses.join(' + ')}</small>` : ''}
                         <small class="text-muted d-block"><i class="bi bi-calendar3 me-1"></i>下单 ${o.date_created ? o.date_created.replace('T', ' ').substring(0, 16) : '-'}</small>
@@ -1181,6 +1183,12 @@
 
                     <td>
                         <div class="fw-bold mb-1"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name}</a></div>
+                        ${o.high_risk_postcode ? `
+                            <div class="alert alert-danger py-2 px-3 mb-2 border border-danger border-2" role="alert" style="box-shadow: 0 0 14px rgba(255,48,69,0.35);">
+                                <div class="fw-bold"><i class="bi bi-shield-fill-exclamation me-2"></i>白嫖风险地区 · 邮编 ${o.high_risk_postcode}</div>
+                                <div class="small mt-1">该邮编地区曾发生客户拒收、退回时包裹内产品丢失。发货前请联系客户并人工核查。</div>
+                            </div>
+                        ` : ''}
                         ${riskBadge ? `<div class="mb-2">${riskBadge}</div>` : ''}
 
                         <!-- Contact Info -->
@@ -1260,7 +1268,7 @@
                         <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="printLabel('${o.id}')" title="打印">
                             <i class="bi bi-printer"></i>
                         </a>
-                        <button class="ship-action btn btn-sm ${o.fulfillment_status || o.parcels_shipped || o.shipment_sync_pending ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal("${o.id}", ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source_url || o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])}, ${JSON.stringify(encodeURIComponent(JSON.stringify(o.products || [])))}, ${JSON.stringify(o.fulfillment_status || "")}, ${JSON.stringify(o.pending_shipment || null)})'><i class="bi bi-truck me-1"></i>${o.fulfillment_status ? '发货' : (o.shipment_sync_pending ? '重试同步' : (o.parcels_shipped ? '继续发货' : '发货'))}</button>
+                        <button class="ship-action btn btn-sm ${o.fulfillment_status || o.parcels_shipped || o.shipment_sync_pending ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal("${o.id}", ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source_url || o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])}, ${JSON.stringify(encodeURIComponent(JSON.stringify(o.products || [])))}, ${JSON.stringify(o.fulfillment_status || "")}, ${JSON.stringify(o.pending_shipment || null)}, ${JSON.stringify(o.high_risk_postcode || "")})'><i class="bi bi-truck me-1"></i>${o.fulfillment_status ? '发货' : (o.shipment_sync_pending ? '重试同步' : (o.parcels_shipped ? '继续发货' : '发货'))}</button>
                     </td>
                 </tr>
             `;
@@ -1700,7 +1708,7 @@
                 .replace(/'/g, '&#039;');
         }
 
-        function openShipModal(orderId, orderNumber, customerName, customerAddress, source, isBigOrder, bigOrderReasons, warehouseName, customerRisk, parcels, products, fulfillmentStatus, pendingShipment) {
+        function openShipModal(orderId, orderNumber, customerName, customerAddress, source, isBigOrder, bigOrderReasons, warehouseName, customerRisk, parcels, products, fulfillmentStatus, pendingShipment, highRiskPostcode) {
             document.getElementById('shipOrderId').value = orderId;
             document.getElementById('shipOrderNumber').value = '#' + orderNumber;
             _shipSource = source || '';
@@ -1722,7 +1730,14 @@
             // the shipper can pick a carrier — they should pause and verify
             // the order before sending a known scammer more goods.
             const riskBanner = renderRiskBadge(customerRisk, { compact: false });
+            const postcodeRiskBanner = highRiskPostcode
+                ? `<div class="alert alert-danger mb-2 py-2 px-3 border border-danger border-2" style="box-shadow:0 0 18px rgba(255,48,69,0.4);">
+                       <div class="fw-bold"><i class="bi bi-shield-fill-exclamation me-2"></i>白嫖风险地区 · 邮编 ${highRiskPostcode}</div>
+                       <div class="small mt-1">该邮编地区曾发生客户拒收、退回时包裹内产品丢失。请先联系客户并人工核查，再决定是否发货。</div>
+                   </div>`
+                : '';
             document.getElementById('shipCustomerInfo').innerHTML = `
+        ${postcodeRiskBanner}
         ${riskBanner}
         <div class="fw-bold">${customerName}</div>
         <small class="text-muted">${customerAddress}</small>
