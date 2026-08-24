@@ -2011,15 +2011,6 @@
         pollCloneJob(activeCloneJob);
     }
 
-    // Resume progress display after a refresh. The worker itself is independent
-    // of the browser, so this only restores observability and never resubmits.
-    const activeCloneJob = sessionStorage.getItem(ACTIVE_CLONE_JOB_KEY);
-    if (activeCloneJob) {
-        $('pmCloneApplyBtn').disabled = true;
-        $('pmCloneApplyBtn').innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>后台克隆中...';
-        pollCloneJob(activeCloneJob);
-    }
-
 })();
 </script>
 {% endblock %}
