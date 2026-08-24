@@ -8,7 +8,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_file
 from openpyxl import load_workbook
 
-from dpd_export import find_recent_duplicate_order_ids, site_order_reference
+from dpd_export import SITE_ABBREVIATIONS, find_recent_duplicate_order_ids, site_order_reference
 from shipping_export import build_dpd_shipping_workbook
 
 
@@ -71,9 +71,37 @@ def test_duplicate_window_matches_dpd_fallback_address():
     assert find_recent_duplicate_order_ids(rows, {'first', 'second'}) == {'first', 'second'}
 
 
-def test_customer_number_uses_requested_vapesklep_abbreviation():
-    assert site_order_reference('https://www.vapesklep.pl', '#12345') == 'vsklep12345'
-    assert site_order_reference('https://vapeklub.pl', 'PL-8') == 'vapeklubPL-8'
+def test_customer_number_uses_short_codes_for_all_polish_sites():
+    expected_codes = {
+        'buchmistrz': 'bm',
+        'hivape': 'hv',
+        'merrymipolska': 'mm',
+        'mocpuff': 'mp',
+        'strefajednorazowek': 'sj',
+        'vapedream': 'vd',
+        'vapego': 'vg',
+        'vapeklub': 'vk',
+        'vapepl': 'vpl',
+        'vapepolska': 'vpol',
+        'vapeprime': 'vpri',
+        'vapesklep': 'vsklep',
+        'vapestar': 'vst',
+        'vapeszczyt': 'vsz',
+        'vapico': 'vi',
+        'vapixo': 'vx',
+    }
+
+    assert SITE_ABBREVIATIONS == expected_codes
+    for site, code in expected_codes.items():
+        assert site_order_reference(f'https://www.{site}.pl', '#12345') == f'{code}12345'
+
+
+def test_customer_number_never_falls_back_to_full_site_name():
+    reference = site_order_reference('https://newpolishstore.pl', 'PL-8')
+
+    assert reference.endswith('PL-8')
+    assert reference.startswith('s')
+    assert 'newpolishstore' not in reference
 
 
 def test_shipping_template_exposes_filtered_poland_dpd_export():

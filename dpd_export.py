@@ -1,5 +1,6 @@
 """Pure helpers for Polish DPD export identity and reference rules."""
 
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -8,7 +9,22 @@ from urllib.parse import urlparse
 
 
 SITE_ABBREVIATIONS = {
+    'buchmistrz': 'bm',
+    'hivape': 'hv',
+    'merrymipolska': 'mm',
+    'mocpuff': 'mp',
+    'strefajednorazowek': 'sj',
+    'vapedream': 'vd',
+    'vapego': 'vg',
+    'vapeklub': 'vk',
+    'vapepl': 'vpl',
+    'vapepolska': 'vpol',
+    'vapeprime': 'vpri',
     'vapesklep': 'vsklep',
+    'vapestar': 'vst',
+    'vapeszczyt': 'vsz',
+    'vapico': 'vi',
+    'vapixo': 'vx',
 }
 
 
@@ -134,12 +150,15 @@ def find_recent_duplicate_order_ids(orders, candidate_ids, window_hours=72):
 
 
 def site_order_reference(source, order_number):
-    """Build the partner customer reference from site label plus order number."""
+    """Build the partner customer reference from a short site code and order number."""
     parsed = urlparse(str(source or ''))
     hostname = (parsed.hostname or parsed.path or '').lower().split(':', 1)[0]
     if hostname.startswith('www.'):
         hostname = hostname[4:]
     label = hostname.split('.', 1)[0]
-    site_label = SITE_ABBREVIATIONS.get(label, label)
+    site_label = SITE_ABBREVIATIONS.get(label)
+    if not site_label:
+        digest = hashlib.sha1(label.encode('utf-8')).hexdigest()[:6]
+        site_label = f's{digest}'
     number = str(order_number or '').strip().lstrip('#').replace(' ', '')
     return f'{site_label}{number}'
