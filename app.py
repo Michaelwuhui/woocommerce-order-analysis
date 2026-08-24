@@ -62,6 +62,7 @@ from product_clone_sku import build_clone_sku, make_clone_suffix, normalize_clon
 from sync_runtime_status import (
     init_sync_runtime_status,
     load_sync_runtime_status,
+    new_sync_runtime_status_id,
     save_sync_runtime_status,
 )
 
@@ -8988,6 +8989,17 @@ def _persist_sync_status(status_id):
     finally:
         conn.close()
 
+
+def _publish_sync_status(status_id):
+    """Refresh the heartbeat and make a task update visible to all workers."""
+    import time as _time
+
+    entry = SYNC_STATUS.get(status_id)
+    if entry is None:
+        return
+    entry['updated_at'] = _time.time()
+    _persist_sync_status(status_id)
+
 @app.route('/api/sync/status/<int:site_id>')
 @login_required
 def get_sync_status(site_id):
@@ -9662,15 +9674,17 @@ def get_check_status(check_id):
 def clean_sync_site(site_id):
     """Clean deleted orders for a single site"""
     import threading
-    
-    # Use unique ID for clean sync status (site_id + 200000)
-    status_id = site_id + 200000
+
+    # Every run gets its own ID. Reusing a site-derived ID can expose a
+    # terminal status from an earlier run to another Gunicorn worker.
+    status_id = new_sync_runtime_status_id()
     
     SYNC_STATUS[status_id] = {
         'status': 'running',
         'message': '正在启动清理同步...',
         'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Clean sync started for site {site_id}"]
     }
+    _publish_sync_status(status_id)
     
     def run_clean_sync(app_context, site_id, status_id):
         with app_context:
@@ -9688,6 +9702,7 @@ def clean_sync_site(site_id):
                 site_url = site['url'].strip()
                 SYNC_STATUS[status_id]['message'] = f'正在获取远程订单ID...'
                 SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching remote order IDs for {site_url}")
+                _publish_sync_status(status_id)
                 
                 from woocommerce import API
                 import time
@@ -9737,6 +9752,7 @@ def clean_sync_site(site_id):
                             remote_ids.add(str(order['id']))
                         
                         SYNC_STATUS[status_id]['message'] = f'已获取 {len(remote_ids)} 个远程订单ID (页 {page})'
+                        _publish_sync_status(status_id)
                         page += 1
                         
                     except Exception as e:
@@ -9746,6 +9762,7 @@ def clean_sync_site(site_id):
                         break
                 
                 SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(remote_ids)} remote orders")
+                _publish_sync_status(status_id)
 
                 # A valid HTTP 200 + JSON list may legitimately contain zero
                 # orders.  Only transport/HTTP/format failures must block all
@@ -9800,6 +9817,7 @@ def clean_sync_site(site_id):
                 
                 # 通过受保护的归档逻辑处理孤儿单（P0-a：先归档留底 + 大批量回滚保护，取代直接物理删除）
                 SYNC_STATUS[status_id]['message'] = f'正在处理 {len(orphaned_ids)} 个疑似已删除订单...'
+                _publish_sync_status(status_id)
                 try:
                     removed = _get_woosync().archive_orphaned_orders(
                         site_url,
@@ -9823,6 +9841,8 @@ def clean_sync_site(site_id):
                 SYNC_STATUS[status_id]['status'] = 'error'
                 SYNC_STATUS[status_id]['message'] = str(e)
                 SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+            finally:
+                _publish_sync_status(status_id)
     
     thread = threading.Thread(target=run_clean_sync, args=(app.app_context(), site_id, status_id))
     thread.start()
@@ -10570,14 +10590,17 @@ def trigger_deep_sync():
 def clean_all_sites():
     """Clean deleted orders from all sites"""
     import threading
-    
-    CLEAN_ALL_ID = 999999
-    
-    SYNC_STATUS[CLEAN_ALL_ID] = {
+
+    # A clean run must not reuse the global quick-sync ID (999999), otherwise
+    # polling can read that task's old terminal state and report a false finish.
+    clean_status_id = new_sync_runtime_status_id()
+
+    SYNC_STATUS[clean_status_id] = {
         'status': 'running',
         'message': '正在启动全站点清理同步...',
         'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Clean all sites started"]
     }
+    _publish_sync_status(clean_status_id)
     
     def run_clean_all(app_context):
         with app_context:
@@ -10594,8 +10617,9 @@ def clean_all_sites():
                 
                 for i, site in enumerate(sites):
                     site_url = site['url'].strip() # Ensure no whitespace
-                    SYNC_STATUS[CLEAN_ALL_ID]['message'] = f'正在处理 {site_url} ({i+1}/{len(sites)})...'
-                    SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Processing {site_url}")
+                    SYNC_STATUS[clean_status_id]['message'] = f'正在处理 {site_url} ({i+1}/{len(sites)})...'
+                    SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Processing {site_url}")
+                    _publish_sync_status(clean_status_id)
                     
                     try:
                         wcapi = API(
@@ -10622,6 +10646,7 @@ def clean_all_sites():
                                 })
                                 
                                 if response.status_code != 200:
+                                    SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] HTTP Error {response.status_code} on page {page}")
                                     break
                                 
                                 data = response.json()
@@ -10630,17 +10655,23 @@ def clean_all_sites():
                                 
                                 for order in data:
                                     remote_ids.add(str(order['id']))
-                                
+
+                                SYNC_STATUS[clean_status_id]['message'] = (
+                                    f'正在处理 {site_url} ({i+1}/{len(sites)})，'
+                                    f'已读取 {len(remote_ids)} 个订单（第 {page} 页）'
+                                )
+                                _publish_sync_status(clean_status_id)
                                 page += 1
                                 
                             except Exception as e:
-                                SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error fetching: {str(e)[:50]}")
+                                SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error fetching: {str(e)[:50]}")
                                 break
                         
-                        SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(remote_ids)} remote orders")
+                        SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(remote_ids)} remote orders")
                         
                         if not remote_ids:
-                            SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping {site_url} - no remote orders")
+                            SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping {site_url} - no remote orders")
+                            _publish_sync_status(clean_status_id)
                             continue
                         
                         # Get local order IDs
@@ -10655,12 +10686,12 @@ def clean_all_sites():
                             # 受保护的归档逻辑（P0-a）：大批量孤儿单（疑似回滚）会被跳过并告警，而非删除
                             removed = _get_woosync().archive_orphaned_orders(site_url, remote_ids)
                             if removed == 0:
-                                SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] {site_url}: {len(orphaned_ids)} orphans, suspected rollback -> skipped & alerted (orders kept)")
+                                SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] {site_url}: {len(orphaned_ids)} orphans, suspected rollback -> skipped & alerted (orders kept)")
                             else:
                                 total_deleted += removed
-                                SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Archived & removed {removed} orphaned orders from {site_url}")
+                                SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Archived & removed {removed} orphaned orders from {site_url}")
                         else:
-                            SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] No orphaned orders in {site_url}")
+                            SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] No orphaned orders in {site_url}")
                             
                         # Clean up draft/trash orders regardless of remote status
                         conn = get_db_connection()
@@ -10673,25 +10704,29 @@ def clean_all_sites():
                                          [site_url] + list(draft_ids))
                             conn.commit()
                             total_deleted += len(draft_ids)
-                            SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Deleted {len(draft_ids)} draft/trash orders from {site_url}")
+                            SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Deleted {len(draft_ids)} draft/trash orders from {site_url}")
                         conn.close()
+                        _publish_sync_status(clean_status_id)
                             
                     except Exception as e:
-                        SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)[:100]}")
+                        SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)[:100]}")
+                        _publish_sync_status(clean_status_id)
                 
-                SYNC_STATUS[CLEAN_ALL_ID]['status'] = 'success'
-                SYNC_STATUS[CLEAN_ALL_ID]['message'] = f'清理完成，共删除 {total_deleted} 个订单'
-                SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Completed: {total_deleted} total deleted")
+                SYNC_STATUS[clean_status_id]['status'] = 'success'
+                SYNC_STATUS[clean_status_id]['message'] = f'清理完成，共删除 {total_deleted} 个订单'
+                SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Completed: {total_deleted} total deleted")
                 
             except Exception as e:
-                SYNC_STATUS[CLEAN_ALL_ID]['status'] = 'error'
-                SYNC_STATUS[CLEAN_ALL_ID]['message'] = str(e)
-                SYNC_STATUS[CLEAN_ALL_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+                SYNC_STATUS[clean_status_id]['status'] = 'error'
+                SYNC_STATUS[clean_status_id]['message'] = str(e)
+                SYNC_STATUS[clean_status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+            finally:
+                _publish_sync_status(clean_status_id)
     
     thread = threading.Thread(target=run_clean_all, args=(app.app_context(),))
     thread.start()
     
-    return jsonify({'success': True, 'sync_id': CLEAN_ALL_ID, 'message': 'Clean all started'})
+    return jsonify({'success': True, 'sync_id': clean_status_id, 'message': 'Clean all started'})
 
 
 @app.route('/api/cron/status')

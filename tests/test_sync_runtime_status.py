@@ -3,6 +3,7 @@ import sqlite3
 from sync_runtime_status import (
     init_sync_runtime_status,
     load_sync_runtime_status,
+    new_sync_runtime_status_id,
     save_sync_runtime_status,
 )
 
@@ -11,6 +12,14 @@ def connect(path):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def test_generated_status_ids_are_distinct_and_browser_safe():
+    status_ids = [new_sync_runtime_status_id() for _ in range(1000)]
+
+    assert len(set(status_ids)) == len(status_ids)
+    assert all(0 < status_id <= (2**53 - 1) for status_id in status_ids)
+    assert 999999 not in status_ids
 
 
 def test_status_is_shared_across_connections(tmp_path):

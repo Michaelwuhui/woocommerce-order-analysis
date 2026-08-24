@@ -3,7 +3,19 @@
 from __future__ import annotations
 
 import json
+import secrets
 import time
+
+
+_MIN_BROWSER_SAFE_STATUS_ID = 1_000_000_000_000_000
+_MAX_BROWSER_SAFE_STATUS_ID = 9_000_000_000_000_000
+
+
+def new_sync_runtime_status_id() -> int:
+    """Return a per-run ID that remains exact in JavaScript and SQLite."""
+    return _MIN_BROWSER_SAFE_STATUS_ID + secrets.randbelow(
+        _MAX_BROWSER_SAFE_STATUS_ID - _MIN_BROWSER_SAFE_STATUS_ID
+    )
 
 
 def init_sync_runtime_status(conn) -> None:
