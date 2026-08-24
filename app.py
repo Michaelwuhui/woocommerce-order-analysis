@@ -15788,6 +15788,19 @@ def get_unknown_products():
             'aliases': aliases,
             'patterns': [brand_name.upper()] + [a.upper() for a in aliases]
         })
+
+    # Manual mappings are authoritative for products whose order-line name does
+    # not contain enough information to infer the brand or puff count.
+    mappings_rows = conn.execute('''
+        SELECT pm.raw_name, pm.source, pm.puff_count, b.name AS brand_name
+        FROM product_mappings pm
+        LEFT JOIN brands b ON pm.brand_id = b.id
+        WHERE pm.is_manual = 1
+    ''').fetchall()
+    manual_mappings = {
+        (normalize_raw_name(row['raw_name']), row['source']): row
+        for row in mappings_rows
+    }
     
     conn.close()
     
@@ -15809,10 +15822,29 @@ def get_unknown_products():
             # Get full name with flavor from meta_data
             full_name, meta_flavor, meta_puffs = get_full_product_name(item)
             
-            # Parse and check if brand is found
-            parsed = parse_product_name(name, brands_cache)
+            # Prefer an explicit product mapping, then fall back to parsing the
+            # order-line name. WooCommerce only includes variation attributes in
+            # many order lines, so use meta puffs when they are available.
+            source = order['source']
+            full_name_key = normalize_raw_name(full_name)
+            name_key = normalize_raw_name(name)
+            mapping = (
+                manual_mappings.get((full_name_key, source))
+                or manual_mappings.get((full_name_key, ''))
+                or manual_mappings.get((full_name_key, None))
+                or manual_mappings.get((name_key, source))
+                or manual_mappings.get((name_key, ''))
+                or manual_mappings.get((name_key, None))
+            )
+            if mapping:
+                brand = mapping['brand_name']
+                puffs = mapping['puff_count'] or meta_puffs
+            else:
+                parsed = parse_product_name(name, brands_cache)
+                brand = parsed.get('brand')
+                puffs = meta_puffs or parsed.get('puffs')
             
-            if parsed.get('brand') is None:
+            if not brand:
                 # This product is unknown
                 # Use a simplified key (remove flavor for grouping)
                 key = name.split(' - ')[0].strip() if ' - ' in name else name
@@ -15821,11 +15853,13 @@ def get_unknown_products():
                     unknown_products[key] = {
                         'name': key,
                         'sample_full_name': full_name,  # Include flavor in sample
-                        'puffs': parsed.get('puffs'),
+                        'puffs': puffs,
                         'quantity': 0,
                         'sources': set()
                     }
                 unknown_products[key]['quantity'] += quantity
+                if unknown_products[key]['puffs'] is None and puffs is not None:
+                    unknown_products[key]['puffs'] = puffs
                 unknown_products[key]['sources'].add(order['source'])
     
     # Convert sets to lists and sort by quantity
