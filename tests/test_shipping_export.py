@@ -7,9 +7,11 @@ from openpyxl import load_workbook
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shipping_export import (
+    DPD_HEADERS,
     PENDING_HEADERS,
     build_australia_pending_workbook,
     build_australia_shipping_workbook,
+    build_dpd_shipping_workbook,
     prepare_australia_pending_items,
 )
 
@@ -53,6 +55,42 @@ class AustraliaShippingWorkbookTests(unittest.TestCase):
             self.assertEqual('@', worksheet[address].number_format)
 
         self.assertEqual('A1:H2', worksheet.auto_filter.ref)
+        self.assertEqual('A2', worksheet.freeze_panes)
+
+    def test_dpd_workbook_matches_partner_columns_and_types(self):
+        rows = [{
+            'customer_number': 'vsklep-00123',
+            'recipient_name': 'Jan Kowalski',
+            'province': 'Warszawa',
+            'city': 'Warszawa',
+            'address': '=HYPERLINK("https://invalid.test")',
+            'phone': '0123456789',
+            'email': 'jan@example.com',
+            'postcode': '00-001',
+            'cod_amount': 249.9,
+        }]
+
+        output = build_dpd_shipping_workbook(rows)
+        workbook = load_workbook(output, data_only=False)
+        worksheet = workbook['下单模板']
+
+        self.assertEqual(DPD_HEADERS, [
+            worksheet.cell(1, column).value for column in range(1, 24)
+        ])
+        self.assertEqual([
+            'vsklep-00123', None, '2581', 'PL', 'Jan Kowalski',
+            'Warszawa', 'Warszawa', '=HYPERLINK("https://invalid.test")',
+            '0123456789', 'jan@example.com', '00-001', 1,
+            'wanju', 'wanju', 'wanju', 1, 'usd', 1, 1,
+            249.9, 'PLN', '是', 'wanju',
+        ], [worksheet.cell(2, column).value for column in range(1, 24)])
+        self.assertEqual('s', worksheet['A2'].data_type)
+        self.assertEqual('s', worksheet['H2'].data_type)
+        self.assertEqual('s', worksheet['I2'].data_type)
+        self.assertEqual('s', worksheet['K2'].data_type)
+        self.assertEqual('@', worksheet['K2'].number_format)
+        self.assertEqual('0.00', worksheet['T2'].number_format)
+        self.assertEqual('A1:W2', worksheet.auto_filter.ref)
         self.assertEqual('A2', worksheet.freeze_panes)
 
     def test_pending_items_split_product_flavor_and_group_products(self):

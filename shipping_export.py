@@ -17,6 +17,18 @@ PENDING_HEADERS = [
     '收件人', '联系方式', '州', '城市', '地址', '邮编',
 ]
 
+DPD_HEADERS = [
+    '客户单号', '转单号', '运输方式', '目的国家', '收件人姓名', '州,省',
+    '城市', '联系地址', '收件人电话', '收件人邮箱', '收件人邮编', '重量(KG)',
+    '中文品名', '海关报关品名1', '配货信息1', '申报价值1', '申报币种 ',
+    '申报品数量1', '申报单重（KG）', '代收货款', '币种', '是否COD', '货物品名',
+]
+
+DPD_COLUMN_WIDTHS = [
+    18, 12, 12, 10, 22, 16, 16, 34, 18, 30, 14, 12,
+    14, 18, 16, 14, 14, 16, 16, 14, 10, 12, 14,
+]
+
 FLAVOR_META_KEYS = {
     'pa_flavour', 'pa_flavor', 'flavour', 'flavor', 'pa_taste', 'taste',
     'pa_variant', 'variant', 'pa_smak', 'smak', 'pa_smaki', 'smaki',
@@ -206,6 +218,79 @@ def build_australia_pending_workbook(rows):
     worksheet.page_setup.fitToHeight = 0
     worksheet.print_title_rows = '1:1'
     worksheet.print_area = f'A1:L{last_row}'
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output
+
+
+def build_dpd_shipping_workbook(rows, template_path=None):
+    """Build the Polish DPD COD workbook in the partner's A-W layout."""
+    if template_path is None:
+        template_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'assets', 'export_templates', 'dpd_poland_template.xlsx',
+        )
+
+    workbook = load_workbook(template_path)
+    worksheet = workbook['下单模板']
+    actual_headers = [worksheet.cell(1, column).value for column in range(1, 24)]
+    if actual_headers != DPD_HEADERS:
+        raise ValueError('DPD template headers do not match the expected A-W layout')
+
+    if worksheet.max_row > 1:
+        worksheet.delete_rows(2, worksheet.max_row - 1)
+
+    text_columns = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+        13, 14, 15, 17, 21, 22, 23,
+    }
+    for row_number, item in enumerate(rows, start=2):
+        values = [
+            item.get('customer_number'),
+            '',
+            '2581',
+            'PL',
+            item.get('recipient_name'),
+            item.get('province'),
+            item.get('city'),
+            item.get('address'),
+            item.get('phone'),
+            item.get('email'),
+            item.get('postcode'),
+            1,
+            'wanju',
+            'wanju',
+            'wanju',
+            1,
+            'usd',
+            1,
+            1,
+            float(item.get('cod_amount') or 0),
+            'PLN',
+            '是',
+            'wanju',
+        ]
+        for column, value in enumerate(values, start=1):
+            cell = worksheet.cell(row=row_number, column=column)
+            if column in text_columns:
+                _set_text_cell(cell, value)
+            else:
+                cell.value = value
+        worksheet.cell(row=row_number, column=20).number_format = '0.00'
+
+    last_row = max(1, len(rows) + 1)
+    for column, width in enumerate(DPD_COLUMN_WIDTHS, start=1):
+        worksheet.column_dimensions[get_column_letter(column)].width = width
+    worksheet.auto_filter.ref = f'A1:W{last_row}'
+    worksheet.freeze_panes = 'A2'
+    worksheet.sheet_properties.pageSetUpPr.fitToPage = True
+    worksheet.page_setup.orientation = 'landscape'
+    worksheet.page_setup.fitToWidth = 1
+    worksheet.page_setup.fitToHeight = 0
+    worksheet.print_title_rows = '1:1'
+    worksheet.print_area = f'A1:W{last_row}'
 
     output = BytesIO()
     workbook.save(output)
