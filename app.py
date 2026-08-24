@@ -15831,7 +15831,7 @@ def get_unknown_products():
     # Convert sets to lists and sort by quantity
     result = []
     for key, product in unknown_products.items():
-        product['sources'] = list(product['sources'])
+        product['sources'] = sorted(product['sources'])
         result.append(product)
     
     result = sorted(result, key=lambda x: x['quantity'], reverse=True)[:limit]
