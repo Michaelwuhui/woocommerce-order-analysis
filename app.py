@@ -21,6 +21,12 @@ from shipping_export import (
     prepare_australia_pending_items,
 )
 from dpd_export import find_recent_duplicate_order_ids, site_order_reference
+from inpost_export import (
+    build_inpost_txt,
+    extract_inpost_locker_code,
+    format_collection_amount,
+    normalize_polish_phone,
+)
 from sales_board_rates import load_monthly_receipt_rates, resolve_sales_board_rate
 from sales_target_inheritance import load_sales_targets_for_month
 from shipment_split import (
@@ -20651,6 +20657,137 @@ def export_dpd_pending_list():
     response.headers['X-DPD-Excluded-Manual-Review-Count'] = str(stats['manual_review_count'])
     response.headers['X-DPD-Excluded-Unsupported-Count'] = str(stats['unsupported_count'])
     response.headers['X-DPD-Excluded-Incomplete-Count'] = str(stats['incomplete_count'])
+    return response
+
+
+@app.route('/api/shipping/export/inpost')
+@login_required
+@shipping_view_required
+def export_inpost_pending_list():
+    """Export eligible Polish InPost Paczkomat COD orders as partner TXT."""
+    country_filter = (request.args.get('country') or '').strip().upper()
+    if country_filter and country_filter != 'PL':
+        return jsonify({'error': 'InPost导出仅支持波兰市场，请将国家筛选切换为 PL'}), 400
+
+    pending_response = get_pending_orders()
+    pending_orders = pending_response.get_json() or []
+
+    conn = get_db_connection()
+    pl_sources = {
+        row['url'] for row in conn.execute(
+            "SELECT url FROM sites WHERE country='PL'"
+        ).fetchall()
+    }
+    candidates = []
+    for order in pending_orders:
+        method = str(order.get('shipping_method') or '').lower()
+        locker_value = str(order.get('customer_inpost_id') or '').strip()
+        if (
+            order.get('source_url') in pl_sources
+            and (locker_value or 'inpost' in method or 'paczkomat' in method)
+        ):
+            candidates.append(order)
+    if not candidates:
+        conn.close()
+        return jsonify({'error': '当前筛选条件下没有波兰InPost待发货订单'}), 404
+
+    duplicate_pool = [dict(row) for row in conn.execute(
+        '''SELECT o.id, o.date_created, o.billing, o.shipping, o.meta_data
+           FROM orders o
+           JOIN sites s ON s.url=o.source
+           WHERE s.country='PL'
+             AND o.status NOT IN ('checkout-draft', 'trash', 'cancelled', 'refunded', 'failed')'''
+    ).fetchall()]
+    conn.close()
+
+    candidate_ids = {order['id'] for order in candidates}
+    duplicate_ids = find_recent_duplicate_order_ids(
+        duplicate_pool, candidate_ids, window_hours=72
+    )
+    big_order_ids = {
+        order['id'] for order in candidates if order.get('is_big_order')
+    }
+    manual_review_ids = {
+        order['id'] for order in candidates
+        if order.get('manual_review')
+        or order.get('has_shortage')
+        or order.get('shipment_sync_pending')
+        or order.get('high_risk_postcode')
+        or int(order.get('parcels_shipped') or 0) > 0
+    }
+    unsupported_ids = {
+        order['id'] for order in candidates
+        if str(order.get('currency') or '').strip().upper() != 'PLN'
+        or str(order.get('payment_method') or '').strip().lower() != 'cod'
+    }
+
+    incomplete_ids = set()
+    export_rows = []
+    for order in candidates:
+        email = str(order.get('customer_email') or '').strip()
+        phone = normalize_polish_phone(order.get('customer_phone'))
+        locker_code = extract_inpost_locker_code(order.get('customer_inpost_id'))
+        amount = format_collection_amount(order.get('total'))
+        customer_number = site_order_reference(
+            order.get('source_url'), order.get('number')
+        )
+        if not all((email, phone, locker_code, amount, customer_number)):
+            incomplete_ids.add(order['id'])
+
+        excluded = (
+            order['id'] in duplicate_ids
+            or order['id'] in big_order_ids
+            or order['id'] in manual_review_ids
+            or order['id'] in unsupported_ids
+            or order['id'] in incomplete_ids
+        )
+        if excluded:
+            continue
+
+        export_rows.append({
+            'email': email,
+            'phone': phone,
+            'customer_number': customer_number,
+            'cod_amount': amount,
+            'locker_code': locker_code,
+        })
+
+    excluded_ids = (
+        duplicate_ids | big_order_ids | manual_review_ids
+        | unsupported_ids | incomplete_ids
+    ) & candidate_ids
+    stats = {
+        'candidate_count': len(candidates),
+        'exported_count': len(export_rows),
+        'excluded_count': len(excluded_ids),
+        'big_order_count': len(big_order_ids),
+        'duplicate_count': len(duplicate_ids & candidate_ids),
+        'manual_review_count': len(manual_review_ids),
+        'unsupported_count': len(unsupported_ids),
+        'incomplete_count': len(incomplete_ids),
+    }
+    if not export_rows:
+        return jsonify({
+            'error': '符合筛选条件的InPost订单均需人工审核或信息不完整，未生成文件',
+            'stats': stats,
+        }), 409
+
+    output = build_inpost_txt(export_rows)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    response = send_file(
+        output,
+        as_attachment=True,
+        download_name=f'InPost_波兰待发货_{timestamp}.txt',
+        mimetype='text/plain; charset=utf-8',
+    )
+    response.headers['X-Export-Row-Count'] = str(stats['exported_count'])
+    response.headers['X-InPost-Candidate-Count'] = str(stats['candidate_count'])
+    response.headers['X-InPost-Excluded-Count'] = str(stats['excluded_count'])
+    response.headers['X-InPost-Excluded-Big-Order-Count'] = str(stats['big_order_count'])
+    response.headers['X-InPost-Excluded-Duplicate-Count'] = str(stats['duplicate_count'])
+    response.headers['X-InPost-Excluded-Manual-Review-Count'] = str(stats['manual_review_count'])
+    response.headers['X-InPost-Excluded-Unsupported-Count'] = str(stats['unsupported_count'])
+    response.headers['X-InPost-Excluded-Incomplete-Count'] = str(stats['incomplete_count'])
     return response
 
 

@@ -25,6 +25,9 @@
                 <i class="bi bi-file-earmark-excel me-1"></i> 导出未发货
             </button>
             {% if has_pl_access %}
+            <button class="btn btn-warning" id="exportInpostBtn" title="按当前站点、负责人、日期和搜索条件导出波兰InPost柜机COD订单；自动排除72小时重复单、大单和需人工处理订单">
+                <i class="bi bi-file-earmark-text me-1"></i> 导出波兰InPost
+            </button>
             <button class="btn btn-danger" id="exportDpdBtn" title="按当前站点、负责人、日期和搜索条件导出波兰DPD COD订单；自动排除72小时重复单、大单和需人工处理订单">
                 <i class="bi bi-file-earmark-excel me-1"></i> 导出波兰DPD
             </button>
@@ -894,6 +897,10 @@
             if (exportDpdBtn) {
                 exportDpdBtn.addEventListener('click', exportDpdOrders);
             }
+            const exportInpostBtn = document.getElementById('exportInpostBtn');
+            if (exportInpostBtn) {
+                exportInpostBtn.addEventListener('click', exportInpostOrders);
+            }
             const exportAustraliaBtn = document.getElementById('exportAustraliaBtn');
             if (exportAustraliaBtn) {
                 exportAustraliaBtn.addEventListener('click', () => exportAustraliaOrders('shipped'));
@@ -966,6 +973,74 @@
                 showToast(`DPD文件已生成：${exported} 单${excludedText}`, 'success', 8000);
             } catch (error) {
                 alert(error.message || 'DPD导出失败，请稍后重试');
+            } finally {
+                button.disabled = false;
+                button.innerHTML = originalHtml;
+            }
+        }
+
+        async function exportInpostOrders() {
+            const country = document.getElementById('countryFilter').value;
+            if (country && country !== 'PL') {
+                alert('InPost导出只支持波兰市场，请先把国家筛选切换为 PL。');
+                return;
+            }
+
+            const button = document.getElementById('exportInpostBtn');
+            const originalHtml = button.innerHTML;
+            button.disabled = true;
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>筛选并生成…';
+            const params = new URLSearchParams({
+                source: document.getElementById('siteFilter').value,
+                country: 'PL',
+                manager: document.getElementById('managerFilter').value,
+                start_date: document.getElementById('dateFrom').value,
+                end_date: document.getElementById('dateTo').value,
+                search: document.getElementById('searchInput').value
+            });
+
+            try {
+                const endpoint = '/api/shipping/export/inpost';
+                const response = await fetch(`${endpoint}?${params.toString()}`);
+                if (!response.ok) {
+                    const payload = await response.json().catch(() => ({}));
+                    throw new Error(payload.error || `InPost导出失败（HTTP ${response.status}）`);
+                }
+
+                const countHeader = name => Number(response.headers.get(name) || 0);
+                const exported = countHeader('X-Export-Row-Count');
+                const excluded = countHeader('X-InPost-Excluded-Count');
+                const details = [
+                    ['大单', countHeader('X-InPost-Excluded-Big-Order-Count')],
+                    ['72小时重复', countHeader('X-InPost-Excluded-Duplicate-Count')],
+                    ['人工处理/已部分发货', countHeader('X-InPost-Excluded-Manual-Review-Count')],
+                    ['非COD或非PLN', countHeader('X-InPost-Excluded-Unsupported-Count')],
+                    ['邮箱、电话或柜机编码不完整', countHeader('X-InPost-Excluded-Incomplete-Count')]
+                ].filter(item => item[1] > 0).map(item => `${item[0]} ${item[1]}`).join('，');
+
+                const blob = await response.blob();
+                const disposition = response.headers.get('Content-Disposition') || '';
+                const utf8Name = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+                const fallbackName = disposition.match(/filename="?([^";]+)"?/i);
+                let filename = `InPost_波兰待发货_${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.txt`;
+                if (utf8Name) filename = decodeURIComponent(utf8Name[1]);
+                else if (fallbackName) filename = fallbackName[1];
+
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                URL.revokeObjectURL(url);
+
+                const excludedText = excluded
+                    ? `；未导出 ${excluded} 单，转人工审核${details ? `（${details}）` : ''}`
+                    : '';
+                showToast(`InPost文件已生成：${exported} 单${excludedText}`, 'success', 8000);
+            } catch (error) {
+                alert(error.message || 'InPost导出失败，请稍后重试');
             } finally {
                 button.disabled = false;
                 button.innerHTML = originalHtml;
