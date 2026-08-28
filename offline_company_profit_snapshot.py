@@ -94,16 +94,17 @@ def build_snapshot(month, database_path):
             sys.path.insert(0, str(APP_ROOT))
             try:
                 app_module = importlib.import_module("app")
-                init_company_profit_tables(app_module.get_db_connection)
-                summary = build_company_profit_summary(
-                    app_module.get_db_connection,
-                    app_module._compute_sales_board_data,
-                    app_module._revenue_status_cond,
-                    month,
-                    partner_recon_detail=app_module._calc_partner_recon_detail,
-                    statement_split=app_module._compute_statement_split,
-                    prefer_reconciled_snapshots=True,
-                )
+                with app_module.app.app_context():
+                    init_company_profit_tables(app_module.get_db_connection)
+                    summary = build_company_profit_summary(
+                        app_module.get_db_connection,
+                        app_module._compute_sales_board_data,
+                        app_module._revenue_status_cond,
+                        month,
+                        partner_recon_detail=app_module._calc_partner_recon_detail,
+                        statement_split=app_module._compute_statement_split,
+                        prefer_reconciled_snapshots=True,
+                    )
             finally:
                 if sys.path and sys.path[0] == str(APP_ROOT):
                     sys.path.pop(0)

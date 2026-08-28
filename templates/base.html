@@ -1244,11 +1244,15 @@
                     html += '<p>' + (billing.country || '') + '</p>';
 
                     // Check for custom billing fields
-                    var customerInPost = '';
+                    // The backend normalizes legacy _billing_inpost and Hivape
+                    // Paczkomaty meta into one display value.
+                    var customerInPost = order.customer_inpost_id || '';
                     var customerSocial = '';
                     if (metaData && Array.isArray(metaData)) {
                         metaData.forEach(function (meta) {
-                            if (meta.key === '_billing_inpost') customerInPost = meta.value;
+                            // Fallback for responses from an older backend
+                            // during a rolling deployment.
+                            if (!customerInPost && meta.key === '_billing_inpost') customerInPost = meta.value;
                             if (meta.key === '_billing_social') customerSocial = meta.value;
                         });
                     }

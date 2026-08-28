@@ -1409,7 +1409,8 @@ def _user_allowed_warehouse_ids(for_view=False):
 
     Two scopes:
       • EDIT scope  (for_view=False, default) — which warehouses' costs the user
-        may add/edit/delete. A non-partner non-admin gets [] (manages none).
+        may add/edit/delete. An internal non-partner user with the explicit
+        can_edit_costs grant is unrestricted; users without that grant get [].
       • VIEW scope  (for_view=True) — which warehouses' costs the user may SEE.
         Viewing is independently gated by can_view_costs; an internal read-only
         viewer (no partner binding) should see ALL costs even though they edit
@@ -1418,14 +1419,16 @@ def _user_allowed_warehouse_ids(for_view=False):
     Returns:
       None  → unrestricted (super admin, admin role; or for_view + no binding)
       [...] → restricted to these warehouse ids (non-admin with partner bindings)
-      []    → no access (edit scope, non-admin without any partner binding)
+      []    → no access (edit scope without can_edit_costs)
 
     Logic:
       • super admin (username 'admin')                → None
       • admin role (e.g. internal finance)            → None
       • non-admin with partner_users binding(s)       → warehouses in the
         countries of all bound partners' bound sites
-      • non-admin without partner binding             → None if for_view else []
+      • non-admin without partner binding             → None for view; for edit,
+                                                        None only when explicitly
+                                                        granted can_edit_costs
     """
     if not current_user.is_authenticated:
         return []
@@ -1433,14 +1436,19 @@ def _user_allowed_warehouse_ids(for_view=False):
         return None
     conn = get_db_connection()
     try:
-        u = conn.execute('SELECT role FROM users WHERE id = ?', (current_user.id,)).fetchone()
+        u = conn.execute(
+            'SELECT role, can_edit_costs FROM users WHERE id = ?',
+            (current_user.id,),
+        ).fetchone()
         if u and u['role'] == 'admin':
             return None
         partner_ids = [r['partner_id'] for r in conn.execute(
             'SELECT partner_id FROM partner_users WHERE user_id = ?', (current_user.id,)
         ).fetchall()]
         if not partner_ids:
-            return None if for_view else []
+            if for_view:
+                return None
+            return None if u and u['can_edit_costs'] == 1 else []
         placeholders = ','.join(['?'] * len(partner_ids))
         countries = [r['country'] for r in conn.execute(f'''
             SELECT DISTINCT s.country FROM effective_partner_sites ps
@@ -5022,6 +5030,9 @@ def get_order_details(order_id):
     order_dict['line_items'] = parse_json_field(order['line_items'])
     order_dict['shipping_lines'] = parse_json_field(order['shipping_lines'])
     order_dict['meta_data'] = parse_json_field(order['meta_data'])
+    order_dict['customer_inpost_id'] = extract_custom_billing_fields(
+        order_dict['meta_data']
+    )['customer_inpost_id']
     order_dict['fee_lines'] = parse_json_field(order['fee_lines'])
     order_dict['coupon_lines'] = parse_json_field(order['coupon_lines'])
     order_dict['coupon_lines'] = parse_json_field(order['coupon_lines'])
@@ -16740,6 +16751,17 @@ def extract_custom_billing_fields(meta_data):
         'dpd_zip': '',
         'dpd_city': ''
     }
+    # Different checkout plugins store the selected InPost locker under
+    # different order-meta keys. The legacy sites use _billing_inpost;
+    # Hivape's Paczkomaty integration stores both a locker id and a
+    # user-facing selection containing the locker address. Collect the
+    # candidates first so the result does not depend on WooCommerce meta order.
+    inpost_candidates = {
+        '_billing_inpost': '',
+        'wybrany paczkomat': '',
+        '_paczkomat_id': '',
+        'paczkomat_key': '',
+    }
     
     if not meta_data:
         return custom_fields
@@ -16748,10 +16770,13 @@ def extract_custom_billing_fields(meta_data):
         if isinstance(meta, dict):
             key = meta.get('key')
             value = meta.get('value')
+            normalized_key = str(key or '').strip().casefold()
+            if normalized_key in inpost_candidates:
+                normalized_value = str(value or '').strip()
+                if normalized_value:
+                    inpost_candidates[normalized_key] = normalized_value
             
-            if key == '_billing_inpost':
-                custom_fields['customer_inpost_id'] = value
-            elif key == '_billing_social':
+            if key == '_billing_social':
                 custom_fields['customer_social'] = value
             elif key == '_billing_adres_dpd':
                 custom_fields['dpd_street'] = value
@@ -16761,6 +16786,13 @@ def extract_custom_billing_fields(meta_data):
                 custom_fields['dpd_zip'] = value
             elif key == '_billing_miejscowosc':
                 custom_fields['dpd_city'] = value
+
+    custom_fields['customer_inpost_id'] = (
+        inpost_candidates['_billing_inpost']
+        or inpost_candidates['wybrany paczkomat']
+        or inpost_candidates['_paczkomat_id']
+        or inpost_candidates['paczkomat_key']
+    )
                 
     return custom_fields
 
