@@ -20778,7 +20778,7 @@ def export_inpost_pending_list():
         output,
         as_attachment=True,
         download_name=f'InPost_波兰待发货_{timestamp}.txt',
-        mimetype='text/plain; charset=utf-8',
+        mimetype='text/plain',
     )
     response.headers['X-Export-Row-Count'] = str(stats['exported_count'])
     response.headers['X-InPost-Candidate-Count'] = str(stats['candidate_count'])

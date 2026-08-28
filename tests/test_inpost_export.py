@@ -158,6 +158,7 @@ def test_inpost_endpoint_excludes_review_and_incomplete_orders(tmp_path):
     assert response.headers['X-InPost-Excluded-Count'] == '2'
     assert response.headers['X-InPost-Excluded-Manual-Review-Count'] == '1'
     assert response.headers['X-InPost-Excluded-Incomplete-Count'] == '1'
+    assert response.content_type == 'text/plain; charset=utf-8'
     response.direct_passthrough = False
     assert response.get_data() == (
         b'eligible@example.com;+48510661430;A;paczkomat;vsklep101;249.9;SOS01N'
