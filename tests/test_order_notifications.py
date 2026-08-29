@@ -2500,6 +2500,37 @@ def test_select_admin_new_order_email_uses_template_even_when_recipient_matches_
     assert customer_only.value.code == "admin_new_order_email_not_found"
 
 
+def test_select_admin_new_order_email_supports_live_czech_and_hungarian_subjects():
+    czech_admin = {
+        "id": 152,
+        "status": "sent",
+        "subject": "[VapeCzech]: Máte novou objednávku: č. 5412",
+        "to": "ops@example.test",
+    }
+    hungarian_admin = {
+        "id": 44,
+        "status": "sent",
+        "subject": "[Magyar Ecigi]: Új rendelés érkezett: #14380",
+        "to": "ops@example.test",
+    }
+    czech_customer = {
+        "id": 153,
+        "status": "sent",
+        "subject": "Vaše objednávka na VapeCzech byla přijata!",
+        "to": "customer@example.test",
+    }
+
+    selected_czech = order_notification_email.select_admin_new_order_log(
+        [czech_customer, czech_admin], "5412", "customer@example.test"
+    )
+    selected_hungarian = order_notification_email.select_admin_new_order_log(
+        [hungarian_admin], "14380", "customer@example.test"
+    )
+
+    assert selected_czech["id"] == 152
+    assert selected_hungarian["id"] == 44
+
+
 def test_fetch_logged_admin_email_uses_get_only_and_keeps_credentials_in_headers(db):
     class Response:
         status_code = 200
