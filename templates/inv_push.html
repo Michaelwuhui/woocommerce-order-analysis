@@ -2,53 +2,278 @@
 {% block title %}Woo库存同步 - 苍赋管理系统{% endblock %}
 {% block content %}
 <div class="container-fluid py-4">
-  <h5 class="text-light mb-3"><i class="bi bi-cloud-upload me-2"></i>Woo库存同步
-    <span class="text-white-50 small ms-2">仅同步维护真实数量的仓库；人工合作仓不会参与</span></h5>
-
-  <div class="alert alert-secondary bg-dark border-secondary text-white-50 small py-2">
-    <i class="bi bi-info-circle me-1"></i>这是管理员工具：把订单系统的可售库存同步到 WooCommerce（仅写 manage_stock / stock_quantity）。
-    金毅金谷等不维护数量的人工仓自动排除；“演练”只计算，不修改站点。
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+    <div>
+      <h5 class="text-light mb-1"><i class="bi bi-cloud-upload me-2"></i>Woo库存同步</h5>
+      <div class="text-white-50 small">按站点独立控制；新站默认关闭，人工合作仓不参与数量同步</div>
+    </div>
+    <div class="d-flex align-items-center gap-2">
+      <span id="globalBadge" class="badge text-bg-secondary">读取全局状态中</span>
+      {% if is_inv_admin %}
+      <button id="globalBtn" class="btn btn-sm btn-outline-warning" onclick="toggleGlobal()" disabled>全局开关</button>
+      {% endif %}
+    </div>
   </div>
 
-  <div class="d-flex gap-2 mb-3 align-items-center">
-    <select id="site" class="form-select form-select-sm bg-dark text-white border-secondary" style="max-width:320px" onchange="loadStock()">
-      <option value="">选择站点</option>{% for s in sites %}<option value="{{ s.id }}">{{ s.url }} ({{ s.country }})</option>{% endfor %}
+  <div class="alert alert-dark border-secondary text-white-50 small py-2">
+    <i class="bi bi-shield-check me-1"></i>
+    <b class="text-light">观察</b>只计算和记录，不修改 WooCommerce；
+    <b class="text-light">正式</b>只写 manage_stock / stock_quantity，并在每次写入后回读确认。
+    站点负责人只看到授权站点；只有库存操作权限可改本站配置，批量和全局开关仅限超级管理员。
+  </div>
+
+  {% if is_inv_admin %}
+  <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+    <button class="btn btn-sm btn-outline-light" onclick="selectAllSites(true)">全选</button>
+    <button class="btn btn-sm btn-outline-light" onclick="selectAllSites(false)">取消全选</button>
+    <button class="btn btn-sm btn-outline-info" onclick="bulkMode('observe')">批量设为观察</button>
+    <button class="btn btn-sm btn-outline-secondary" onclick="bulkMode('off')">批量关闭</button>
+    <button class="btn btn-sm btn-outline-danger" onclick="bulkMode('live')">批量正式同步</button>
+    <span id="configMsg" class="small text-info"></span>
+  </div>
+  {% else %}
+  <div id="configMsg" class="small text-info mb-2"></div>
+  {% endif %}
+
+  <div class="card data-card mb-4">
+    <div class="card-body p-0">
+      <div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead>
+            <tr class="text-white-50 small">
+              {% if is_inv_admin %}<th style="width:36px"></th>{% endif %}
+              <th>站点</th><th>就绪检查</th><th>模式</th><th>间隔</th>
+              <th>共享库存</th><th>安全库存</th><th>最近运行</th><th class="text-end">操作</th>
+            </tr>
+          </thead>
+          <tbody id="configBody">
+            <tr><td colspan="9" class="text-center text-white-50 py-4">正在读取配置…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <h6 class="text-light mb-2">库存计算与人工执行</h6>
+  <div class="d-flex flex-wrap gap-2 mb-3 align-items-center">
+    <select id="site" class="form-select form-select-sm bg-dark text-white border-secondary"
+            style="max-width:320px" onchange="loadStock()">
+      <option value="">选择站点</option>
+      {% for s in sites %}<option value="{{ s.id }}">{{ s.url }} ({{ s.country }})</option>{% endfor %}
     </select>
-    <button class="btn btn-sm btn-outline-info" onclick="loadStock()"><i class="bi bi-calculator"></i> 计算可同步库存</button>
-    {% if is_inv_admin %}
-    <button class="btn btn-sm btn-outline-light" onclick="push(true)"><i class="bi bi-play"></i> 同步演练</button>
-    <button class="btn btn-sm btn-danger" onclick="push(false)"><i class="bi bi-cloud-upload"></i> 同步到 Woo</button>
+    <button class="btn btn-sm btn-outline-info" onclick="loadStock()">
+      <i class="bi bi-calculator"></i> 计算自动同步库存
+    </button>
+    <button class="btn btn-sm btn-outline-light" onclick="pushStock(true)">
+      <i class="bi bi-play"></i> 同步演练
+    </button>
+    {% if can_manage_inv %}
+    <button class="btn btn-sm btn-danger" onclick="pushStock(false)">
+      <i class="bi bi-cloud-upload"></i> 人工同步到 Woo
+    </button>
     {% endif %}
     <span id="msg" class="small text-info"></span>
   </div>
 
-  <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
-    <table class="table table-dark table-hover align-middle mb-0">
-      <thead><tr class="text-white-50 small"><th>WC商品ID</th><th>SKU</th><th>名称</th><th class="text-end">可用(SKU)</th><th class="text-end">每件折合</th><th class="text-end">可发布库存</th><th>服务仓</th></tr></thead>
-      <tbody id="tb"><tr><td colspan="7" class="text-center text-white-50 py-4">选择站点后计算</td></tr></tbody>
-    </table></div></div></div>
+  <div class="card data-card">
+    <div class="card-body p-0">
+      <div class="table-responsive">
+        <table class="table table-dark table-hover align-middle mb-0">
+          <thead>
+            <tr class="text-white-50 small">
+              <th>WC商品ID</th><th>SKU</th><th>名称</th>
+              <th class="text-end">库存池可用</th><th class="text-end">本站配额</th>
+              <th class="text-end">每件折合</th><th class="text-end">可发布</th><th>服务仓</th>
+            </tr>
+          </thead>
+          <tbody id="tb">
+            <tr><td colspan="8" class="text-center text-white-50 py-4">选择站点后计算</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 </div>
+
 <script>
-const IS_ADMIN={{ 'true' if is_inv_admin else 'false' }};
-function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const IS_SUPERADMIN={{ 'true' if is_inv_admin else 'false' }};
+const CAN_MANAGE={{ 'true' if can_manage_inv else 'false' }};
+let syncState={global_enabled:false,sites:[]};
 const qs=id=>document.getElementById(id);
+const esc=s=>(s==null?'':String(s)).replace(/[&<>"']/g,c=>(
+  {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+));
+
+async function api(url, options={}){
+  const response=await fetch(url, options);
+  const text=await response.text();
+  let body={};
+  try{body=text?JSON.parse(text):{};}catch(_e){
+    throw new Error('服务器返回了非 JSON 响应（HTTP '+response.status+'），请刷新后重试');
+  }
+  if(!response.ok)throw new Error(body.error||body.fatal||('请求失败 HTTP '+response.status));
+  return body;
+}
+
+function modeLabel(mode){
+  return {off:'关闭',observe:'观察',live:'正式',paused:'已自动暂停'}[mode]||mode;
+}
+
+function readinessHtml(readiness){
+  const errors=readiness.errors||[], warnings=readiness.warnings||[];
+  if(errors.length)return '<span class="badge text-bg-danger">未就绪</span><div class="small text-danger mt-1">'+esc(errors.join('；'))+'</div>';
+  if(warnings.length)return '<span class="badge text-bg-warning">有提醒</span><div class="small text-warning mt-1">'+esc(warnings.join('；'))+'</div>';
+  return '<span class="badge text-bg-success">已就绪</span><div class="small text-white-50 mt-1">'+readiness.mapping_count+' 个映射</div>';
+}
+
+function latestHtml(run){
+  if(!run)return '<span class="text-white-50">尚未运行</span>';
+  const cls=run.status==='success'?'text-success':(run.status==='partial'?'text-warning':'text-danger');
+  return '<div class="'+cls+'">'+esc(run.status)+'</div><div class="small text-white-50">'
+    +esc(run.started_at||'')+' · '+run.ok_count+' 写入 / '+run.unchanged_count+' 未变 / '+run.error_count+' 失败</div>';
+}
+
+function renderConfigs(){
+  qs('globalBadge').className='badge '+(syncState.global_enabled?'text-bg-success':'text-bg-secondary');
+  qs('globalBadge').textContent=syncState.global_enabled?'全局自动任务：开启':'全局自动任务：关闭';
+  if(qs('globalBtn')){
+    qs('globalBtn').disabled=false;
+    qs('globalBtn').textContent=syncState.global_enabled?'关闭全局自动任务':'开启全局自动任务';
+  }
+  const colspan=IS_SUPERADMIN?9:8;
+  if(!syncState.sites.length){
+    qs('configBody').innerHTML='<tr><td colspan="'+colspan+'" class="text-center text-white-50 py-4">没有可查看的站点</td></tr>';
+    return;
+  }
+  qs('configBody').innerHTML=syncState.sites.map(s=>{
+    const disabled=s.can_edit?'':'disabled';
+    const selector=IS_SUPERADMIN?'<td><input class="form-check-input site-check" type="checkbox" value="'+s.id+'"></td>':'';
+    return '<tr data-site="'+s.id+'">'+selector
+      +'<td><div class="text-light">'+esc(s.url)+'</div><span class="badge bg-secondary">'+esc(s.country||'—')+'</span>'
+      +(s.manager?'<span class="small text-white-50 ms-1">'+esc(s.manager)+'</span>':'')+'</td>'
+      +'<td style="max-width:280px">'+readinessHtml(s.readiness)+'</td>'
+      +'<td><select class="form-select form-select-sm bg-dark text-white border-secondary cfg-mode" '+disabled+'>'
+      +['off','observe','live'].map(m=>'<option value="'+m+'" '+(s.mode===m?'selected':'')+'>'+modeLabel(m)+'</option>').join('')
+      +(s.mode==='paused'?'<option value="paused" selected>已自动暂停</option>':'')+'</select>'
+      +(s.paused_reason?'<div class="small text-danger mt-1">'+esc(s.paused_reason)+'</div>':'')+'</td>'
+      +'<td><input class="form-control form-control-sm bg-dark text-white border-secondary cfg-interval" type="number" min="5" max="1440" value="'+s.interval_minutes+'" '+disabled+' style="width:78px"><span class="small text-white-50">分钟</span></td>'
+      +'<td><select class="form-select form-select-sm bg-dark text-white border-secondary cfg-strategy" '+disabled+'>'
+      +'<option value="quota" '+(s.allocation_strategy==='quota'?'selected':'')+'>按权重配额</option>'
+      +'<option value="mirror" '+(s.allocation_strategy==='mirror'?'selected':'')+'>镜像（不推荐）</option></select>'
+      +'<div class="input-group input-group-sm mt-1" style="width:112px"><span class="input-group-text bg-dark text-white-50">权重</span>'
+      +'<input class="form-control bg-dark text-white border-secondary cfg-weight" type="number" min="1" max="1000" value="'+s.allocation_weight+'" '+disabled+'></div></td>'
+      +'<td><input class="form-control form-control-sm bg-dark text-white border-secondary cfg-safety" type="number" min="0" value="'+s.safety_stock+'" '+disabled+' style="width:78px"></td>'
+      +'<td style="min-width:180px">'+latestHtml(s.latest_run)
+      +(s.last_error?'<div class="small text-danger mt-1">'+esc(s.last_error)+'</div>':'')+'</td>'
+      +'<td class="text-end"><button class="btn btn-sm btn-outline-primary me-1" onclick="chooseSite('+s.id+')">查看</button>'
+      +(s.can_edit?'<button class="btn btn-sm btn-primary" onclick="saveConfig('+s.id+')">保存</button>':'')+'</td></tr>';
+  }).join('');
+}
+
+async function loadConfigs(){
+  try{syncState=await api('/api/inv/sync-configs');renderConfigs();}
+  catch(e){qs('configMsg').textContent=e.message;}
+}
+
+function rowConfig(siteId){
+  const row=document.querySelector('tr[data-site="'+siteId+'"]');
+  return {
+    mode:row.querySelector('.cfg-mode').value,
+    interval_minutes:Number(row.querySelector('.cfg-interval').value),
+    allocation_strategy:row.querySelector('.cfg-strategy').value,
+    allocation_weight:Number(row.querySelector('.cfg-weight').value),
+    safety_stock:Number(row.querySelector('.cfg-safety').value)
+  };
+}
+
+async function saveConfig(siteId){
+  const config=rowConfig(siteId);
+  if(config.mode==='live'&&!confirm('正式模式会由定时任务修改线上 WooCommerce 库存。确认保存？'))return;
+  qs('configMsg').textContent='保存中…';
+  try{
+    await api('/api/inv/sync-config/'+siteId,{
+      method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)
+    });
+    qs('configMsg').textContent='配置已保存';
+    await loadConfigs();
+  }catch(e){qs('configMsg').textContent=e.message;await loadConfigs();}
+}
+
+function selectedSites(){
+  return [...document.querySelectorAll('.site-check:checked')].map(el=>Number(el.value));
+}
+function selectAllSites(checked){
+  document.querySelectorAll('.site-check').forEach(el=>{el.checked=checked;});
+}
+async function bulkMode(mode){
+  const siteIds=selectedSites();
+  if(!siteIds.length){alert('请先选择站点');return;}
+  if(mode==='live'&&!confirm('将所选站点成组切换为正式同步，并可能修改线上库存。确认继续？'))return;
+  qs('configMsg').textContent='批量更新中…';
+  try{
+    const result=await api('/api/inv/sync-config/bulk',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({site_ids:siteIds,mode:mode})
+    });
+    qs('configMsg').textContent='已更新 '+result.updated.length+' 个站点'
+      +(result.errors.length?'，'+result.errors.length+' 个未通过就绪检查':'');
+  }catch(e){qs('configMsg').textContent=e.message;}
+  await loadConfigs();
+}
+
+async function toggleGlobal(){
+  const enabled=!syncState.global_enabled;
+  if(enabled&&!confirm('全局开启后，观察站会定时演练，正式站会写入 WooCommerce。确认开启？'))return;
+  try{
+    await api('/api/inv/sync-global',{
+      method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})
+    });
+    await loadConfigs();
+  }catch(e){qs('configMsg').textContent=e.message;}
+}
+
+function chooseSite(siteId){
+  qs('site').value=String(siteId);
+  loadStock();
+  qs('site').scrollIntoView({behavior:'smooth',block:'center'});
+}
+
 async function loadStock(){
-  const sid=qs('site').value;if(!sid){qs('tb').innerHTML='<tr><td colspan="7" class="text-center text-white-50 py-4">请选择站点</td></tr>';return;}
-  const rows=await (await fetch('/api/inv/site-stock/'+sid)).json();
-  qs('tb').innerHTML=rows.length?rows.map(r=>`<tr><td>${r.wc_product_id||''}</td><td><code class="text-info">${esc(r.sku_code)}</code></td>
-    <td>${esc(r.sku_name)}</td><td class="text-end">${r.available_sku}</td><td class="text-end">${r.qty_per_item}</td>
-    <td class="text-end fw-bold ${r.publishable>0?'text-success':'text-danger'}">${r.publishable}</td>
-    <td class="small text-white-50">仓 ${(r.serving_warehouses||[]).join(',')||'—'}</td></tr>`).join('')
-    :'<tr><td colspan="7" class="text-center text-white-50 py-4">该站点暂无 SKU 映射</td></tr>';
-  qs('msg').textContent=`${rows.length} 个已映射商品`;
+  const sid=qs('site').value;
+  if(!sid){
+    qs('tb').innerHTML='<tr><td colspan="8" class="text-center text-white-50 py-4">请选择站点</td></tr>';
+    return;
+  }
+  qs('msg').textContent='计算中…';
+  try{
+    const rows=await api('/api/inv/site-stock/'+sid+'?strategy=auto');
+    qs('tb').innerHTML=rows.length?rows.map(r=>'<tr><td>'+esc(r.wc_product_id||'')+'</td>'
+      +'<td><code class="text-info">'+esc(r.sku_code)+'</code></td><td>'+esc(r.sku_name)+'</td>'
+      +'<td class="text-end">'+r.available_sku+'</td><td class="text-end">'+r.allocated_sku
+      +'<div class="small text-white-50">'+r.allocation_participants+' 站共享</div></td>'
+      +'<td class="text-end">'+r.qty_per_item+'</td>'
+      +'<td class="text-end fw-bold '+(r.publishable>0?'text-success':'text-danger')+'">'+r.publishable+'</td>'
+      +'<td class="small text-white-50">仓 '+((r.serving_warehouses||[]).join(',')||'—')+'</td></tr>').join('')
+      :'<tr><td colspan="8" class="text-center text-white-50 py-4">该站点暂无 SKU 映射</td></tr>';
+    qs('msg').textContent=rows.length+' 个已映射商品';
+  }catch(e){qs('msg').textContent=e.message;}
 }
-async function push(dry){
-  const sid=qs('site').value;if(!sid){alert('请选择站点');return;}
-  if(!dry&&!confirm('确认把可用库存真实写入该站点 WC 商品?此操作会修改线上库存。'))return;
-  qs('msg').textContent=dry?'演练中...':'下推中...';
-  const r=await fetch('/api/inv/push/'+sid,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dry_run:dry})});
-  const j=await r.json();if(!r.ok){qs('msg').textContent=j.error||'失败';return;}
-  qs('msg').textContent=`${dry?'演练':'下推'}完成: 商品 ${j.total} · 成功 ${j.ok} · 失败 ${j.error}`+(j.fatal?(' · '+j.fatal):'');
+
+async function pushStock(dry){
+  const sid=qs('site').value;
+  if(!sid){alert('请选择站点');return;}
+  if(!dry&&!confirm('确认把自动同步计算结果真实写入该站点，并逐项回读验证？'))return;
+  qs('msg').textContent=dry?'演练中…':'同步并回读中…';
+  try{
+    const result=await api('/api/inv/push/'+sid,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dry_run:dry})
+    });
+    qs('msg').textContent=(dry?'演练':'同步')+'完成：商品 '+result.total
+      +' · 写入 '+result.ok+' · 未变化 '+result.unchanged+' · 失败 '+result.error;
+    await loadConfigs();
+  }catch(e){qs('msg').textContent=e.message;await loadConfigs();}
 }
+
+loadConfigs();
 </script>
 {% endblock %}

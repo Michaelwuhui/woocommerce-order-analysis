@@ -2709,6 +2709,137 @@ def down_020(conn):
     conn.commit()
 
 
+# ───────────────── 021: 按站点的 Woo 库存自动同步 ─────────────────
+
+AUTO_PUSH_SETTING_KEYS = (
+    "inv_auto_push_global_enabled",
+    "inv_auto_push_zero_guard_percent",
+    "inv_auto_push_max_drop_percent",
+    "inv_auto_push_external_freshness_minutes",
+)
+MIGRATION_021_STATE_KEY = "inv_migration_021_previous_state"
+
+
+def up_021(conn):
+    """Add fail-closed per-site stock sync configuration and execution audit."""
+    conn.executescript(
+        '''
+        CREATE TABLE IF NOT EXISTS inv_site_sync_config (
+            site_id                INTEGER PRIMARY KEY,
+            mode                   TEXT NOT NULL DEFAULT 'off'
+                                   CHECK(mode IN ('off','observe','live','paused')),
+            interval_minutes       INTEGER NOT NULL DEFAULT 15 CHECK(interval_minutes >= 5),
+            allocation_strategy    TEXT NOT NULL DEFAULT 'quota'
+                                   CHECK(allocation_strategy IN ('quota','mirror')),
+            allocation_weight      INTEGER NOT NULL DEFAULT 1 CHECK(allocation_weight >= 1),
+            safety_stock           INTEGER NOT NULL DEFAULT 0 CHECK(safety_stock >= 0),
+            failure_threshold      INTEGER NOT NULL DEFAULT 3 CHECK(failure_threshold >= 1),
+            consecutive_failures   INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at        TEXT,
+            last_success_at        TEXT,
+            next_run_at            TEXT,
+            last_error             TEXT,
+            paused_reason          TEXT,
+            updated_by             INTEGER,
+            updated_by_name        TEXT,
+            created_at             TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at             TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_inv_sync_due
+            ON inv_site_sync_config(mode, next_run_at);
+
+        CREATE TABLE IF NOT EXISTS inv_push_runs (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id           INTEGER NOT NULL,
+            trigger_type      TEXT NOT NULL,
+            configured_mode   TEXT NOT NULL,
+            dry_run           INTEGER NOT NULL DEFAULT 1,
+            status            TEXT NOT NULL DEFAULT 'running',
+            total_count       INTEGER NOT NULL DEFAULT 0,
+            ok_count          INTEGER NOT NULL DEFAULT 0,
+            unchanged_count   INTEGER NOT NULL DEFAULT 0,
+            error_count       INTEGER NOT NULL DEFAULT 0,
+            fatal_error       TEXT,
+            operator_id       INTEGER,
+            operator_name     TEXT,
+            started_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+            finished_at       TEXT,
+            FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_inv_push_runs_site
+            ON inv_push_runs(site_id, started_at DESC);
+
+        CREATE TABLE IF NOT EXISTS inv_push_locks (
+            site_id       INTEGER PRIMARY KEY,
+            lock_token    TEXT NOT NULL,
+            acquired_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS inv_site_sync_audit (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id         INTEGER,
+            action          TEXT NOT NULL,
+            before_json     TEXT,
+            after_json      TEXT,
+            operator_id     INTEGER,
+            operator_name   TEXT,
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_inv_sync_audit_site
+            ON inv_site_sync_audit(site_id, created_at DESC);
+        '''
+    )
+    state_row = conn.execute(
+        "SELECT 1 FROM settings WHERE key=?", (MIGRATION_021_STATE_KEY,)
+    ).fetchone()
+    if not state_row:
+        previous = {}
+        for key in AUTO_PUSH_SETTING_KEYS:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            previous[key] = row["value"] if row else None
+        conn.execute(
+            "INSERT INTO settings (key,value) VALUES (?,?)",
+            (MIGRATION_021_STATE_KEY, json.dumps(previous, ensure_ascii=False)),
+        )
+    defaults = {
+        "inv_auto_push_global_enabled": "0",
+        "inv_auto_push_zero_guard_percent": "50",
+        "inv_auto_push_max_drop_percent": "80",
+        "inv_auto_push_external_freshness_minutes": "180",
+    }
+    for key, value in defaults.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)",
+            (key, value),
+        )
+    conn.commit()
+
+
+def down_021(conn):
+    """Remove the scheduler control plane without touching item push history."""
+    conn.execute("DROP TABLE IF EXISTS inv_site_sync_audit")
+    conn.execute("DROP TABLE IF EXISTS inv_push_locks")
+    conn.execute("DROP TABLE IF EXISTS inv_push_runs")
+    conn.execute("DROP TABLE IF EXISTS inv_site_sync_config")
+    state_row = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (MIGRATION_021_STATE_KEY,)
+    ).fetchone()
+    previous = json.loads(state_row["value"]) if state_row and state_row["value"] else {}
+    for key in AUTO_PUSH_SETTING_KEYS:
+        if previous.get(key) is None:
+            conn.execute("DELETE FROM settings WHERE key=?", (key,))
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+                (key, previous[key]),
+            )
+    conn.execute("DELETE FROM settings WHERE key=?", (MIGRATION_021_STATE_KEY,))
+    conn.commit()
+
+
 MIGRATIONS = [
     ('001', 'core_inv_schema', up_001, down_001),
     ('002', 'seed_hu_pl_markets', up_002, down_002),
@@ -2730,6 +2861,7 @@ MIGRATIONS = [
     ('018', 'manual_shipper_scope_and_replenishment', up_018, down_018),
     ('019', 'warehouse_first_woo_mapping_catalog', up_019, down_019),
     ('020', 'joint_dispatch_groups', up_020, down_020),
+    ('021', 'per_site_automatic_inventory_sync', up_021, down_021),
 ]
 
 

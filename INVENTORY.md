@@ -33,7 +33,9 @@
 (出入库流水,只增不改,带操作人+时间+前后数量)、`inv_purchase_orders(+_items)`、
 `inv_suppliers`、`inv_fulfillments(+_items)`(分单)、`inv_market_warehouses`
 (市场→仓优先级)、`inv_warehouse_ext`(仓库扩展:自营/合伙人/partner_id)、
-`inv_order_state`(订单库存联动状态)、`inv_push_logs`、`inv_notifications`。
+`inv_order_state`(订单库存联动状态)、`inv_push_logs`、`inv_notifications`、
+`inv_site_sync_config`(站点开关/间隔/配额)、`inv_push_runs`(运行审计)、
+`inv_push_locks`(站点互斥锁)、`inv_site_sync_audit`(配置审计)。
 
 对现有表唯一的「加法」:`users` 加 `can_view_inventory`/`can_manage_inventory`,
 `inv_skus` 的 `reorder_point`(均为纯新增列,不改现有列含义)。
@@ -68,18 +70,23 @@
 捷克(CZ)已配置:HU 自营仓(优先)> PL 合伙人仓(金毅金谷,次选,缺货拆单)。
 
 ### 4.4 下推 WordPress
-每站每映射商品可发布量 = `floor(Σ服务仓 max(0,on_hand−reserved) / qty_per_item)`。
-写入复用 Product Manager 的 PUT 白名单(仅 `manage_stock`/`stock_quantity`)。
+
+- 人工旧计算仍可查看服务仓完整可用量。
+- 自动同步按“相同服务仓集合 + 标准 SKU”识别共享库存池，先扣安全库存，再按站点权重分配整数 SKU 配额，所有站点配额合计不超过库存池可用量。
+- 站点模式：`off` 关闭、`observe` 只计算、`live` 正式写入、`paused` 连续失败后自动暂停。
+- 正式写入复用 Product Manager 白名单，只写 `manage_stock`/`stock_quantity`；先 GET 差异、相同值跳过，PUT 后再次 GET 回读确认。
+- 映射无数量数据源、外部库存过期、共享库存站点未成组正式启用、批量归零或大幅下降时拒绝写入。
 
 ## 5. 角色与权限
 
 | 角色 | 范围 | 读写 |
 |---|---|---|
-| 管理员(admin) | 全部仓 | 读写 + 主数据 |
-| 库存管理(can_manage_inventory) | 全部仓 | 读写 |
-| 库存查看(can_view_inventory) | 全部仓 | 只读 |
+| 超级管理员(username=admin) | 全部仓/全部站点 | 全局开关、批量开关、配置、演练和正式同步 |
+| 内部管理员(role=admin + 库存权限) | 全部站点 | 单站配置、演练和正式同步 |
+| 站点库存管理(can_manage_inventory) | 授权国家/站点或本人负责站点 | 本站配置、演练和正式同步 |
+| 库存查看(can_view_inventory) | 授权国家/站点或本人负责站点 | 查看和演练，不可写 Woo |
 | 发货员(can_ship) | 全部仓 | 只读 |
-| 合伙人(partner_users) | **只看自己仓** | 只读 |
+| 合伙人(partner_users) | **只看自己仓** | 不进入 Woo 库存同步 |
 
 合伙人通过「仓库管理」里把合伙人仓**关联合伙人账户**(`inv_warehouse_ext.partner_id`)
 + 现有 `partner_users` 绑定实现只读自己仓。
@@ -92,8 +99,8 @@ venv/bin/python inv_migrations.py status      # 查看
 venv/bin/python inv_migrations.py up          # 应用
 venv/bin/python inv_migrations.py down 001    # 回滚到 001 之前(含)
 
-# 库存下推(与 15 分钟拉单错峰,例如每 30 分钟)
-*/30 * * * * cd /www/wwwroot/woo-analysis && venv/bin/python inv_push_cron.py >> inv_push.log 2>&1
+# 库存下推调度器(每 5 分钟检查各站 next_run_at；默认全局关闭)
+*/5 * * * * cd /www/wwwroot/woo-analysis && flock -n /tmp/woo-inv-push.lock venv/bin/python inv_push_cron.py >> inv_push_cron.log 2>&1
 
 # 通知扫描(每天)
 0 9 * * * cd /www/wwwroot/woo-analysis && venv/bin/python inv_notify_cron.py >> inv_notify.log 2>&1
