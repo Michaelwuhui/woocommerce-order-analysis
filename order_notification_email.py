@@ -47,6 +47,8 @@ _ADMIN_NEW_ORDER_PHRASES = (
     "nowe zamowienie",
     "nová objednávka",
     "nova objednavka",
+    "novou objednávku",
+    "novou objednavku",
     "új rendelés",
     "uj rendeles",
     "neue bestellung",
