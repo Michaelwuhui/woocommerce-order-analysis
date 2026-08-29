@@ -22,18 +22,23 @@
     站点负责人只看到授权站点；只有库存操作权限可改本站配置，批量和全局开关仅限超级管理员。
   </div>
 
-  {% if is_inv_admin %}
   <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+    <label for="siteSort" class="small text-white-50 mb-0">排序方式</label>
+    <select id="siteSort" class="form-select form-select-sm bg-dark text-white border-secondary"
+            style="width:140px" onchange="renderConfigs()">
+      <option value="site">按站点排序</option>
+      <option value="manager">按负责人排序</option>
+      <option value="country">按国家排序</option>
+    </select>
+    {% if is_inv_admin %}
     <button class="btn btn-sm btn-outline-light" onclick="selectAllSites(true)">全选</button>
     <button class="btn btn-sm btn-outline-light" onclick="selectAllSites(false)">取消全选</button>
     <button class="btn btn-sm btn-outline-info" onclick="bulkMode('observe')">批量设为观察</button>
     <button class="btn btn-sm btn-outline-secondary" onclick="bulkMode('off')">批量关闭</button>
     <button class="btn btn-sm btn-outline-danger" onclick="bulkMode('live')">批量正式同步</button>
+    {% endif %}
     <span id="configMsg" class="small text-info"></span>
   </div>
-  {% else %}
-  <div id="configMsg" class="small text-info mb-2"></div>
-  {% endif %}
 
   <div class="card data-card mb-4">
     <div class="card-body p-0">
@@ -133,6 +138,20 @@ function latestHtml(run){
     +esc(run.started_at||'')+' · '+run.ok_count+' 写入 / '+run.unchanged_count+' 未变 / '+run.error_count+' 失败</div>';
 }
 
+function sortedConfigSites(){
+  const mode=(qs('siteSort')||{}).value||'site';
+  const siteName=s=>(s.url||'').replace(/^https?:\/\/(www\.)?/i,'');
+  const value=(s,key)=>{
+    if(key==='manager')return (s.manager||'\uffff').trim();
+    if(key==='country')return (s.country||'\uffff').trim();
+    return siteName(s);
+  };
+  return [...syncState.sites].sort((a,b)=>{
+    const primary=value(a,mode).localeCompare(value(b,mode),'zh-CN',{numeric:true,sensitivity:'base'});
+    return primary||siteName(a).localeCompare(siteName(b),'zh-CN',{numeric:true,sensitivity:'base'});
+  });
+}
+
 function renderConfigs(){
   qs('globalBadge').className='badge '+(syncState.global_enabled?'text-bg-success':'text-bg-secondary');
   qs('globalBadge').textContent=syncState.global_enabled?'全局自动任务：开启':'全局自动任务：关闭';
@@ -145,7 +164,7 @@ function renderConfigs(){
     qs('configBody').innerHTML='<tr><td colspan="'+colspan+'" class="text-center text-white-50 py-4">没有可查看的站点</td></tr>';
     return;
   }
-  qs('configBody').innerHTML=syncState.sites.map(s=>{
+  qs('configBody').innerHTML=sortedConfigSites().map(s=>{
     const disabled=s.can_edit?'':'disabled';
     const selector=IS_SUPERADMIN?'<td><input class="form-check-input site-check" type="checkbox" value="'+s.id+'"></td>':'';
     return '<tr data-site="'+s.id+'">'+selector
