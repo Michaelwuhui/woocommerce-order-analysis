@@ -29,6 +29,7 @@ from inpost_export import (
 )
 from sales_board_rates import load_monthly_receipt_rates, resolve_sales_board_rate
 from sales_target_inheritance import load_sales_targets_for_month
+from customer_spending import customer_spending_cny_by_email
 from shipment_split import (
     ShipmentItemError,
     normalize_batch_items,
@@ -4612,6 +4613,21 @@ def customers():
     
     customers_data = conn.execute(query, params).fetchall()
 
+    # Convert successful spending in monthly currency buckets. The customer
+    # table spans several countries, so summing native amounts first would make
+    # HUF/CZK customers look artificially larger than PLN/AUD customers.
+    spending_rows = conn.execute(f'''
+        SELECT
+            json_extract(billing, '$.email') as email,
+            UPPER(COALESCE(NULLIF(TRIM(currency), ''), 'PLN')) as currency,
+            SUBSTR(date_created, 1, 7) as year_month,
+            {_success_amount_case('total')} as total_spent
+        FROM orders
+        {where_clause}
+        GROUP BY email, UPPER(COALESCE(NULLIF(TRIM(currency), ''), 'PLN')), SUBSTR(date_created, 1, 7)
+    ''', params).fetchall()
+    spending_cny_by_email = customer_spending_cny_by_email(spending_rows, get_cny_rate)
+
     # Site→manager map used to label each customer's sites in the 多站下单 column.
     site_managers_global = {s['url']: (s['manager'] or '')
                             for s in conn.execute('SELECT url, manager FROM sites').fetchall()}
@@ -4624,7 +4640,7 @@ def customers():
 
     conn.close()
 
-    total_revenue = 0
+    total_revenue_cny = 0
     repeat_customers = 0
     new_customers_month = 0
     new_customers_last_month = 0
@@ -4634,7 +4650,7 @@ def customers():
     #   by_revenue = repeat_spending / total_revenue
     total_success_orders = 0
     repeat_success_orders = 0
-    repeat_spending = 0.0
+    repeat_spending_cny = 0.0
 
     import datetime
     now = datetime.datetime.now()
@@ -4678,6 +4694,7 @@ def customers():
                 'cluster_key': ck,
                 'emails_by_spend': [], 'names_by_spend': [], 'phones': set(),
                 'total_orders': 0, 'successful_orders': 0, 'total_spent': 0.0,
+                'total_spent_cny': 0.0, 'missing_exchange_rates': set(),
                 'undelivered_orders': 0, 'shipping_loss_total': 0.0,
                 'problem_return_orders': 0, 'product_loss_total': 0.0,
                 'sources': set(), 'currencies': set(),
@@ -4694,6 +4711,9 @@ def customers():
         idn['total_orders'] += int(c.get('total_orders') or 0)
         idn['successful_orders'] += int(c.get('successful_orders') or 0)
         idn['total_spent'] += spend
+        email_cny = spending_cny_by_email.get(norm, {})
+        idn['total_spent_cny'] += float(email_cny.get('total_spent_cny') or 0)
+        idn['missing_exchange_rates'].update(email_cny.get('missing_exchange_rates') or set())
         idn['undelivered_orders'] += int(c.get('undelivered_orders') or 0)
         idn['shipping_loss_total'] += float(c.get('shipping_loss_total') or 0)
         idn['problem_return_orders'] += int(c.get('problem_return_orders') or 0)
@@ -4735,6 +4755,8 @@ def customers():
         c['total_orders'] = idn['total_orders']
         c['successful_orders'] = idn['successful_orders']
         c['total_spent'] = round(idn['total_spent'], 2)
+        c['total_spent_cny'] = round(idn['total_spent_cny'], 2)
+        c['missing_exchange_rates'] = sorted(idn['missing_exchange_rates'])
         c['undelivered_orders'] = idn['undelivered_orders']
         c['shipping_loss_total'] = round(idn['shipping_loss_total'], 2)
         c['problem_return_orders'] = idn['problem_return_orders']
@@ -4747,7 +4769,7 @@ def customers():
         c['currency'] = cur_str
         c['currencies'] = ','.join(sorted(idn['currencies']))
 
-        total_revenue += c['total_spent']
+        total_revenue_cny += c['total_spent_cny']
 
         if c['total_loss'] > 0:
             loss_stats['customers_with_loss'] += 1
@@ -4766,7 +4788,7 @@ def customers():
         if c['successful_orders'] > 1:
             repeat_customers += 1
             repeat_success_orders += c['successful_orders']
-            repeat_spending += c['total_spent']
+            repeat_spending_cny += c['total_spent_cny']
         if c['first_order_date'] and c['first_order_date'] >= thirty_days_ago:
             new_customers_month += 1
         elif c['first_order_date'] and c['first_order_date'] >= sixty_days_ago:
@@ -4821,8 +4843,9 @@ def customers():
 
     # Identity count drives all the per-customer rate stats below.
     total_customers = len(customers_list)
-    # Initial server-side order: highest spenders first (DataTables re-sorts client-side).
-    customers_list.sort(key=lambda x: x['total_spent'], reverse=True)
+    # Initial server-side order: highest CNY-equivalent spenders first
+    # (DataTables re-sorts client-side using the same value).
+    customers_list.sort(key=lambda x: x['total_spent_cny'], reverse=True)
 
     # Calculate growth rate
     if new_customers_last_month > 0:
@@ -4851,15 +4874,15 @@ def customers():
 
     stats = {
         'total_customers': total_customers,
-        'avg_ltv': total_revenue / total_customers if total_customers > 0 else 0,
+        'avg_ltv': total_revenue_cny / total_customers if total_customers > 0 else 0,
         'repeat_rate': (repeat_customers / total_customers * 100) if total_customers > 0 else 0,
         # Weighted repeat-rate variants (switchable on the KPI card).
         'repeat_rate_orders': (repeat_success_orders / total_success_orders * 100) if total_success_orders > 0 else 0,
-        'repeat_rate_revenue': (repeat_spending / total_revenue * 100) if total_revenue > 0 else 0,
+        'repeat_rate_revenue': (repeat_spending_cny / total_revenue_cny * 100) if total_revenue_cny > 0 else 0,
         'repeat_customers': repeat_customers,
         'repeat_success_orders': repeat_success_orders,
         'total_success_orders': total_success_orders,
-        'repeat_spending': round(repeat_spending, 2),
+        'repeat_spending': round(repeat_spending_cny, 2),
         'new_customer_rate': (new_customers_month / total_customers * 100) if total_customers > 0 else 0,
         'new_customers_month': new_customers_month,
         'new_customers_last_month': new_customers_last_month,
