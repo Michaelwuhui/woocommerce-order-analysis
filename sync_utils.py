@@ -236,7 +236,8 @@ def create_robust_wcapi(url, consumer_key, consumer_secret, proxy_config=None):
 def create_database_connection():
     """Create SQLite database connection (兼容旧接口，新代码建议使用 get_thread_db_connection)"""
     try:
-        connection = sqlite3.connect(DB_FILE)
+        connection = sqlite3.connect(DB_FILE, timeout=30)
+        connection.execute("PRAGMA busy_timeout=30000")
         return connection
     except Exception as e:
         print(f"Error creating database connection: {e}")

@@ -578,7 +578,19 @@ def sync_shipment(conn, shipment_id: str) -> dict:
     )
     if final or fmt == "ast":
         conn.execute("UPDATE orders SET status=? WHERE id=?", (payload["status"], order["id"]))
-    notification = _notify_shipment(conn, site, order, shipment, fmt, final)
+    # Persist the local tracking mirror before calling the remote mail endpoint.
+    # SQLite permits only one writer; holding this transaction during a 30-75s
+    # network call blocked manual shipping in the web app.
+    conn.commit()
+    try:
+        notification = _notify_shipment(conn, site, order, shipment, fmt, final)
+        # Persist the idempotency marker before the audit event. If the worker
+        # stops afterwards, the next attempt sees sent/already_sent.
+        conn.commit()
+    except WooError:
+        # _notify_shipment records the failed attempt before raising.
+        conn.commit()
+        raise
     record_event(
         conn,
         "shipment",

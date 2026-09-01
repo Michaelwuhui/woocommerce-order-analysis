@@ -91,6 +91,9 @@ DB_FILE = 'woocommerce_orders.db'
 WC_MUTATION_TIMEOUT = (5, 15)
 WC_VERIFY_TIMEOUT = (5, 10)
 WC_AUXILIARY_TIMEOUT = (5, 10)
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
+SQLITE_LOCAL_WRITE_TIMEOUT_SECONDS = 10
+SQLITE_LOCAL_WRITE_ATTEMPTS = 3
 
 FULFILLMENT_TERMINAL_ORDER_STATUSES = {
     'shipped', 'completed', 'cancelled', 'refunded', 'failed', 'trash'
@@ -378,11 +381,35 @@ def load_user(user_id):
     return None
 
 
-def get_db_connection():
+def get_db_connection(timeout_seconds=SQLITE_BUSY_TIMEOUT_SECONDS):
     """Create database connection"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=timeout_seconds)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={int(timeout_seconds * 1000)}")
     return conn
+
+
+def _run_sqlite_write_with_retry(operation):
+    """Retry one local SQLite transaction without repeating remote effects."""
+    import time
+
+    last_error = None
+    for attempt in range(SQLITE_LOCAL_WRITE_ATTEMPTS):
+        conn = get_db_connection(SQLITE_LOCAL_WRITE_TIMEOUT_SECONDS)
+        try:
+            result = operation(conn)
+            conn.commit()
+            return result
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if not any(token in str(exc).lower() for token in ('locked', 'busy')):
+                raise
+            last_error = exc
+        finally:
+            conn.close()
+        if attempt + 1 < SQLITE_LOCAL_WRITE_ATTEMPTS:
+            time.sleep(0.2 * (attempt + 1))
+    raise last_error
 
 
 def get_all_managers():
@@ -18417,6 +18444,10 @@ def ship_order():
     # expected by AST's partial-shipment email template. Other plugins retain
     # the existing WooCommerce order PUT path. Send exactly once: repeating an
     # ambiguous POST can create duplicate parcels or duplicate notifications.
+    # All values needed below are detached rows now. Close the read connection
+    # before any network call so this request can never retain a DB transaction
+    # while waiting for WooCommerce or the mail endpoint.
+    conn.close()
     try:
         request_url = ast_api_url if ast_api_payload is not None else status_url
         request_payload = ast_api_payload if ast_api_payload is not None else put_payload
@@ -18436,27 +18467,31 @@ def ship_order():
             "[SHIP] response site=%s order=%s fmt=%s status=%s",
             site['url'], order['id'], fmt, resp.status_code,
         )
-        if resp.status_code in (200, 201):
-            remote_success = True
-        else:
-            try:
-                if _remote_order_applied(resp.json()):
-                    remote_success = True
-                    warnings.append(f"远程返回 {resp.status_code}，但返回内容确认运单已写入")
-            except Exception:
-                pass
-            if not remote_success and _verify_remote_saved(
-                f"远程返回 {resp.status_code}，但二次查询确认运单已写入"
-            ):
+        try:
+            if _remote_order_applied(resp.json()):
                 remote_success = True
-            if not remote_success:
-                body = (resp.text or '')[:300]
-                if body.lstrip().startswith(('<!', '<html')):
-                    remote_state_uncertain = True
-                    warnings.append(f"WP 返回 HTML（疑似 WAF 拦截 / 认证失败），HTTP {resp.status_code}")
-                else:
-                    remote_state_uncertain = resp.status_code >= 500
-                    warnings.append(f"远程返回 {resp.status_code}: {body}")
+                if resp.status_code not in (200, 201):
+                    warnings.append(f"远程返回 {resp.status_code}，但返回内容确认运单已写入")
+        except Exception:
+            pass
+        verify_reason = (
+            "成功响应后，二次查询确认运单已写入"
+            if resp.status_code in (200, 201)
+            else f"远程返回 {resp.status_code}，但二次查询确认运单已写入"
+        )
+        if not remote_success and _verify_remote_saved(verify_reason):
+            remote_success = True
+        if not remote_success:
+            body = (resp.text or '')[:300]
+            if resp.status_code in (200, 201):
+                remote_state_uncertain = True
+                warnings.append("成功响应未确认运单已写入，二次查询也未找到该运单号")
+            elif body.lstrip().startswith(('<!', '<html')):
+                remote_state_uncertain = True
+                warnings.append(f"WP 返回 HTML（疑似 WAF 拦截 / 认证失败），HTTP {resp.status_code}")
+            else:
+                remote_state_uncertain = resp.status_code >= 500
+                warnings.append(f"远程返回 {resp.status_code}: {body}")
     except req.exceptions.RequestException as e:
         app.logger.warning(
             "[SHIP] response uncertain site=%s order=%s fmt=%s error=%s",
@@ -18477,32 +18512,39 @@ def ship_order():
         # row without remote confirmation would create a phantom parcel. For a
         # normal/first shipment we retain the submitted value as pending_sync,
         # but it is not treated as a confirmed parcel.
+        pending_saved = False
         if not new_parcel and not is_reship:
-            existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
-            if existing_log:
-                conn.execute(
-                    """UPDATE shipping_logs
-                       SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now'),
-                           items_json=?, is_partial=0, status='pending_sync'
-                       WHERE order_id=?""",
-                    (tracking_number, carrier_slug, current_user.id, current_items_json, order_id)
-                )
-            else:
-                conn.execute(
-                    '''INSERT INTO shipping_logs
-                       (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial, status)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'pending_sync')''',
-                    (order_id, order['number'], order['source'], tracking_number,
-                     carrier_slug, current_user.id, current_items_json)
-                )
-            conn.commit()
+            def _write_pending_sync(local_conn):
+                existing_log = local_conn.execute(
+                    'SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)
+                ).fetchone()
+                if existing_log:
+                    local_conn.execute(
+                        """UPDATE shipping_logs
+                           SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now'),
+                               items_json=?, is_partial=0, status='pending_sync'
+                           WHERE order_id=?""",
+                        (tracking_number, carrier_slug, current_user.id, current_items_json, order_id)
+                    )
+                else:
+                    local_conn.execute(
+                        '''INSERT INTO shipping_logs
+                           (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial, status)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'pending_sync')''',
+                        (order_id, order['number'], order['source'], tracking_number,
+                         carrier_slug, current_user.id, current_items_json)
+                    )
+            try:
+                _run_sqlite_write_with_retry(_write_pending_sync)
+                pending_saved = True
+            except Exception as local_err:
+                warnings.append(f"本地待同步记录写入失败: {local_err}")
         # A failed reship must NOT stash/overwrite the original tracking row.
         if remote_state_uncertain:
             action_note = '远端最终状态尚未确认，请勿重复提交；请先刷新并核对该订单。'
         else:
             action_note = '远端明确未成功，可核对后再试。'
-        stash_note = '' if (new_parcel or is_reship) else '运单号已暂存为待同步。'
-        conn.close()
+        stash_note = '运单号已暂存为待同步。' if pending_saved else ''
         return jsonify({
             'success': False,
             'uncertain': remote_state_uncertain,
@@ -18596,11 +18638,13 @@ def ship_order():
             app.logger.warning(f"Remote reship note for order {order_id} failed: {remote_err}")
 
     # Local DB: status + shipping_logs (mirror the remote state we just set).
-    try:
-        conn.execute("UPDATE orders SET status=? WHERE id=?", (expected_status, order_id))
+    # Only this local transaction is retried. The Woo write and customer email
+    # above are deliberately outside the callback and therefore run once.
+    def _write_local_mirror(local_conn):
+        local_conn.execute("UPDATE orders SET status=? WHERE id=?", (expected_status, order_id))
         if new_parcel:
             # Split shipment: record this parcel as its own row.
-            conn.execute(
+            local_conn.execute(
                 '''INSERT INTO shipping_logs
                    (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial, status)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'shipped')''',
@@ -18613,20 +18657,22 @@ def ship_order():
             # preserved locally even though WP only carries the new (replacing)
             # tracking. Also write an order_notes audit row (local source of
             # truth, always succeeds even if the remote note above failed).
-            conn.execute(
+            local_conn.execute(
                 '''INSERT INTO shipping_logs (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, reship_reason, is_reship)
                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)''',
                 (order_id, order['number'], order['source'], tracking_number, carrier_slug, current_user.id, reship_reason)
             )
-            conn.execute(
+            local_conn.execute(
                 '''INSERT INTO order_notes (order_id, note, date_created, customer_note, author, added_by_user)
                    VALUES (?, ?, datetime('now'), 0, ?, 1)''',
                 (order_id, reship_log_line, current_user.name)
             )
         else:
-            existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id=?', (order_id,)).fetchone()
+            existing_log = local_conn.execute(
+                'SELECT id FROM shipping_logs WHERE order_id=?', (order_id,)
+            ).fetchone()
             if existing_log:
-                conn.execute(
+                local_conn.execute(
                     """UPDATE shipping_logs
                        SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now'),
                            items_json=?, is_partial=0, status='shipped'
@@ -18634,18 +18680,30 @@ def ship_order():
                     (tracking_number, carrier_slug, current_user.id, current_items_json, order_id)
                 )
             else:
-                conn.execute(
+                local_conn.execute(
                     '''INSERT INTO shipping_logs
                        (order_id, woo_order_id, source, tracking_number, carrier_slug, shipped_by, items_json, is_partial, status)
                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'shipped')''',
                     (order_id, order['number'], order['source'], tracking_number,
                      carrier_slug, current_user.id, current_items_json)
                 )
-        conn.commit()
+
+    try:
+        _run_sqlite_write_with_retry(_write_local_mirror)
     except Exception as e:
-        conn.close()
-        return jsonify({'success': False, 'error': f"本地数据库更新失败: {e}"}), 500
-    conn.close()
+        app.logger.exception(
+            "[SHIP] local mirror failed after remote commit site=%s order=%s tracking=%s",
+            site['url'], order['id'], tracking_number,
+        )
+        return jsonify({
+            'success': False,
+            'remote_committed': True,
+            'retry_safe': False,
+            'error': (
+                f"远端运单已写入，但本地记录更新失败: {e}。"
+                "请勿重复提交；请刷新并核对订单，或联系管理员修复本地记录。"
+            ),
+        }), 503
 
     # Annotate the success message — split-shipment aware.
     parcel_count = len(parcels)
