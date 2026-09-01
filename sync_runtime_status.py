@@ -26,12 +26,25 @@ def init_sync_runtime_status(conn) -> None:
             status TEXT NOT NULL,
             message TEXT NOT NULL DEFAULT '',
             logs_json TEXT NOT NULL DEFAULT '[]',
+            progress REAL NOT NULL DEFAULT 0,
             updated_at_epoch REAL NOT NULL,
             started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             completed_at TEXT
         )
         """
     )
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(sync_runtime_status)")
+    }
+    if "progress" not in columns:
+        try:
+            conn.execute(
+                "ALTER TABLE sync_runtime_status "
+                "ADD COLUMN progress REAL NOT NULL DEFAULT 0"
+            )
+        except Exception as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
     conn.commit()
 
 
@@ -46,12 +59,14 @@ def save_sync_runtime_status(conn, status_id: int, entry: dict) -> None:
     conn.execute(
         f"""
         INSERT INTO sync_runtime_status (
-            status_id, status, message, logs_json, updated_at_epoch, completed_at
-        ) VALUES (?, ?, ?, ?, ?, {completed_at_sql})
+            status_id, status, message, logs_json, progress,
+            updated_at_epoch, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, {completed_at_sql})
         ON CONFLICT(status_id) DO UPDATE SET
             status=excluded.status,
             message=excluded.message,
             logs_json=excluded.logs_json,
+            progress=excluded.progress,
             updated_at_epoch=excluded.updated_at_epoch,
             started_at=CASE
                 WHEN excluded.status='running'
@@ -66,6 +81,7 @@ def save_sync_runtime_status(conn, status_id: int, entry: dict) -> None:
             status,
             str(entry.get("message") or ""),
             json.dumps(entry.get("logs") or [], ensure_ascii=False),
+            float(entry.get("progress") or 0),
             updated_at,
         ),
     )
@@ -88,6 +104,7 @@ def load_sync_runtime_status(conn, status_id: int, *, now: float | None = None) 
         "status": raw.get("status") or "unknown",
         "message": raw.get("message") or "",
         "logs": logs if isinstance(logs, list) else [],
+        "progress": float(raw.get("progress") or 0),
         "updated_at": updated_at,
         "stale_seconds": round(max(0.0, (now or time.time()) - updated_at), 1),
     }

@@ -10613,56 +10613,70 @@ def trigger_deep_sync():
     import subprocess
     import threading
 
-    DEEP_SYNC_ID = 888888
+    deep_sync_id = new_sync_runtime_status_id()
 
-    SYNC_STATUS[DEEP_SYNC_ID] = {
+    SYNC_STATUS[deep_sync_id] = {
         'status': 'running',
         'message': '正在启动深度同步...',
-        'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Deep sync job started"]
+        'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Deep sync job started"],
+        'progress': 0,
     }
+    _publish_sync_status(deep_sync_id)
+
+    def mark_deep_sync_error(message):
+        conn = get_db_connection()
+        try:
+            current = load_sync_runtime_status(conn, deep_sync_id)
+        finally:
+            conn.close()
+        if current and current.get('status') == 'error':
+            return
+        logs = list((current or {}).get('logs') or [])
+        logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+        SYNC_STATUS[deep_sync_id] = {
+            'status': 'error',
+            'message': message,
+            'logs': logs[-200:],
+            'progress': (current or {}).get('progress', 0),
+        }
+        _publish_sync_status(deep_sync_id)
 
     def run_deep_sync(app_context):
         with app_context:
             try:
                 # Use the standalone full-resync script (no date filter, all pages, every site)
-                script_path = '/www/wwwroot/woo-analysis/full_resync_all.py'
-                venv_python = '/www/wwwroot/woo-analysis/venv/bin/python'
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                script_path = os.path.join(script_dir, 'full_resync_all.py')
+                venv_python = os.path.join(script_dir, 'venv', 'bin', 'python')
+                log_path = os.path.join(script_dir, 'full_resync_all.log')
 
-                SYNC_STATUS[DEEP_SYNC_ID]['message'] = '正在执行全量深度同步...'
-                SYNC_STATUS[DEEP_SYNC_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Running {script_path}")
+                SYNC_STATUS[deep_sync_id]['message'] = '正在执行全量深度同步...'
+                SYNC_STATUS[deep_sync_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Running {script_path}")
+                _publish_sync_status(deep_sync_id)
 
-                result = subprocess.run(
-                    [venv_python, '-u', script_path],
-                    cwd='/www/wwwroot/woo-analysis',
-                    capture_output=True,
-                    text=True,
-                    timeout=7200  # 2 hour timeout for full resync of all sites
-                )
-                
-                if result.returncode == 0:
-                    SYNC_STATUS[DEEP_SYNC_ID]['status'] = 'success'
-                    SYNC_STATUS[DEEP_SYNC_ID]['message'] = '深度同步完成'
-                    SYNC_STATUS[DEEP_SYNC_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Completed successfully")
-                    # Add last few lines of output
-                    output_lines = result.stdout.strip().split('\n')[-10:]
-                    for line in output_lines:
-                        SYNC_STATUS[DEEP_SYNC_ID]['logs'].append(line)
-                else:
-                    SYNC_STATUS[DEEP_SYNC_ID]['status'] = 'error'
-                    SYNC_STATUS[DEEP_SYNC_ID]['message'] = '深度同步失败'
-                    SYNC_STATUS[DEEP_SYNC_ID]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {result.stderr[:500]}")
-                    
+                with open(log_path, 'a', encoding='utf-8', buffering=1) as log_file:
+                    result = subprocess.run(
+                        [venv_python, '-u', script_path,
+                         '--status-id', str(deep_sync_id)],
+                        cwd=script_dir,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=21600,
+                    )
+                if result.returncode != 0:
+                    mark_deep_sync_error(
+                        f'深度同步失败（退出码 {result.returncode}），请查看实时日志'
+                    )
             except subprocess.TimeoutExpired:
-                SYNC_STATUS[DEEP_SYNC_ID]['status'] = 'error'
-                SYNC_STATUS[DEEP_SYNC_ID]['message'] = '深度同步超时'
+                mark_deep_sync_error('深度同步超过 6 小时，已停止')
             except Exception as e:
-                SYNC_STATUS[DEEP_SYNC_ID]['status'] = 'error'
-                SYNC_STATUS[DEEP_SYNC_ID]['message'] = str(e)
-    
+                mark_deep_sync_error(str(e))
+
     thread = threading.Thread(target=run_deep_sync, args=(app.app_context(),))
     thread.start()
     
-    return jsonify({'success': True, 'sync_id': DEEP_SYNC_ID, 'message': 'Deep sync started'})
+    return jsonify({'success': True, 'sync_id': deep_sync_id, 'message': 'Deep sync started'})
 
 
 @app.route('/api/sync/clean/all', methods=['POST'])
