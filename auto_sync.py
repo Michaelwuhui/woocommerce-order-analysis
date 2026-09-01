@@ -6,7 +6,6 @@ Runs sites sequentially with incremental checkpoints and bounded note refreshes.
 """
 import sqlite3
 import threading
-import fcntl
 import time
 from datetime import datetime
 import sys
@@ -16,6 +15,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import sync_utils
+from sync_process_lock import SyncAlreadyRunning, exclusive_sync_lock
 
 DB_FILE = 'woocommerce_orders.db'
 MAX_SITE_CONCURRENCY = 1
@@ -24,7 +24,6 @@ INCREMENTAL_OVERLAP_MINUTES = 10
 NOTES_ACTIVE_LIMIT = 25
 NOTES_REFRESH_INTERVAL_HOURS = 24
 NOTE_WORKERS = 1
-LOCK_FILE = '/tmp/woo-analysis-auto-sync.lock'
 
 # 线程安全的打印锁
 _print_lock = threading.Lock()
@@ -184,22 +183,14 @@ def run_sync_batch():
 
 def main():
     """Run one batch only; skip safely if an earlier batch is still active."""
-    lock_handle = open(LOCK_FILE, 'w')
     try:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        with exclusive_sync_lock():
+            run_sync_batch()
+    except SyncAlreadyRunning:
         safe_print(
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-            "Auto-sync skipped: another batch is still running"
+            "Auto-sync skipped: automatic or full synchronization is already running"
         )
-        lock_handle.close()
-        return
-
-    try:
-        run_sync_batch()
-    finally:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-        lock_handle.close()
 
 
 if __name__ == '__main__':

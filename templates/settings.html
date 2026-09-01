@@ -2085,7 +2085,7 @@
             const timeText = document.getElementById('syncTimeText');
 
             // Reset UI
-            progressBar.style.width = '100%';
+            progressBar.style.width = '0%';
             progressBar.classList.add('progress-bar-animated', 'bg-warning');
             progressBar.classList.remove('bg-success', 'bg-danger', 'bg-primary');
             statusText.textContent = '正在启动深度同步...';
@@ -2114,6 +2114,11 @@
                                 .then(res => res.json())
                                 .then(status => {
                                     statusText.textContent = status.message;
+
+                                    const numericProgress = Number(status.progress);
+                                    if (Number.isFinite(numericProgress)) {
+                                        progressBar.style.width = `${Math.max(0, Math.min(100, numericProgress))}%`;
+                                    }
 
                                     if (status.logs && status.logs.length > 0) {
                                         logConsole.innerHTML = status.logs.map(log =>
