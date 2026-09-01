@@ -2209,7 +2209,7 @@
                     shipped_items: shippedItems
                 })
             })
-                .then(res => res.json())
+                .then(res => parseMutationJsonResponse(res, '发货'))
                 .then(data => {
                     restore();
                     if (data.success) {
@@ -2359,7 +2359,7 @@
                     reship_reason: reason
                 })
             })
-                .then(res => res.json())
+                .then(res => parseMutationJsonResponse(res, '补发'))
                 .then(data => {
                     restore();
                     if (data.success) {

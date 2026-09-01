@@ -2039,6 +2039,19 @@
                 });
         }
 
+        function parseMutationJsonResponse(response, actionLabel) {
+            return response.text().then(function (text) {
+                try {
+                    return text ? JSON.parse(text) : {};
+                } catch (err) {
+                    throw new Error(
+                        actionLabel + '接口返回非 JSON（HTTP ' + response.status +
+                        '）。本次操作结果未知，请勿重复提交；请先刷新页面并核对实际状态。'
+                    );
+                }
+            });
+        }
+
         // Update order status via API
         function updateOrderStatus(orderId, newStatus) {
             var statusLabels = {
@@ -2060,7 +2073,7 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ status: newStatus })
             })
-                .then(function (response) { return response.json(); })
+                .then(function (response) { return parseMutationJsonResponse(response, '订单状态'); })
                 .then(function (data) {
                     if (data.success) {
                         // Show success and refresh modal

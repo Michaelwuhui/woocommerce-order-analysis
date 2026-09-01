@@ -85,6 +85,13 @@ login_manager.login_message = '请先登录以访问此页面'
 # Database configuration
 DB_FILE = 'woocommerce_orders.db'
 
+# Keep synchronous WooCommerce writes well below Gunicorn's worker timeout.
+# Requests uses (connect timeout, read timeout) tuples here; a timed-out write is
+# never retried blindly because the remote side may already have committed it.
+WC_MUTATION_TIMEOUT = (5, 15)
+WC_VERIFY_TIMEOUT = (5, 10)
+WC_AUXILIARY_TIMEOUT = (5, 10)
+
 FULFILLMENT_TERMINAL_ORDER_STATUSES = {
     'shipped', 'completed', 'cancelled', 'refunded', 'failed', 'trash'
 }
@@ -9101,6 +9108,7 @@ def sync_data():
         'message': 'Starting synchronization...',
         'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Job started"]
     }
+    _publish_sync_status(site_id)
     
     def run_sync(app_context, site_id):
         with app_context:
@@ -9113,6 +9121,7 @@ def sync_data():
                 if not site:
                     SYNC_STATUS[site_id]['status'] = 'error'
                     SYNC_STATUS[site_id]['message'] = 'Site not found'
+                    _publish_sync_status(site_id)
                     return
 
                 def progress_callback(msg):
@@ -9120,6 +9129,7 @@ def sync_data():
                     log_entry = f"[{timestamp}] {msg}"
                     SYNC_STATUS[site_id]['message'] = msg
                     SYNC_STATUS[site_id]['logs'].append(log_entry)
+                    _publish_sync_status(site_id)
                     print(log_entry) # Keep console logging for debug
 
                 result = sync_utils.sync_site(
@@ -9142,6 +9152,7 @@ def sync_data():
                     SYNC_STATUS[site_id]['status'] = 'success'
                     SYNC_STATUS[site_id]['message'] = 'Synchronization completed successfully'
                     SYNC_STATUS[site_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Finished: New {result['new_orders']}, Updated {result['updated_orders']}")
+                    _publish_sync_status(site_id)
                     
                     # Save sync log to database
                     save_sync_log(site_id, site['url'], 'success', 
@@ -9151,6 +9162,7 @@ def sync_data():
                     SYNC_STATUS[site_id]['status'] = 'error'
                     SYNC_STATUS[site_id]['message'] = result.get('message', 'Unknown error')
                     SYNC_STATUS[site_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {result.get('message')}")
+                    _publish_sync_status(site_id)
                     
                     # Save error log to database
                     save_sync_log(site_id, site['url'], 'error', result.get('message', 'Unknown error'), 0, 0, duration)
@@ -9160,6 +9172,7 @@ def sync_data():
                 SYNC_STATUS[site_id]['status'] = 'error'
                 SYNC_STATUS[site_id]['message'] = str(e)
                 SYNC_STATUS[site_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+                _publish_sync_status(site_id)
                 
                 # Save error log to database
                 try:
@@ -18045,7 +18058,7 @@ def _post_fallback_customer_note(req, site, order, carrier_name, tracking_number
             note_url,
             json={'note': note_content, 'customer_note': True},
             auth=(site['consumer_key'], site['consumer_secret']),
-            timeout=45,
+            timeout=WC_AUXILIARY_TIMEOUT,
             headers=api_headers,
         )
         if note_resp.status_code not in (200, 201):
@@ -18336,6 +18349,7 @@ def ship_order():
             ast_api_payload['qty'] = ','.join(str(p.get('qty')) for p in current_products)
     warnings = []
     remote_success = False
+    remote_state_uncertain = False
 
     def _decode_nested_json(value):
         if isinstance(value, str):
@@ -18389,7 +18403,7 @@ def ship_order():
             check = req.get(
                 status_url,
                 auth=(site['consumer_key'], site['consumer_secret']),
-                timeout=30,
+                timeout=WC_VERIFY_TIMEOUT,
                 headers=api_headers,
             )
             if check.status_code == 200 and _remote_order_applied(check.json()):
@@ -18401,56 +18415,68 @@ def ship_order():
 
     # AST goes through its native API so product rows are stored as the objects
     # expected by AST's partial-shipment email template. Other plugins retain
-    # the existing WooCommerce order PUT path.
-    for attempt in range(3):
-        try:
-            request_url = ast_api_url if ast_api_payload is not None else status_url
-            request_payload = ast_api_payload if ast_api_payload is not None else put_payload
-            request_method = req.post if ast_api_payload is not None else req.put
-            resp = request_method(
-                request_url,
-                json=request_payload,
-                auth=(site['consumer_key'], site['consumer_secret']),
-                timeout=60,
-                headers=api_headers
-            )
-            print(f"[SHIP] {site['url']} order {order['id']} fmt={fmt} attempt={attempt+1} status={resp.status_code}")
-            if resp.status_code in (200, 201):
-                remote_success = True
-                break
+    # the existing WooCommerce order PUT path. Send exactly once: repeating an
+    # ambiguous POST can create duplicate parcels or duplicate notifications.
+    try:
+        request_url = ast_api_url if ast_api_payload is not None else status_url
+        request_payload = ast_api_payload if ast_api_payload is not None else put_payload
+        request_method = req.post if ast_api_payload is not None else req.put
+        app.logger.info(
+            "[SHIP] start site=%s order=%s fmt=%s user=%s",
+            site['url'], order['id'], fmt, current_user.id,
+        )
+        resp = request_method(
+            request_url,
+            json=request_payload,
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=WC_MUTATION_TIMEOUT,
+            headers=api_headers
+        )
+        app.logger.info(
+            "[SHIP] response site=%s order=%s fmt=%s status=%s",
+            site['url'], order['id'], fmt, resp.status_code,
+        )
+        if resp.status_code in (200, 201):
+            remote_success = True
+        else:
             try:
                 if _remote_order_applied(resp.json()):
                     remote_success = True
                     warnings.append(f"远程返回 {resp.status_code}，但返回内容确认运单已写入")
-                    break
             except Exception:
                 pass
-            if _verify_remote_saved(f"远程返回 {resp.status_code}，但二次查询确认运单已写入"):
+            if not remote_success and _verify_remote_saved(
+                f"远程返回 {resp.status_code}，但二次查询确认运单已写入"
+            ):
                 remote_success = True
-                break
-            body = (resp.text or '')[:300]
-            if body.lstrip().startswith(('<!', '<html')):
-                warnings.append(f"WP 返回 HTML（疑似 WAF 拦截 / 认证失败），HTTP {resp.status_code}")
-            else:
-                warnings.append(f"远程返回 {resp.status_code}: {body}")
-        except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
-            print(f"[SHIP] {site['url']} order {order['id']} attempt {attempt+1} timed out: {e}")
-            # Verify by GET — the write may have actually applied even if the
-            # response never made it back.
-            if _verify_remote_saved("写入响应超时，但二次查询确认运单已写入"):
-                remote_success = True
-                break
-            if attempt < 2:
-                time.sleep(2)
-        except Exception as e:
-            warnings.append(f"远程异常: {e}")
-            break
+            if not remote_success:
+                body = (resp.text or '')[:300]
+                if body.lstrip().startswith(('<!', '<html')):
+                    remote_state_uncertain = True
+                    warnings.append(f"WP 返回 HTML（疑似 WAF 拦截 / 认证失败），HTTP {resp.status_code}")
+                else:
+                    remote_state_uncertain = resp.status_code >= 500
+                    warnings.append(f"远程返回 {resp.status_code}: {body}")
+    except req.exceptions.RequestException as e:
+        app.logger.warning(
+            "[SHIP] response uncertain site=%s order=%s fmt=%s error=%s",
+            site['url'], order['id'], fmt, e,
+        )
+        # Verify once by GET. Never repeat the write: the first request may have
+        # committed even though its response did not reach this process.
+        if _verify_remote_saved("写入响应超时，但二次查询确认运单已写入"):
+            remote_success = True
+        else:
+            remote_state_uncertain = True
+            warnings.append("远程响应超时，二次查询仍无法确认写入结果")
+    except Exception as e:
+        warnings.append(f"远程异常: {e}")
 
     if not remote_success:
-        # For a NEW parcel (split shipment) we don't stash anything: the parcel
-        # didn't actually ship, and inserting a row would create a phantom
-        # parcel. The user just retries. For a normal/first shipment we stash
-        # the tracking number locally so it doesn't have to be retyped on retry.
+        # For a NEW parcel (split shipment) we don't stash anything: inserting a
+        # row without remote confirmation would create a phantom parcel. For a
+        # normal/first shipment we retain the submitted value as pending_sync,
+        # but it is not treated as a confirmed parcel.
         if not new_parcel and not is_reship:
             existing_log = conn.execute('SELECT id FROM shipping_logs WHERE order_id = ?', (order_id,)).fetchone()
             if existing_log:
@@ -18471,12 +18497,18 @@ def ship_order():
                 )
             conn.commit()
         # A failed reship must NOT stash/overwrite the original tracking row.
-        stash_note = '' if (new_parcel or is_reship) else '运单号已暂存本地，请稍后重试。'
+        if remote_state_uncertain:
+            action_note = '远端最终状态尚未确认，请勿重复提交；请先刷新并核对该订单。'
+        else:
+            action_note = '远端明确未成功，可核对后再试。'
+        stash_note = '' if (new_parcel or is_reship) else '运单号已暂存为待同步。'
         conn.close()
         return jsonify({
             'success': False,
-            'error': f"发货失败（{fmt_label}）：{'; '.join(warnings) or '远程未返回成功'}。{stash_note}"
-        }), 500
+            'uncertain': remote_state_uncertain,
+            'retry_safe': not remote_state_uncertain,
+            'error': f"发货失败（{fmt_label}）：{'; '.join(warnings) or '远程未返回成功'}。{action_note}{stash_note}"
+        }), 504 if remote_state_uncertain else 502
 
     # Build the re-shipment audit line once; reused for the local order_notes
     # row and the best-effort remote WC note below.
@@ -18514,7 +18546,7 @@ def ship_order():
             trig_resp = req.post(
                 trig_url,
                 json={'tracking_number': tracking_number, 'carrier_slug': carrier_slug},
-                timeout=30,
+                timeout=WC_AUXILIARY_TIMEOUT,
                 headers={
                     **api_headers,
                     'X-Woo-Tracking-Key': site['consumer_key'],
@@ -19563,30 +19595,79 @@ def update_order_status(order_id):
         # 1. Update order status via WooCommerce API.
         # Use orders.id (WC internal post ID), not order['number'], because sites
         # using Sequential Order Numbers have number != id and the REST API only
-        # accepts the post ID.
+        # accepts the post ID. The mutation is sent once, then verified by GET
+        # when its response is ambiguous.
         status_url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}"
+        remote_confirmed = False
+        remote_state_uncertain = False
+        upstream_error = ''
+        status_warning = ''
 
-        print(f"[DEBUG] Update Status - URL: {status_url}")
-        print(f"[DEBUG] Update Status - Order ID: {order['id']}, Number: {order['number']}, New Status: {new_status}")
-
-        status_resp = req.put(
-            status_url,
-            json={'status': new_status},
-            auth=(site['consumer_key'], site['consumer_secret']),
-            timeout=60,
-            headers=api_headers
+        app.logger.info(
+            "[ORDER_STATUS] start site=%s order=%s from=%s to=%s user=%s",
+            site['url'], order['id'], old_status, new_status, current_user.id,
         )
+        try:
+            status_resp = req.put(
+                status_url,
+                json={'status': new_status},
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=WC_MUTATION_TIMEOUT,
+                headers=api_headers
+            )
+            response_text = status_resp.text or ''
+            if response_text.lstrip().startswith(('<!', '<html')):
+                remote_state_uncertain = True
+                upstream_error = f"WordPress 返回 HTML 而非 JSON（HTTP {status_resp.status_code}）"
+            elif status_resp.status_code not in (200, 201):
+                remote_state_uncertain = status_resp.status_code >= 500
+                upstream_error = f"远程 API 错误: {status_resp.status_code} - {response_text[:200]}"
+            else:
+                try:
+                    remote_confirmed = status_resp.json().get('status') == new_status
+                except Exception:
+                    remote_state_uncertain = True
+                    upstream_error = '远程返回成功状态码，但响应不是有效 JSON'
+                if not remote_confirmed and not upstream_error:
+                    remote_state_uncertain = True
+                    upstream_error = '远程响应未确认目标订单状态'
+        except req.exceptions.RequestException as exc:
+            remote_state_uncertain = True
+            upstream_error = f"远程响应超时、连接中断或请求异常: {exc}"
 
-        print(f"[DEBUG] Update Status - Response Code: {status_resp.status_code}")
+        if not remote_confirmed:
+            try:
+                verify_resp = req.get(
+                    status_url,
+                    auth=(site['consumer_key'], site['consumer_secret']),
+                    timeout=WC_VERIFY_TIMEOUT,
+                    headers=api_headers,
+                )
+                if verify_resp.status_code == 200 and verify_resp.json().get('status') == new_status:
+                    remote_confirmed = True
+                    status_warning = '写入响应异常，但二次查询确认远程状态已更新'
+            except Exception as verify_exc:
+                app.logger.warning(
+                    "[ORDER_STATUS] verify failed site=%s order=%s error=%s",
+                    site['url'], order['id'], verify_exc,
+                )
 
-        # Check if response is HTML instead of JSON
-        response_text = status_resp.text or ''
-        if response_text.strip().startswith('<!') or response_text.strip().startswith('<html'):
-            print(f"[DEBUG] API returned HTML: {response_text[:200]}")
-            raise Exception(f"WordPress返回HTML而非JSON，可能是WAF阻止或认证问题")
-
-        if status_resp.status_code not in [200, 201]:
-            raise Exception(f"远程API错误: {status_resp.status_code} - {response_text[:200]}")
+        if not remote_confirmed:
+            app.logger.warning(
+                "[ORDER_STATUS] unconfirmed site=%s order=%s target=%s error=%s",
+                site['url'], order['id'], new_status, upstream_error,
+            )
+            conn.close()
+            return jsonify({
+                'success': False,
+                'uncertain': remote_state_uncertain,
+                'retry_safe': not remote_state_uncertain,
+                'error': (
+                    f"{upstream_error or '远端未确认状态更新'}。"
+                    + ('请勿重复提交，请先刷新并核对远端订单状态。' if remote_state_uncertain
+                       else '远端明确未成功，可核对原因后再试。')
+                ),
+            }), 504 if remote_state_uncertain else 502
 
         # 2. Add order note documenting the change
         note_url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes"
@@ -19597,7 +19678,7 @@ def update_order_status(order_id):
                 note_url,
                 json={'note': note_content, 'customer_note': False},
                 auth=(site['consumer_key'], site['consumer_secret']),
-                timeout=30,
+                timeout=WC_AUXILIARY_TIMEOUT,
                 headers=api_headers
             )
             # Note failure is not critical, just log it
@@ -19611,12 +19692,16 @@ def update_order_status(order_id):
         conn.commit()
         conn.close()
         
-        return jsonify({
+        result = {
             'success': True, 
             'message': f'订单状态已从 {status_labels.get(old_status, old_status)} 修改为 {status_labels.get(new_status, new_status)}',
             'old_status': old_status,
             'new_status': new_status
-        })
+        }
+        if status_warning:
+            result['warning'] = True
+            result['message'] += f'；{status_warning}'
+        return jsonify(result)
         
     except Exception as e:
         conn.close()

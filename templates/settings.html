@@ -2785,7 +2785,7 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ site_id: siteId })
                 })
-                    .then(response => response.json())
+                    .then(response => parseMutationJsonResponse(response, '订单同步'))
                     .then(result => {
                         if (result.success) {
                             // Start Polling
@@ -2797,7 +2797,7 @@
                                 timeText.textContent = `${mins}:${secs}`;
 
                                 fetch(`/api/sync/status/${siteId}`)
-                                    .then(res => res.json())
+                                    .then(res => parseMutationJsonResponse(res, '订单同步状态'))
                                     .then(status => {
                                         // Update Logs
                                         if (status.logs && status.logs.length > 0) {
@@ -2833,10 +2833,17 @@
                                             statusText.classList.add('text-danger');
                                             closeBtn.disabled = false;
                                         }
+                                    })
+                                    .catch(error => {
+                                        clearInterval(syncPollInterval);
+                                        progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                                        progressBar.classList.add('bg-danger');
+                                        statusText.textContent = '同步状态读取失败: ' + error.message;
+                                        closeBtn.disabled = false;
                                     });
                             }, 1000);
                         } else {
-                            statusText.textContent = '启动失败: ' + result.message;
+                            statusText.textContent = '启动失败: ' + (result.message || result.error || '未知错误');
                             progressBar.classList.remove('bg-primary');
                             progressBar.classList.add('bg-danger');
                             progressBar.style.width = '100%';
