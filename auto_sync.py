@@ -36,8 +36,9 @@ def safe_print(msg):
 
 def get_db_connection():
     """Create database connection"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 def log_sync(site_id, site_url, status, message, new_orders=0, updated_orders=0, duration=0):
