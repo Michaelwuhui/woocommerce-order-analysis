@@ -15518,6 +15518,10 @@ def products():
         LEFT JOIN brands b ON pm.brand_id = b.id
         WHERE pm.is_manual = 1
     ''').fetchall()
+    # All rows needed by the expensive in-memory aggregation are materialized.
+    # End the PostgreSQL read transaction before CPU work so it cannot sit
+    # idle-in-transaction long enough for the server safety timeout to fire.
+    conn.commit()
     manual_mappings = {}
     for m in mappings_rows:
         # Index by canonical form so HTML-entity vs decoded variants both match
@@ -15759,6 +15763,7 @@ def products():
     ).fetchall():
         cur = r['currency'] or 'N/A'
         shipping_loss_by_currency[cur] = float(r['loss'] or 0)
+    conn.commit()
 
     # Subtract the loss from each currency's product revenue so the card
     # represents real net (gross product revenue − shipping_loss).
@@ -15853,6 +15858,8 @@ def products():
         SELECT id, line_items, source, date_created
         FROM orders {trend_where_clause}
     ''', trend_params).fetchall()
+    # Trend rendering can be CPU-heavy; release the DB transaction first.
+    conn.commit()
     
     weekly_flavor_data = {}  # {week_key: {flavor: quantity}}
     
