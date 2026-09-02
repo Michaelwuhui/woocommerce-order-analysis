@@ -1,5 +1,7 @@
 import sqlite3
 
+import product_clone_jobs
+
 from product_clone_jobs import (
     claim_clone_job,
     enqueue_clone_job,
@@ -15,6 +17,27 @@ def make_conn(tmp_path):
     conn.row_factory = sqlite3.Row
     init_product_clone_jobs(conn)
     return conn
+
+
+def test_postgres_startup_verifies_migrated_table_without_ddl(monkeypatch):
+    class Connection:
+        def __init__(self):
+            self.statements = []
+            self.commits = 0
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+        def commit(self):
+            self.commits += 1
+
+    monkeypatch.setattr(product_clone_jobs.db, "is_postgres_backend", lambda: True)
+    conn = Connection()
+
+    init_product_clone_jobs(conn)
+
+    assert conn.statements == ["SELECT 1 FROM product_clone_jobs WHERE 1=0"]
+    assert conn.commits == 1
 
 
 def enqueue(conn, product_ids=(11, 12)):

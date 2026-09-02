@@ -18,6 +18,14 @@ TERMINAL_STATUSES = frozenset({"succeeded", "partial_failed", "failed", "interru
 
 
 def init_product_clone_jobs(conn) -> None:
+    if db.is_postgres_backend():
+        # PostgreSQL schema is owned by versioned migrations.  The application
+        # role deliberately has no CREATE privilege, so startup only verifies
+        # that the migrated queue table is present and closes the short read
+        # transaction explicitly.
+        conn.execute("SELECT 1 FROM product_clone_jobs WHERE 1=0")
+        conn.commit()
+        return
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS product_clone_jobs (
