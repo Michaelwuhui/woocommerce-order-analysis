@@ -213,7 +213,10 @@ def create_sqlite_backup(timestamp):
     final_path = os.path.join(BACKUP_DIR, f"woocommerce_orders_{timestamp}.db.gz")
     source_size = os.path.getsize(SRC_DB)
     log(f"开始 SQLite 一致性备份（源文件 {source_size / 1024 / 1024:.1f} MB）")
-    temporary_dir = tempfile.mkdtemp(prefix="woo-sqlite-backup-")
+    # Keep the temporary artifact on the destination filesystem so the final
+    # os.replace() remains atomic under systemd PrivateTmp and separate /www
+    # mounts instead of failing with EXDEV.
+    temporary_dir = tempfile.mkdtemp(prefix=".woo-sqlite-backup-", dir=BACKUP_DIR)
     try:
         snapshot_path = os.path.join(temporary_dir, "snapshot.db")
         compressed_path = os.path.join(temporary_dir, "snapshot.db.gz")
@@ -280,7 +283,7 @@ def create_postgres_backup(timestamp):
     if not pg_dump or not pg_restore:
         raise RuntimeError("pg_dump and pg_restore must both be installed")
     final_path = os.path.join(BACKUP_DIR, f"woo_analysis_{timestamp}.dump")
-    temporary_dir = tempfile.mkdtemp(prefix="woo-postgres-backup-")
+    temporary_dir = tempfile.mkdtemp(prefix=".woo-postgres-backup-", dir=BACKUP_DIR)
     temporary_dump = os.path.join(temporary_dir, "database.dump")
     environment = os.environ.copy()
     environment["PGPASSWORD"] = settings["password"]

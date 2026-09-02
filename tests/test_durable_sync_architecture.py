@@ -295,6 +295,12 @@ def test_redis_is_local_durable_and_noeviction():
     assert "ExecPaths=/usr/local/lib" not in service_dropin
 
 
+def test_backups_stage_atomic_artifacts_on_destination_filesystem():
+    source = (ROOT / "backup_db.py").read_text()
+    assert source.count('tempfile.mkdtemp(prefix=".woo-') == 2
+    assert source.count('dir=BACKUP_DIR') == 2
+
+
 def test_backup_supports_both_backends_checksums_and_hourly_timer():
     backup = (ROOT / "backup_db.py").read_text()
     service = (ROOT / "deploy/systemd/woo-postgres-backup.service").read_text()
