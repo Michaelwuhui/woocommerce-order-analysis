@@ -23,7 +23,7 @@ LEGACY_MARKERS = {
 
 DATABASE_WRITER_MARKERS = {
     "inventory_push": (
-        "/www/wwwroot/woo-analysis/inv_push_cron.py",
+        "/run/lock/woo-analysis-inv-push.cron.lock",
         1,
     ),
     "resolve_outcomes": (
