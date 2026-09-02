@@ -236,7 +236,7 @@
                         </a>
                     </li>
                     {% endif %}
-                    {% if current_user.can_manage_users() %}
+                    {% if (current_user.is_admin() and current_user.can_manage_users()) or current_user.can_manage_own_site_sync() %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint in ['settings','users_page'] else '' }}"
                             href="{{ url_for('settings') }}">
