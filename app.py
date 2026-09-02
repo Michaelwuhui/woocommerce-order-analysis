@@ -251,6 +251,26 @@ class User(UserMixin):
         except sqlite3.OperationalError:
             return False
 
+    def can_manage_own_site_sync(self):
+        """Allow access to the connected-sites card for this user's own sites.
+
+        Site ownership is enforced separately against the live users.name and
+        sites.manager values for every page load and synchronization request.
+        """
+        if self.username == 'admin':
+            return True
+        conn = get_db_connection()
+        try:
+            user = conn.execute(
+                'SELECT can_manage_own_site_sync FROM users WHERE id = ?',
+                (self.id,),
+            ).fetchone()
+            return bool(user and user['can_manage_own_site_sync'] == 1)
+        except sqlite3.OperationalError:
+            return False
+        finally:
+            conn.close()
+
     def product_manager_own_scoped(self):
         """Whether product management should be limited to the user's own sites.
         Non-admin operators are always own-scoped; admin-role users are scoped
@@ -1298,6 +1318,69 @@ a{background:#3b82f6;color:#fff;padding:10px 24px;border-radius:8px;text-decorat
 <a href="/"><i class="bi bi-house"></i> 返回首页</a>
 </div></body></html>
             '''), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def _can_manage_all_settings(user):
+    """Full settings remain limited to admin-role user managers."""
+    return bool(user.is_authenticated and user.is_admin() and user.can_manage_users())
+
+
+def _can_manage_site_sync(user, site_id):
+    """Authorize one site using the current DB name-to-manager assignment."""
+    if _can_manage_all_settings(user):
+        return True
+    if not user.is_authenticated or not user.can_manage_own_site_sync():
+        return False
+    try:
+        site_id = int(site_id)
+    except (TypeError, ValueError):
+        return False
+    conn = get_db_connection()
+    try:
+        return conn.execute(
+            '''
+            SELECT 1
+            FROM sites s
+            JOIN users u ON u.id = ?
+            WHERE s.id = ?
+              AND TRIM(COALESCE(u.name, '')) != ''
+              AND TRIM(COALESCE(s.manager, '')) = TRIM(u.name)
+            LIMIT 1
+            ''',
+            (user.id, site_id),
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def settings_access_required(f):
+    """Allow full settings managers or own-site synchronization operators."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login'))
+        if (_can_manage_all_settings(current_user)
+                or current_user.can_manage_own_site_sync()):
+            return f(*args, **kwargs)
+        return render_template_string('''
+<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><title>权限不足</title></head>
+<body style="background:#0f172a;color:#e2e8f0;font-family:sans-serif;text-align:center;padding:12vh 20px">
+<h1>权限不足</h1><p>需要“用户管理权限”或“本人站点同步权限”。</p>
+<a href="/" style="color:#60a5fa">返回首页</a></body></html>
+        '''), 403
+    return decorated_function
+
+
+def all_site_sync_required(f):
+    """Protect global synchronization and global synchronization telemetry."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return jsonify({'error': '请先登录'}), 401
+        if not _can_manage_all_settings(current_user):
+            return jsonify({'error': '无权操作或查看全站同步'}), 403
         return f(*args, **kwargs)
     return decorated_function
 
@@ -6727,6 +6810,15 @@ def init_sales_board_tables():
     except:
         pass  # Column already exists
 
+    # Connected-sites card: synchronize only sites whose manager matches the
+    # user's current name. This does not grant credential, edit, delete, or
+    # all-site synchronization access.
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN can_manage_own_site_sync INTEGER DEFAULT 0')
+        conn.commit()
+    except:
+        pass  # Column already exists
+
     # Sales targets table - monthly targets per manager
     conn.execute('''
         CREATE TABLE IF NOT EXISTS sales_targets (
@@ -7266,10 +7358,40 @@ with app.app_context():
 
 @app.route('/settings')
 @login_required
-@admin_required
+@settings_access_required
 def settings():
-    """Settings page for site management - Admin only"""
+    """Full settings, or the connected-sites card scoped to the user's sites."""
     conn = get_db_connection()
+    site_sync_only = not _can_manage_all_settings(current_user)
+    if site_sync_only:
+        sites = conn.execute(
+            '''
+            SELECT s.id, s.url, s.manager, s.last_sync
+            FROM sites s
+            JOIN users u ON u.id = ?
+            WHERE TRIM(COALESCE(u.name, '')) != ''
+              AND TRIM(COALESCE(s.manager, '')) = TRIM(u.name)
+            ORDER BY s.url
+            ''',
+            (current_user.id,),
+        ).fetchall()
+        site_managers = sorted({
+            (site['manager'] or '').strip()
+            for site in sites
+            if (site['manager'] or '').strip()
+        }, key=str.casefold)
+        conn.close()
+        return render_template(
+            'settings.html',
+            sites=sites,
+            site_managers=site_managers,
+            exchange_rates=[],
+            currencies=[],
+            product_masters=[],
+            masters_lookup={},
+            site_sync_only=True,
+        )
+
     sites = conn.execute('SELECT * FROM sites').fetchall()
     site_managers = sorted({
         (site['manager'] or '').strip()
@@ -7318,7 +7440,8 @@ def settings():
                           exchange_rates=exchange_rates,
                           currencies=currency_list,
                           product_masters=product_masters_list,
-                          masters_lookup=masters_lookup)
+                          masters_lookup=masters_lookup,
+                          site_sync_only=False)
 
 
 @app.route('/api/exchange-rates', methods=['GET', 'POST'])
@@ -9074,9 +9197,9 @@ def _publish_sync_status(status_id):
     entry['updated_at'] = _time.time()
     _persist_sync_status(status_id)
 
-@app.route('/api/sync/status/<int:site_id>')
+@app.route('/api/sync/status/<int:status_id>')
 @login_required
-def get_sync_status(site_id):
+def get_sync_status(status_id):
     """Get synchronization status for a site.
 
     Returns the in-memory SYNC_STATUS entry plus a derived `stale_seconds`
@@ -9091,14 +9214,18 @@ def get_sync_status(site_id):
     # synchronization thread. A process-local dict is only a legacy fallback.
     conn = get_db_connection()
     try:
-        persisted = load_sync_runtime_status(conn, site_id)
+        persisted = load_sync_runtime_status(conn, status_id)
     finally:
         conn.close()
     if persisted is not None:
+        if not _can_manage_site_sync(current_user, persisted.get('site_id')):
+            return jsonify({'error': '无权查看该站点的同步状态'}), 403
         return jsonify(persisted)
 
-    entry = SYNC_STATUS.get(site_id)
+    entry = SYNC_STATUS.get(status_id)
     if entry is None:
+        if not _can_manage_all_settings(current_user):
+            return jsonify({'error': '无法确认该同步任务所属站点'}), 403
         # This worker has no record. Either the sync never ran here, or it
         # ran in another worker that's since been recycled (HUP / OOM).
         return jsonify({
@@ -9107,6 +9234,9 @@ def get_sync_status(site_id):
             'logs': [],
             'stale_seconds': None,
         })
+
+    if not _can_manage_site_sync(current_user, entry.get('site_id')):
+        return jsonify({'error': '无权查看该站点的同步状态'}), 403
 
     out = dict(entry)
     updated_at = out.get('updated_at')
@@ -9122,15 +9252,22 @@ def sync_data():
     """Trigger data synchronization"""
     import sync_utils
     import threading
-    
-    site_id = request.json.get('site_id')
+
+    data = request.get_json(silent=True) or {}
+    site_id = data.get('site_id')
     if not site_id:
         return jsonify({'error': 'Missing site_id'}), 400
-        
-    site_id = int(site_id)
+
+    try:
+        site_id = int(site_id)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid site_id'}), 400
+    if not _can_manage_site_sync(current_user, site_id):
+        return jsonify({'error': '无权同步该站点'}), 403
     
     # Initialize status
     SYNC_STATUS[site_id] = {
+        'site_id': site_id,
         'status': 'running',
         'message': 'Starting synchronization...',
         'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Job started"]
@@ -9220,15 +9357,19 @@ def deep_sync_site(site_id):
     """Trigger deep sync for a single site using 1.wooorders_sqlite.py"""
     import subprocess
     import threading
-    
-    # Use unique ID for deep sync status (site_id + 100000)
-    status_id = site_id + 100000
-    
+
+    if not _can_manage_site_sync(current_user, site_id):
+        return jsonify({'error': '无权同步该站点'}), 403
+
+    status_id = new_sync_runtime_status_id()
+
     SYNC_STATUS[status_id] = {
+        'site_id': site_id,
         'status': 'running',
         'message': '正在启动单站点深度同步...',
         'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Deep sync started for site {site_id}"]
     }
+    _publish_sync_status(status_id)
     
     def run_deep_sync(app_context, site_id, status_id):
         with app_context:
@@ -9240,11 +9381,13 @@ def deep_sync_site(site_id):
                 if not site:
                     SYNC_STATUS[status_id]['status'] = 'error'
                     SYNC_STATUS[status_id]['message'] = 'Site not found'
+                    _publish_sync_status(status_id)
                     return
                 
                 site_url = site['url']
                 SYNC_STATUS[status_id]['message'] = f'正在深度同步 {site_url}...'
                 SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Processing {site_url}")
+                _publish_sync_status(status_id)
                 
                 # Import sync functions directly
                 from woocommerce import API
@@ -9266,6 +9409,7 @@ def deep_sync_site(site_id):
                 per_page = 50
                 
                 SYNC_STATUS[status_id]['message'] = f'正在获取所有订单...'
+                _publish_sync_status(status_id)
                 
                 while True:
                     try:
@@ -9289,6 +9433,7 @@ def deep_sync_site(site_id):
                             SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ {error_msg}")
                             SYNC_STATUS[status_id]['status'] = 'error'
                             SYNC_STATUS[status_id]['message'] = error_msg
+                            _publish_sync_status(status_id)
                             
                             # Update site API status in database
                             conn = get_db_connection()
@@ -9300,6 +9445,7 @@ def deep_sync_site(site_id):
                         
                         if response.status_code != 200:
                             SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] HTTP {response.status_code}")
+                            _publish_sync_status(status_id)
                             break
                         
                         data = response.json()
@@ -9316,11 +9462,13 @@ def deep_sync_site(site_id):
                         
                         SYNC_STATUS[status_id]['message'] = f'已获取 {len(orders)} 个订单 (页 {page})'
                         SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Page {page}: {len(data)} orders")
+                        _publish_sync_status(status_id)
                         
                         page += 1
                         
                     except Exception as e:
                         SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
+                        _publish_sync_status(status_id)
                         break
                 
                 # Update last sync time and API status (success)
@@ -9333,11 +9481,13 @@ def deep_sync_site(site_id):
                 SYNC_STATUS[status_id]['status'] = 'success'
                 SYNC_STATUS[status_id]['message'] = f'深度同步完成，共 {len(orders)} 个订单'
                 SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Completed: {len(orders)} total orders")
+                _publish_sync_status(status_id)
                 
             except Exception as e:
                 SYNC_STATUS[status_id]['status'] = 'error'
                 SYNC_STATUS[status_id]['message'] = str(e)
                 SYNC_STATUS[status_id]['logs'].append(f"[{datetime.now().strftime('%H:%M:%S')}] Critical Error: {str(e)}")
+                _publish_sync_status(status_id)
     
     thread = threading.Thread(target=run_deep_sync, args=(app.app_context(), site_id, status_id))
     thread.start()
@@ -9755,11 +9905,15 @@ def clean_sync_site(site_id):
     """Clean deleted orders for a single site"""
     import threading
 
+    if not _can_manage_site_sync(current_user, site_id):
+        return jsonify({'error': '无权同步该站点'}), 403
+
     # Every run gets its own ID. Reusing a site-derived ID can expose a
     # terminal status from an earlier run to another Gunicorn worker.
     status_id = new_sync_runtime_status_id()
     
     SYNC_STATUS[status_id] = {
+        'site_id': site_id,
         'status': 'running',
         'message': '正在启动清理同步...',
         'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Clean sync started for site {site_id}"]
@@ -9776,6 +9930,7 @@ def clean_sync_site(site_id):
                 if not site:
                     SYNC_STATUS[status_id]['status'] = 'error'
                     SYNC_STATUS[status_id]['message'] = 'Site not found'
+                    _publish_sync_status(status_id)
                     return
                 
                 # Strip whitespace to handle potential database issues
@@ -9932,6 +10087,7 @@ def clean_sync_site(site_id):
 
 @app.route('/api/sync/all', methods=['POST'])
 @login_required
+@all_site_sync_required
 def sync_all_data():
     """Trigger data synchronization for ALL sites"""
     import sync_utils
@@ -10305,6 +10461,7 @@ def backup_site_diff():
 
 @app.route('/api/settings/autosync', methods=['GET'])
 @login_required
+@all_site_sync_required
 def get_autosync_status():
     """Get autosync status from database and verify cron status"""
     conn = get_db_connection()
@@ -10332,6 +10489,7 @@ def get_autosync_status():
 
 @app.route('/api/settings/autosync', methods=['POST'])
 @login_required
+@all_site_sync_required
 def set_autosync_status():
     """Set autosync status, save to database and manage cron job"""
     import subprocess
@@ -10405,6 +10563,7 @@ def set_autosync_status():
 
 @app.route('/api/sync/logs')
 @login_required
+@all_site_sync_required
 def get_sync_logs():
     """Get synchronization logs"""
     site_id = request.args.get('site_id', '')
@@ -10433,6 +10592,7 @@ def get_sync_logs():
 
 @app.route('/api/sync/file-logs')
 @login_required
+@all_site_sync_required
 def get_sync_file_logs():
     """读取同步日志文件的最近内容"""
     import os
@@ -10481,6 +10641,7 @@ def get_sync_file_logs():
 
 @app.route('/api/sync/dashboard')
 @login_required
+@all_site_sync_required
 def get_sync_dashboard():
     """获取全局同步状态摘要"""
     import subprocess, os
@@ -10564,6 +10725,7 @@ def get_sync_dashboard():
 
 @app.route('/api/sync/summary')
 @login_required
+@all_site_sync_required
 def get_sync_summary():
     """Get sync summary for all sites"""
     conn = get_db_connection()
@@ -10608,6 +10770,7 @@ def get_sync_summary():
 
 @app.route('/api/sync/deep', methods=['POST'])
 @login_required
+@all_site_sync_required
 def trigger_deep_sync():
     """Trigger TRUE deep sync — fetch every order page from each site, no date filter."""
     import subprocess
@@ -10681,6 +10844,7 @@ def trigger_deep_sync():
 
 @app.route('/api/sync/clean/all', methods=['POST'])
 @login_required
+@all_site_sync_required
 def clean_all_sites():
     """Clean deleted orders from all sites"""
     import threading
@@ -10825,6 +10989,7 @@ def clean_all_sites():
 
 @app.route('/api/cron/status')
 @login_required
+@all_site_sync_required
 def get_cron_status():
     """Get current cron job status for deep sync"""
     import subprocess
@@ -10858,6 +11023,7 @@ def get_cron_status():
 
 @app.route('/api/cron/setup', methods=['POST'])
 @login_required
+@all_site_sync_required
 def setup_cron():
     """Setup cron job for deep sync"""
     import subprocess
@@ -10898,6 +11064,7 @@ def setup_cron():
 
 @app.route('/api/cron/remove', methods=['DELETE'])
 @login_required
+@all_site_sync_required
 def remove_cron():
     """Remove cron job for deep sync"""
     import subprocess
@@ -10921,6 +11088,7 @@ def remove_cron():
 
 @app.route('/api/cron/clean/status')
 @login_required
+@all_site_sync_required
 def get_clean_cron_status():
     """Get status of clean sync cron job"""
     import subprocess
@@ -10956,6 +11124,7 @@ def get_clean_cron_status():
 
 @app.route('/api/cron/clean/setup', methods=['POST'])
 @login_required
+@all_site_sync_required
 def setup_clean_cron():
     """Setup cron job for clean sync"""
     import subprocess
@@ -10998,6 +11167,7 @@ def setup_clean_cron():
 
 @app.route('/api/cron/clean/remove', methods=['DELETE'])
 @login_required
+@all_site_sync_required
 def remove_clean_cron():
     """Remove cron job for clean sync"""
     import subprocess
@@ -11040,6 +11210,8 @@ def get_users():
     # back if columns are missing. The init_*_tables() functions always add
     # them on startup, so in practice the first SELECT succeeds.
     SCHEMAS = [
+        # Latest: connected-sites synchronization scoped to the user's sites.
+        'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_manage_own_site_sync, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, created_at FROM users',
         # 0: latest — incl. 库存权限 can_view_inventory / can_manage_inventory
         'SELECT id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, created_at FROM users',
         # 0a: missing product own-scope column
@@ -11097,6 +11269,7 @@ def get_users():
         u.setdefault('can_view_inventory', 0)
         u.setdefault('can_manage_inventory', 0)
         u.setdefault('can_manage_own_products', 0)
+        u.setdefault('can_manage_own_site_sync', 0)
         u['site_count'] = site_counts.get(u.get('name') or '', 0)
         u['reconciliation_partner_ids'] = reconciliation_partner_ids.get(u['id'], [])
         if not u.get('can_view_reconciliation'):
@@ -11222,9 +11395,10 @@ def update_user(user_id):
             return jsonify({'error': '超级管理员角色不可更改'}), 403
 
         # Only the 'admin' superuser can grant/revoke can_manage_users,
-        # can_view_reconciliation, can_edit_reconciliation, can_view_costs, can_edit_costs
+        # can_manage_own_site_sync, reconciliation, and cost permissions.
         if is_super_admin:
             can_manage_users_val = 1 if data.get('can_manage_users') else 0
+            can_manage_own_site_sync_val = 1 if data.get('can_manage_own_site_sync') else 0
             can_view_reconciliation_val = 1 if data.get('can_view_reconciliation') else 0
             can_edit_reconciliation_val = 1 if data.get('can_edit_reconciliation') else 0
             reconciliation_scope = data.get('reconciliation_scope', 'all')
@@ -11263,6 +11437,16 @@ def update_user(user_id):
             if can_view_own_sales_board_val and not conn.execute(
                     'SELECT 1 FROM sites WHERE manager = ? LIMIT 1', (name,)).fetchone():
                 can_view_own_sales_board_val = 0
+            if can_manage_own_site_sync_val and not conn.execute(
+                    '''
+                    SELECT 1 FROM sites
+                    WHERE TRIM(COALESCE(manager, '')) = TRIM(?)
+                      AND TRIM(?) != ''
+                    LIMIT 1
+                    ''',
+                    (name, name),
+            ).fetchone():
+                return jsonify({'error': '该用户名下没有站点，不能授予本人站点同步权限'}), 400
             can_manage_blocklist_val = 1 if data.get('can_manage_blocklist') else 0
             # 库存权限:操作含查看(不能操作看不到的东西)
             can_view_inventory_val = 1 if data.get('can_view_inventory') else 0
@@ -11270,11 +11454,11 @@ def update_user(user_id):
             if can_manage_inventory_val and not can_view_inventory_val:
                 can_view_inventory_val = 1
             if password:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, password_hash=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, generate_password_hash(password), user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_manage_own_site_sync=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=?, password_hash=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_manage_own_site_sync_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, generate_password_hash(password), user_id))
             else:
-                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=? WHERE id=?',
-                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, user_id))
+                conn.execute('UPDATE users SET name=?, role=?, can_ship=?, can_view_shipping=?, can_view_report=?, can_view_sales_board=?, can_view_own_sales_board=?, can_manage_users=?, can_manage_own_site_sync=?, can_view_reconciliation=?, can_edit_reconciliation=?, can_manage_products=?, can_manage_own_products=?, can_view_costs=?, can_edit_costs=?, can_manage_blocklist=?, can_view_inventory=?, can_manage_inventory=? WHERE id=?',
+                            (name, role, can_ship, can_view_shipping_val, can_view_report, can_view_sales_board, can_view_own_sales_board_val, can_manage_users_val, can_manage_own_site_sync_val, can_view_reconciliation_val, can_edit_reconciliation_val, can_manage_products, can_manage_own_products, can_view_costs_val, can_edit_costs_val, can_manage_blocklist_val, can_view_inventory_val, can_manage_inventory_val, user_id))
             # Keep the view flag and its data scope in the same transaction.
             # No bindings intentionally means "all partners"; selected mode
             # always has at least one validated binding.

@@ -23,6 +23,7 @@ def init_sync_runtime_status(conn) -> None:
         """
         CREATE TABLE IF NOT EXISTS sync_runtime_status (
             status_id INTEGER PRIMARY KEY,
+            site_id INTEGER,
             status TEXT NOT NULL,
             message TEXT NOT NULL DEFAULT '',
             logs_json TEXT NOT NULL DEFAULT '[]',
@@ -36,12 +37,19 @@ def init_sync_runtime_status(conn) -> None:
     columns = {
         row[1] for row in conn.execute("PRAGMA table_info(sync_runtime_status)")
     }
-    if "progress" not in columns:
+    migrations = (
+        ("site_id", "ALTER TABLE sync_runtime_status ADD COLUMN site_id INTEGER"),
+        (
+            "progress",
+            "ALTER TABLE sync_runtime_status "
+            "ADD COLUMN progress REAL NOT NULL DEFAULT 0",
+        ),
+    )
+    for column, statement in migrations:
+        if column in columns:
+            continue
         try:
-            conn.execute(
-                "ALTER TABLE sync_runtime_status "
-                "ADD COLUMN progress REAL NOT NULL DEFAULT 0"
-            )
+            conn.execute(statement)
         except Exception as exc:
             if "duplicate column" not in str(exc).lower():
                 raise
@@ -59,10 +67,11 @@ def save_sync_runtime_status(conn, status_id: int, entry: dict) -> None:
     conn.execute(
         f"""
         INSERT INTO sync_runtime_status (
-            status_id, status, message, logs_json, progress,
+            status_id, site_id, status, message, logs_json, progress,
             updated_at_epoch, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, {completed_at_sql})
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, {completed_at_sql})
         ON CONFLICT(status_id) DO UPDATE SET
+            site_id=excluded.site_id,
             status=excluded.status,
             message=excluded.message,
             logs_json=excluded.logs_json,
@@ -78,6 +87,7 @@ def save_sync_runtime_status(conn, status_id: int, entry: dict) -> None:
         """,
         (
             int(status_id),
+            int(entry["site_id"]) if entry.get("site_id") is not None else None,
             status,
             str(entry.get("message") or ""),
             json.dumps(entry.get("logs") or [], ensure_ascii=False),
@@ -101,6 +111,7 @@ def load_sync_runtime_status(conn, status_id: int, *, now: float | None = None) 
         logs = []
     updated_at = float(raw.get("updated_at_epoch") or 0)
     return {
+        "site_id": raw.get("site_id"),
         "status": raw.get("status") or "unknown",
         "message": raw.get("message") or "",
         "logs": logs if isinstance(logs, list) else [],

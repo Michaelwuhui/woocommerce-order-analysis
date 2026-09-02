@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}设置 - 苍赋管理系统
+{% if not site_sync_only %}
 <!-- Delete Confirmation Modal -->
 <div class="modal fade" id="deleteConfirmModal" tabindex="-1">
     <div class="modal-dialog">
@@ -21,6 +22,7 @@
         </div>
     </div>
 </div>
+{% endif %}
 
 {% endblock %}
 
@@ -71,15 +73,22 @@
                 <p class="text-white-50 mb-0">管理 WooCommerce 站点连接和数据同步</p>
             </div>
             <div class="d-flex gap-2">
+                {% if site_sync_only %}
+                <span class="badge bg-info bg-opacity-10 text-info border border-info border-opacity-25 px-3 py-2">
+                    <i class="bi bi-person-lock me-1"></i>仅显示本人负责站点
+                </span>
+                {% else %}
                 <a href="/users" class="btn btn-outline-light">
                     <i class="bi bi-people me-1"></i> 用户管理
                 </a>
                 <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addSiteModal">
                     <i class="bi bi-plus-lg me-1"></i> 添加站点
                 </button>
+                {% endif %}
             </div>
         </div>
 
+        {% if not site_sync_only %}
         <!-- Toolbar -->
         <div class="card bg-dark border-secondary border-opacity-25 mb-4">
             <div class="card-body py-2 px-3">
@@ -123,8 +132,10 @@
                 </div>
             </div>
         </div>
+        {% endif %}
     </div>
 
+    {% if not site_sync_only %}
     <!-- 数据备份与灾备 -->
     <div class="card data-card mb-4" id="backupCard">
         <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
@@ -176,6 +187,7 @@
             </div>
         </div>
     </div>
+    {% endif %}
 
     <!-- Sites List -->
     <div class="card data-card mb-4">
@@ -191,10 +203,14 @@
                     <thead>
                         <tr>
                             <th class="ps-4">站点</th>
+                            {% if not site_sync_only %}
                             <th>Consumer Key</th>
                             <th>Mask ID</th>
+                            {% endif %}
                             <th>上次同步时间</th>
+                            {% if not site_sync_only %}
                             <th>状态</th>
+                            {% endif %}
                             <th class="text-end pe-4">操作</th>
                         </tr>
                     </thead>
@@ -216,7 +232,7 @@
                                         {% endif %}
                                         <span class="text-white">{{ site.url.replace('https://www.',
                                             '').replace('https://', '') }}</span>
-                                        {% if site.product_master_id and masters_lookup.get(site.product_master_id) %}
+                                        {% if not site_sync_only and site.product_master_id and masters_lookup.get(site.product_master_id) %}
                                         {% set m = masters_lookup[site.product_master_id] %}
                                         <span class="badge ms-2"
                                             style="background:rgba(168,85,247,0.15); color:#c084fc; border:1px solid rgba(168,85,247,0.4); font-weight:500;"
@@ -227,6 +243,7 @@
                                     </div>
                                 </div>
                             </td>
+                            {% if not site_sync_only %}
                             <td class="text-white-50 font-monospace small">{{ site.consumer_key[:10] }}...</td>
                             <td class="text-white-50 font-monospace small">
                                 {% if site.mask_id %}
@@ -235,6 +252,7 @@
                                 <span class="text-muted">-</span>
                                 {% endif %}
                             </td>
+                            {% endif %}
                             <td class="text-white-50">
                                 {% if site.last_sync %}
                                 {{ site.last_sync }}
@@ -242,6 +260,7 @@
                                 <span class="text-muted fst-italic">从未同步</span>
                                 {% endif %}
                             </td>
+                            {% if not site_sync_only %}
                             <td>
                                 <!-- Read Permission Badge -->
                                 {% if site.api_read_status == 'ok' %}
@@ -285,11 +304,14 @@
                                 </span>
                                 {% endif %}
                             </td>
+                            {% endif %}
                             <td class="text-end pe-4">
+                                {% if not site_sync_only %}
                                 <button class="btn btn-sm btn-outline-secondary me-1 check-api-btn"
                                     data-site-id="{{ site.id }}" title="检测API连接">
                                     <i class="bi bi-broadcast"></i>
                                 </button>
+                                {% endif %}
                                 <div class="btn-group me-2">
                                     <button class="btn btn-sm btn-outline-primary sync-btn" data-site-id="{{ site.id }}"
                                         title="快速同步 - 增量获取新订单"><i class="bi bi-arrow-repeat"></i></button>
@@ -300,6 +322,7 @@
                                         data-site-id="{{ site.id }}" title="清理同步 - 删除已在远程删除的订单"><i
                                             class="bi bi-trash2"></i></button>
                                 </div>
+                                {% if not site_sync_only %}
                                 <button class="btn btn-sm btn-outline-secondary me-2 edit-btn"
                                     data-site-id="{{ site.id }}" data-url="{{ site.url }}"
                                     data-key="{{ site.consumer_key }}" data-secret="{{ site.consumer_secret }}"
@@ -309,13 +332,14 @@
                                     data-product-master-id="{{ site.product_master_id or '' }}"><i class="bi bi-pencil"></i></button>
                                 <button class="btn btn-sm btn-outline-danger delete-btn" data-site-id="{{ site.id }}"><i
                                         class="bi bi-trash"></i></button>
+                                {% endif %}
                             </td>
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="6" class="text-center py-5 text-muted">
+                            <td colspan="{{ 3 if site_sync_only else 6 }}" class="text-center py-5 text-muted">
                                 <i class="bi bi-hdd-network display-4 d-block mb-3 opacity-50"></i>
-                                暂无已连接的站点，请点击右上角添加
+                                {% if site_sync_only %}暂无本人负责的站点{% else %}暂无已连接的站点，请点击右上角添加{% endif %}
                             </td>
                         </tr>
                         {% endfor %}
@@ -326,6 +350,7 @@
     </div>
 </div>
 
+{% if not site_sync_only %}
 <!-- Big Order Alert Thresholds -->
 <div class="card data-card mb-4">
     <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
@@ -1579,6 +1604,7 @@
 </div>
 
 <!-- Deep Sync Confirmation Modal -->
+{% endif %}
 <div class="modal fade" id="deepSyncConfirmModal" tabindex="-1">
     <div class="modal-dialog">
         <div class="modal-content bg-dark border border-secondary border-opacity-25">
@@ -1621,6 +1647,7 @@
 </div>
 
 <!-- Deep Sync All Confirmation Modal -->
+{% if not site_sync_only %}
 <div class="modal fade" id="deepSyncAllConfirmModal" tabindex="-1">
     <div class="modal-dialog">
         <div class="modal-content bg-dark border border-secondary border-opacity-25">
@@ -1659,10 +1686,14 @@
         </div>
     </div>
 </div>
+{% endif %}
 
 {% endblock %}
 
 {% block scripts %}
+{% if site_sync_only %}
+<script src="{{ url_for('static', filename='js/site_sync_settings.js') }}"></script>
+{% else %}
 <script>
     document.addEventListener('DOMContentLoaded', function () {
         const sortSitesByManagerBtn = document.getElementById('sortSitesByManagerBtn');
@@ -4072,4 +4103,5 @@ function deleteWarehouse(id, name) {
 })();
 </script>
 
+{% endif %}
 {% endblock %}

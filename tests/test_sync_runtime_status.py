@@ -32,6 +32,7 @@ def test_status_is_shared_across_connections(tmp_path):
         writer,
         999999,
         {
+            "site_id": 27,
             "status": "running",
             "message": "Syncing site 2/32",
             "logs": ["started", "site 1 completed"],
@@ -41,6 +42,7 @@ def test_status_is_shared_across_connections(tmp_path):
     )
     loaded = load_sync_runtime_status(reader, 999999, now=1004.25)
     assert loaded["status"] == "running"
+    assert loaded["site_id"] == 27
     assert loaded["message"] == "Syncing site 2/32"
     assert loaded["logs"] == ["started", "site 1 completed"]
     assert loaded["progress"] == 37.5
@@ -71,7 +73,7 @@ def test_new_run_overwrites_terminal_status_for_other_workers(tmp_path):
     conn.close()
 
 
-def test_existing_status_table_is_migrated_with_progress_column(tmp_path):
+def test_existing_status_table_is_migrated_with_site_and_progress_columns(tmp_path):
     db_path = tmp_path / "legacy-sync-status.db"
     conn = connect(db_path)
     conn.execute(
@@ -94,5 +96,6 @@ def test_existing_status_table_is_migrated_with_progress_column(tmp_path):
     columns = {
         row[1] for row in conn.execute("PRAGMA table_info(sync_runtime_status)")
     }
+    assert "site_id" in columns
     assert "progress" in columns
     conn.close()

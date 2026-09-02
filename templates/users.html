@@ -269,6 +269,13 @@
                                 <i class="bi bi-shield-fill-check me-1"></i>用户管理权限 <small class="text-muted">（可管理用户和权限）</small>
                             </label>
                         </div>
+                        <div class="form-check mt-2" id="wrapCanManageOwnSiteSync">
+                            <input class="form-check-input" type="checkbox" id="editCanManageOwnSiteSync">
+                            <label class="form-check-label text-info" for="editCanManageOwnSiteSync">
+                                <i class="bi bi-arrow-repeat me-1"></i>本人站点同步权限
+                                <small class="text-muted" id="ownSiteSyncHint">（进入系统设置，仅操作本人负责站点的快速、深度和清理同步）</small>
+                            </label>
+                        </div>
                         <div class="form-check mt-2">
                             <input class="form-check-input" type="checkbox" id="editCanManageBlocklist">
                             <label class="form-check-label text-white-50" for="editCanManageBlocklist">
@@ -351,7 +358,7 @@
             } else if (btn.classList.contains('btn-edit')) {
                 const user = window._usersData && window._usersData[userId];
                 if (user) {
-                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_manage_own_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0, user.can_view_own_sales_board || 0, user.site_count || 0, user.can_view_shipping || 0, user.can_manage_blocklist || 0, user.can_view_inventory || 0, user.can_manage_inventory || 0, user.reconciliation_scope || 'none', user.reconciliation_partner_ids || []);
+                    openEditUser(user.id, user.username, user.name || '', user.role, user.can_ship || 0, user.can_view_report || 0, user.can_view_sales_board || 0, user.can_manage_users || 0, user.can_manage_own_site_sync || 0, user.can_view_reconciliation || 0, user.can_edit_reconciliation || 0, user.can_manage_products || 0, user.can_manage_own_products || 0, user.can_view_costs || 0, user.can_edit_costs || 0, user.can_view_own_sales_board || 0, user.site_count || 0, user.can_view_shipping || 0, user.can_manage_blocklist || 0, user.can_view_inventory || 0, user.can_manage_inventory || 0, user.reconciliation_scope || 'none', user.reconciliation_partner_ids || []);
                 }
             } else if (btn.classList.contains('btn-delete')) {
                 deleteUser(userId);
@@ -493,7 +500,7 @@
         });
 
         // Edit User
-        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, site_count, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, reconciliation_scope, reconciliation_partner_ids) {
+        window.openEditUser = function (id, username, name, role, can_ship, can_view_report, can_view_sales_board, can_manage_users, can_manage_own_site_sync, can_view_reconciliation, can_edit_reconciliation, can_manage_products, can_manage_own_products, can_view_costs, can_edit_costs, can_view_own_sales_board, site_count, can_view_shipping, can_manage_blocklist, can_view_inventory, can_manage_inventory, reconciliation_scope, reconciliation_partner_ids) {
             document.getElementById('editUserId').value = id;
             document.getElementById('editUsername').value = username;
             document.getElementById('editName').value = name;
@@ -541,6 +548,18 @@
             if (costsEditEl) costsEditEl.checked = can_edit_costs == 1;
             var cmEl = document.getElementById('editCanManageUsers');
             if (cmEl) cmEl.checked = can_manage_users == 1;
+            var ownSiteSyncEl = document.getElementById('editCanManageOwnSiteSync');
+            if (ownSiteSyncEl) {
+                var hasOwnedSites = (parseInt(site_count) || 0) > 0;
+                ownSiteSyncEl.disabled = !hasOwnedSites;
+                ownSiteSyncEl.checked = hasOwnedSites && (can_manage_own_site_sync == 1);
+                var ownSiteSyncHint = document.getElementById('ownSiteSyncHint');
+                var ownSiteSyncWrap = document.getElementById('wrapCanManageOwnSiteSync');
+                if (ownSiteSyncWrap) ownSiteSyncWrap.style.opacity = hasOwnedSites ? '1' : '0.5';
+                if (ownSiteSyncHint) ownSiteSyncHint.textContent = hasOwnedSites
+                    ? '（仅操作本人负责的 ' + site_count + ' 个站点：快速、深度和清理同步）'
+                    : '（该用户名下没有站点，无法开启）';
+            }
             var mbEl = document.getElementById('editCanManageBlocklist');
             if (mbEl) mbEl.checked = can_manage_blocklist == 1;
             var ivEl = document.getElementById('editCanViewInventory');
@@ -715,6 +734,7 @@
                     can_view_costs: (document.getElementById('editCanViewCosts') || {}).checked ? 1 : 0,
                     can_edit_costs: (document.getElementById('editCanEditCosts') || {}).checked ? 1 : 0,
                     can_manage_users: (document.getElementById('editCanManageUsers') || {}).checked ? 1 : 0,
+                    can_manage_own_site_sync: (document.getElementById('editCanManageOwnSiteSync') || {}).checked ? 1 : 0,
                     can_manage_blocklist: (document.getElementById('editCanManageBlocklist') || {}).checked ? 1 : 0,
                     can_view_inventory: (document.getElementById('editCanViewInventory') || {}).checked ? 1 : 0,
                     can_manage_inventory: (document.getElementById('editCanManageInventory') || {}).checked ? 1 : 0
