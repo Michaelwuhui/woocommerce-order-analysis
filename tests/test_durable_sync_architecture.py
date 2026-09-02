@@ -218,7 +218,7 @@ def test_cutover_crontab_filter_is_exact_and_preserves_unrelated_jobs():
 30 4 * * 0 cd /www/wwwroot/woo-analysis && python 1.wooorders_sqlite.py --clean
 17 * * * * /usr/bin/flock -n /run/lock/woo-analysis-auto-sync.cron.lock python auto_sync.py
 20 * * * * python /www/wwwroot/woo-analysis/backup_db.py
-*/5 * * * * python /www/wwwroot/woo-analysis/inv_push_cron.py
+*/5 * * * * cd /www/wwwroot/woo-analysis && /usr/bin/flock -n /run/lock/woo-analysis-inv-push.cron.lock python inv_push_cron.py
 0 5 * * * python /www/wwwroot/woo-analysis/resolve_outcomes.py --live
 """
     maintenance, counts = filtered_crontab(source, "maintenance")
