@@ -56,6 +56,7 @@ def _create_shipping_db(path):
         );
         CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
         CREATE TABLE order_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             order_id TEXT,
             note TEXT,
             date_created TEXT,

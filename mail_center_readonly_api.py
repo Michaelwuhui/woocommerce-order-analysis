@@ -12,7 +12,7 @@ import hashlib
 import hmac
 import os
 import re
-import sqlite3
+import db_backend as sqlite3
 import stat
 from contextlib import closing
 from datetime import datetime, timezone
@@ -77,6 +77,13 @@ def _database_path() -> Path:
 
 
 def _connect_readonly() -> sqlite3.Connection:
+    if sqlite3.is_postgres_backend():
+        conn = sqlite3.connect(
+            os.getenv("WOO_SQLITE_PATH", "woocommerce_orders.db"),
+            timeout=2.0,
+        )
+        conn.row_factory = sqlite3.Row
+        return conn
     path = _database_path().resolve(strict=True)
     encoded_path = quote(path.as_posix(), safe="/:")
     conn = sqlite3.connect(f"file:{encoded_path}?mode=ro", uri=True, timeout=2.0)

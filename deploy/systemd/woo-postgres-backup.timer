@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly Woo Analysis PostgreSQL backup
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+Unit=woo-postgres-backup.service
+
+[Install]
+WantedBy=timers.target

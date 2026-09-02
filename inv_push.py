@@ -6,7 +6,7 @@ mode performs the same calculation and audit path without writing WooCommerce.
 """
 
 import json
-import sqlite3
+import db_backend as sqlite3
 import uuid
 from functools import wraps
 

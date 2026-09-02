@@ -2,7 +2,7 @@
 WooCommerce Order Analysis Web Dashboard
 Flask application with user authentication and data visualization
 """
-import sqlite3
+import db_backend as sqlite3
 import json
 import html
 import os
@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 from functools import wraps
 
-from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session, send_file, make_response, g
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, jsonify, session, send_file, make_response, g, has_request_context
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from oid_utils import woo_post_id  # cross-site-safe WC post id for REST calls
 import blocklist  # customer blocklist: auto-cancel COD orders from blacklisted phones
@@ -44,6 +44,7 @@ from order_shipments import (
     is_pending_shipping_candidate,
     partition_shipping_logs,
 )
+from external_operations import begin_operation, transition_operation
 from partner_site_scope import (
     EFFECTIVE_PARTNER_SITES,
     get_partner_site_scope,
@@ -74,7 +75,13 @@ from sync_runtime_status import (
 )
 
 app = Flask(__name__)
-app.secret_key = 'woocommerce-order-analysis-secret-key-2024'
+app.secret_key = os.getenv("FLASK_SECRET_KEY")
+if not app.secret_key:
+    if sqlite3.is_postgres_backend():
+        raise RuntimeError("FLASK_SECRET_KEY must be supplied by the protected environment file")
+    # Unit tests and the preserved SQLite rollback release do not load the
+    # production EnvironmentFile. This value is explicitly non-production.
+    app.secret_key = "sqlite-test-only-secret"
 
 # Flask-Login setup
 login_manager = LoginManager()
@@ -82,8 +89,9 @@ login_manager.init_app(app)
 login_manager.login_view = 'login'
 login_manager.login_message = '请先登录以访问此页面'
 
-# Database configuration
-DB_FILE = 'woocommerce_orders.db'
+# Database configuration. db_backend routes this legacy path to the bounded
+# PostgreSQL pool when WOO_DB_BACKEND=postgres.
+DB_FILE = os.getenv("WOO_SQLITE_PATH", "woocommerce_orders.db")
 
 # Keep synchronous WooCommerce writes well below Gunicorn's worker timeout.
 # Requests uses (connect timeout, read timeout) tuples here; a timed-out write is
@@ -406,7 +414,23 @@ def get_db_connection(timeout_seconds=SQLITE_BUSY_TIMEOUT_SECONDS):
     conn = sqlite3.connect(DB_FILE, timeout=timeout_seconds)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={int(timeout_seconds * 1000)}")
+    if sqlite3.is_postgres_backend() and has_request_context():
+        connections = getattr(g, "_postgres_connections", None)
+        if connections is None:
+            connections = g._postgres_connections = []
+        connections.append(conn)
     return conn
+
+
+@app.teardown_request
+def _close_request_postgres_connections(_error=None):
+    """Return every request-owned PostgreSQL session, including error paths."""
+    for connection in getattr(g, "_postgres_connections", ()):
+        try:
+            connection.close()
+        except Exception:
+            pass
+    g._postgres_connections = []
 
 
 def _run_sqlite_write_with_retry(operation):
@@ -430,6 +454,22 @@ def _run_sqlite_write_with_retry(operation):
         if attempt + 1 < SQLITE_LOCAL_WRITE_ATTEMPTS:
             time.sleep(0.2 * (attempt + 1))
     raise last_error
+
+
+def _transition_external_operation(operation_id, target_status, **kwargs):
+    """Persist one external-operation transition in its own short transaction."""
+    if not operation_id:
+        return None
+
+    def _transition(conn):
+        return transition_operation(
+            conn,
+            operation_id,
+            target_status,
+            **kwargs,
+        )
+
+    return _run_sqlite_write_with_retry(_transition)
 
 
 def get_all_managers():
@@ -1748,7 +1788,6 @@ def dashboard():
         source_filter = ''  # Reset invalid filter
     
     # Get available sources (filtered by permissions and manager)
-    conn = get_db_connection()
     
     # Base source query
     source_query = 'SELECT DISTINCT source FROM orders'
@@ -2589,7 +2628,6 @@ def orders():
             )
     
     # Get available sources (filtered by permissions and manager)
-    conn = get_db_connection()
     
     # Base source query
     source_query = 'SELECT DISTINCT source FROM orders'
@@ -2723,9 +2761,9 @@ def orders():
                               THEN COALESCE(product_loss_amount, 0)
                               ELSE 0 END), 0) AS product_loss,
             COALESCE(SUM(COALESCE((
-                SELECT SUM(CAST(COALESCE(json_extract(item.value, '$.quantity'), 0) AS INTEGER))
+                SELECT SUM(COALESCE(CAST(json_extract(item.value, '$.quantity') AS INTEGER), 0))
                 FROM json_each(
-                    CASE WHEN json_valid(orders.line_items) THEN orders.line_items ELSE '[]' END
+                    CASE WHEN json_valid(orders.line_items) = 1 THEN orders.line_items ELSE '[]' END
                 ) AS item
             ), 0)), 0) AS product_count
         FROM orders {listing_where}
@@ -2934,7 +2972,6 @@ def monthly():
         source_filter = ''
     
     # Get available sources (filtered by permissions and manager)
-    conn = get_db_connection()
     
     # Base source query
     source_query = 'SELECT DISTINCT source FROM orders'
@@ -4625,7 +4662,6 @@ def customers():
         source_filter = ''
     
     # Get available sources (filtered by permissions and manager)
-    conn = get_db_connection()
     
     # Base source query
     source_query = 'SELECT DISTINCT source FROM orders'
@@ -4708,8 +4744,9 @@ def customers():
     query = f'''
         SELECT
             json_extract(billing, '$.email') as email,
-            json_extract(billing, '$.first_name') || ' ' || json_extract(billing, '$.last_name') as name,
-            json_extract(billing, '$.phone') as phone,
+            MAX(json_extract(billing, '$.first_name')) || ' ' ||
+                MAX(json_extract(billing, '$.last_name')) as name,
+            MAX(json_extract(billing, '$.phone')) as phone,
             COUNT(*) as total_orders,
             SUM({_success_status_case()}) as successful_orders,
             {_success_amount_case('total')} as total_spent,
@@ -5716,7 +5753,7 @@ def update_customer_quality():
     try:
         conn.execute('''
             INSERT INTO customer_settings (email, quality_tier, updated_at) 
-            VALUES (?, ?, datetime('now'))
+            VALUES (?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(email) DO UPDATE SET 
                 quality_tier = excluded.quality_tier,
                 updated_at = excluded.updated_at
@@ -7330,31 +7367,43 @@ def init_blocklist_tables():
     conn.close()
 
 
-# Initialize tables on startup
-with app.app_context():
-    init_sites_table()
-    init_product_masters_table()
-    init_product_operation_logs_table()
-    init_sync_logs_table()
-    init_settings_table()
-    init_users_table()
-    init_shipping_tables()
-    init_undelivered_columns()
-    init_problem_return_columns()
-    init_product_tables()
-    init_user_preferences_table()
-    init_sales_board_tables()
-    init_sales_groups_tables()
-    init_partner_reconciliation_tables()
-    init_product_costs_tables()
-    init_warehouses()
-    init_blocklist_tables()
-    _clone_jobs_conn = get_db_connection()
+# SQLite keeps its historical bootstrap for rollback and isolated tests.
+# PostgreSQL schema changes are versioned and must never run during app import.
+if sqlite3.is_sqlite_backend():
+    with app.app_context():
+        init_sites_table()
+        init_product_masters_table()
+        init_product_operation_logs_table()
+        init_sync_logs_table()
+        init_settings_table()
+        init_users_table()
+        init_shipping_tables()
+        init_undelivered_columns()
+        init_problem_return_columns()
+        init_product_tables()
+        init_user_preferences_table()
+        init_sales_board_tables()
+        init_sales_groups_tables()
+        init_partner_reconciliation_tables()
+        init_product_costs_tables()
+        init_warehouses()
+        init_blocklist_tables()
+        _clone_jobs_conn = get_db_connection()
+        try:
+            init_product_clone_jobs(_clone_jobs_conn)
+            init_sync_runtime_status(_clone_jobs_conn)
+        finally:
+            _clone_jobs_conn.close()
+else:
+    _schema_check = get_db_connection()
     try:
-        init_product_clone_jobs(_clone_jobs_conn)
-        init_sync_runtime_status(_clone_jobs_conn)
+        ready = _schema_check.execute(
+            "SELECT to_regclass('public.orders'), to_regclass('public.sync_runs')"
+        ).fetchone()
+        if not ready or not all(ready):
+            raise RuntimeError("PostgreSQL schema is not migrated")
     finally:
-        _clone_jobs_conn.close()
+        _schema_check.close()
 
 @app.route('/settings')
 @login_required
@@ -7390,6 +7439,12 @@ def settings():
             product_masters=[],
             masters_lookup={},
             site_sync_only=True,
+            # The global edit-scope context may include grants unrelated to
+            # the stricter manager-owned sync scope.  Never embed those other
+            # site URLs in this reduced settings page.
+            editable_sources_json=json.dumps(
+                sorted(str(site['url']) for site in sites)
+            ),
         )
 
     sites = conn.execute('SELECT * FROM sites').fetchall()
@@ -7507,68 +7562,13 @@ def delete_exchange_rate(rate_id):
 @login_required
 @admin_required
 def import_sites_from_script():
-    """从 1.wooorders_sqlite.py 的硬编码配置导入站点到数据库（管理员专用：同样会批量建站）"""
-    import ast
-    import re
-    
-    script_path = '1.wooorders_sqlite.py'
-    
-    try:
-        with open(script_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # 提取 HARDCODED_SITES 列表
-        pattern = r'HARDCODED_SITES\s*=\s*(\[[\s\S]*?\n\])'
-        match = re.search(pattern, content)
-        
-        if not match:
-            # 尝试旧格式 sites = [...]
-            pattern = r'^sites\s*=\s*(\[[\s\S]*?\n\])'
-            match = re.search(pattern, content, re.MULTILINE)
-        
-        if not match:
-            return jsonify({'error': '无法在脚本中找到站点配置'}), 400
-        
-        # 解析 Python 列表
-        sites_str = match.group(1)
-        sites_list = ast.literal_eval(sites_str)
-        
-        conn = get_db_connection()
-        imported = 0
-        skipped = 0
-        
-        for site in sites_list:
-            url = site.get('url', '')
-            ck = site.get('ck', '')
-            cs = site.get('cs', '')
-            
-            if not all([url, ck, cs]):
-                continue
-            
-            # 检查是否已存在
-            existing = conn.execute('SELECT id FROM sites WHERE url = ?', (url,)).fetchone()
-            if existing:
-                skipped += 1
-                continue
-            
-            conn.execute('INSERT INTO sites (url, consumer_key, consumer_secret) VALUES (?, ?, ?)',
-                        (url, ck, cs))
-            imported += 1
-        
-        conn.commit()
-        conn.close()
-        
-        return jsonify({
-            'success': True, 
-            'imported': imported, 
-            'skipped': skipped,
-            'message': f'成功导入 {imported} 个站点，跳过 {skipped} 个已存在的站点'
-        })
-        
-    except FileNotFoundError:
-        return jsonify({'error': f'找不到脚本文件: {script_path}'}), 404
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    """Reject the retired source-controlled credential import path."""
+    return jsonify({
+        'error': (
+            '源码站点凭据导入已永久停用；请通过受保护的站点管理入口配置。'
+        )
+    }), 410
+
 
 # ============================================================================
 # Product Masters (WooMultistore master sites for product CRUD)
@@ -9197,7 +9197,58 @@ def _publish_sync_status(status_id):
     entry['updated_at'] = _time.time()
     _persist_sync_status(status_id)
 
-@app.route('/api/sync/status/<int:status_id>')
+def _sync_actor():
+    return (
+        getattr(current_user, 'username', None)
+        or current_user.get_id()
+        or 'authenticated-user'
+    )
+
+
+def _authorize_sync_status(status):
+    if _can_manage_all_settings(current_user):
+        return True
+    return all(
+        _can_manage_site_sync(current_user, site.get('site_id'))
+        for site in status.get('sites', [])
+    )
+
+
+def _start_durable_sync(mode, site_ids=None):
+    from sync_service import start_sync
+
+    try:
+        status, created = start_sync(
+            mode=mode,
+            created_by=_sync_actor(),
+            site_ids=site_ids,
+            params={
+                'per_page': 50,
+                'incremental_overlap_minutes': 10,
+                'notes_per_page': 10 if mode != 'deep' else 0,
+            },
+        )
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception:
+        app.logger.exception('创建持久化同步批次失败')
+        return jsonify({'success': False, 'error': '同步任务暂时无法入队'}), 503
+    payload = {
+        'success': True,
+        'created': created,
+        'existing': not created,
+        'run_id': status['run_id'],
+        'sync_id': status['run_id'],
+        'status': status,
+        'message': (
+            '同步任务已创建' if created
+            else '已有同步任务正在运行，已返回现有任务'
+        ),
+    }
+    return jsonify(payload), (202 if created else 200)
+
+
+@app.route('/api/sync/status/<status_id>')
 @login_required
 def get_sync_status(status_id):
     """Get synchronization status for a site.
@@ -9209,7 +9260,22 @@ def get_sync_status(status_id):
     the one running the sync will see no entry at all — also surfaced as
     a fresh 'unknown' status to the client.
     """
+    if sqlite3.is_postgres_backend():
+        from sync_service import get_run_status
+
+        try:
+            status = get_run_status(status_id)
+        except KeyError:
+            return jsonify({'error': '同步任务不存在'}), 404
+        if not _authorize_sync_status(status):
+            return jsonify({'error': '无权查看该同步任务'}), 403
+        return jsonify(status)
+
     import time as _time
+    try:
+        status_id = int(status_id)
+    except (TypeError, ValueError):
+        return jsonify({'error': '同步任务不存在'}), 404
     # SQLite is authoritative because another Gunicorn worker may own the
     # synchronization thread. A process-local dict is only a legacy fallback.
     conn = get_db_connection()
@@ -9246,6 +9312,44 @@ def get_sync_status(status_id):
         out['stale_seconds'] = None
     return jsonify(out)
 
+
+@app.route('/api/sync/active')
+@login_required
+def get_active_sync():
+    if not sqlite3.is_postgres_backend():
+        return jsonify({'active': None})
+    from sync_service import active_run, get_run_status
+
+    row = active_run()
+    if not row:
+        return jsonify({'active': None})
+    status = get_run_status(str(row['run_id']))
+    if not _authorize_sync_status(status):
+        return jsonify({'active': None})
+    return jsonify({'active': status})
+
+
+@app.route('/api/sync/<run_id>/cancel', methods=['POST'])
+@login_required
+def cancel_sync_run(run_id):
+    if not sqlite3.is_postgres_backend():
+        return jsonify({'error': '此版本不支持持久化取消'}), 409
+    from sync_service import cancel_sync, get_run_status
+
+    try:
+        current = get_run_status(run_id)
+    except KeyError:
+        return jsonify({'error': '同步任务不存在'}), 404
+    if not _authorize_sync_status(current):
+        return jsonify({'error': '无权取消该同步任务'}), 403
+    try:
+        status = cancel_sync(run_id, requested_by=_sync_actor())
+    except Exception:
+        app.logger.exception('安全取消同步失败: run_id=%s', run_id)
+        return jsonify({'error': '取消请求暂时无法保存'}), 503
+    return jsonify({'success': True, 'run_id': run_id, 'status': status})
+
+
 @app.route('/api/sync', methods=['POST'])
 @login_required
 def sync_data():
@@ -9264,6 +9368,8 @@ def sync_data():
         return jsonify({'error': 'Invalid site_id'}), 400
     if not _can_manage_site_sync(current_user, site_id):
         return jsonify({'error': '无权同步该站点'}), 403
+    if sqlite3.is_postgres_backend():
+        return _start_durable_sync('quick', [site_id])
     
     # Initialize status
     SYNC_STATUS[site_id] = {
@@ -9360,6 +9466,8 @@ def deep_sync_site(site_id):
 
     if not _can_manage_site_sync(current_user, site_id):
         return jsonify({'error': '无权同步该站点'}), 403
+    if sqlite3.is_postgres_backend():
+        return _start_durable_sync('deep', [site_id])
 
     status_id = new_sync_runtime_status_id()
 
@@ -9732,13 +9840,22 @@ CHECK_STATUS = {}
 @app.route('/api/sites/check-all', methods=['POST'])
 @login_required
 def check_all_sites_api():
-    """Check API connectivity for all sites - runs in background thread to avoid timeout"""
+    """Run the legacy SQLite bulk connectivity check without write probes."""
+    if sqlite3.is_postgres_backend():
+        return jsonify({
+            'error': (
+                '批量 API 检测的旧 Gunicorn 后台线程已停用；'
+                '请使用各站点的只读连接检测。'
+            )
+        }), 409
+
     import threading
-    
-    # Use a unique ID for this check operation
-    CHECK_ALL_ID = 888888
-    
-    CHECK_STATUS[CHECK_ALL_ID] = {
+
+    # The rollback-only implementation still needs a per-request ID so a new
+    # check can never inherit another worker's stale terminal state.
+    check_id = new_sync_runtime_status_id()
+
+    CHECK_STATUS[check_id] = {
         'status': 'running',
         'message': '正在启动API检测...',
         'results': [],
@@ -9800,53 +9917,10 @@ def check_all_sites_api():
                             read_status = 'error'
                             error_msg = f"读权限测试失败: {str(e)}"
                         
-                        # Test WRITE permission (only if read is ok)
-                        if read_status == 'ok':
-                            try:
-                                orders_response = wcapi.get("orders", params={"per_page": 1, "status": "any"})
-                                
-                                if orders_response.status_code == 200:
-                                    orders = orders_response.json()
-                                    
-                                    if orders and len(orders) > 0:
-                                        test_order_id = orders[0]['id']
-                                        
-                                        test_note_response = wcapi.post(
-                                            f"orders/{test_order_id}/notes",
-                                            data={
-                                                "note": "[API权限测试] 此消息用于验证写权限，将立即删除",
-                                                "customer_note": False
-                                            }
-                                        )
-                                        
-                                        if test_note_response.status_code in (200, 201):
-                                            write_status = 'ok'
-                                            try:
-                                                note_id = test_note_response.json().get('id')
-                                                if note_id:
-                                                    wcapi.delete(f"orders/{test_order_id}/notes/{note_id}")
-                                            except:
-                                                pass
-                                        elif test_note_response.status_code in (401, 403):
-                                            write_status = 'error'
-                                            if not error_msg:
-                                                error_msg = "写权限被拒绝"
-                                        else:
-                                            write_status = 'error'
-                                            if not error_msg:
-                                                error_msg = f"写入测试失败 HTTP {test_note_response.status_code}"
-                                    else:
-                                        write_status = 'unknown'
-                                        if not error_msg:
-                                            error_msg = "无订单可测试写权限"
-                                else:
-                                    write_status = 'unknown'
-                            except Exception as e:
-                                write_status = 'error'
-                                if not error_msg:
-                                    error_msg = f"写权限测试失败: {str(e)}"
-                        else:
-                            write_status = 'unknown'
+                        # Never create/delete notes on a real customer order to
+                        # probe write permission.  Business writes are verified
+                        # by their durable operation ledger and read-back path.
+                        write_status = 'unknown'
                             
                     except Exception as e:
                         read_status = 'error'
@@ -9874,8 +9948,8 @@ def check_all_sites_api():
                 conn.close()
                 
                 # Calculate final stats
-                ok_count = sum(1 for r in results if r['read'] == 'ok' and r['write'] == 'ok')
-                error_count = sum(1 for r in results if r['read'] == 'error' or r['write'] == 'error')
+                ok_count = sum(1 for r in results if r['read'] == 'ok')
+                error_count = sum(1 for r in results if r['read'] == 'error')
                 
                 CHECK_STATUS[status_id]['status'] = 'success'
                 CHECK_STATUS[status_id]['message'] = f'检测完成！正常: {ok_count} 个，异常: {error_count} 个'
@@ -9884,10 +9958,10 @@ def check_all_sites_api():
                 CHECK_STATUS[status_id]['status'] = 'error'
                 CHECK_STATUS[status_id]['message'] = f'检测失败: {str(e)}'
     
-    thread = threading.Thread(target=run_check_all, args=(app.app_context(), CHECK_ALL_ID))
+    thread = threading.Thread(target=run_check_all, args=(app.app_context(), check_id))
     thread.start()
-    
-    return jsonify({'success': True, 'check_id': CHECK_ALL_ID, 'message': 'API检测已启动'})
+
+    return jsonify({'success': True, 'check_id': check_id, 'message': 'API检测已启动'})
 
 
 @app.route('/api/sites/check-status/<int:check_id>')
@@ -9907,6 +9981,10 @@ def clean_sync_site(site_id):
 
     if not _can_manage_site_sync(current_user, site_id):
         return jsonify({'error': '无权同步该站点'}), 403
+    if sqlite3.is_postgres_backend():
+        return jsonify({
+            'error': '清理同步是删除性维护操作，已从 Web 后台线程停用；请使用受控维护流程。'
+        }), 409
 
     # Every run gets its own ID. Reusing a site-derived ID can expose a
     # terminal status from an earlier run to another Gunicorn worker.
@@ -10090,12 +10168,14 @@ def clean_sync_site(site_id):
 @all_site_sync_required
 def sync_all_data():
     """Trigger data synchronization for ALL sites"""
+    if sqlite3.is_postgres_backend():
+        return _start_durable_sync('quick')
     import sync_utils
     import threading
     import time as _time
 
-    # Use a special ID for "all sites" sync status
-    ALL_SITES_ID = 999999
+    # SQLite rollback path still allocates a unique status per request.
+    ALL_SITES_ID = new_sync_runtime_status_id()
 
     # `updated_at` is a wall-clock heartbeat the frontend uses to detect a
     # zombie sync — if the gunicorn worker hosting this thread is killed
@@ -10197,17 +10277,28 @@ _BK_DIR = '/www/backups/woo-orders'
 _BK_OFFSITE_CFG = '/www/wwwroot/woo-analysis/backup_offsite.json'
 _BK_SCRIPT = '/www/wwwroot/woo-analysis/backup_db.py'
 _BK_VENV_PY = '/www/wwwroot/woo-analysis/venv/bin/python'
-_BK_NAME_RE = re.compile(r'^woocommerce_orders_\d{8}_\d{6}\.db\.gz$')
+_BK_NAME_RE = re.compile(
+    r'^(?:woocommerce_orders_\d{8}_\d{6}\.db\.gz|woo_analysis_\d{8}_\d{6}\.dump)$'
+)
 
 
 def _bk_local_list():
     import os, glob
     files = []
     if os.path.isdir(_BK_DIR):
-        for p in glob.glob(os.path.join(_BK_DIR, 'woocommerce_orders_*.db.gz')):
+        paths = glob.glob(os.path.join(_BK_DIR, 'woocommerce_orders_*.db.gz'))
+        paths += glob.glob(os.path.join(_BK_DIR, 'woo_analysis_*.dump'))
+        for p in paths:
             try:
                 st = os.stat(p)
-                files.append({'name': os.path.basename(p), 'size': st.st_size, 'mtime': st.st_mtime})
+                files.append({
+                    'name': os.path.basename(p),
+                    'size': st.st_size,
+                    'mtime': st.st_mtime,
+                    'backend': 'postgres' if p.endswith('.dump') else 'sqlite',
+                    'sha256_available': os.path.isfile(p + '.sha256'),
+                    'manifest_available': os.path.isfile(p + '.manifest.json'),
+                })
             except OSError:
                 pass
     files.sort(key=lambda f: f['mtime'], reverse=True)
@@ -10239,6 +10330,11 @@ def backup_status():
         import subprocess
         r = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
         cron_on = 'backup_db.py' in (r.stdout or '')
+        timer = subprocess.run(
+            ['/usr/bin/systemctl', 'is-enabled', 'woo-postgres-backup.timer'],
+            capture_output=True, text=True, timeout=5
+        )
+        cron_on = cron_on or timer.returncode == 0
     except Exception:
         pass
 
@@ -10463,7 +10559,7 @@ def backup_site_diff():
 @login_required
 @all_site_sync_required
 def get_autosync_status():
-    """Get autosync status from database and verify cron status"""
+    """Get autosync status from the authoritative database settings."""
     conn = get_db_connection()
     enabled_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_enabled'").fetchone()
     interval_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_interval'").fetchone()
@@ -10472,7 +10568,14 @@ def get_autosync_status():
     enabled = enabled_row['value'] == 'true' if enabled_row else False
     interval = int(interval_row['value']) if interval_row else 900
     
-    # Verify cron job exists if enabled
+    if sqlite3.is_postgres_backend():
+        return jsonify({
+            'enabled': enabled,
+            'interval': interval,
+            'scheduler': 'celery-beat',
+        })
+
+    # SQLite rollback mode still verifies the legacy cron.
     if enabled:
         import subprocess
         try:
@@ -10491,7 +10594,7 @@ def get_autosync_status():
 @login_required
 @all_site_sync_required
 def set_autosync_status():
-    """Set autosync status, save to database and manage cron job"""
+    """Save autosync settings; Celery Beat reads them in PostgreSQL mode."""
     import subprocess
     
     data = request.json
@@ -10513,12 +10616,26 @@ def set_autosync_status():
             new_interval = interval
     
     # Save to database
-    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('autosync_enabled', ?)", 
-                 ('true' if new_enabled else 'false',))
-    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('autosync_interval', ?)", 
-                 (str(new_interval),))
+    conn.execute(
+        "INSERT INTO settings (key,value) VALUES ('autosync_enabled',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ('true' if new_enabled else 'false',),
+    )
+    conn.execute(
+        "INSERT INTO settings (key,value) VALUES ('autosync_interval',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(new_interval),),
+    )
     conn.commit()
     conn.close()
+
+    if sqlite3.is_postgres_backend():
+        return jsonify({
+            'success': True,
+            'enabled': new_enabled,
+            'interval': new_interval,
+            'scheduler': 'celery-beat',
+        })
     
     # Manage cron job
     try:
@@ -10651,30 +10768,45 @@ def get_sync_dashboard():
     # 1. 获取自动同步设置
     autosync_enabled_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_enabled'").fetchone()
     autosync_interval_row = conn.execute("SELECT value FROM settings WHERE key = 'autosync_interval'").fetchone()
+    deep_enabled_row = conn.execute("SELECT value FROM settings WHERE key = 'deep_sync_enabled'").fetchone()
+    deep_hour_row = conn.execute("SELECT value FROM settings WHERE key = 'deep_sync_hour'").fetchone()
+    deep_minute_row = conn.execute("SELECT value FROM settings WHERE key = 'deep_sync_minute'").fetchone()
     
     autosync_enabled = autosync_enabled_row['value'] == 'true' if autosync_enabled_row else False
     autosync_interval = int(autosync_interval_row['value']) if autosync_interval_row else 900
     
     # 2. 获取 Crontab 配置
     cron_info = {}
-    try:
-        result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
-        crontab = result.stdout if result.returncode == 0 else ''
-        for line in crontab.split('\n'):
-            if 'auto_sync.py' in line and not line.startswith('#'):
-                parts = line.split()
-                if len(parts) >= 5:
-                    cron_info['auto_sync'] = ' '.join(parts[:5])
-            elif '1.wooorders_sqlite.py' in line and '--clean' not in line and not line.startswith('#'):
-                parts = line.split()
-                if len(parts) >= 5:
-                    cron_info['deep_sync'] = ' '.join(parts[:5])
-            elif '1.wooorders_sqlite.py' in line and '--clean' in line and not line.startswith('#'):
-                parts = line.split()
-                if len(parts) >= 5:
-                    cron_info['clean_sync'] = ' '.join(parts[:5])
-    except Exception:
-        pass
+    if sqlite3.is_postgres_backend():
+        deep_enabled = (
+            str(deep_enabled_row['value']).lower() == 'true'
+            if deep_enabled_row else True
+        )
+        deep_hour = int(deep_hour_row['value']) if deep_hour_row else 3
+        deep_minute = int(deep_minute_row['value']) if deep_minute_row else 30
+        if autosync_enabled:
+            cron_info['auto_sync'] = f'Celery Beat · every {autosync_interval}s'
+        if deep_enabled:
+            cron_info['deep_sync'] = f'Celery Beat · {deep_hour:02d}:{deep_minute:02d}'
+    else:
+        try:
+            result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
+            crontab = result.stdout if result.returncode == 0 else ''
+            for line in crontab.split('\n'):
+                if 'auto_sync.py' in line and not line.startswith('#'):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        cron_info['auto_sync'] = ' '.join(parts[:5])
+                elif '1.wooorders_sqlite.py' in line and '--clean' not in line and not line.startswith('#'):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        cron_info['deep_sync'] = ' '.join(parts[:5])
+                elif '1.wooorders_sqlite.py' in line and '--clean' in line and not line.startswith('#'):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        cron_info['clean_sync'] = ' '.join(parts[:5])
+        except Exception:
+            pass
     
     # 3. 获取最近同步记录统计
     stats_24h = conn.execute('''
@@ -10773,6 +10905,8 @@ def get_sync_summary():
 @all_site_sync_required
 def trigger_deep_sync():
     """Trigger TRUE deep sync — fetch every order page from each site, no date filter."""
+    if sqlite3.is_postgres_backend():
+        return _start_durable_sync('deep')
     import subprocess
     import threading
 
@@ -10847,9 +10981,13 @@ def trigger_deep_sync():
 @all_site_sync_required
 def clean_all_sites():
     """Clean deleted orders from all sites"""
+    if sqlite3.is_postgres_backend():
+        return jsonify({
+            'error': '清理同步是删除性维护操作，已从 Web 后台线程停用；请使用受控维护流程。'
+        }), 409
     import threading
 
-    # A clean run must not reuse the global quick-sync ID (999999), otherwise
+    # A clean run must not reuse another quick-sync ID, otherwise
     # polling can read that task's old terminal state and report a false finish.
     clean_status_id = new_sync_runtime_status_id()
 
@@ -10991,7 +11129,25 @@ def clean_all_sites():
 @login_required
 @all_site_sync_required
 def get_cron_status():
-    """Get current cron job status for deep sync"""
+    """Get deep-sync schedule from Beat settings or legacy cron."""
+    if sqlite3.is_postgres_backend():
+        conn = get_db_connection()
+        rows = conn.execute(
+            "SELECT key,value FROM settings WHERE key IN "
+            "('deep_sync_enabled','deep_sync_hour','deep_sync_minute')"
+        ).fetchall()
+        conn.close()
+        values = {row['key']: row['value'] for row in rows}
+        enabled = str(values.get('deep_sync_enabled', 'true')).lower() == 'true'
+        hour = min(23, max(0, int(values.get('deep_sync_hour', 3))))
+        minute = min(59, max(0, int(values.get('deep_sync_minute', 30))))
+        return jsonify({
+            'enabled': enabled,
+            'schedule': f'{minute} {hour} * * *' if enabled else None,
+            'hour': hour,
+            'minute': minute,
+            'scheduler': 'celery-beat',
+        })
     import subprocess
     
     try:
@@ -11025,7 +11181,7 @@ def get_cron_status():
 @login_required
 @all_site_sync_required
 def setup_cron():
-    """Setup cron job for deep sync"""
+    """Configure daily deep sync without recreating cron on PostgreSQL."""
     import subprocess
     
     data = request.json
@@ -11034,6 +11190,31 @@ def setup_cron():
     
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return jsonify({'error': 'Invalid time'}), 400
+
+    if sqlite3.is_postgres_backend():
+        conn = get_db_connection()
+        try:
+            for key, value in (
+                ('deep_sync_enabled', 'true'),
+                ('deep_sync_hour', str(hour)),
+                ('deep_sync_minute', str(minute)),
+            ):
+                conn.execute(
+                    "INSERT INTO settings(key,value) VALUES (?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return jsonify({
+            'success': True,
+            'message': f'Celery Beat deep sync set for {hour:02d}:{minute:02d}',
+            'scheduler': 'celery-beat',
+        })
     
     try:
         # Get existing crontab
@@ -11066,7 +11247,20 @@ def setup_cron():
 @login_required
 @all_site_sync_required
 def remove_cron():
-    """Remove cron job for deep sync"""
+    """Disable deep sync in Beat settings or remove the legacy cron."""
+    if sqlite3.is_postgres_backend():
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES ('deep_sync_enabled','false') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({
+            'success': True,
+            'message': 'Celery Beat deep sync disabled',
+            'scheduler': 'celery-beat',
+        })
     import subprocess
     
     try:
@@ -11091,6 +11285,12 @@ def remove_cron():
 @all_site_sync_required
 def get_clean_cron_status():
     """Get status of clean sync cron job"""
+    if sqlite3.is_postgres_backend():
+        return jsonify({
+            'enabled': False,
+            'scheduler': 'disabled-on-postgresql',
+            'message': '删除性清理调度已停用，必须走受控维护流程。',
+        })
     import subprocess
     
     try:
@@ -11127,6 +11327,10 @@ def get_clean_cron_status():
 @all_site_sync_required
 def setup_clean_cron():
     """Setup cron job for clean sync"""
+    if sqlite3.is_postgres_backend():
+        return jsonify({
+            'error': 'PostgreSQL 模式禁止创建删除性清理 cron；请走受控维护流程。'
+        }), 409
     import subprocess
     
     data = request.json
@@ -11170,6 +11374,11 @@ def setup_clean_cron():
 @all_site_sync_required
 def remove_clean_cron():
     """Remove cron job for clean sync"""
+    if sqlite3.is_postgres_backend():
+        return jsonify({
+            'success': True,
+            'message': 'PostgreSQL 模式下清理调度已保持禁用',
+        })
     import subprocess
     
     try:
@@ -15482,7 +15691,6 @@ def products():
     )
     
     # Get available sources (filtered by permissions and manager)
-    conn = get_db_connection()
     
     # Base source query
     source_query = 'SELECT DISTINCT source FROM orders'
@@ -16796,11 +17004,12 @@ def au_orders_sheet():
                o.customer_note, o.payment_method,
                n.note AS internal_note
         FROM orders o
-        LEFT JOIN (
-            SELECT order_id, note, date_created FROM order_notes
-            WHERE customer_note = 0 AND added_by_user = 1
-            GROUP BY order_id HAVING date_created = MAX(date_created)
-        ) n ON o.id = n.order_id
+        LEFT JOIN order_notes n ON n.id = (
+            SELECT n2.id FROM order_notes n2
+            WHERE n2.order_id = o.id
+              AND n2.customer_note = 0 AND n2.added_by_user = 1
+            ORDER BY n2.date_created DESC, n2.id DESC LIMIT 1
+        )
         WHERE o.source IN ({ph})
           AND o.status NOT IN ('checkout-draft', 'trash')
         ORDER BY o.date_created DESC
@@ -17239,13 +17448,11 @@ def get_pending_orders():
         FROM orders o
         LEFT JOIN sites s ON o.source = s.url
         LEFT JOIN warehouses w ON o.warehouse_id = w.id
-        LEFT JOIN (
-            SELECT order_id, note, date_created, author
-            FROM order_notes
-            WHERE customer_note = 0
-            GROUP BY order_id
-            HAVING date_created = MAX(date_created)
-        ) n ON o.id = n.order_id
+        LEFT JOIN order_notes n ON n.id = (
+            SELECT n2.id FROM order_notes n2
+            WHERE n2.order_id = o.id AND n2.customer_note = 0
+            ORDER BY n2.date_created DESC, n2.id DESC LIMIT 1
+        )
         WHERE o.status IN ('processing', 'offline', 'partial-shipped')
     '''
     params = []
@@ -17602,13 +17809,11 @@ def get_pending_outcome_orders():
         LEFT JOIN shipping_logs sl ON sl.id = (
             SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
         )
-        LEFT JOIN (
-            SELECT order_id, note, date_created, author
-            FROM order_notes
-            WHERE customer_note = 0
-            GROUP BY order_id
-            HAVING date_created = MAX(date_created)
-        ) n ON o.id = n.order_id
+        LEFT JOIN order_notes n ON n.id = (
+            SELECT n2.id FROM order_notes n2
+            WHERE n2.order_id = o.id AND n2.customer_note = 0
+            ORDER BY n2.date_created DESC, n2.id DESC LIMIT 1
+        )
         WHERE o.status IN ('on-hold', 'shipped', 'partial-shipped')
           AND o.payment_method = 'cod'
           AND COALESCE(o.is_undelivered, 0) = 0
@@ -17794,13 +17999,11 @@ def get_shipped_orders():
             SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
         )
         LEFT JOIN users u ON o.undelivered_by = u.id
-        LEFT JOIN (
-            SELECT order_id, note, date_created, author
-            FROM order_notes
-            WHERE customer_note = 0
-            GROUP BY order_id
-            HAVING date_created = MAX(date_created)
-        ) n ON o.id = n.order_id
+        LEFT JOIN order_notes n ON n.id = (
+            SELECT n2.id FROM order_notes n2
+            WHERE n2.order_id = o.id AND n2.customer_note = 0
+            ORDER BY n2.date_created DESC, n2.id DESC LIMIT 1
+        )
     '''
     conditions = ["o.status IN ('on-hold', 'shipped', 'partial-shipped')"]
     params = []
@@ -17990,13 +18193,11 @@ def find_orders_by_tracking():
             SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
         )
         LEFT JOIN users u ON o.undelivered_by = u.id
-        LEFT JOIN (
-            SELECT order_id, note, date_created, author
-            FROM order_notes
-            WHERE customer_note = 0
-            GROUP BY order_id
-            HAVING date_created = MAX(date_created)
-        ) n ON o.id = n.order_id
+        LEFT JOIN order_notes n ON n.id = (
+            SELECT n2.id FROM order_notes n2
+            WHERE n2.order_id = o.id AND n2.customer_note = 0
+            ORDER BY n2.date_created DESC, n2.id DESC LIMIT 1
+        )
         WHERE (
             o.number LIKE ?
             OR sl.tracking_number LIKE ?
@@ -18286,10 +18487,12 @@ def _post_fallback_customer_note(req, site, order, carrier_name, tracking_number
             timeout=WC_AUXILIARY_TIMEOUT,
             headers=api_headers,
         )
-        if note_resp.status_code not in (200, 201):
-            warnings.append(f"回退客户备注失败 HTTP {note_resp.status_code}")
+        if note_resp.status_code in (200, 201):
+            return True
+        warnings.append(f"回退客户备注失败 HTTP {note_resp.status_code}")
     except Exception as e:
         warnings.append(f"回退客户备注异常: {e}")
+    return False
 
 
 def target_status_for_format(fmt):
@@ -18301,6 +18504,79 @@ def target_status_for_format(fmt):
     sites). Mirroring what manual entry in WP-admin would do.
     """
     return 'shipped' if fmt == 'ast' else 'on-hold'
+
+
+def _put_wc_status_once(site, order_id, target_status, log_label):
+    """Send one WC status mutation and verify ambiguity with a read-only GET."""
+    import requests as req
+
+    url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order_id)}"
+    headers = {
+        'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+    confirmed = False
+    uncertain = False
+    http_status = None
+    confirmation = None
+
+    def verify():
+        try:
+            response = req.get(
+                url,
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=WC_VERIFY_TIMEOUT,
+                headers=headers,
+            )
+            if response.status_code == 200 and response.json().get('status') == target_status:
+                return True
+        except Exception as exc:
+            app.logger.warning(
+                '[%s] verify failed site=%s order=%s error=%s',
+                log_label, site['url'], order_id, exc,
+            )
+        return False
+
+    try:
+        response = req.put(
+            url,
+            json={'status': target_status},
+            auth=(site['consumer_key'], site['consumer_secret']),
+            timeout=WC_MUTATION_TIMEOUT,
+            headers=headers,
+        )
+        http_status = int(response.status_code)
+        if http_status in (200, 201):
+            try:
+                confirmed = response.json().get('status') == target_status
+                if confirmed:
+                    confirmation = 'response_body'
+                else:
+                    uncertain = True
+            except Exception:
+                uncertain = True
+        elif http_status >= 500 or (response.text or '').lstrip().startswith(('<!', '<html')):
+            uncertain = True
+        if not confirmed and verify():
+            confirmed = True
+            confirmation = 'verified_get'
+    except req.exceptions.RequestException:
+        uncertain = True
+        if verify():
+            confirmed = True
+            confirmation = 'verified_get'
+    except Exception:
+        uncertain = True
+        if verify():
+            confirmed = True
+            confirmation = 'verified_get'
+    return {
+        'confirmed': confirmed,
+        'uncertain': uncertain and not confirmed,
+        'http_status': http_status,
+        'confirmation': confirmation,
+    }
 
 
 def build_custom_lineitem_payload(tracking_number, carrier_slug, tracking_url, line_items):
@@ -18415,6 +18691,33 @@ def ship_order():
             'success': False,
             'error': f'该运单号已用于订单 #{duplicate_number}，不能重复绑定到不同订单，请核对运单号'
         }), 409
+
+    # An exact same-order submission is an idempotent replay, not a new
+    # shipment.  This guard also protects records created before the durable
+    # external_operations ledger existed.  A pending_sync row is deliberately
+    # not reported as success because the remote outcome still needs review.
+    existing_tracking = conn.execute(
+        """
+        SELECT status FROM shipping_logs
+        WHERE order_id=? AND tracking_number=? AND carrier_slug=?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (order_id, tracking_number, carrier_slug),
+    ).fetchone()
+    if existing_tracking:
+        conn.close()
+        if str(existing_tracking['status'] or '') == 'pending_sync':
+            return jsonify({
+                'success': False,
+                'uncertain': True,
+                'retry_safe': False,
+                'error': '该运单已有待核对记录，请勿重复提交；请先完成远端对账。',
+            }), 409
+        return jsonify({
+            'success': True,
+            'idempotent': True,
+            'message': '该订单已保存相同运单，本次未再次发货或通知客户。',
+        })
 
     # Customer-facing tracking URL — resolve placeholders from the DB template.
     # No carrier-specific hardcoding here; if a new carrier needs a URL, add a
@@ -18572,9 +18875,67 @@ def ship_order():
         if not missing_sku:
             ast_api_payload['sku'] = ','.join(str(item.get('sku')).strip() for item in selected_lines)
             ast_api_payload['qty'] = ','.join(str(p.get('qty')) for p in current_products)
+
+    external_operation_id = None
+    if sqlite3.is_postgres_backend():
+        operation_request = {
+            'order_id': str(order['id']),
+            'site_id': int(site['id']),
+            'tracking_number': tracking_number,
+            'carrier_slug': carrier_slug,
+            'expected_status': expected_status,
+            'new_parcel': new_parcel,
+            'more_batches': more_batches,
+            'is_reship': is_reship,
+            'reship_reason': reship_reason,
+            'items': current_products,
+        }
+        try:
+            external_operation = begin_operation(
+                conn,
+                operation_type='ship_order',
+                order_id=str(order['id']),
+                site_id=int(site['id']),
+                request_payload=operation_request,
+                created_by=str(current_user.id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            app.logger.exception(
+                '[SHIP] failed to persist operation before remote call site=%s order=%s',
+                site['url'], order['id'],
+            )
+            return jsonify({
+                'success': False,
+                'retry_safe': True,
+                'error': '无法创建发货幂等记录，尚未调用远端；请稍后重试。',
+            }), 503
+
+        external_operation_id = external_operation['operation_id']
+        if not external_operation['should_execute']:
+            conn.close()
+            prior_status = str(external_operation['status'])
+            if prior_status in ('local_committed', 'notified'):
+                return jsonify({
+                    'success': True,
+                    'idempotent': True,
+                    'operation_status': prior_status,
+                    'message': '相同发货操作已完成，本次未再次调用远端或通知客户。',
+                })
+            return jsonify({
+                'success': False,
+                'retry_safe': False,
+                'operation_status': prior_status,
+                'error': '相同发货操作正在执行或等待对账，请勿重复提交。',
+            }), 409
+
     warnings = []
     remote_success = False
     remote_state_uncertain = False
+    remote_http_status = None
+    remote_confirmation = None
 
     def _decode_nested_json(value):
         if isinstance(value, str):
@@ -18624,6 +18985,7 @@ def ship_order():
         return status_ok and _remote_order_has_tracking(payload)
 
     def _verify_remote_saved(reason):
+        nonlocal remote_confirmation
         try:
             check = req.get(
                 status_url,
@@ -18633,6 +18995,7 @@ def ship_order():
             )
             if check.status_code == 200 and _remote_order_applied(check.json()):
                 warnings.append(reason)
+                remote_confirmation = 'verified_get'
                 return True
         except Exception as verify_err:
             print(f"[SHIP] verify remote saved failed: {verify_err}")
@@ -18661,6 +19024,7 @@ def ship_order():
             timeout=WC_MUTATION_TIMEOUT,
             headers=api_headers
         )
+        remote_http_status = resp.status_code
         app.logger.info(
             "[SHIP] response site=%s order=%s fmt=%s status=%s",
             site['url'], order['id'], fmt, resp.status_code,
@@ -18668,6 +19032,7 @@ def ship_order():
         try:
             if _remote_order_applied(resp.json()):
                 remote_success = True
+                remote_confirmation = 'response_body'
                 if resp.status_code not in (200, 201):
                     warnings.append(f"远程返回 {resp.status_code}，但返回内容确认运单已写入")
         except Exception:
@@ -18703,9 +19068,55 @@ def ship_order():
             remote_state_uncertain = True
             warnings.append("远程响应超时，二次查询仍无法确认写入结果")
     except Exception as e:
+        remote_state_uncertain = True
         warnings.append(f"远程异常: {e}")
 
+    if remote_success and external_operation_id:
+        try:
+            _transition_external_operation(
+                external_operation_id,
+                'external_success',
+                external_reference=str(woo_post_id(order['id'])),
+                evidence={
+                    'http_status': remote_http_status,
+                    'confirmation': remote_confirmation or 'verified',
+                    'format': fmt,
+                },
+            )
+        except Exception:
+            app.logger.exception(
+                '[SHIP] remote committed but operation ledger update failed site=%s order=%s',
+                site['url'], order['id'],
+            )
+            return jsonify({
+                'success': False,
+                'remote_committed': True,
+                'retry_safe': False,
+                'error': '远端运单已写入，但操作状态未能持久化；请勿重复提交，需先对账。',
+            }), 503
+
     if not remote_success:
+        if external_operation_id:
+            try:
+                _transition_external_operation(
+                    external_operation_id,
+                    'reconciliation_required' if remote_state_uncertain else 'failed',
+                    evidence={
+                        'http_status': remote_http_status,
+                        'confirmation': remote_confirmation or 'not_confirmed',
+                        'format': fmt,
+                    },
+                    error=(
+                        'remote mutation outcome uncertain'
+                        if remote_state_uncertain
+                        else 'remote mutation definitively rejected'
+                    ),
+                )
+            except Exception:
+                app.logger.exception(
+                    '[SHIP] failed to record rejected/uncertain operation site=%s order=%s',
+                    site['url'], order['id'],
+                )
         # For a NEW parcel (split shipment) we don't stash anything: inserting a
         # row without remote confirmation would create a phantom parcel. For a
         # normal/first shipment we retain the submitted value as pending_sync,
@@ -18759,85 +19170,9 @@ def ship_order():
             f"新运单号 {tracking_number}。补发原因：{reship_reason}"
         )
 
-    # Trigger the site's native shipment email when the tracking API has not
-    # already done so. AST's native shipment endpoint handles both the status
-    # transition and its email; calling our trigger endpoint afterwards would
-    # duplicate the customer notification. VillaTheme (Orders Tracking for
-    # WooCommerce) does NOT hook into
-    #     status changes — its admin save handler invokes
-    #     VI_WOO_ORDERS_TRACKING_ADMIN_IMPORT_CSV::send_mail() directly.
-    #     Setting meta via REST never triggers send_mail(), so VillaTheme
-    #     sites stopped emailing customers after the ship_order rewrite.
-    #     The trigger endpoint replicates the admin call.
-    email_trigger_info = None
-    # Did a customer-facing notification actually go out? Only consumed by the
-    # reship fallback below; harmless for normal ships.
-    customer_notified = False
-    if send_email and fmt == 'ast' and ast_api_payload is not None:
-        email_trigger_info = {
-            'plugin': 'AST',
-            'email_sent': None,
-            'note': 'AST native shipment API handled the notification',
-        }
-        customer_notified = True
-    elif send_email:
-        try:
-            trig_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/trigger-shipment-email"
-            trig_resp = req.post(
-                trig_url,
-                json={'tracking_number': tracking_number, 'carrier_slug': carrier_slug},
-                timeout=WC_AUXILIARY_TIMEOUT,
-                headers={
-                    **api_headers,
-                    'X-Woo-Tracking-Key': site['consumer_key'],
-                    'X-Woo-Tracking-Secret': site['consumer_secret'],
-                },
-            )
-            if trig_resp.status_code == 200:
-                td = trig_resp.json() if trig_resp.text else {}
-                email_trigger_info = td
-                # Surface a warning only if we KNOW the email failed; AST
-                # returns email_sent=null because it's async, that's fine.
-                if td.get('email_sent') is True:
-                    customer_notified = True
-                elif td.get('email_sent') is False and td.get('plugin') not in ('AST',):
-                    warnings.append(f"邮件触发失败（{td.get('plugin', '?')}）: {td.get('note', '')}")
-            elif trig_resp.status_code == 404:
-                # Plugin not installed on this site — fall back to the
-                # legacy customer_note approach so the buyer still gets
-                # *some* notification.
-                warnings.append("邮件触发端点未找到（请确认 woo-orders-tracking-rest-api mu-plugin 已安装）")
-                _post_fallback_customer_note(req, site, order, carrier_name, tracking_number, tracking_url, api_headers, warnings)
-                customer_notified = True
-            else:
-                warnings.append(f"邮件触发返回 {trig_resp.status_code}")
-        except Exception as e:
-            warnings.append(f"邮件触发异常: {e}")
-
-    # 补发 MUST reach the customer with the NEW tracking. Whenever neither the
-    # native tracking API nor the plugin-specific trigger sent a notification,
-    # fall back to a WooCommerce customer note containing the new tracking.
-    if is_reship and send_email and not customer_notified:
-        _post_fallback_customer_note(req, site, order, carrier_name, tracking_number, tracking_url, api_headers, warnings)
-
-    # Re-shipment: leave an explicit audit note on the WC order so the WP admin
-    # reflects WHY a second tracking went out (best-effort; mirrors the
-    # mark-undelivered remote-note path).
-    if is_reship and reship_log_line:
-        try:
-            req.post(
-                f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes",
-                json={'note': reship_log_line, 'customer_note': False},
-                auth=(site['consumer_key'], site['consumer_secret']),
-                timeout=10,
-                headers=api_headers,
-            )
-        except Exception as remote_err:
-            app.logger.warning(f"Remote reship note for order {order_id} failed: {remote_err}")
-
     # Local DB: status + shipping_logs (mirror the remote state we just set).
-    # Only this local transaction is retried. The Woo write and customer email
-    # above are deliberately outside the callback and therefore run once.
+    # Only this local transaction is retried. Remote calls remain outside the
+    # callback and therefore run once.
     def _write_local_mirror(local_conn):
         local_conn.execute("UPDATE orders SET status=? WHERE id=?", (expected_status, order_id))
         if new_parcel:
@@ -18893,15 +19228,121 @@ def ship_order():
             "[SHIP] local mirror failed after remote commit site=%s order=%s tracking=%s",
             site['url'], order['id'], tracking_number,
         )
+        if external_operation_id:
+            try:
+                _transition_external_operation(
+                    external_operation_id,
+                    'reconciliation_required',
+                    error='local mirror failed after confirmed remote success',
+                )
+            except Exception:
+                app.logger.exception(
+                    '[SHIP] failed to mark local reconciliation site=%s order=%s',
+                    site['url'], order['id'],
+                )
         return jsonify({
             'success': False,
             'remote_committed': True,
             'retry_safe': False,
             'error': (
-                f"远端运单已写入，但本地记录更新失败: {e}。"
+                "远端运单已写入，但本地记录更新失败。"
                 "请勿重复提交；请刷新并核对订单，或联系管理员修复本地记录。"
             ),
         }), 503
+
+    if external_operation_id:
+        try:
+            _transition_external_operation(external_operation_id, 'local_committed')
+        except Exception:
+            app.logger.exception(
+                '[SHIP] local mirror committed but ledger update failed site=%s order=%s',
+                site['url'], order['id'],
+            )
+            return jsonify({
+                'success': False,
+                'remote_committed': True,
+                'local_committed': True,
+                'retry_safe': False,
+                'error': '远端和本地均已写入，但操作状态更新失败；请勿重复提交，需先对账。',
+            }), 503
+
+    # Notify only after the local mirror transaction has committed. AST's
+    # native shipment endpoint may already have notified as part of its single
+    # remote mutation; all other sites are notified here exactly once.
+    email_trigger_info = None
+    customer_notified = False
+    if send_email and fmt == 'ast' and ast_api_payload is not None:
+        email_trigger_info = {
+            'plugin': 'AST',
+            'email_sent': None,
+            'note': 'AST native shipment API handled the notification',
+        }
+        customer_notified = True
+    elif send_email:
+        try:
+            trig_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/trigger-shipment-email"
+            trig_resp = req.post(
+                trig_url,
+                json={'tracking_number': tracking_number, 'carrier_slug': carrier_slug},
+                timeout=WC_AUXILIARY_TIMEOUT,
+                headers={
+                    **api_headers,
+                    'X-Woo-Tracking-Key': site['consumer_key'],
+                    'X-Woo-Tracking-Secret': site['consumer_secret'],
+                },
+            )
+            if trig_resp.status_code == 200:
+                td = trig_resp.json() if trig_resp.text else {}
+                email_trigger_info = td
+                if td.get('email_sent') is True:
+                    customer_notified = True
+                elif td.get('email_sent') is False and td.get('plugin') not in ('AST',):
+                    warnings.append(f"邮件触发失败（{td.get('plugin', '?')}）: {td.get('note', '')}")
+            elif trig_resp.status_code == 404:
+                warnings.append("邮件触发端点未找到（请确认 woo-orders-tracking-rest-api mu-plugin 已安装）")
+                customer_notified = _post_fallback_customer_note(
+                    req, site, order, carrier_name, tracking_number,
+                    tracking_url, api_headers, warnings,
+                )
+            else:
+                warnings.append(f"邮件触发返回 {trig_resp.status_code}")
+        except Exception as e:
+            warnings.append(f"邮件触发异常: {e}")
+
+    # A re-shipment must explicitly tell the customer the replacement tracking
+    # when no plugin-native notification was confirmed.
+    if is_reship and send_email and not customer_notified:
+        customer_notified = _post_fallback_customer_note(
+            req, site, order, carrier_name, tracking_number,
+            tracking_url, api_headers, warnings,
+        )
+
+    # Keep a best-effort non-customer WooCommerce audit note for a re-shipment.
+    # The committed local row above prevents this side effect from being
+    # repeated if the client retries after losing the HTTP response.
+    if is_reship and reship_log_line:
+        try:
+            req.post(
+                f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes",
+                json={'note': reship_log_line, 'customer_note': False},
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=WC_AUXILIARY_TIMEOUT,
+                headers=api_headers,
+            )
+        except Exception as remote_err:
+            app.logger.warning(
+                "Remote reship note for order %s failed: %s", order_id, remote_err,
+            )
+
+    if customer_notified and external_operation_id:
+        try:
+            _transition_external_operation(external_operation_id, 'notified')
+        except Exception:
+            app.logger.exception(
+                '[SHIP] notification succeeded but ledger update failed site=%s order=%s',
+                site['url'], order['id'],
+            )
+            warnings.append('客户通知已执行，但通知状态需后台对账')
 
     # Annotate the success message — split-shipment aware.
     parcel_count = len(parcels)
@@ -19043,15 +19484,25 @@ def debug_tracking_sync(order_id):
 @shipper_required
 @order_site_editable
 def complete_order(order_id):
-    """Mark order as completed"""
+    """Mark an order completed without ever repeating an ambiguous WC write."""
     import requests as req
-    
+
     conn = get_db_connection()
-    
-    order = conn.execute('SELECT id, number, source FROM orders WHERE id = ?', (order_id,)).fetchone()
+
+    order = conn.execute(
+        'SELECT id, number, source, status FROM orders WHERE id = ?',
+        (order_id,),
+    ).fetchone()
     if not order:
         conn.close()
         return jsonify({'success': False, 'error': '订单不存在'}), 404
+    if order['status'] == 'completed':
+        conn.close()
+        return jsonify({
+            'success': True,
+            'idempotent': True,
+            'message': '订单已经是已完成，本次未再次调用站点。',
+        })
 
     from fulfillment_service import completion_guard
     may_complete, completion_error = completion_guard(conn, order_id)
@@ -19063,31 +19514,215 @@ def complete_order(order_id):
     if not site:
         conn.close()
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
-    
+
+    operation_id = None
+    if sqlite3.is_postgres_backend():
+        try:
+            operation = begin_operation(
+                conn,
+                operation_type='complete_order',
+                order_id=str(order['id']),
+                site_id=int(site['id']),
+                request_payload={'target_status': 'completed'},
+                created_by=str(current_user.id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            app.logger.exception(
+                '[COMPLETE] failed to persist operation site=%s order=%s',
+                site['url'], order['id'],
+            )
+            return jsonify({
+                'success': False,
+                'retry_safe': True,
+                'error': '无法创建完成订单幂等记录，尚未调用远端；请稍后重试。',
+            }), 503
+        operation_id = operation['operation_id']
+        if not operation['should_execute']:
+            conn.close()
+            prior_status = str(operation['status'])
+            if prior_status in ('local_committed', 'notified'):
+                return jsonify({
+                    'success': True,
+                    'idempotent': True,
+                    'operation_status': prior_status,
+                    'message': '相同完成操作已执行，本次未再次调用站点。',
+                })
+            return jsonify({
+                'success': False,
+                'retry_safe': False,
+                'operation_status': prior_status,
+                'error': '相同完成操作正在执行或等待对账，请勿重复提交。',
+            }), 409
+
+    conn.close()
+    url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}"
+    headers = {
+        'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+    remote_confirmed = False
+    uncertain = False
+    http_status = None
+    confirmation = None
+
+    def _verify_completed():
+        nonlocal confirmation
+        try:
+            check = req.get(
+                url,
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=WC_VERIFY_TIMEOUT,
+                headers=headers,
+            )
+            if check.status_code == 200 and check.json().get('status') == 'completed':
+                confirmation = 'verified_get'
+                return True
+        except Exception as verify_error:
+            app.logger.warning(
+                '[COMPLETE] verify failed site=%s order=%s error=%s',
+                site['url'], order['id'], verify_error,
+            )
+        return False
+
     try:
-        # Update order status via WooCommerce API
-        url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}"
         resp = req.put(
             url,
             json={'status': 'completed'},
             auth=(site['consumer_key'], site['consumer_secret']),
-            timeout=30
+            timeout=WC_MUTATION_TIMEOUT,
+            headers=headers,
         )
-        
-        if resp.status_code not in [200, 201]:
-            raise Exception(f"API错误: {resp.text}")
-        
-        # Update local database
-        conn.execute("UPDATE orders SET status = 'completed' WHERE id = ?", (order_id,))
-        conn.execute("UPDATE shipping_logs SET status = 'completed', completed_at = datetime('now') WHERE order_id = ?", (order_id,))
-        conn.commit()
-        conn.close()
-        
-        return jsonify({'success': True, 'message': '订单已完成'})
-        
-    except Exception as e:
-        conn.close()
-        return jsonify({'success': False, 'error': str(e)}), 500
+        http_status = int(resp.status_code)
+        if http_status in (200, 201):
+            try:
+                remote_confirmed = resp.json().get('status') == 'completed'
+                if remote_confirmed:
+                    confirmation = 'response_body'
+            except Exception:
+                uncertain = True
+        elif http_status >= 500 or (resp.text or '').lstrip().startswith(('<!', '<html')):
+            uncertain = True
+        if not remote_confirmed:
+            remote_confirmed = _verify_completed()
+    except req.exceptions.RequestException:
+        uncertain = True
+        remote_confirmed = _verify_completed()
+    except Exception:
+        uncertain = True
+        remote_confirmed = _verify_completed()
+
+    if not remote_confirmed:
+        if operation_id:
+            try:
+                _transition_external_operation(
+                    operation_id,
+                    'reconciliation_required' if uncertain else 'failed',
+                    evidence={
+                        'http_status': http_status,
+                        'confirmation': confirmation or 'not_confirmed',
+                    },
+                    error=(
+                        'complete order outcome uncertain'
+                        if uncertain else 'complete order rejected'
+                    ),
+                )
+            except Exception:
+                app.logger.exception(
+                    '[COMPLETE] failed to persist rejected outcome site=%s order=%s',
+                    site['url'], order['id'],
+                )
+        return jsonify({
+            'success': False,
+            'uncertain': uncertain,
+            'retry_safe': not uncertain,
+            'error': (
+                '站点完成状态无法确认；请勿重复提交，需先刷新并对账。'
+                if uncertain else '站点明确未接受完成状态，请核对后再试。'
+            ),
+        }), 504 if uncertain else 502
+
+    if operation_id:
+        try:
+            _transition_external_operation(
+                operation_id,
+                'external_success',
+                external_reference=str(woo_post_id(order['id'])),
+                evidence={
+                    'http_status': http_status,
+                    'confirmation': confirmation or 'verified',
+                },
+            )
+        except Exception:
+            app.logger.exception(
+                '[COMPLETE] remote committed but ledger update failed site=%s order=%s',
+                site['url'], order['id'],
+            )
+            return jsonify({
+                'success': False,
+                'remote_committed': True,
+                'retry_safe': False,
+                'error': '站点已完成订单，但操作状态未持久化；请勿重复提交，需先对账。',
+            }), 503
+
+    def _write_completed(local_conn):
+        local_conn.execute(
+            "UPDATE orders SET status='completed' WHERE id=?", (order_id,)
+        )
+        local_conn.execute(
+            """
+            UPDATE shipping_logs
+            SET status='completed',completed_at=CURRENT_TIMESTAMP
+            WHERE order_id=?
+            """,
+            (order_id,),
+        )
+
+    try:
+        _run_sqlite_write_with_retry(_write_completed)
+    except Exception:
+        if operation_id:
+            try:
+                _transition_external_operation(
+                    operation_id,
+                    'reconciliation_required',
+                    error='local completion mirror failed after remote success',
+                )
+            except Exception:
+                app.logger.exception(
+                    '[COMPLETE] failed to mark reconciliation site=%s order=%s',
+                    site['url'], order['id'],
+                )
+        return jsonify({
+            'success': False,
+            'remote_committed': True,
+            'retry_safe': False,
+            'error': '站点已完成订单，但本地写入失败；请勿重复提交，需先对账。',
+        }), 503
+
+    if operation_id:
+        try:
+            _transition_external_operation(operation_id, 'local_committed')
+            # WooCommerce's completed transition is itself the notification
+            # trigger; the confirmed remote response proves it was requested.
+            _transition_external_operation(operation_id, 'notified')
+        except Exception:
+            app.logger.exception(
+                '[COMPLETE] committed but final ledger update failed site=%s order=%s',
+                site['url'], order['id'],
+            )
+            return jsonify({
+                'success': False,
+                'remote_committed': True,
+                'local_committed': True,
+                'retry_safe': False,
+                'error': '订单已完成，但操作账本需对账；请勿重复提交。',
+            }), 503
+
+    return jsonify({'success': True, 'message': '订单已完成'})
 
 
 @app.route('/api/shipping/carriers')
@@ -20083,6 +20718,184 @@ def confirm_order_delivery(order_id):
     if not may_complete:
         conn.close()
         return jsonify({'success': False, 'error': completion_error}), 409
+
+    # PostgreSQL production path: the external state change is durably claimed
+    # before the network call, sent once, verified, and only then mirrored in a
+    # short local transaction. The SQLite branch below remains available solely
+    # for emergency rollback.
+    if sqlite3.is_postgres_backend() and order['status'] != 'completed':
+        site = conn.execute(
+            'SELECT * FROM sites WHERE url=?', (order['source'],)
+        ).fetchone()
+        writable = bool(
+            site
+            and site['consumer_key']
+            and site['consumer_secret']
+            and ('api_write_status' not in site.keys() or site['api_write_status'] != 'error')
+        )
+        if writable:
+            try:
+                operation = begin_operation(
+                    conn,
+                    operation_type='confirm_delivery',
+                    order_id=str(order['id']),
+                    site_id=int(site['id']),
+                    request_payload={'target_status': 'completed'},
+                    created_by=str(current_user.id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                conn.close()
+                app.logger.exception(
+                    '[CONFIRM_DELIVERY] failed to persist operation site=%s order=%s',
+                    site['url'], order['id'],
+                )
+                return jsonify({
+                    'success': False,
+                    'retry_safe': True,
+                    'error': '无法创建确认签收幂等记录，尚未调用远端；请稍后重试。',
+                }), 503
+
+            operation_id = operation['operation_id']
+            if not operation['should_execute']:
+                conn.close()
+                prior_status = str(operation['status'])
+                if prior_status in ('local_committed', 'notified'):
+                    return jsonify({
+                        'success': True,
+                        'idempotent': True,
+                        'operation_status': prior_status,
+                        'message': '该签收操作已完成，本次未再次更新站点或发送通知。',
+                    })
+                return jsonify({
+                    'success': False,
+                    'retry_safe': False,
+                    'operation_status': prior_status,
+                    'error': '该签收操作正在执行或等待对账，请勿重复提交。',
+                }), 409
+
+            conn.close()
+            remote = _put_wc_status_once(
+                site, order['id'], 'completed', 'CONFIRM_DELIVERY'
+            )
+            if not remote['confirmed']:
+                try:
+                    _transition_external_operation(
+                        operation_id,
+                        'reconciliation_required' if remote['uncertain'] else 'failed',
+                        evidence={
+                            'http_status': remote['http_status'],
+                            'confirmation': remote['confirmation'] or 'not_confirmed',
+                        },
+                        error=(
+                            'confirm delivery outcome uncertain'
+                            if remote['uncertain'] else 'confirm delivery rejected'
+                        ),
+                    )
+                except Exception:
+                    app.logger.exception(
+                        '[CONFIRM_DELIVERY] failed to persist rejected outcome site=%s order=%s',
+                        site['url'], order['id'],
+                    )
+                return jsonify({
+                    'success': False,
+                    'uncertain': remote['uncertain'],
+                    'retry_safe': not remote['uncertain'],
+                    'error': (
+                        '站点签收状态无法确认；请勿重复提交，需先刷新并对账。'
+                        if remote['uncertain'] else '站点明确未接受签收状态，请核对后再试。'
+                    ),
+                }), 504 if remote['uncertain'] else 502
+
+            try:
+                _transition_external_operation(
+                    operation_id,
+                    'external_success',
+                    external_reference=str(woo_post_id(order['id'])),
+                    evidence={
+                        'http_status': remote['http_status'],
+                        'confirmation': remote['confirmation'] or 'verified',
+                    },
+                )
+            except Exception:
+                app.logger.exception(
+                    '[CONFIRM_DELIVERY] remote committed but ledger failed site=%s order=%s',
+                    site['url'], order['id'],
+                )
+                return jsonify({
+                    'success': False,
+                    'remote_committed': True,
+                    'retry_safe': False,
+                    'error': '站点已确认签收，但操作状态未持久化；请勿重复提交，需先对账。',
+                }), 503
+
+            def _write_confirmed(local_conn):
+                cursor = local_conn.execute(
+                    """
+                    UPDATE orders
+                    SET delivery_confirmed=true,
+                        delivery_confirmed_at=CURRENT_TIMESTAMP,
+                        delivery_confirmed_by=?,status='completed'
+                    WHERE id=? AND COALESCE(delivery_confirmed,false)=false
+                    """,
+                    (int(current_user.id), order_id),
+                )
+                if int(cursor.rowcount or 0):
+                    local_conn.execute(
+                        """
+                        INSERT INTO order_notes
+                            (order_id,note,date_created,customer_note,author,added_by_user)
+                        VALUES (?,?,CURRENT_TIMESTAMP,false,?,true)
+                        """,
+                        (
+                            order_id,
+                            f"订单被 {current_user.name} 确认「已签收」",
+                            current_user.name,
+                        ),
+                    )
+
+            try:
+                _run_sqlite_write_with_retry(_write_confirmed)
+            except Exception:
+                try:
+                    _transition_external_operation(
+                        operation_id,
+                        'reconciliation_required',
+                        error='local delivery confirmation failed after remote success',
+                    )
+                except Exception:
+                    app.logger.exception(
+                        '[CONFIRM_DELIVERY] failed to mark reconciliation site=%s order=%s',
+                        site['url'], order['id'],
+                    )
+                return jsonify({
+                    'success': False,
+                    'remote_committed': True,
+                    'retry_safe': False,
+                    'error': '站点已确认签收，但本地写入失败；请勿重复提交，需先对账。',
+                }), 503
+
+            try:
+                _transition_external_operation(operation_id, 'local_committed')
+                _transition_external_operation(operation_id, 'notified')
+            except Exception:
+                app.logger.exception(
+                    '[CONFIRM_DELIVERY] final ledger update failed site=%s order=%s',
+                    site['url'], order['id'],
+                )
+                return jsonify({
+                    'success': False,
+                    'remote_committed': True,
+                    'local_committed': True,
+                    'retry_safe': False,
+                    'error': '签收已完成，但操作账本需对账；请勿重复提交。',
+                }), 503
+
+            return jsonify({
+                'success': True,
+                'message': '已确认签收；已同步站点为「已完成」',
+            })
 
     # 1. Local confirm — source of truth for the queue; always first.
     if not order['delivery_confirmed']:
@@ -22149,8 +22962,13 @@ def api_report_data():
     has_traffic = any('uv' in m for s in combined.values() for m in s.values())
     if has_traffic:
         try:
-            conn.execute('INSERT OR REPLACE INTO report_cache (cache_key, cache_value) VALUES (?, ?)', 
-                        (cache_key, json.dumps(final_result)))
+            conn.execute('''
+                INSERT INTO report_cache (cache_key, cache_value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    cache_value=excluded.cache_value,
+                    updated_at=excluded.updated_at
+            ''', (cache_key, json.dumps(final_result)))
             conn.commit()
             print(f"DEBUG: Updated server cache for {cache_key}")
         except Exception as e:
@@ -22191,8 +23009,13 @@ def report_cache_sync():
              
         # Save to DB
         conn = get_db_connection()
-        conn.execute('INSERT OR REPLACE INTO report_cache (cache_key, cache_value) VALUES (?, ?)', 
-                    (cache_key, json.dumps(traffic_data)))
+        conn.execute('''
+            INSERT INTO report_cache (cache_key, cache_value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                cache_value=excluded.cache_value,
+                updated_at=excluded.updated_at
+        ''', (cache_key, json.dumps(traffic_data)))
         conn.commit()
         conn.close()
         

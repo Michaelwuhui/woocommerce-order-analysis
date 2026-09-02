@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import socket
-import sqlite3
+import db_backend as sqlite3
 import time
 import traceback
 import uuid

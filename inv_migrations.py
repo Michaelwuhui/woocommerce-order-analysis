@@ -24,7 +24,7 @@ import sys
 import shutil
 import datetime
 import json
-import sqlite3
+import db_backend as sqlite3
 
 from inv_common import (
     DB_FILE,

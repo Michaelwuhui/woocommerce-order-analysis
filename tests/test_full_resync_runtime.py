@@ -1,11 +1,5 @@
 from pathlib import Path
 
-import pytest
-
-import full_resync_all
-from sync_runtime_status import load_sync_runtime_status
-
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -33,74 +27,54 @@ class SequenceWCAPI:
         return outcome
 
 
-def test_page_request_retries_network_failures_then_succeeds():
-    wcapi = SequenceWCAPI(
-        [TimeoutError("ipv6 timeout"), TimeoutError("read timeout"), FakeResponse()]
-    )
-    sleeps = []
-
-    response = full_resync_all.fetch_orders_page(
-        wcapi,
-        7,
-        sleep_fn=sleeps.append,
-    )
-
-    assert response.status_code == 200
-    assert wcapi.calls == full_resync_all.MAX_PAGE_ATTEMPTS == 3
-    assert sleeps == [1, 2]
+def test_deep_entrypoint_submits_the_durable_pipeline():
+    source = ROOT.joinpath("full_resync_all.py").read_text(encoding="utf-8")
+    assert "from sync_service import start_sync" in source
+    assert 'mode="deep"' in source
+    assert 'params={"per_page": 50' in source
+    assert "threading.Thread" not in source
+    assert "woocommerce.API" not in source
 
 
-def test_page_request_stops_after_bounded_attempts():
-    wcapi = SequenceWCAPI([TimeoutError("offline")] * 5)
-
-    with pytest.raises(TimeoutError, match="offline"):
-        full_resync_all.fetch_orders_page(wcapi, 3, sleep_fn=lambda _seconds: None)
-
-    assert wcapi.calls == full_resync_all.MAX_PAGE_ATTEMPTS == 3
+def test_fetch_retry_budget_lives_in_the_celery_page_task():
+    source = ROOT.joinpath("sync_tasks.py").read_text(encoding="utf-8")
+    assert "MAX_FETCH_RETRIES = 3" in source
+    assert "max_retries=MAX_FETCH_RETRIES" in source
+    assert "raise self.retry(" in source
 
 
-def test_page_request_retries_retryable_http_status():
-    wcapi = SequenceWCAPI([FakeResponse(503), FakeResponse(200)])
-
-    response = full_resync_all.fetch_orders_page(
-        wcapi,
-        2,
-        sleep_fn=lambda _seconds: None,
-    )
-
-    assert response.status_code == 200
-    assert wcapi.calls == 2
+def test_fetch_retry_classification_is_explicit():
+    source = ROOT.joinpath("sync_tasks.py").read_text(encoding="utf-8")
+    assert "RETRYABLE_HTTP = {429, 500, 502, 503, 504}" in source
+    assert "if status in {401, 403}:" in source
+    assert "raise PermanentFetchError" in source
 
 
-def test_runtime_reporter_persists_progress_for_other_processes(tmp_path, monkeypatch):
-    db_path = tmp_path / "orders.db"
-    monkeypatch.setattr(full_resync_all, "DB_FILE", str(db_path))
-    reporter = full_resync_all.RuntimeStatusReporter(123456)
-
-    reporter.update(
-        status="running",
-        message="站点 2/34，第 4 页",
-        progress=4.25,
-        log="page 4 saved",
-    )
-
-    conn = full_resync_all._connect_db()
-    loaded = load_sync_runtime_status(conn, 123456)
-    conn.close()
-    assert loaded["status"] == "running"
-    assert loaded["message"] == "站点 2/34，第 4 页"
-    assert loaded["progress"] == 4.25
-    assert loaded["logs"] == ["page 4 saved"]
+def test_runtime_progress_is_persisted_in_postgres_authority_tables():
+    schema = ROOT.joinpath(
+        "migrations", "postgresql", "002_sync_pipeline.sql"
+    ).read_text(encoding="utf-8")
+    for table in ("sync_runs", "sync_site_progress", "sync_page_receipts"):
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in schema
+    for column in (
+        "heartbeat_at", "completed_sites", "current_page", "fetched_count",
+        "written_count", "retry_count",
+    ):
+        assert column in schema
 
 
-def test_auto_and_full_sync_use_the_same_exclusive_lock():
+def test_auto_and_full_sync_use_the_same_database_global_mutex():
     auto_source = ROOT.joinpath("auto_sync.py").read_text(encoding="utf-8")
     full_source = ROOT.joinpath("full_resync_all.py").read_text(encoding="utf-8")
+    schema = ROOT.joinpath(
+        "migrations", "postgresql", "002_sync_pipeline.sql"
+    ).read_text(encoding="utf-8")
 
-    assert "from sync_process_lock import" in auto_source
-    assert "from sync_process_lock import" in full_source
-    assert "with exclusive_sync_lock()" in auto_source
-    assert "with exclusive_sync_lock()" in full_source
+    assert "from sync_service import start_sync" in auto_source
+    assert "from sync_service import start_sync" in full_source
+    assert 'mode="auto"' in auto_source
+    assert 'mode="deep"' in full_source
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_runs_one_active" in schema
 
 
 def test_deep_sync_route_uses_unique_persisted_status_and_child_status_id():

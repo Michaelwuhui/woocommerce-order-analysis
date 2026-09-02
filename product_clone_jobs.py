@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import uuid
 
+import db_backend as db
+
 
 TERMINAL_STATUSES = frozenset({"succeeded", "partial_failed", "failed", "interrupted"})
 
@@ -103,9 +105,11 @@ def recover_interrupted_jobs(conn) -> int:
 
 
 def claim_clone_job(conn, worker_id: str) -> dict | None:
-    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("BEGIN" if db.is_postgres_backend() else "BEGIN IMMEDIATE")
+    lock_clause = " FOR UPDATE SKIP LOCKED" if db.is_postgres_backend() else ""
     row = conn.execute(
-        "SELECT id FROM product_clone_jobs WHERE status='queued' ORDER BY created_at, id LIMIT 1"
+        "SELECT id FROM product_clone_jobs WHERE status='queued' "
+        "ORDER BY created_at, id LIMIT 1" + lock_clause
     ).fetchone()
     if not row:
         conn.commit()

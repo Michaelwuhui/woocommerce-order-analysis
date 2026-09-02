@@ -1,0 +1,35 @@
+[Unit]
+Description=Woo Analysis singleton Celery Beat scheduler
+After=network-online.target postgresql.service redis-server.service woo-celery-write.service
+Wants=network-online.target
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/www/wwwroot/woo-analysis
+EnvironmentFile=/etc/woo-analysis/woo-analysis.env
+Environment=PYTHONUNBUFFERED=1
+Environment=WOO_DB_POOL_MAX=1
+Environment=WOO_DB_APPLICATION_NAME=woo-celery-beat
+ExecStart=/www/wwwroot/woo-analysis/venv/bin/python -m celery -A celery_app:celery_app beat --schedule=/var/lib/woo-analysis/celerybeat-schedule --pidfile=/run/woo-analysis/celery-beat.pid --loglevel=INFO --logfile=/var/log/woo-analysis/celery-beat.log
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+RuntimeDirectory=woo-analysis
+RuntimeDirectoryMode=0750
+StateDirectory=woo-analysis
+StateDirectoryMode=0750
+LogsDirectory=woo-analysis
+LogsDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/woo-analysis /run/woo-analysis /var/lib/woo-analysis
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

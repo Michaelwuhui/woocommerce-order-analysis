@@ -1019,7 +1019,9 @@ def create_test_send_job(
     return {"created": True, "duplicate": False, "job": dict(job)}
 
 
-def enqueue_synced_orders(candidates: list[dict]) -> None:
+def enqueue_synced_orders(
+    candidates: list[dict], *, raise_on_error: bool = False
+) -> None:
     """Called after WooCommerce UPSERT commit; never breaks core sync."""
     if not candidates:
         return
@@ -1043,6 +1045,8 @@ def enqueue_synced_orders(candidates: list[dict]) -> None:
         finally:
             conn.close()
     except Exception as exc:
+        if raise_on_error:
+            raise
         print(f"[order-notification] enqueue skipped: {type(exc).__name__}")
 
 

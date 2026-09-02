@@ -21,7 +21,7 @@ carrier_status stores the NORMALIZED outcome:
     venv/bin/python resolve_outcomes.py --live      # write carrier_status; registers DPD numbers w/ 17track
     venv/bin/python resolve_outcomes.py --live --carrier inpost   # one carrier only
 """
-import sqlite3
+import db_backend as sqlite3
 import json
 import time
 import sys

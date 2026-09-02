@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Test the check_all_sites_api function"""
+"""Read-only WooCommerce API connectivity diagnostic.
+
+This file intentionally performs no write-permission probe.  Production write
+paths are verified with mocks plus their durable operation/read-back ledger.
+"""
 import sys
 sys.path.insert(0, '/www/wwwroot/woo-analysis')
 
@@ -36,33 +40,7 @@ with app.app_context():
         
         if response.status_code == 200:
             print("✓ Read permission OK")
-            
-            # Test write
-            print("\nTesting WRITE permission...")
-            orders = response.json()
-            if orders and len(orders) > 0:
-                test_order_id = orders[0]['id']
-                print(f"Using order ID: {test_order_id}")
-                
-                test_note_response = wcapi.post(
-                    f"orders/{test_order_id}/notes",
-                    data={
-                        "note": "[API权限测试] 此消息用于验证写权限，将立即删除",
-                        "customer_note": False
-                    }
-                )
-                print(f"Note creation status: {test_note_response.status_code}")
-                
-                if test_note_response.status_code in (200, 201):
-                    print("✓ Write permission OK")
-                    note_id = test_note_response.json().get('id')
-                    if note_id:
-                        delete_resp = wcapi.delete(f"orders/{test_order_id}/notes/{note_id}")
-                        print(f"Note deletion status: {delete_resp.status_code}")
-                else:
-                    print(f"✗ Write permission FAILED: {test_note_response.text}")
-            else:
-                print("No orders to test write permission")
+            print("Write permission: NOT TESTED (production-safe read-only mode)")
         else:
             print(f"✗ Read permission FAILED: {response.status_code}")
             

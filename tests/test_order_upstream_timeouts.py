@@ -86,13 +86,15 @@ def test_fulfillment_worker_commits_tracking_before_network_notification():
 def test_all_order_runtime_connections_wait_for_short_sqlite_contention():
     app_connection = _function_source("get_db_connection")
     auto_sync = ROOT.joinpath("auto_sync.py").read_text(encoding="utf-8")
+    db_backend = ROOT.joinpath("db_backend.py").read_text(encoding="utf-8")
     sync_utils = ROOT.joinpath("sync_utils.py").read_text(encoding="utf-8")
 
     assert "timeout_seconds=SQLITE_BUSY_TIMEOUT_SECONDS" in app_connection
     assert "timeout=timeout_seconds" in app_connection
     assert "PRAGMA busy_timeout" in app_connection
-    assert "sqlite3.connect(DB_FILE, timeout=30)" in auto_sync
-    assert "PRAGMA busy_timeout=30000" in auto_sync
+    assert "from sync_service import start_sync" in auto_sync
+    assert "ConnectionPool" in db_backend
+    assert "WOO_DB_POOL_TIMEOUT" in db_backend
     assert sync_utils.count("sqlite3.connect(DB_FILE, timeout=30)") >= 2
 
 
