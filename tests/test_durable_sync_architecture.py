@@ -212,6 +212,22 @@ def test_postgresql_mode_cannot_recreate_legacy_sync_crons():
     assert clean.index("sqlite3.is_postgres_backend()") < clean.index("/usr/bin/crontab")
 
 
+def test_products_route_ends_read_transactions_before_cpu_aggregation():
+    source = (ROOT / "app.py").read_text()
+    products = source[source.index("def products():") : source.index("@app.route('/api/brands')")]
+    first_query = products.index("mappings_rows = conn.execute")
+    first_commit = products.index("conn.commit()", first_query)
+    assert first_commit < products.index("# Aggregate product data")
+
+    loss_query = products.index("shipping_loss_by_currency = {}")
+    loss_commit = products.index("conn.commit()", loss_query)
+    assert loss_commit < products.index("# Subtract the loss")
+
+    trend_query = products.index("trend_orders = conn.execute")
+    trend_commit = products.index("conn.commit()", trend_query)
+    assert trend_commit < products.index("weekly_flavor_data = {}")
+
+
 def test_cutover_crontab_filter_is_exact_and_preserves_unrelated_jobs():
     source = """LANG=en_US.UTF-8
 30 3 * * * cd /www/wwwroot/woo-analysis && python 1.wooorders_sqlite.py
