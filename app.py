@@ -21775,13 +21775,16 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
     else:  # month
         time_expr = "strftime('%Y-%m', date_created)"
     
-    # success_net excludes undelivered (via _revenue_status_cond) AND deducts
-    # the shipping_loss that those undelivered orders cost us — keeps the
+    # total_amount is native-currency GMV. Keep it for legacy API consumers,
+    # but also convert each (period, currency) bucket to gmv_cny so the report
+    # never adds unlike currencies together. success_net excludes undelivered
+    # (via _revenue_status_cond) AND deducts their shipping loss, keeping the
     # report's net column consistent with /monthly and /orders summary views.
     query = f'''
         SELECT
             source,
             {time_expr} as period,
+            strftime('%Y-%m', date_created) as rate_month,
             COUNT(*) as order_count,
             SUM(total) as total_amount,
             SUM(total - shipping_total) as net_amount,
@@ -21822,7 +21825,9 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
         query += ' AND source = ?'
         params.append(source)
     
-    query += f' GROUP BY source, period, currency ORDER BY source, period'
+    # A week can span two calendar months. Keep rate_month in the grouping so
+    # each order bucket uses the exchange rate for its actual order month.
+    query += f' GROUP BY source, period, rate_month, currency ORDER BY source, period'
     
     orders = conn.execute(query, params).fetchall()
     conn.close()
@@ -21840,19 +21845,42 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
             result[source_url]['periods'][period] = {
                 'order_count': 0,
                 'total_amount': 0,
+                'gmv_cny': 0,
                 'net_amount': 0,
-                'net_cny': 0
+                'net_cny': 0,
+                'missing_exchange_rates': []
             }
         
-        # Get exchange rate (use month from period for rate lookup)
-        rate_month = period[:7] if len(period) >= 7 else period
+        # Always use the order's calendar month, including for weekly reports.
+        rate_month = row['rate_month']
         rate, _ = get_cny_rate(currency, rate_month)
-        rate = rate or 1
-        
-        result[source_url]['periods'][period]['order_count'] += row['order_count']
-        result[source_url]['periods'][period]['total_amount'] += row['total_amount'] or 0
-        result[source_url]['periods'][period]['net_amount'] += row['success_net'] or 0
-        result[source_url]['periods'][period]['net_cny'] += (row['success_net'] or 0) * rate
+
+        period_data = result[source_url]['periods'][period]
+        native_gmv = float(row['total_amount'] or 0)
+        native_net = float(row['success_net'] or 0)
+        period_data['order_count'] += int(row['order_count'] or 0)
+        period_data['total_amount'] += native_gmv
+        period_data['net_amount'] += native_net
+
+        if rate is None:
+            missing_key = f"{(currency or 'N/A').upper()}@{rate_month}"
+            if missing_key not in period_data['missing_exchange_rates']:
+                period_data['missing_exchange_rates'].append(missing_key)
+        else:
+            period_data['gmv_cny'] += native_gmv * float(rate)
+            period_data['net_cny'] += native_net * float(rate)
+
+    for source_data in result.values():
+        for period_data in source_data['periods'].values():
+            period_data['total_amount'] = round(period_data['total_amount'], 2)
+            period_data['net_amount'] = round(period_data['net_amount'], 2)
+            if period_data['missing_exchange_rates']:
+                # A partial CNY sum is misleading, so fail closed for this cell.
+                period_data['gmv_cny'] = None
+                period_data['net_cny'] = None
+            else:
+                period_data['gmv_cny'] = round(period_data['gmv_cny'], 2)
+                period_data['net_cny'] = round(period_data['net_cny'], 2)
     
     return result
 
@@ -21898,7 +21926,7 @@ def api_report_data():
         start_date = start_dt.strftime('%Y-%m-%d')
     
     # Cache Logic - include granularity, country, and manager in key
-    report_cache_version = 'v6'
+    report_cache_version = 'v7'
     cache_key = f"traffic_{report_cache_version}_{start_date}_{end_date}_{granularity}_{country}_{manager}"
     force_refresh = request.args.get('force', 'false') == 'true'
     
@@ -22033,6 +22061,7 @@ def api_report_data():
     
     # Process orders data (new structure with currency)
     site_currencies = {}  # Store currency per site
+    all_missing_exchange_rates = set()
     for source, source_data in orders_data.items():
         site_name = None
         norm_source = normalize_domain(source)
@@ -22069,17 +22098,33 @@ def api_report_data():
             current['order_count'] = current.get('order_count', 0) + data['order_count']
             current['total_amount'] = current.get('total_amount', 0) + data['total_amount']
             current['net_amount'] = current.get('net_amount', 0) + data['net_amount']
-            current['net_cny'] = current.get('net_cny', 0) + data['net_cny']
+            missing_rates = data.get('missing_exchange_rates') or []
+            if missing_rates:
+                current_missing = current.setdefault('missing_exchange_rates', [])
+                for missing_rate in missing_rates:
+                    if missing_rate not in current_missing:
+                        current_missing.append(missing_rate)
+                all_missing_exchange_rates.update(missing_rates)
+            else:
+                current['gmv_cny'] = current.get('gmv_cny', 0) + (data.get('gmv_cny') or 0)
+                current['net_cny'] = current.get('net_cny', 0) + (data.get('net_cny') or 0)
     
     # Calculate derived metrics
     for site_name, periods in combined.items():
         for period, data in periods.items():
             uv = data.get('uv', 0)
             orders = data.get('order_count', 0)
-            net_cny = data.get('net_cny', 0)
-            
             data['conversion_rate'] = round(orders / uv * 100, 2) if uv > 0 else None
-            data['aov_cny'] = round(net_cny / orders, 2) if orders > 0 else None
+            if data.get('missing_exchange_rates'):
+                data['gmv_cny'] = None
+                data['net_cny'] = None
+                data['aov_cny'] = None
+            else:
+                gmv_cny = round(data.get('gmv_cny', 0), 2)
+                data['gmv_cny'] = gmv_cny
+                data['net_cny'] = round(data.get('net_cny', 0), 2)
+                # AOV uses the same gross-order population as GMV/order_count.
+                data['aov_cny'] = round(gmv_cny / orders, 2) if orders > 0 else None
     
     sorted_periods = sorted(all_periods)
     
@@ -22094,6 +22139,7 @@ def api_report_data():
         'date_range': {'start': start_date, 'end': end_date},
         'granularity': granularity,
         'cache_version': report_cache_version,
+        'missing_exchange_rates': sorted(all_missing_exchange_rates),
         'filters': {'country': country, 'manager': manager}
     }
 
@@ -22137,7 +22183,7 @@ def report_cache_sync():
         if not start_date or not end_date or not traffic_data:
             return jsonify({'success': False, 'error': '数据不完整'}), 400
             
-        cache_key = f"traffic_v6_{start_date}_{end_date}_{granularity}_{country}_{manager}"
+        cache_key = f"traffic_v7_{start_date}_{end_date}_{granularity}_{country}_{manager}"
         
         # Verify structure roughly
         if 'data' not in traffic_data or 'months' not in traffic_data:
