@@ -35,52 +35,16 @@ def create_robust_wcapi(url, consumer_key, consumer_secret, proxy_config=None):
         print(f"创建 WooCommerce API 客户端时出错: {e}")
         return None
 
-# -----------------------------
-# 硬编码站点配置（作为备用/初始数据）
-# Web 应用会优先使用数据库中的 sites 表配置
-# -----------------------------
-HARDCODED_SITES = [
-    {
-        "url": "https://www.buchmistrz.pl",
-        "ck": "ck_75e405e4a60395d1b76aaebb1bf9cda39f53373a",
-        "cs": "cs_7b4c64a2aa0681754d85a35100b70ddf562a33ca"
-    },
-    {
-        "url": "https://www.strefajednorazowek.pl",
-        "ck": "ck_5ce4c80f4b4abe045c2ba3bbe3ca31525db1b101",
-        "cs": "cs_0016d8fd65de3474b16879281804b6fc055b34f1"
-    },
-    {
-        "url": "https://www.vapicoau.com",
-        "ck": "ck_72397759d2c45840107b9d9929ea3dbf4743c28a",
-        "cs": "cs_555a5c961438a761f953c624a76de60c243d4a97"
-    },
-    {
-        "url": "https://www.vapeprime.pl",
-        "ck": "ck_b4d828f212b61228ae94506f6bdb71b5a4f41e8c",
-        "cs": "cs_06af71df5c384c910726d23bcb2d34f94f783253"
-    },
-    {
-        "url": "https://www.vapeprimeau.com",
-        "ck": "ck_e8ff54af41a9de304614bb504665e1de53162da5",
-        "cs": "cs_77a37538dd6c480227a1f57e28b2903411220a6c"
-    },
-    {
-        "url": "https://www.vaportrail.ae",
-        "ck": "ck_646ed2e068e58bda88e5af7ee43c36f981087416",
-        "cs": "cs_0cf22f59596be752c3243d80294e003bdb87bd2f"
-    },
-    {
-        "url": "https://vaporburst.ae",
-        "ck": "cs_838aa96f94e0cabc041be0aeaa541804871e16a9",
-        "cs": "ck_2fb0cf7665a180445bfb28fbdbd7f66281bbf1c7"
-    },
-]
+# Site credentials are loaded exclusively from the protected database. Never
+# add fallback Consumer Keys or Consumer Secrets to source control.
 
 # -----------------------------
 # SQLite 数据库配置
 # -----------------------------
-DB_FILE = 'woocommerce_orders.db'
+DB_FILE = os.getenv(
+    'WOO_SQLITE_PATH',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'woocommerce_orders.db'),
+)
 
 # -----------------------------
 # 孤儿单清理保护阈值（P0-a 数据保护改造）
@@ -126,12 +90,11 @@ def get_sites_from_db():
 
 
 def get_sites():
-    """获取站点配置，优先从数据库读取，若无数据则使用硬编码配置"""
+    """仅从受保护数据库读取站点配置。"""
     db_sites = get_sites_from_db()
     if db_sites:
         return db_sites
-    print("数据库无站点配置，使用硬编码配置")
-    return HARDCODED_SITES
+    raise RuntimeError('数据库中没有可用站点配置；拒绝使用源码凭据回退')
 
 def create_orders_table():
     """创建订单表"""

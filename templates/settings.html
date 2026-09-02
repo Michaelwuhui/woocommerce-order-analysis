@@ -183,7 +183,8 @@
             <div class="small text-white-50 mt-3">
                 <i class="bi bi-info-circle me-1"></i>
                 自动策略：每小时一致性热备 → 本地保留约 2 天 → 上传 Cloudflare R2（30 天自动清理）。
-                还原：下载某份 <code>.db.gz</code>，解压校验后替换数据库即可（步骤见 backup_db.py 顶部注释）。
+                还原：SQLite 使用 <code>.db.gz</code>，PostgreSQL 使用 <code>.dump</code>；先按同名
+                <code>.sha256</code> 校验，再按 backup_db.py 顶部步骤恢复到独立测试库验证。
             </div>
         </div>
     </div>
@@ -1933,14 +1934,15 @@
                 btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> 检测中...';
 
                 fetch('/api/sites/check-all', { method: 'POST' })
-                    .then(res => {
+                    .then(async res => {
                         if (res.redirected || res.status === 302 || res.status === 401) {
                             throw new Error('登录已过期，请刷新页面重新登录');
                         }
+                        const data = await res.json().catch(() => ({}));
                         if (!res.ok) {
-                            throw new Error(`服务器错误 (HTTP ${res.status})`);
+                            throw new Error(data.error || `服务器错误 (HTTP ${res.status})`);
                         }
-                        return res.json();
+                        return data;
                     })
                     .then(data => {
                         if (data.success && data.check_id) {
@@ -2373,137 +2375,6 @@
                         } else {
                             alert('禁用失败: ' + (data.error || '未知错误'));
                         }
-                    });
-            });
-        }
-
-        // Import from Script Button
-        const importBtn = document.getElementById('importFromScriptBtn');
-        if (importBtn) {
-            importBtn.addEventListener('click', function () {
-                if (!confirm('确定要从 1.wooorders_sqlite.py 脚本中导入站点配置吗？\n\n已存在的站点将会被跳过。')) {
-                    return;
-                }
-
-                importBtn.disabled = true;
-                importBtn.innerHTML = '<i class="bi bi-hourglass-split me-1"></i> 导入中...';
-
-                fetch('/api/sites/import-from-script', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
-                })
-                    .then(response => response.json())
-                    .then(result => {
-                        if (result.success) {
-                            alert(result.message);
-                            location.reload();
-                        } else {
-                            alert('导入失败: ' + (result.error || '未知错误'));
-                            importBtn.disabled = false;
-                            importBtn.innerHTML = '<i class="bi bi-download me-1"></i> 从脚本导入';
-                        }
-                    })
-                    .catch(error => {
-                        alert('请求错误: ' + error);
-                        importBtn.disabled = false;
-                        importBtn.innerHTML = '<i class="bi bi-download me-1"></i> 从脚本导入';
-                    });
-            });
-        }
-
-        // Sync All Button
-        const syncAllBtn = document.getElementById('syncAllBtn');
-        if (syncAllBtn) {
-            syncAllBtn.addEventListener('click', function () {
-
-                const modalEl = document.getElementById('syncProgressModal');
-                const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
-                const progressBar = document.getElementById('syncProgressBar');
-                const statusText = document.getElementById('syncStatusText');
-                const logConsole = document.getElementById('syncLogConsole');
-                const closeBtn = document.getElementById('closeSyncModalBtn');
-                const timeText = document.getElementById('syncTimeText');
-
-                // Reset UI
-                progressBar.style.width = '0%';
-                progressBar.classList.add('progress-bar-animated');
-                progressBar.classList.remove('bg-success', 'bg-danger');
-                progressBar.classList.add('bg-primary');
-                statusText.textContent = '正在启动全局同步任务...';
-                logConsole.innerHTML = '';
-                closeBtn.disabled = true;
-                const startTime = Date.now();
-
-                modal.show();
-
-                // Start Sync All
-                fetch('/api/sync/all', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
-                })
-                    .then(response => response.json())
-                    .then(result => {
-                        if (result.success) {
-                            const syncId = result.sync_id;
-
-                            // Start Polling
-                            const syncPollInterval = setInterval(() => {
-                                // Update timer
-                                const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                                const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
-                                const secs = (elapsed % 60).toString().padStart(2, '0');
-                                timeText.textContent = `${mins}:${secs}`;
-
-                                fetch(`/api/sync/status/${syncId}`)
-                                    .then(res => res.json())
-                                    .then(status => {
-                                        // Update Logs
-                                        if (status.logs && status.logs.length > 0) {
-                                            logConsole.innerHTML = status.logs.map(log =>
-                                                `<div class="text-white-50 mb-1">${log}</div>`
-                                            ).join('');
-                                            logConsole.scrollTop = logConsole.scrollHeight;
-                                        }
-
-                                        // Update Status
-                                        statusText.textContent = status.message;
-
-                                        if (status.status === 'running') {
-                                            if (progressBar.style.width === '0%') progressBar.style.width = '100%';
-                                        } else if (status.status === 'success') {
-                                            clearInterval(syncPollInterval);
-                                            progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                            progressBar.classList.add('bg-success');
-                                            progressBar.style.width = '100%';
-                                            statusText.textContent = '所有站点同步完成！';
-                                            statusText.classList.add('text-success');
-                                            closeBtn.disabled = false;
-                                            closeBtn.textContent = '完成并刷新';
-                                            // Broadcast sync completion to other tabs
-                                            localStorage.setItem('syncCompleted', Date.now().toString());
-                                            closeBtn.onclick = () => location.reload();
-                                        } else if (status.status === 'error') {
-                                            clearInterval(syncPollInterval);
-                                            progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                            progressBar.classList.add('bg-danger');
-                                            progressBar.style.width = '100%';
-                                            statusText.textContent = '同步出错';
-                                            statusText.classList.add('text-danger');
-                                            closeBtn.disabled = false;
-                                        }
-                                    });
-                            }, 1000);
-                        } else {
-                            statusText.textContent = '启动失败: ' + result.message;
-                            progressBar.classList.remove('bg-primary');
-                            progressBar.classList.add('bg-danger');
-                            progressBar.style.width = '100%';
-                            closeBtn.disabled = false;
-                        }
-                    })
-                    .catch(error => {
-                        statusText.textContent = '请求错误: ' + error;
-                        closeBtn.disabled = false;
                     });
             });
         }

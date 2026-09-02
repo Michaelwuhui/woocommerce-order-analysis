@@ -483,6 +483,17 @@
                         </div>
                     </div>
 
+                    <div class="row g-2 mb-3 small text-white-50" id="syncMetrics">
+                        <div class="col-md-4">模式：<span id="syncModeValue">-</span></div>
+                        <div class="col-md-8">当前站点：<span id="syncSiteValue">-</span></div>
+                        <div class="col-md-4">站点进度：<span id="syncSitesValue">0 / 0</span></div>
+                        <div class="col-md-4">当前页：<span id="syncPageValue">0</span></div>
+                        <div class="col-md-4">重试：<span id="syncRetryValue">0</span></div>
+                        <div class="col-md-4">抓取订单：<span id="syncFetchedValue">0</span></div>
+                        <div class="col-md-4">写入订单：<span id="syncWrittenValue">0</span></div>
+                        <div class="col-md-4">心跳：<span id="syncHeartbeatValue">-</span></div>
+                    </div>
+
                     <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25">
                         <div class="card-header bg-transparent border-bottom border-secondary border-opacity-25 py-2">
                             <small class="text-white-50">同步日志</small>
@@ -495,6 +506,9 @@
                     </div>
                 </div>
                 <div class="modal-footer border-top border-secondary border-opacity-25">
+                    <button type="button" class="btn btn-outline-warning" id="cancelSyncBtn" disabled>
+                        安全取消
+                    </button>
                     <button type="button" class="btn btn-primary" id="closeSyncModalBtn" disabled
                         data-bs-dismiss="modal">完成</button>
                 </div>
@@ -503,137 +517,8 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="{{ url_for('static', filename='js/sync_runs.js') }}"></script>
     <script>
-        // Sync All Logic
-        document.addEventListener('DOMContentLoaded', function () {
-            const syncAllBtn = document.getElementById('syncAllBtn');
-            if (syncAllBtn) {
-                syncAllBtn.addEventListener('click', function () {
-                    const modalEl = document.getElementById('syncProgressModal');
-                    const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
-                    const progressBar = document.getElementById('syncProgressBar');
-                    const statusText = document.getElementById('syncStatusText');
-                    const logConsole = document.getElementById('syncLogConsole');
-                    const closeBtn = document.getElementById('closeSyncModalBtn');
-                    const timeText = document.getElementById('syncTimeText');
-
-                    // Reset UI
-                    progressBar.style.width = '0%';
-                    progressBar.classList.add('progress-bar-animated');
-                    progressBar.classList.remove('bg-success', 'bg-danger');
-                    progressBar.classList.add('bg-primary');
-                    statusText.textContent = '正在启动全局同步任务...';
-                    statusText.classList.remove('text-danger', 'text-warning', 'text-success');
-                    logConsole.innerHTML = '';
-                    closeBtn.disabled = true;
-                    closeBtn.textContent = '完成'; // Reset button text
-                    closeBtn.onclick = null; // Remove custom click handler
-                    const startTime = Date.now();
-
-                    modal.show();
-
-                    // Start Sync All
-                    fetch('/api/sync/all', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' }
-                    })
-                        .then(response => response.json())
-                        .then(result => {
-                            if (result.success) {
-                                const syncId = result.sync_id;
-
-                                // Start Polling
-                                const syncPollInterval = setInterval(() => {
-                                    // Update timer
-                                    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                                    const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
-                                    const secs = (elapsed % 60).toString().padStart(2, '0');
-                                    timeText.textContent = `${mins}:${secs}`;
-
-                                    fetch(`/api/sync/status/${syncId}`)
-                                        .then(res => res.json())
-                                        .then(status => {
-                                            // Update Logs
-                                            if (status.logs && status.logs.length > 0) {
-                                                logConsole.innerHTML = status.logs.map(log =>
-                                                    `<div class="text-white-50 mb-1">${log}</div>`
-                                                ).join('');
-                                                logConsole.scrollTop = logConsole.scrollHeight;
-                                            }
-
-                                            // Update Status
-                                            statusText.textContent = status.message;
-
-                                            // Server has no memory of this sync (worker was recycled,
-                                            // e.g. a deploy HUP killed the background thread). Treat
-                                            // it as terminated so the modal isn't stuck forever.
-                                            if (status.status === 'unknown') {
-                                                clearInterval(syncPollInterval);
-                                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                                progressBar.classList.add('bg-danger');
-                                                progressBar.style.width = '100%';
-                                                statusText.textContent = '同步状态已丢失（服务可能已重启）。请关闭并查看最新数据。';
-                                                statusText.classList.add('text-danger');
-                                                closeBtn.disabled = false;
-                                                closeBtn.textContent = '关闭并刷新';
-                                                closeBtn.onclick = () => location.reload();
-                                                return;
-                                            }
-
-                                            // Backend heartbeat went silent for >90s while it claims
-                                            // to still be running — almost certainly a zombie. Same
-                                            // remedy: stop polling, prompt the user.
-                                            if (status.status === 'running' && status.stale_seconds != null && status.stale_seconds > 90) {
-                                                clearInterval(syncPollInterval);
-                                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                                progressBar.classList.add('bg-warning');
-                                                progressBar.style.width = '100%';
-                                                statusText.textContent = `服务端 ${Math.round(status.stale_seconds)} 秒无响应，同步可能已中断。请关闭并查看最新数据。`;
-                                                statusText.classList.add('text-warning');
-                                                closeBtn.disabled = false;
-                                                closeBtn.textContent = '关闭并刷新';
-                                                closeBtn.onclick = () => location.reload();
-                                                return;
-                                            }
-
-                                            if (status.status === 'running') {
-                                                if (progressBar.style.width === '0%') progressBar.style.width = '100%';
-                                            } else if (status.status === 'success') {
-                                                clearInterval(syncPollInterval);
-                                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                                progressBar.classList.add('bg-success');
-                                                progressBar.style.width = '100%';
-                                                statusText.textContent = '所有站点同步完成！';
-                                                statusText.classList.add('text-success');
-                                                closeBtn.disabled = false;
-                                                closeBtn.textContent = '完成并刷新';
-                                                closeBtn.onclick = () => location.reload();
-                                            } else if (status.status === 'error') {
-                                                clearInterval(syncPollInterval);
-                                                progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                                progressBar.classList.add('bg-danger');
-                                                progressBar.style.width = '100%';
-                                                statusText.textContent = '同步出错';
-                                                statusText.classList.add('text-danger');
-                                                closeBtn.disabled = false;
-                                            }
-                                        });
-                                }, 1000);
-                            } else {
-                                statusText.textContent = '启动失败: ' + result.error;
-                                statusText.classList.add('text-danger');
-                                closeBtn.disabled = false;
-                            }
-                        })
-                        .catch(err => {
-                            statusText.textContent = '请求错误: ' + err.message;
-                            statusText.classList.add('text-danger');
-                            closeBtn.disabled = false;
-                        });
-                });
-            }
-        });
-
         // Edit scope (server-injected): null = 可编辑全部；否则为可编辑站点 URL 列表。
         // 用于隐藏受限用户在未授权站点订单上的编辑按钮（后端仍有强制校验）。
         window._editableSources = {{ editable_sources_json|safe }};

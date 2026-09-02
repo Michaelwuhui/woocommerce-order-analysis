@@ -9,7 +9,7 @@ import json
 import os
 import random
 import socket
-import sqlite3
+import db_backend as sqlite3
 import sys
 import time
 import traceback
@@ -80,7 +80,7 @@ def _bucket(minutes: int = 60) -> str:
 
 
 def claim_job(conn) -> dict | None:
-    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("BEGIN" if sqlite3.is_postgres_backend() else "BEGIN IMMEDIATE")
     conn.execute(
         '''UPDATE oms_integration_jobs
            SET status='retry', locked_at=NULL, locked_by=NULL, lease_expires_at=NULL,
@@ -89,12 +89,13 @@ def claim_job(conn) -> dict | None:
              AND lease_expires_at < ?''',
         (utcnow(),),
     )
+    lock_clause = " FOR UPDATE SKIP LOCKED" if sqlite3.is_postgres_backend() else ""
     row = conn.execute(
         '''SELECT * FROM oms_integration_jobs
            WHERE status IN ('pending','retry')
              AND available_at <= ?
              AND attempts < max_attempts
-           ORDER BY available_at, id LIMIT 1''',
+           ORDER BY available_at, id LIMIT 1''' + lock_clause,
         (utcnow(),),
     ).fetchone()
     if not row:

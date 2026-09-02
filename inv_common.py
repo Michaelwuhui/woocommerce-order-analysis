@@ -15,7 +15,7 @@ inv_common.py — 进销存(库存)模块共享基础设施。
 """
 
 import os
-import sqlite3
+import db_backend as sqlite3
 from functools import wraps
 
 # 与 app.py 保持一致:相对路径,跟随进程工作目录。

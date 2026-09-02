@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
+import db_backend as sqlite3
 from datetime import datetime, timezone
 from typing import Any, Iterable
 

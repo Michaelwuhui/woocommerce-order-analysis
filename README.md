@@ -177,7 +177,7 @@ python inv_migrations.py down
 
 - Linux 生产环境；Windows 可用于开发和测试。
 - Python 3.10+。
-- SQLite 3、Nginx、Gunicorn。
+- PostgreSQL 17、Redis、Nginx、Gunicorn 与 Celery。
 - 订单邮件截图启用时需要 Playwright Chromium 和支持中日韩文字的字体。
 
 ### 安装
@@ -192,14 +192,11 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-### 初始化
+### 初始化与迁移
 
-```bash
-# 仅用于新环境；不要在未备份的生产数据库上盲目执行
-python 1.wooorders_sqlite.py
-python inv_migrations.py status
-python inv_migrations.py up
-```
+PostgreSQL schema、SQLite 一致性迁移、Redis/Celery 配置及生产回滚步骤见
+`deploy/POSTGRES_CELERY_OPERATIONS.md`。不要直接对生产库运行迁移脚本，也不要从源码
+导入站点凭据。
 
 ### 启动开发服务
 
@@ -207,12 +204,13 @@ python inv_migrations.py up
 python app.py
 ```
 
-生产环境使用 Nginx + Gunicorn，不使用 Flask debug server。后台任务分别运行：
+生产环境使用 Nginx + Gunicorn，不使用 Flask debug server。同步由独立的 Celery
+fetch、writer 与唯一 Beat 服务运行；履约和产品复制 worker 仍保持独立。完整 systemd
+单元位于 `deploy/systemd/`。
 
 ```bash
 python fulfillment_worker.py --idle-sleep 5
 python product_clone_worker.py --idle-sleep 2
-python auto_sync.py
 python inv_push_cron.py
 ```
 
@@ -224,6 +222,9 @@ systemd 示例位于 `deploy/woo-fulfillment-worker.service` 和 `deploy/woo-pro
 
 | 变量 | 说明 |
 |---|---|
+| `WOO_DB_*` | PostgreSQL 最小权限应用连接；真实密码只存于 0600 环境文件 |
+| `CELERY_BROKER_URL` | 仅指向本机 Redis 的 Celery broker URL |
+| `WOO_SYNC_*` | 同步超时、IPv4、心跳与恢复参数 |
 | `OMS_DB_FILE`, `INV_DB_FILE` | 订单/履约数据库绝对路径 |
 | `WMS_BASE_URL`, `WMS_SALT` | 匈牙利 WMS 地址与签名密钥 |
 | `WMS_WEBHOOK_TOKEN` | WMS 回调独立令牌 |

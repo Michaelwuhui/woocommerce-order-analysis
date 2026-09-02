@@ -11,7 +11,7 @@ import hashlib
 import html
 import json
 import re
-import sqlite3
+import db_backend as sqlite3
 import unicodedata
 import uuid
 from collections import defaultdict

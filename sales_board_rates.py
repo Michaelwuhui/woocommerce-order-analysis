@@ -6,7 +6,7 @@ rates.
 """
 
 from collections import defaultdict
-import sqlite3
+import db_backend as sqlite3
 
 
 def load_monthly_receipt_rates(conn, year_month):

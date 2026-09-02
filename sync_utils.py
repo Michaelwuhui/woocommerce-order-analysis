@@ -1,7 +1,7 @@
 import json
 import hashlib
 import time
-import sqlite3
+import db_backend as sqlite3
 import threading
 import concurrent.futures
 from datetime import datetime, timedelta
@@ -126,7 +126,7 @@ def reconcile_legacy_terminal_shortages(conn, candidates):
     return reconciled
 
 
-def _enqueue_fulfillment_plans(candidates):
+def _enqueue_fulfillment_plans(candidates, *, raise_on_error=False):
     """Queue planning after the Woo order transaction has committed.
 
     A separate row-factory connection isolates fulfillment failures from the
@@ -182,18 +182,22 @@ def _enqueue_fulfillment_plans(candidates):
         finally:
             conn.close()
     except Exception as exc:
+        if raise_on_error:
+            raise
         # Order sync remains authoritative and must not fail because the
         # optional fulfillment queue is unavailable during rollout.
         print(f"[fulfillment] enqueue skipped: {exc}")
 
 
-def _enqueue_order_notifications(candidates):
+def _enqueue_order_notifications(candidates, *, raise_on_error=False):
     """Dark-launched order-card notifications after the authoritative commit."""
     try:
         from order_notification_service import enqueue_synced_orders
 
-        enqueue_synced_orders(candidates)
+        enqueue_synced_orders(candidates, raise_on_error=raise_on_error)
     except Exception as exc:
+        if raise_on_error:
+            raise
         # Notification availability must never break WooCommerce synchronization.
         print(f"[order-notification] enqueue skipped: {type(exc).__name__}")
 
@@ -279,105 +283,180 @@ def get_last_modified_date_from_db(site_url):
         if connection:
             connection.close()
 
+WC_ORDER_FIELDS = [
+    'id', 'parent_id', 'number', 'order_key', 'created_via', 'version',
+    'status', 'currency', 'date_created', 'date_created_gmt', 'date_modified',
+    'date_modified_gmt', 'discount_total', 'discount_tax', 'shipping_total',
+    'shipping_tax', 'cart_tax', 'total', 'total_tax', 'prices_include_tax',
+    'customer_id', 'customer_ip_address', 'customer_user_agent',
+    'customer_note', 'billing', 'shipping', 'payment_method',
+    'payment_method_title', 'transaction_id', 'date_paid', 'date_paid_gmt',
+    'date_completed', 'date_completed_gmt', 'cart_hash', 'meta_data',
+    'line_items', 'tax_lines', 'shipping_lines', 'fee_lines', 'coupon_lines',
+    'refunds', 'set_paid', 'source',
+]
+
+
+def upsert_orders_in_transaction(orders_data, connection):
+    """Write one bounded page without committing or swallowing failures."""
+
+    filtered = [
+        order for order in (orders_data or [])
+        if order.get('status') != 'checkout-draft'
+    ]
+    all_columns = WC_ORDER_FIELDS + ['woo_id', 'updated_at']
+    placeholders = ', '.join(['?'] * len(all_columns))
+    update_set = ', '.join(
+        f'{column} = excluded.{column}'
+        for column in all_columns
+        if column != 'id'
+    )
+    insert_query = f"""
+        INSERT INTO orders ({', '.join(all_columns)})
+        VALUES ({placeholders})
+        ON CONFLICT(id) DO UPDATE SET {update_set}
+    """
+
+    processed_orders = []
+    planning_candidates = []
+    identity_versions = {}
+    now = datetime.now().isoformat()
+    for order in filtered:
+        woo_id = order.get('id')
+        site_id = site_id_for_source(connection, order.get('source'))
+        if site_id is None:
+            raise ValueError(
+                f"unknown source for WooCommerce order {woo_id}"
+            )
+        oid = make_oid(site_id, woo_id)
+        values = []
+        for field in WC_ORDER_FIELDS:
+            value = order.get(field)
+            if field == 'id':
+                values.append(oid)
+            elif field == 'set_paid':
+                values.append(
+                    0 if isinstance(value, dict) or value is None
+                    else (1 if value else 0)
+                )
+            elif field == 'prices_include_tax':
+                values.append(bool(value))
+            elif isinstance(value, (dict, list)):
+                values.append(json.dumps(value, ensure_ascii=False))
+            else:
+                values.append(value)
+        values.extend((woo_id, now))
+        processed_orders.append(tuple(values))
+        identity_versions[str(oid)] = (
+            str(order.get('date_modified') or ''),
+            str(order.get('status') or ''),
+        )
+        planning_candidates.append({
+            'order_id': oid,
+            'status': order.get('status'),
+            'date_modified': order.get('date_modified'),
+            'source': order.get('source'),
+        })
+
+    existing = {}
+    ids = list(identity_versions)
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        marks = ','.join('?' for _ in chunk)
+        for row in connection.execute(
+            f"SELECT id,date_modified,status FROM orders WHERE id IN ({marks})",
+            tuple(chunk),
+        ).fetchall():
+            existing[str(row['id'])] = (
+                str(row['date_modified'] or ''),
+                str(row['status'] or ''),
+            )
+
+    if processed_orders:
+        connection.executemany(insert_query, processed_orders)
+        reconcile_legacy_terminal_shortages(connection, planning_candidates)
+    inserted = sum(1 for oid in identity_versions if oid not in existing)
+    changed = sum(
+        1 for oid, version in identity_versions.items()
+        if oid not in existing or existing[oid] != version
+    )
+    return {
+        'written': len(processed_orders),
+        'inserted': inserted,
+        'changed': changed,
+        'planning_candidates': planning_candidates,
+    }
+
+
+def upsert_order_notes_in_transaction(notes_data, connection):
+    """Upsert fetched order notes in the caller's page transaction."""
+
+    rows = []
+    for note in notes_data or []:
+        order_id = note.get('_local_order_id')
+        if order_id is None or note.get('id') is None:
+            continue
+        rows.append((
+            note.get('id'),
+            order_id,
+            note.get('note', ''),
+            note.get('date_created', ''),
+            bool(note.get('customer_note', False)),
+            note.get('author', ''),
+            bool(note.get('added_by_user', False)),
+        ))
+    if not rows:
+        return 0
+    connection.executemany(
+        """
+        INSERT INTO order_notes (
+            wc_note_id,order_id,note,date_created,customer_note,author,added_by_user
+        ) VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(order_id,wc_note_id) DO UPDATE SET
+            note=excluded.note,
+            date_created=excluded.date_created,
+            customer_note=excluded.customer_note,
+            author=CASE
+                WHEN order_notes.added_by_user IS TRUE
+                     AND COALESCE(order_notes.author,'') NOT IN ('','WooCommerce')
+                THEN order_notes.author
+                ELSE excluded.author
+            END,
+            added_by_user=order_notes.added_by_user OR excluded.added_by_user
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def run_post_commit_sync_actions(planning_candidates, *, strict=False):
+    """Run existing idempotent local queue hooks only after page commit."""
+
+    _enqueue_fulfillment_plans(planning_candidates, raise_on_error=strict)
+    _enqueue_order_notifications(planning_candidates, raise_on_error=strict)
+
+
 def save_orders_to_db(orders_data, connection=None):
-    """Save orders to SQLite database"""
+    """Legacy wrapper; Celery uses upsert_orders_in_transaction directly."""
+
     if not orders_data:
-        return
-    
+        return {'written': 0, 'inserted': 0, 'changed': 0}
     own_connection = connection is None
     if own_connection:
         connection = create_database_connection()
         if not connection:
-            return
-    
+            raise RuntimeError("database connection unavailable")
     try:
-        cursor = connection.cursor()
-
-        # WC-managed columns. Local-only columns (is_undelivered,
-        # shipping_loss_amount, undelivered_*, is_problem_return,
-        # problem_return_*, product_loss_amount) are deliberately NOT listed —
-        # they're set by /api/order/<id>/mark-* and must survive every sync.
-        # Previously we used INSERT OR REPLACE which DELETEs the row first,
-        # wiping those flags on every refresh; UPSERT only touches the columns
-        # we name, so the local markings stay intact.
-        wc_fields = [
-            'id', 'parent_id', 'number', 'order_key', 'created_via', 'version', 'status', 'currency',
-            'date_created', 'date_created_gmt', 'date_modified', 'date_modified_gmt',
-            'discount_total', 'discount_tax', 'shipping_total', 'shipping_tax', 'cart_tax',
-            'total', 'total_tax', 'prices_include_tax', 'customer_id', 'customer_ip_address',
-            'customer_user_agent', 'customer_note', 'billing', 'shipping', 'payment_method',
-            'payment_method_title', 'transaction_id', 'date_paid', 'date_paid_gmt',
-            'date_completed', 'date_completed_gmt', 'cart_hash', 'meta_data', 'line_items',
-            'tax_lines', 'shipping_lines', 'fee_lines', 'coupon_lines', 'refunds', 'set_paid', 'source'
-        ]
-        # woo_id keeps the raw per-site WC post id; id is the cross-site-safe
-        # surrogate "<sites.id>-<woo_id>" so same-numbered orders from different
-        # stores no longer collide under ON CONFLICT(id). See oid_utils.py.
-        all_columns = wc_fields + ['woo_id', 'updated_at']
-        placeholders = ', '.join(['?'] * len(all_columns))
-        # On UPDATE, set every column EXCEPT id (the conflict key).
-        update_set = ', '.join(f'{c} = excluded.{c}' for c in all_columns if c != 'id')
-        insert_query = f"""
-        INSERT INTO orders ({', '.join(all_columns)})
-        VALUES ({placeholders})
-        ON CONFLICT(id) DO UPDATE SET {update_set}
-        """
-
-        # Filter out checkout-draft orders - they should not be synced
-        orders_data = [o for o in orders_data if o.get('status') != 'checkout-draft']
-
-        if not orders_data:
-            return
-
-        processed_orders = []
-        planning_candidates = []
-        for order in orders_data:
-            woo_id = order.get('id')
-            site_id = site_id_for_source(connection, order.get('source'))
-            if site_id is None:
-                # Unknown source -> cannot build a safe surrogate; skip rather
-                # than mis-key. (Should not happen: every synced site is in `sites`.)
-                print(f"[save_orders_to_db] skip order {woo_id}: unknown source {order.get('source')!r}")
-                continue
-            oid = make_oid(site_id, woo_id)
-            processed_order = []
-            for field in wc_fields:
-                value = order.get(field)
-                if field == 'id':
-                    processed_order.append(oid)
-                elif field == 'set_paid':
-                    if isinstance(value, dict) or value is None:
-                        processed_order.append(0)
-                    else:
-                        processed_order.append(1 if value else 0)
-                elif field == 'prices_include_tax':
-                    processed_order.append(1 if value else 0)
-                elif isinstance(value, (dict, list)):
-                    processed_order.append(json.dumps(value, ensure_ascii=False))
-                else:
-                    processed_order.append(value)
-
-            processed_order.append(woo_id)                      # woo_id
-            processed_order.append(datetime.now().isoformat())  # updated_at
-            processed_orders.append(tuple(processed_order))
-            planning_candidates.append({
-                'order_id': oid,
-                'status': order.get('status'),
-                'date_modified': order.get('date_modified'),
-                'source': order.get('source'),
-            })
-
-        cursor.executemany(insert_query, processed_orders)
-        reconcile_legacy_terminal_shortages(connection, planning_candidates)
+        result = upsert_orders_in_transaction(orders_data, connection)
         connection.commit()
-        _enqueue_fulfillment_plans(planning_candidates)
-        _enqueue_order_notifications(planning_candidates)
-        
-    except Exception as e:
-        print(f"Error saving orders: {e}")
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         if own_connection and connection:
             connection.close()
+    run_post_commit_sync_actions(result['planning_candidates'])
+    return result
 
 def fetch_orders_incrementally(wcapi, site_url, last_order_date=None, progress_callback=None, connection=None):
     """Fetch orders incrementally"""
