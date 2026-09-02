@@ -193,6 +193,11 @@
         <p class="text-muted">正在从 51.la API 获取流量数据...</p>
     </div>
 
+    <div id="fxWarning" class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25" style="display: none;">
+        <i class="bi bi-exclamation-triangle me-2"></i>
+        <span id="fxWarningText"></span>
+    </div>
+
     <!-- Chart Card -->
     <div class="card mb-4" id="chartCard" style="display: none;">
         <div class="card-header">
@@ -386,16 +391,17 @@
 
 <script>
     // Global Constants
-    const REPORT_DATA_CACHE_VERSION = 'v6';
+    const REPORT_DATA_CACHE_VERSION = 'v7';
     const ALL_METRICS = [
         { key: 'uv', label: 'UV (访客数)', class: 'metric-uv', sum: true },
         { key: 'pv', label: 'PV (浏览量)', class: 'metric-pv', sum: true },
         { key: 'order_count', label: '订单数', class: 'metric-orders', sum: true },
-        { key: 'total_amount', label: '订单金额', class: 'metric-amount', sum: true, format: 'currency' },
-        { key: 'net_cny', label: '净额(CNY)', class: 'metric-cny', sum: true, format: 'cny' },
+        { key: 'gmv_cny', label: 'GMV(CNY)', class: 'metric-amount', sum: true, format: 'cny', help: '全部非草稿/回收站订单总额（含运费及失败/取消订单），按订单月份汇率换算' },
+        { key: 'net_cny', label: '净销售额(CNY)', class: 'metric-cny', sum: true, format: 'cny', help: '可确认收入订单扣除运费及未送达运费损失后，按订单月份汇率换算' },
         { key: 'conversion_rate', label: '转化率', class: 'metric-rate', avg: true, format: 'percent' },
-        { key: 'aov_cny', label: '客单价(CNY)', class: 'metric-aov', avg: true, format: 'cny' }
+        { key: 'aov_cny', label: '客单价(CNY)', class: 'metric-aov', avg: true, format: 'cny', help: 'GMV(CNY) ÷ 订单数' }
     ];
+    const CNY_METRIC_KEYS = new Set(['gmv_cny', 'net_cny', 'aov_cny']);
 
     let currentResult = null; // Store current API result for re-rendering
     let trendChart = null; // Chart instance
@@ -446,7 +452,13 @@
     // Metrics Filter Logic
     function initMetricsFilter() {
         const container = document.getElementById('metricsFilterList');
-        const savedMetrics = JSON.parse(localStorage.getItem('report_selected_metrics') || 'null');
+        let savedMetrics = JSON.parse(localStorage.getItem('report_selected_metrics') || 'null');
+
+        // Migrate the former native-currency metric selection to CNY GMV.
+        if (Array.isArray(savedMetrics) && savedMetrics.includes('total_amount')) {
+            savedMetrics = savedMetrics.map(key => key === 'total_amount' ? 'gmv_cny' : key);
+            localStorage.setItem('report_selected_metrics', JSON.stringify(savedMetrics));
+        }
 
         // If no saved, default to All
         const selectedKeys = savedMetrics || ALL_METRICS.map(m => m.key);
@@ -457,7 +469,7 @@
                     value="${m.key}" id="check_${m.key}"
                     ${selectedKeys.includes(m.key) ? 'checked' : ''}
                     onchange="onMetricChange()">
-                <label class="form-check-label text-white-50" for="check_${m.key}">
+                <label class="form-check-label text-white-50" for="check_${m.key}" title="${m.help || ''}">
                     ${m.label}
                 </label>
             </div>
@@ -483,11 +495,25 @@
 
     function refreshReportView() {
         if (!currentResult) return;
+        updateFxWarning(currentResult);
         initSitesFilter(getFilteredReportSites(currentResult));
         renderReport(currentResult);
         document.getElementById('reportCard').style.display = 'block';
         document.getElementById('chartCard').style.display = 'block';
         syncReportStickyHeader();
+    }
+
+    function updateFxWarning(result) {
+        const warning = document.getElementById('fxWarning');
+        const warningText = document.getElementById('fxWarningText');
+        const missingRates = (result && result.missing_exchange_rates) || [];
+        if (missingRates.length === 0) {
+            warning.style.display = 'none';
+            warningText.textContent = '';
+            return;
+        }
+        warningText.textContent = `以下币种月份缺少人民币汇率，相关金额不显示：${missingRates.join('、')}`;
+        warning.style.display = 'block';
     }
 
     // Sites Filter Logic
@@ -860,30 +886,7 @@
     }
 
     function renderReport(result) {
-        const { data, months, sites, site_currencies } = result;
-
-        // 货币符号映射
-        const CURRENCY_SYMBOLS = {
-            'PLN': 'zł',
-            'EUR': '€',
-            'USD': '$',
-            'GBP': '£',
-            'AED': 'AED',
-            'AUD': 'A$',
-            'CAD': 'C$',
-            'CHF': 'CHF',
-            'JPY': '¥',
-            'KRW': '₩',
-            'SAR': 'SAR',
-            'QAR': 'QAR',
-            'KWD': 'KWD'
-        };
-
-        function getCurrencySymbol(siteName) {
-            if (!site_currencies) return '';
-            const currency = site_currencies[siteName];
-            return currency ? (CURRENCY_SYMBOLS[currency] || currency) : '';
-        }
+        const { data, months, sites } = result;
 
         // Get Selected Metrics
         const selectedKeys = Array.from(document.querySelectorAll('.metric-check:checked')).map(cb => cb.value);
@@ -946,29 +949,29 @@
                 const metricCell = document.createElement('td');
                 metricCell.className = `sticky-col-2 ${metric.class}`;
                 metricCell.textContent = metric.label;
+                metricCell.title = metric.help || '';
                 row.appendChild(metricCell);
 
                 // Values for each month
                 let total = 0;
                 let count = 0;
+                let hasMissingRate = false;
 
                 months.forEach(month => {
                     const cell = document.createElement('td');
                     const monthData = siteData[month] || {};
                     const value = monthData[metric.key];
+                    const missingRates = monthData.missing_exchange_rates || [];
 
                     if (value !== undefined && value !== null) {
-                        let displayValue = formatValue(value, metric.format);
-                        // 为订单金额添加货币符号
-                        if (metric.key === 'total_amount' && value > 0) {
-                            const currencySymbol = getCurrencySymbol(site);
-                            if (currencySymbol) {
-                                displayValue = displayValue + ' ' + currencySymbol;
-                            }
-                        }
-                        cell.textContent = displayValue;
+                        cell.textContent = formatValue(value, metric.format);
                         total += value;
                         count++;
+                    } else if (CNY_METRIC_KEYS.has(metric.key) && missingRates.length > 0) {
+                        cell.textContent = '缺汇率';
+                        cell.title = missingRates.join('、');
+                        cell.style.color = '#fbbf24';
+                        hasMissingRate = true;
                     } else {
                         cell.textContent = '-';
                         cell.style.color = '#ccc';
@@ -981,16 +984,11 @@
                 const summaryCell = document.createElement('td');
                 summaryCell.className = 'summary-col';
 
-                if (metric.sum && count > 0) {
-                    let summaryValue = formatValue(total, metric.format);
-                    // 为订单金额合计添加货币符号
-                    if (metric.key === 'total_amount' && total > 0) {
-                        const currencySymbol = getCurrencySymbol(site);
-                        if (currencySymbol) {
-                            summaryValue = summaryValue + ' ' + currencySymbol;
-                        }
-                    }
-                    summaryCell.textContent = summaryValue;
+                if (hasMissingRate) {
+                    summaryCell.textContent = '缺汇率';
+                    summaryCell.style.color = '#fbbf24';
+                } else if (metric.sum && count > 0) {
+                    summaryCell.textContent = formatValue(total, metric.format);
                 } else if (metric.avg && count > 0) {
                     // For conversion rate, recalculate from totals
                     // Note: This summary logic needs strict recalculation for accuracy
@@ -1008,7 +1006,7 @@
                         let totalCNY = 0, totalOrders = 0;
                         months.forEach(month => {
                             if (siteData[month]) {
-                                totalCNY += siteData[month].net_cny || 0;
+                                totalCNY += siteData[month].gmv_cny || 0;
                                 totalOrders += siteData[month].order_count || 0;
                             }
                         });
@@ -1237,8 +1235,8 @@
                                 // Calculate summary for this month across active sites
                                 let stats = {
                                     uv: 0, pv: 0, order_count: 0,
-                                    total_amount: 0, net_cny: 0,
-                                    net_amount: 0
+                                    gmv_cny: 0, net_cny: 0,
+                                    net_amount: 0, cny_complete: true
                                 };
 
                                 activeSites.forEach(site => {
@@ -1247,7 +1245,8 @@
                                         stats.uv += d.uv || 0;
                                         stats.pv += d.pv || 0;
                                         stats.order_count += d.order_count || 0;
-                                        stats.total_amount += d.total_amount || 0;
+                                        if ((d.missing_exchange_rates || []).length > 0) stats.cny_complete = false;
+                                        stats.gmv_cny += d.gmv_cny || 0;
                                         stats.net_cny += d.net_cny || 0;
                                     }
                                 });
@@ -1258,10 +1257,10 @@
                                     if (m.key === 'uv') val = stats.uv;
                                     else if (m.key === 'pv') val = stats.pv;
                                     else if (m.key === 'order_count') val = stats.order_count;
-                                    else if (m.key === 'total_amount') val = stats.total_amount;
-                                    else if (m.key === 'net_cny') val = stats.net_cny;
+                                    else if (m.key === 'gmv_cny') val = stats.cny_complete ? stats.gmv_cny : null;
+                                    else if (m.key === 'net_cny') val = stats.cny_complete ? stats.net_cny : null;
                                     else if (m.key === 'conversion_rate') val = stats.uv > 0 ? (stats.order_count / stats.uv * 100) : 0;
-                                    else if (m.key === 'aov_cny') val = stats.order_count > 0 ? (stats.net_cny / stats.order_count) : 0;
+                                    else if (m.key === 'aov_cny') val = stats.cny_complete && stats.order_count > 0 ? (stats.gmv_cny / stats.order_count) : null;
 
                                     lines.push(`${m.label}: ${formatValue(val, m.format)}`);
                                 });
@@ -1317,24 +1316,26 @@
 
         // Pre-aggregate raw sums per period (additive metrics only). Derived
         // metrics (转化率 / 客单价) are computed from these on the fly.
-        const sums = {};   // period → { uv, pv, order_count, total_amount, net_cny }
-        const grand = { uv: 0, pv: 0, order_count: 0, total_amount: 0, net_cny: 0 };
+        const sums = {};   // period → additive metrics plus CNY completeness
+        const grand = { uv: 0, pv: 0, order_count: 0, gmv_cny: 0, net_cny: 0, cny_complete: true };
         months.forEach(m => {
-            const s = { uv: 0, pv: 0, order_count: 0, total_amount: 0, net_cny: 0 };
+            const s = { uv: 0, pv: 0, order_count: 0, gmv_cny: 0, net_cny: 0, cny_complete: true };
             activeSites.forEach(site => {
                 const cell = (allData[site] && allData[site][m]) || {};
                 s.uv          += (cell.uv || 0);
                 s.pv          += (cell.pv || 0);
                 s.order_count += (cell.order_count || 0);
-                s.total_amount += (cell.total_amount || 0);
+                if ((cell.missing_exchange_rates || []).length > 0) s.cny_complete = false;
+                s.gmv_cny     += (cell.gmv_cny || 0);
                 s.net_cny     += (cell.net_cny || 0);
             });
             sums[m] = s;
             grand.uv          += s.uv;
             grand.pv          += s.pv;
             grand.order_count += s.order_count;
-            grand.total_amount += s.total_amount;
+            grand.gmv_cny     += s.gmv_cny;
             grand.net_cny     += s.net_cny;
+            grand.cny_complete = grand.cny_complete && s.cny_complete;
         });
 
         // Compute the value of one metric for a given period sums bucket
@@ -1343,10 +1344,10 @@
                 case 'uv':              return b.uv;
                 case 'pv':              return b.pv;
                 case 'order_count':     return b.order_count;
-                case 'total_amount':    return b.total_amount;
-                case 'net_cny':         return b.net_cny;
+                case 'gmv_cny':         return b.cny_complete ? b.gmv_cny : null;
+                case 'net_cny':         return b.cny_complete ? b.net_cny : null;
                 case 'conversion_rate': return b.uv > 0 ? (b.order_count * 100 / b.uv) : null;
-                case 'aov_cny':         return b.order_count > 0 ? (b.net_cny / b.order_count) : null;
+                case 'aov_cny':         return b.cny_complete && b.order_count > 0 ? (b.gmv_cny / b.order_count) : null;
                 default:                return 0;
             }
         }
@@ -1356,7 +1357,7 @@
             uv:              { bg: 'rgba(59,130,246,0.2)',  fg: '#60a5fa', icon: 'bi-people-fill' },
             pv:              { bg: 'rgba(34,211,238,0.2)',  fg: '#22d3ee', icon: 'bi-eye-fill' },
             order_count:     { bg: 'rgba(16,185,129,0.2)',  fg: '#34d399', icon: 'bi-bag-check' },
-            total_amount:    { bg: 'rgba(168,85,247,0.2)',  fg: '#c084fc', icon: 'bi-cash-stack' },
+            gmv_cny:         { bg: 'rgba(168,85,247,0.2)',  fg: '#c084fc', icon: 'bi-cash-stack' },
             net_cny:         { bg: 'rgba(245,158,11,0.2)',  fg: '#fbbf24', icon: 'bi-cash-coin' },
             conversion_rate: { bg: 'rgba(251,191,36,0.15)', fg: '#fde68a', icon: 'bi-percent' },
             aov_cny:         { bg: 'rgba(244,114,182,0.2)', fg: '#f472b6', icon: 'bi-tag' },
@@ -1396,6 +1397,7 @@
             const labelTd = document.createElement('td');
             labelTd.innerHTML = `<span class="badge" style="background:${style.bg}; color:${style.fg};">`
                 + `<i class="bi ${style.icon} me-1"></i>${metric.label}</span>`;
+            labelTd.title = metric.help || '';
             tr.appendChild(labelTd);
 
             // Per-period values
@@ -1404,7 +1406,9 @@
                 td.className = 'text-end fw-bold';
                 td.style.color = style.fg;
                 const v = valueOf(metric.key, sums[m]);
-                td.textContent = (v === null || v === 0) ? '-' : formatValue(v, metric.format);
+                td.textContent = (v === null && CNY_METRIC_KEYS.has(metric.key) && !sums[m].cny_complete)
+                    ? '缺汇率'
+                    : ((v === null || v === 0) ? '-' : formatValue(v, metric.format));
                 tr.appendChild(td);
             });
 
@@ -1415,11 +1419,13 @@
             if (metric.key === 'conversion_rate') {
                 totalVal = grand.uv > 0 ? (grand.order_count * 100 / grand.uv) : null;
             } else if (metric.key === 'aov_cny') {
-                totalVal = grand.order_count > 0 ? (grand.net_cny / grand.order_count) : null;
+                totalVal = grand.cny_complete && grand.order_count > 0 ? (grand.gmv_cny / grand.order_count) : null;
             } else {
                 totalVal = valueOf(metric.key, grand);
             }
-            totalTd.textContent = (totalVal === null || totalVal === 0) ? '-' : formatValue(totalVal, metric.format);
+            totalTd.textContent = (totalVal === null && CNY_METRIC_KEYS.has(metric.key) && !grand.cny_complete)
+                ? '缺汇率'
+                : ((totalVal === null || totalVal === 0) ? '-' : formatValue(totalVal, metric.format));
             tr.appendChild(totalTd);
 
             tbody.appendChild(tr);
