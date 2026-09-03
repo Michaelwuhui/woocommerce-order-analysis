@@ -951,9 +951,20 @@ class PgCompatCursor:
             return self._set_synthetic([(self.connection._last_insert_id,)])
         if re.match(r"^\s*SELECT\s+changes\s*\(\s*\)", text, re.IGNORECASE):
             return self._set_synthetic([(self.connection._last_changes,)])
-        if re.match(r"^\s*BEGIN\s+(?:IMMEDIATE|EXCLUSIVE)\b", text, re.IGNORECASE):
-            if self.connection._raw.info.transaction_status == TransactionStatus.IDLE:
-                self._raw.execute("BEGIN")
+        if re.match(
+            r"^\s*BEGIN(?:\s+(?:DEFERRED|IMMEDIATE|EXCLUSIVE))?"
+            r"(?:\s+TRANSACTION)?\s*;?\s*$",
+            text,
+            re.IGNORECASE,
+        ):
+            # Compile-time catalog lookups start a psycopg transaction. Handle
+            # transaction control before compile() so a legacy explicit BEGIN
+            # does not become a nested BEGIN and flood PostgreSQL with warnings.
+            # psycopg starts a transaction automatically on the next SQL
+            # statement. Sending BEGIN through a non-autocommit connection
+            # would itself cause an implicit BEGIN followed by a redundant
+            # nested BEGIN warning. A no-op here preserves the transaction
+            # boundary for the immediately following legacy statement.
             self.connection._last_changes = 0
             return self
         compiled = self.connection.compile(text, params)

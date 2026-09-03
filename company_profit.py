@@ -865,6 +865,14 @@ def _latest_actual_cost_forecast_rates(conn, year_month):
     while retaining the configured gross-margin split instead of reverse
     engineering a percentage from rounded statement amounts.
     """
+    try:
+        cutoff_year, cutoff_month = (
+            int(part) for part in str(year_month).split("-", 1)
+        )
+        cutoff_period = cutoff_year * 100 + cutoff_month
+    except (TypeError, ValueError):
+        return {}
+
     statement_columns = _table_columns(conn, "reconciliation_statements")
     required = {
         "partner_id",
@@ -906,14 +914,14 @@ def _latest_actual_cost_forecast_rates(conn, year_month):
                    actual_cost_pln_snapshot, exchange_rate_cny
             FROM reconciliation_statements
             WHERE partner_id = ?
-              AND printf('%04d-%02d', period_year, period_month) < ?
+              AND (period_year * 100 + period_month) < ?
               AND actual_cost_pln_snapshot IS NOT NULL
               AND total_net_pln > 0
               AND COALESCE(is_manual, 0) = 0
             ORDER BY period_year DESC, period_month DESC, id DESC
             LIMIT 1
             """,
-            (partner["id"], year_month),
+            (partner["id"], cutoff_period),
         ).fetchone()
         if not snapshot:
             continue
