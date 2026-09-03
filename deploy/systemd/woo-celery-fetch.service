@@ -14,20 +14,18 @@ Environment=PYTHONUNBUFFERED=1
 Environment=WOO_DB_POOL_MAX=2
 Environment=WOO_DB_APPLICATION_NAME=woo-celery-fetch
 Environment=WOO_SYNC_IPV4_ONLY=1
-ExecStart=/www/wwwroot/woo-analysis/venv/bin/python -m celery -A celery_app:celery_app worker --queues=sync_fetch --concurrency=3 --pool=prefork --prefetch-multiplier=1 --hostname=fetch@%%h --loglevel=INFO --logfile=/var/log/woo-analysis/celery-fetch.log --pidfile=/run/woo-analysis/celery-fetch.pid --max-tasks-per-child=200
+ExecStart=/www/wwwroot/woo-analysis/venv/bin/python -m celery -A celery_app:celery_app worker --queues=sync_fetch --concurrency=3 --pool=prefork --prefetch-multiplier=1 --hostname=fetch@%%h --loglevel=INFO --logfile=/var/log/woo-analysis/celery-fetch.log --max-tasks-per-child=200
 Restart=always
 RestartSec=5
 TimeoutStopSec=960
 KillSignal=SIGTERM
-RuntimeDirectory=woo-analysis
-RuntimeDirectoryMode=0750
 LogsDirectory=woo-analysis
 LogsDirectoryMode=0750
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log/woo-analysis /run/woo-analysis
+ReadWritePaths=/var/log/woo-analysis
 UMask=0027
 
 [Install]
