@@ -140,7 +140,10 @@ def _available_sku(conn, sku_id, warehouses):
     if local_ids:
         marks = ",".join("?" * len(local_ids))
         row = conn.execute(
-            f"""SELECT COALESCE(SUM(MAX(st.on_hand - st.reserved, 0)),0) AS available
+            f"""SELECT COALESCE(SUM(
+                         CASE WHEN st.on_hand - st.reserved > 0
+                              THEN st.on_hand - st.reserved ELSE 0 END
+                       ),0) AS available
                 FROM inv_stock st JOIN oms_sku_warehouses sw
                   ON sw.warehouse_id=st.warehouse_id
                  AND sw.sku_id=st.sku_id AND sw.is_enabled=1
@@ -151,7 +154,10 @@ def _available_sku(conn, sku_id, warehouses):
     if external_ids:
         marks = ",".join("?" * len(external_ids))
         row = conn.execute(
-            f"""SELECT COALESCE(SUM(MAX(available_quantity,0)),0) AS available
+            f"""SELECT COALESCE(SUM(
+                         CASE WHEN available_quantity > 0
+                              THEN available_quantity ELSE 0 END
+                       ),0) AS available
                 FROM oms_external_stock WHERE sku_id=? AND warehouse_id IN ({marks})""",
             [sku_id] + external_ids,
         ).fetchone()

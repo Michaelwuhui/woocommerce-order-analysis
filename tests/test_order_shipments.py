@@ -131,6 +131,24 @@ class OrderShipmentPresentationTests(unittest.TestCase):
 
         self.assertFalse(is_pending_shipping_candidate(order, []))
 
+    def test_terminal_oms_fulfillments_hide_order_before_remote_sync(self):
+        order = {
+            "status": "processing",
+            "is_undelivered": 0,
+            "is_problem_return": 0,
+            "delivery_confirmed": 0,
+        }
+
+        self.assertFalse(is_pending_shipping_candidate(
+            order, [], ["shipped"],
+        ))
+        self.assertFalse(is_pending_shipping_candidate(
+            order, [], ["shipped", "delivered"],
+        ))
+        self.assertTrue(is_pending_shipping_candidate(
+            order, [], ["shipped", "ready_to_pick"],
+        ))
+
     def test_duplicate_tracking_is_detected_only_on_another_order(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

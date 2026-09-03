@@ -17514,6 +17514,7 @@ def get_pending_orders():
     fulfillment_state_map = {}
     fulfillment_products_map = {}
     fulfillment_warehouses_map = {}
+    fulfillment_statuses_map = {}
     preplan_products_map = {}
     explicit_warehouse_scope = False
     manual_partner_only = False
@@ -17539,7 +17540,9 @@ def get_pending_orders():
             conn, current_user.id, 'can_view'
         )
         allowed_warehouse_ids = [r['warehouse_id'] for r in permission_rows if r['can_view']]
-        fulfillment_query = f'''SELECT f.id, f.order_id, f.warehouse_id, w.name AS warehouse_name
+        fulfillment_query = f'''SELECT f.id, f.order_id, f.warehouse_id,
+                                       f.status AS fulfillment_status,
+                                       w.name AS warehouse_name
                                 FROM oms_fulfillments f
                                 JOIN oms_order_fulfillment_state ofs
                                   ON ofs.order_id=f.order_id AND ofs.revision=f.revision
@@ -17557,6 +17560,9 @@ def get_pending_orders():
         for f in visible_fulfillments:
             visible_fids.append(f['id'])
             fulfillment_warehouses_map.setdefault(f['order_id'], set()).add(f['warehouse_name'] or str(f['warehouse_id']))
+            fulfillment_statuses_map.setdefault(f['order_id'], []).append(
+                f['fulfillment_status']
+            )
         if visible_fids:
             fid_ph = ','.join('?' for _ in visible_fids)
             for r in conn.execute(
@@ -17643,7 +17649,9 @@ def get_pending_orders():
     orders = [
         order for order in orders
         if is_pending_shipping_candidate(
-            order, shipping_state_rows_map.get(order['id'], [])
+            order,
+            shipping_state_rows_map.get(order['id'], []),
+            fulfillment_statuses_map.get(order['id']),
         )
     ]
 

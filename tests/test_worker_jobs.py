@@ -1,5 +1,7 @@
 import sqlite3
 import unittest
+import re
+from pathlib import Path
 from unittest.mock import patch
 
 from fulfillment_service import enqueue_job
@@ -10,9 +12,13 @@ from fulfillment_worker import (
     handle_verify_poland_submission,
     handle_verify_submission,
     retry_job,
+    run_one,
     run_iteration,
 )
 from poland_wms import PolandWmsError
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class DurableJobTests(unittest.TestCase):
@@ -76,6 +82,40 @@ class DurableJobTests(unittest.TestCase):
         self.assertTrue(
             self.db.execute("SELECT 1").fetchone()[0]
         )
+
+    def test_failed_job_rolls_back_before_recording_retry(self):
+        class RollbackAwareConnection:
+            rolled_back = False
+
+            def rollback(self):
+                self.rolled_back = True
+
+        conn = RollbackAwareConnection()
+        job = {
+            "id": 7,
+            "attempts": 1,
+            "max_attempts": 10,
+            "aggregate_type": "shipment",
+        }
+
+        def assert_transaction_recovered(actual_conn, *_args, **_kwargs):
+            self.assertIs(actual_conn, conn)
+            self.assertTrue(actual_conn.rolled_back)
+
+        with patch("fulfillment_worker.claim_job", return_value=job), \
+             patch("fulfillment_worker.dispatch", side_effect=RuntimeError("bad SQL")), \
+             patch("fulfillment_worker.retry_job", side_effect=assert_transaction_recovered):
+            self.assertTrue(run_one(conn))
+
+    def test_fulfillment_sql_avoids_sqlite_scalar_max(self):
+        pattern = re.compile(r"SUM\s*\(\s*MAX\s*\([^\n)]*,", re.IGNORECASE)
+        for name in (
+            "fulfillment_woocommerce.py",
+            "fulfillment_service.py",
+            "inv_push.py",
+        ):
+            source = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIsNone(pattern.search(source), name)
 
     def test_unknown_wms_submission_never_auto_resubmits(self):
         fulfillment = {

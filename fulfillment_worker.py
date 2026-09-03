@@ -1608,25 +1608,35 @@ def run_one(conn) -> bool:
         result = dispatch(conn, job)
         finish_job(conn, job["id"], result)
     except RetryTask as exc:
+        conn.rollback()
         retry_job(conn, job, exc, delay_seconds=exc.delay_seconds, code=exc.code)
     except NotificationRetry as exc:
+        conn.rollback()
         retry_job(conn, job, exc, delay_seconds=exc.delay_seconds, code=exc.code)
     except NotificationPermanent as exc:
+        conn.rollback()
         dead_job(conn, job, exc, code=exc.code)
     except (WmsError, PolandWmsError) as exc:
+        conn.rollback()
         if exc.retryable:
             retry_job(conn, job, exc, code=exc.code)
         else:
             dead_job(conn, job, exc, code=exc.code)
     except WooError as exc:
+        conn.rollback()
         if exc.retryable or exc.unknown_outcome:
             retry_job(conn, job, exc, code=exc.code)
         else:
             dead_job(conn, job, exc, code=exc.code)
     except DomainError as exc:
+        conn.rollback()
         dead_job(conn, job, exc, code=exc.code)
     except Exception as exc:
         print(traceback.format_exc(), file=sys.stderr, flush=True)
+        # PostgreSQL rejects every statement after one statement in the
+        # transaction fails.  Clear that failed transaction before recording
+        # the durable retry; SQLite accepts the same rollback safely.
+        conn.rollback()
         retry_job(conn, job, exc, code="unhandled")
     return True
 

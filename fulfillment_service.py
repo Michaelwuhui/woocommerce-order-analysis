@@ -1409,7 +1409,11 @@ def plan_order(
     if old_revision:
         reserved_rows = conn.execute(
             '''SELECT f.warehouse_id,fi.sku_id,
-                      SUM(MAX(0,fi.allocated_qty-fi.fulfilled_qty-fi.cancelled_qty)) AS qty
+                      SUM(CASE
+                            WHEN fi.allocated_qty-fi.fulfilled_qty-fi.cancelled_qty > 0
+                            THEN fi.allocated_qty-fi.fulfilled_qty-fi.cancelled_qty
+                            ELSE 0
+                          END) AS qty
                FROM oms_fulfillments f
                JOIN oms_fulfillment_items fi ON fi.fulfillment_id=f.id
                WHERE f.order_id=? AND f.revision=?

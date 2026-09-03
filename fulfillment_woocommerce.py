@@ -236,7 +236,13 @@ def _is_fully_shipped(conn, order_id: str, revision: int) -> bool:
     if not state or state["has_shortage"] or state["manual_review"]:
         return False
     open_qty = conn.execute(
-        '''SELECT COALESCE(SUM(MAX(fi.allocated_qty-fi.fulfilled_qty-fi.cancelled_qty,0)),0) AS qty
+        '''SELECT COALESCE(SUM(
+                     CASE
+                       WHEN fi.allocated_qty-fi.fulfilled_qty-fi.cancelled_qty > 0
+                       THEN fi.allocated_qty-fi.fulfilled_qty-fi.cancelled_qty
+                       ELSE 0
+                     END
+                   ),0) AS qty
            FROM oms_fulfillment_items fi
            JOIN oms_fulfillments f ON f.id=fi.fulfillment_id
            WHERE f.order_id=? AND f.revision=? AND f.status NOT IN ('cancelled','superseded')''',
