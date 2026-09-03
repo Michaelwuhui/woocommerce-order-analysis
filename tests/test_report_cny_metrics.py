@@ -1,4 +1,5 @@
 import ast
+from datetime import datetime
 from pathlib import Path
 
 
@@ -36,6 +37,7 @@ def _load_report_aggregator(rows, rates):
         'get_db_connection': lambda: connection,
         '_revenue_status_cond': lambda: '1 = 1',
         'get_cny_rate': lambda currency, month: (rates.get((currency, month)), month),
+        'datetime': datetime,
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), 'app.py', 'exec'), namespace)
     return namespace['get_orders_for_report'], connection
@@ -86,23 +88,39 @@ def test_report_missing_rate_never_treats_native_amount_as_cny():
 def test_week_spanning_months_uses_each_orders_calendar_month_rate():
     rows = [
         {
-            'source': 'shop.example', 'period': '2026-W35', 'rate_month': '2026-08', 'currency': 'PLN',
+            'source': 'shop.example', 'period': '2026-08-31', 'rate_month': '2026-08', 'currency': 'PLN',
             'order_count': 1, 'total_amount': 100, 'net_amount': 90, 'success_net': 80,
         },
         {
-            'source': 'shop.example', 'period': '2026-W35', 'rate_month': '2026-09', 'currency': 'PLN',
+            'source': 'shop.example', 'period': '2026-09-01', 'rate_month': '2026-09', 'currency': 'PLN',
             'order_count': 1, 'total_amount': 100, 'net_amount': 90, 'success_net': 80,
         },
     ]
-    aggregate, _ = _load_report_aggregator(
+    aggregate, connection = _load_report_aggregator(
         rows,
         {('PLN', '2026-08'): 2.0, ('PLN', '2026-09'): 3.0},
     )
 
-    period = aggregate('2026-08-31', '2026-09-06', granularity='week')['shop.example']['periods']['2026-W35']
+    period = aggregate('2026-08-31', '2026-09-06', granularity='week')['shop.example']['periods']['2026-W36']
 
     assert period['gmv_cny'] == 500.0
     assert period['net_cny'] == 400.0
+    assert "%Y-W%W" not in connection.query
+    assert "strftime('%Y-%m-%d', date_created)" in connection.query
+
+
+def test_iso_week_uses_iso_year_at_new_year_boundary():
+    rows = [{
+        'source': 'shop.example', 'period': '2027-01-01', 'rate_month': '2027-01', 'currency': 'PLN',
+        'order_count': 1, 'total_amount': 10, 'net_amount': 9, 'success_net': 8,
+    }]
+    aggregate, _ = _load_report_aggregator(rows, {('PLN', '2027-01'): 2.0})
+
+    periods = aggregate(
+        '2027-01-01', '2027-01-01', granularity='week'
+    )['shop.example']['periods']
+
+    assert list(periods) == ['2026-W53']
 
 
 def test_report_ui_uses_cny_gmv_for_amount_and_aov():

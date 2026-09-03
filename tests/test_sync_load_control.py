@@ -226,6 +226,33 @@ def test_note_refresh_includes_changed_orders_and_caps_active_rotation():
     )
 
 
+def test_note_upsert_preserves_human_author_and_boolean_origin():
+    conn = make_note_db()
+    conn.execute(
+        """INSERT INTO order_notes
+           (wc_note_id,order_id,note,date_created,customer_note,author,added_by_user)
+           VALUES (1010,'1-101','old','2026-07-31T09:00:00',0,'Operator',1)"""
+    )
+
+    written = sync_utils.upsert_order_notes_in_transaction(
+        [{
+            'id': 1010,
+            '_local_order_id': '1-101',
+            'note': 'remote refresh',
+            'date_created': '2026-07-31T10:00:00',
+            'customer_note': False,
+            'author': 'WooCommerce',
+            'added_by_user': False,
+        }],
+        conn,
+    )
+
+    assert written == 1
+    assert conn.execute(
+        "SELECT note,author,added_by_user FROM order_notes WHERE wc_note_id=1010"
+    ).fetchone() == ('remote refresh', 'Operator', 1)
+
+
 def test_note_state_table_is_committed_when_no_orders_are_selected():
     conn = make_note_db()
 

@@ -46,6 +46,15 @@ DB_FILE = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'woocommerce_orders.db'),
 )
 
+
+def _require_legacy_sqlite_backend():
+    backend = os.getenv('WOO_DB_BACKEND', 'sqlite').strip().lower()
+    if backend in {'postgres', 'postgresql', 'pg'}:
+        raise SystemExit(
+            '拒绝运行旧 SQLite 同步器：PostgreSQL 生产环境必须通过 Celery '
+            '统一同步 pipeline 发起任务。'
+        )
+
 # -----------------------------
 # 孤儿单清理保护阈值（P0-a 数据保护改造）
 # 站点若被回滚到旧库，会突然出现大量"本地有、远程没有"的孤儿单；超过阈值即判定为
@@ -664,6 +673,7 @@ def main(incremental=True, sync_status=True, start_date=None, clean_deleted=Fals
         start_date: 起始日期
         clean_deleted: 是否清理已删除的订单
     """
+    _require_legacy_sqlite_backend()
     print("开始 WooCommerce 订单同步程序（SQLite版本）...")
     
     if clean_deleted:

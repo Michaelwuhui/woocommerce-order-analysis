@@ -284,6 +284,25 @@ def delete_sku_map(mid):
 
 # ─────────────────────────── 解析辅助 API ───────────────────────────
 
+def _parse_suggest_candidate_query(brand_id, series_id=None, puff_count=None):
+    """Build a typed, portable candidate query for optional taxonomy values.
+
+    PostgreSQL cannot infer the type of a bare ``? IS NULL`` parameter. Omitting
+    optional predicates preserves the old wildcard behaviour without relying on
+    an untyped NULL placeholder; SQLite receives the same query shape.
+    """
+    sql = '''SELECT id, sku_code, name FROM inv_skus
+             WHERE is_active=1 AND brand_id=?'''
+    params = [brand_id]
+    if series_id is not None:
+        sql += ' AND (series_id=? OR series_id IS NULL)'
+        params.append(series_id)
+    if puff_count is not None:
+        sql += ' AND (puff_count=? OR puff_count IS NULL)'
+        params.append(puff_count)
+    sql += ' ORDER BY sku_code LIMIT 20'
+    return sql, tuple(params)
+
 @inv_sku_bp.route('/api/inv/parse-suggest', methods=['GET'])
 @login_required
 @inv_view_required
@@ -298,12 +317,10 @@ def parse_suggest():
         brand_id, series_id, puff, flavor = inv_resolver.resolve_taxonomy(conn, name, source)
         cand = []
         if brand_id:
-            rows = conn.execute('''SELECT id, sku_code, name FROM inv_skus
-                WHERE is_active=1 AND brand_id=?
-                  AND (? IS NULL OR series_id=? OR series_id IS NULL)
-                  AND (? IS NULL OR puff_count=? OR puff_count IS NULL)
-                ORDER BY sku_code LIMIT 20''',
-                (brand_id, series_id, series_id, puff, puff)).fetchall()
+            candidate_sql, candidate_params = _parse_suggest_candidate_query(
+                brand_id, series_id, puff
+            )
+            rows = conn.execute(candidate_sql, candidate_params).fetchall()
             cand = [dict(r) for r in rows]
         brand_name = None
         if brand_id:

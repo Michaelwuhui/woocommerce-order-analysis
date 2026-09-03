@@ -2,7 +2,9 @@
 inv_migrations.py — 进销存模块的可回滚数据库迁移。
 
 为什么自己写一个迷你迁移器而不用 Alembic:
-  - 现有项目是 sqlite 单库 + 零迁移框架,引入 Alembic 成本过高。
+  - 这是迁移前保留的 SQLite 专用迁移器。
+  - PostgreSQL 使用 migrations/postgresql 下的版本化迁移；本脚本在该后端
+    只允许查看 status，up/down 会在建立连接或备份前安全拒绝。
   - 我们只需要:有序应用 / 按序回滚 / 记录已应用版本 / 改动前自动备份。
 
 约束(对齐用户锁定的硬约束):
@@ -2867,6 +2869,13 @@ MIGRATIONS = [
 
 # ───────────────────────── 运行器 ─────────────────────────
 
+def _require_sqlite_migration_backend(command):
+    if sqlite3.is_postgres_backend():
+        raise SystemExit(
+            f"拒绝执行 inv_migrations.py {command}：旧迁移器仅支持 SQLite；"
+            "PostgreSQL 请使用 migrations/postgresql 下的版本化迁移。"
+        )
+
 def _backup(tag):
     stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     dst = f'{DB_FILE}.pre{tag}_{stamp}'
@@ -2880,7 +2889,8 @@ def _backup(tag):
 def cmd_status():
     conn = get_conn()
     applied = _applied(conn)
-    print(f'数据库: {DB_FILE}')
+    backend = 'PostgreSQL' if sqlite3.is_postgres_backend() else f'SQLite ({DB_FILE})'
+    print(f'数据库后端: {backend}')
     print('版本   状态        名称')
     for v, name, _, _ in MIGRATIONS:
         mark = '已应用' if v in applied else '待应用'
@@ -2889,6 +2899,7 @@ def cmd_status():
 
 
 def cmd_up(target=None):
+    _require_sqlite_migration_backend('up')
     conn = get_conn()
     applied = _applied(conn)
     pending = [m for m in MIGRATIONS if m[0] not in applied
@@ -2911,6 +2922,7 @@ def cmd_up(target=None):
 
 def cmd_down(target=None):
     """回滚。target=None 只回滚最近一个;target=版本号 回滚 >=该版本 的全部。"""
+    _require_sqlite_migration_backend('down')
     conn = get_conn()
     applied = _applied(conn)
     to_rollback = sorted([m for m in MIGRATIONS if m[0] in applied],

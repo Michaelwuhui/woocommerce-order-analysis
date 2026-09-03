@@ -120,7 +120,11 @@ def warehouse_rows(conn, allowed_ids=None):
             return []
         sql += f" AND w.id IN ({','.join('?' * len(allowed_ids))})"
         params.extend(allowed_ids)
-    sql += " GROUP BY w.id ORDER BY w.country,w.name"
+    # SQLite accepts the selected integration column when only w.id is grouped;
+    # PostgreSQL correctly requires every non-aggregate expression. Keep the
+    # complete grouping explicit so this read path is portable on both backends.
+    sql += (" GROUP BY w.id,w.name,w.code,w.country,wi.inventory_authority"
+            " ORDER BY w.country,w.name")
     return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
 

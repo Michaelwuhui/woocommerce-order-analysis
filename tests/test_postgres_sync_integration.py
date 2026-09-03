@@ -7,6 +7,7 @@ import pytest
 import requests
 
 import db_backend as db
+import inv_mapping_service
 import sync_service
 import sync_tasks
 from external_operations import begin_operation, transition_operation
@@ -254,6 +255,17 @@ def test_parameterized_sql_preserves_literal_percent_formats_and_like_patterns()
         ).fetchone()
         assert row[0] == "2026-09"
         assert row[1] is True
+    finally:
+        connection.close()
+
+
+def test_inventory_warehouse_rows_grouping_is_postgres_safe():
+    connection = _connection()
+    try:
+        rows = inv_mapping_service.warehouse_rows(connection)
+        assert isinstance(rows, list)
+        if rows:
+            assert {'id', 'inventory_authority', 'sku_count'} <= set(rows[0])
     finally:
         connection.close()
 
@@ -659,6 +671,77 @@ def test_external_operation_state_machine_and_failed_retry_claim():
         assert resumed["resumed"] is True
         assert resumed["should_execute"] is True
         assert int(resumed["attempts"]) == 2
+    finally:
+        connection.close()
+
+
+def test_mock_order_note_response_is_mirrored_with_postgres_booleans(monkeypatch):
+    import app as app_module
+
+    connection = _connection()
+    try:
+        site = connection.execute("SELECT * FROM sites ORDER BY id LIMIT 1").fetchone()
+        admin = connection.execute(
+            "SELECT id,name,username FROM users WHERE username='admin' LIMIT 1"
+        ).fetchone()
+        assert site and admin
+        woo_id = 991230051
+        upsert_orders_in_transaction([_synthetic_order(site['url'], woo_id)], connection)
+        connection.commit()
+        order_id = make_oid(int(site['id']), woo_id)
+    finally:
+        connection.close()
+
+    note_id = 991230052
+    note_text = 'pytest PostgreSQL boolean note mirror'
+
+    class Response:
+        status_code = 201
+        text = '{}'
+
+        @staticmethod
+        def json():
+            return {
+                'id': note_id,
+                'note': note_text,
+                'date_created': '2026-09-03T00:00:00',
+                'customer_note': False,
+                'author': 'WooCommerce',
+                'added_by_user': False,
+            }
+
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs['json']))
+        return Response()
+
+    monkeypatch.setattr(requests, 'post', fake_post)
+    app_module.app.config.update(TESTING=True)
+    client = app_module.app.test_client()
+    with client.session_transaction() as session:
+        session['_user_id'] = str(admin['id'])
+        session['_fresh'] = True
+
+    response = client.post(
+        f'/api/order/{order_id}/note',
+        json={'note': note_text, 'notify_customer': False},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()['success'] is True
+    assert len(calls) == 1
+    connection = _connection()
+    try:
+        stored = connection.execute(
+            """SELECT note,customer_note,author,added_by_user
+               FROM order_notes WHERE order_id=? AND wc_note_id=?""",
+            (order_id, note_id),
+        ).fetchone()
+        assert stored['note'] == note_text
+        assert stored['customer_note'] is False
+        assert stored['author'] == (admin['name'] or admin['username'])
+        assert stored['added_by_user'] is True
     finally:
         connection.close()
 
