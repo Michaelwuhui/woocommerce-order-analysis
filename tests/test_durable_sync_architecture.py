@@ -180,6 +180,13 @@ def test_worker_units_enforce_fetch_three_writer_one_and_single_beat():
     assert "Environment=WOO_SYNC_IPV4_ONLY=1" in fetch
     assert "--queues=sync_write" in writer
     assert "--concurrency=1" in writer
+    # Foreground workers are supervised by systemd and must not share Beat's
+    # RuntimeDirectory. Restarting either worker used to remove the other
+    # process's pidfile and make its next clean shutdown fail with EROFS.
+    assert "--pidfile=" not in fetch
+    assert "--pidfile=" not in writer
+    assert "RuntimeDirectory=woo-analysis" not in fetch
+    assert "RuntimeDirectory=woo-analysis" not in writer
     assert "--pidfile=/run/woo-analysis/celery-beat.pid" in beat
     assert "Restart=always" in fetch
     assert "Restart=always" in writer
