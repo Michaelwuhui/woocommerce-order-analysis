@@ -68,3 +68,9 @@ def test_known_postgres_incompatible_fragments_are_absent_from_runtime_paths():
     assert 'order_notes.added_by_user = 1 THEN 1' not in combined
     assert '? IS NULL OR series_id=?' not in combined
     assert '? IS NULL OR puff_count=?' not in combined
+
+
+def test_company_profit_period_lookup_avoids_sqlite_printf():
+    source = (ROOT / 'company_profit.py').read_text(encoding='utf-8')
+    assert "printf('%04d-%02d'" not in source
+    assert '(period_year * 100 + period_month) < ?' in source

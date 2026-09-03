@@ -122,6 +122,38 @@ def test_compat_row_iterates_values_and_still_converts_to_mapping():
     assert dict(row) == {"alpha": 1, "beta": 2}
 
 
+def test_explicit_begin_bypasses_postgres_sql_compilation():
+    class Info:
+        transaction_status = db_backend.TransactionStatus.IDLE
+
+    class RawConnection:
+        info = Info()
+
+    class RawCursor:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    class Connection:
+        def __init__(self):
+            self._raw = RawConnection()
+            self._last_changes = 9
+
+        def compile(self, *_args, **_kwargs):
+            raise AssertionError("BEGIN must not invoke SQL compilation")
+
+    connection = Connection()
+    raw_cursor = RawCursor()
+    cursor = db_backend.PgCompatCursor(connection, raw_cursor)
+
+    cursor.execute("BEGIN")
+
+    assert raw_cursor.statements == []
+    assert connection._last_changes == 0
+
+
 def test_replace_conflict_keys_match_the_migrated_reconciliation_schema():
     assert db_backend._REPLACE_CONFLICT_KEYS["reconciliation_statements"] == (
         "partner_id",
