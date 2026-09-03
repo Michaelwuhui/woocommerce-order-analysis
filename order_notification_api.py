@@ -1098,9 +1098,9 @@ def notification_targets():
                    WHERE id<>? AND enabled=1
                      AND deleted_at IS NULL
                      AND environment=?
-                     AND store_id IS ?
+                     AND store_id IS NOT DISTINCT FROM ?
                      AND LOWER(COALESCE(country_code,''))=LOWER(COALESCE(?,''))
-                     AND warehouse_id IS ?
+                     AND warehouse_id IS NOT DISTINCT FROM ?
                      AND LOWER(COALESCE(shipping_method,''))=LOWER(COALESCE(?,''))""",
                 (
                     target_id, environment, store_id, country_code,

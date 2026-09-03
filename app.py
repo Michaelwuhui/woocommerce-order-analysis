@@ -20295,40 +20295,28 @@ def add_order_note(order_id):
         if not remote_note or 'id' not in remote_note:
             return
         from datetime import datetime
+        from sync_utils import upsert_order_notes_in_transaction
         display_author = remote_note.get('author', '')
         if submitted_by_current_user and current_user.is_authenticated:
             display_author = (current_user.name or current_user.username or display_author or '').strip()
-        added_by_user = 1 if (submitted_by_current_user or remote_note.get('added_by_user', True)) else 0
+        local_note = dict(remote_note)
+        local_note.update({
+            '_local_order_id': order_id,
+            'note': remote_note.get('note', note),
+            'date_created': remote_note.get('date_created', datetime.now().isoformat()),
+            'customer_note': bool(remote_note.get('customer_note', notify_customer)),
+            'author': display_author,
+            'added_by_user': bool(
+                submitted_by_current_user or remote_note.get('added_by_user', True)
+            ),
+        })
         conn2 = get_db_connection()
         try:
-            conn2.execute('''
-                INSERT INTO order_notes (
-                    wc_note_id, order_id, note, date_created, customer_note, author, added_by_user
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(order_id, wc_note_id) DO UPDATE SET
-                    note = excluded.note,
-                    date_created = excluded.date_created,
-                    customer_note = excluded.customer_note,
-                    author = CASE
-                        WHEN order_notes.added_by_user = 1
-                             AND COALESCE(order_notes.author, '') NOT IN ('', 'WooCommerce')
-                        THEN order_notes.author
-                        ELSE excluded.author
-                    END,
-                    added_by_user = CASE
-                        WHEN order_notes.added_by_user = 1 THEN 1
-                        ELSE excluded.added_by_user
-                    END
-            ''', (
-                remote_note.get('id'),
-                order_id,
-                remote_note.get('note', note),
-                remote_note.get('date_created', datetime.now().isoformat()),
-                1 if remote_note.get('customer_note', notify_customer) else 0,
-                display_author,
-                added_by_user,
-            ))
+            upsert_order_notes_in_transaction([local_note], conn2)
             conn2.commit()
+        except Exception:
+            conn2.rollback()
+            raise
         finally:
             conn2.close()
 
@@ -22598,8 +22586,11 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
     if granularity == 'day':
         time_expr = "strftime('%Y-%m-%d', date_created)"
     elif granularity == 'week':
-        # ISO week format: YYYY-Www
-        time_expr = "strftime('%Y-W%W', date_created)"
+        # Aggregate by calendar day in SQL, then fold the rows into ISO weeks
+        # below. SQLite's %W and PostgreSQL's to_char week tokens have different
+        # semantics, especially around New Year, so the database must not invent
+        # the week label.
+        time_expr = "strftime('%Y-%m-%d', date_created)"
     else:  # month
         time_expr = "strftime('%Y-%m', date_created)"
     
@@ -22664,6 +22655,17 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
     for row in orders:
         source_url = row['source']
         period = row['period']
+        if granularity == 'week':
+            try:
+                iso_year, iso_week, _ = datetime.strptime(
+                    str(period)[:10], '%Y-%m-%d'
+                ).isocalendar()
+                period = f'{iso_year}-W{iso_week:02d}'
+            except (TypeError, ValueError):
+                # Invalid legacy timestamps cannot be assigned to a trustworthy
+                # week bucket. They remain excluded just as SQL strftime(NULL)
+                # rows were unusable before this compatibility fix.
+                continue
         currency = row['currency']
         
         if source_url not in result:

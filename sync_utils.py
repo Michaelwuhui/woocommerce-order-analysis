@@ -422,7 +422,8 @@ def upsert_order_notes_in_transaction(notes_data, connection):
                 THEN order_notes.author
                 ELSE excluded.author
             END,
-            added_by_user=order_notes.added_by_user OR excluded.added_by_user
+            added_by_user=COALESCE(order_notes.added_by_user,FALSE)
+                          OR excluded.added_by_user
         """,
         rows,
     )
@@ -725,38 +726,11 @@ def sync_order_notes(
                 result["failed"] += 1
 
         if all_notes:
-            insert_query = """
-            INSERT INTO order_notes (
-                wc_note_id, order_id, note, date_created, customer_note, author, added_by_user
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(order_id, wc_note_id) DO UPDATE SET
-                note = excluded.note,
-                date_created = excluded.date_created,
-                customer_note = excluded.customer_note,
-                author = CASE
-                    WHEN order_notes.added_by_user = 1
-                         AND COALESCE(order_notes.author, '') NOT IN ('', 'WooCommerce')
-                    THEN order_notes.author
-                    ELSE excluded.author
-                END,
-                added_by_user = CASE
-                    WHEN order_notes.added_by_user = 1 THEN 1
-                    ELSE excluded.added_by_user
-                END
-            """
-            processed_notes = []
-            for note in all_notes:
-                processed_notes.append((
-                    note.get("id"),
-                    note["_local_order_id"],
-                    note.get("note", ""),
-                    note.get("date_created", ""),
-                    1 if note.get("customer_note", False) else 0,
-                    note.get("author", ""),
-                    1 if note.get("added_by_user", False) else 0,
-                ))
-            cursor.executemany(insert_query, processed_notes)
-            result["notes"] = len(processed_notes)
+            # Keep the legacy direct-sync path on the same PostgreSQL-safe,
+            # idempotent upsert used by the durable page writer.
+            result["notes"] = upsert_order_notes_in_transaction(
+                all_notes, connection
+            )
 
         if successful_order_ids:
             cursor.executemany(
@@ -772,6 +746,10 @@ def sync_order_notes(
         return result
 
     except Exception as exc:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
         print(f"Error syncing order notes: {exc}")
         result["failed"] += 1
         return result
