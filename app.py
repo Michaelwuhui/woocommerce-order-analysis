@@ -18951,6 +18951,7 @@ def ship_order():
     remote_state_uncertain = False
     remote_http_status = None
     remote_confirmation = None
+    remote_order_status = None
 
     def _decode_nested_json(value):
         if isinstance(value, str):
@@ -18991,13 +18992,22 @@ def ship_order():
         return False
 
     def _remote_order_applied(payload):
+        nonlocal remote_order_status
         if not isinstance(payload, dict):
             return False
         remote_id = str(payload.get('id') or '')
         if remote_id and remote_id != str(woo_post_id(order['id'])):
             return False
-        status_ok = payload.get('status') == expected_status
-        return status_ok and _remote_order_has_tracking(payload)
+        # The exact tracking number is the authoritative evidence that this
+        # shipment mutation reached WooCommerce. Some stores run a hook after
+        # AST saves the parcel and immediately advance ``shipped`` to
+        # ``completed``. Requiring the transient requested status would turn a
+        # successful shipment into an ambiguous 504 and invite a dangerous
+        # duplicate submission.
+        if not _remote_order_has_tracking(payload):
+            return False
+        remote_order_status = str(payload.get('status') or '').strip() or None
+        return True
 
     def _verify_remote_saved(reason):
         nonlocal remote_confirmation
@@ -19010,6 +19020,12 @@ def ship_order():
             )
             if check.status_code == 200 and _remote_order_applied(check.json()):
                 warnings.append(reason)
+                if remote_order_status and remote_order_status != expected_status:
+                    warnings.append(
+                        '站点保存运单后将订单状态调整为 '
+                        + remote_order_status
+                        + '，本地已按远端真实状态记录'
+                    )
                 remote_confirmation = 'verified_get'
                 return True
         except Exception as verify_err:
@@ -19096,6 +19112,7 @@ def ship_order():
                     'http_status': remote_http_status,
                     'confirmation': remote_confirmation or 'verified',
                     'format': fmt,
+                    'remote_status': remote_order_status or expected_status,
                 },
             )
         except Exception:
@@ -19174,7 +19191,11 @@ def ship_order():
             'uncertain': remote_state_uncertain,
             'retry_safe': not remote_state_uncertain,
             'error': f"发货失败（{fmt_label}）：{'; '.join(warnings) or '远程未返回成功'}。{action_note}{stash_note}"
-        }), 504 if remote_state_uncertain else 502
+        # 502/504 responses may be replaced with an HTML error page by the CDN,
+        # hiding the structured reconciliation warning from the browser. This
+        # is an application conflict (do not replay) or a definitive rejected
+        # mutation, so return statuses that preserve the JSON body end-to-end.
+        }), 409 if remote_state_uncertain else 422
 
     # Build the re-shipment audit line once; reused for the local order_notes
     # row and the best-effort remote WC note below.
@@ -19189,7 +19210,10 @@ def ship_order():
     # Only this local transaction is retried. Remote calls remain outside the
     # callback and therefore run once.
     def _write_local_mirror(local_conn):
-        local_conn.execute("UPDATE orders SET status=? WHERE id=?", (expected_status, order_id))
+        local_conn.execute(
+            "UPDATE orders SET status=? WHERE id=?",
+            (remote_order_status or expected_status, order_id),
+        )
         if new_parcel:
             # Split shipment: record this parcel as its own row.
             local_conn.execute(
