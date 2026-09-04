@@ -409,7 +409,7 @@
                             <tbody>
                                 {% for product in top_products %}
                                 <tr style="cursor: pointer;"
-                                    onclick="openProductMapping('{{ product.name | e }}', '{{ (product.brand or '') | e }}', '{{ (product.puffs or '') | e }}', '{{ (product.flavor or '') | e }}')"
+                                    onclick="openProductMapping({{ loop.index0 }})"
                                     title="点击编辑产品映射">
                                     <td>
                                         {% if loop.index <= 3 %} <span
@@ -503,12 +503,21 @@
                         <div class="row mt-3">
                             <div class="col-md-6">
                                 <small class="d-block mb-1" style="color:#cbd5e1;">来源网站：</small>
-                                <div id="productSources"><span style="color:#cbd5e1;">加载中...</span></div>
+                                <div id="productSources"><span style="color:#cbd5e1;">未找到</span></div>
                             </div>
                             <div class="col-md-6">
                                 <small class="d-block mb-1" style="color:#cbd5e1;">相关订单号 (最近10个)：</small>
                                 <div id="productOrders" style="max-height: 80px; overflow-y: auto;"><span
-                                        style="color:#cbd5e1;">加载中...</span></div>
+                                        style="color:#cbd5e1;">未找到</span></div>
+                            </div>
+                        </div>
+                        <div class="mt-3">
+                            <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-1">
+                                <small style="color:#cbd5e1;">各来源网站成交单价：</small>
+                                <small class="text-white-50">来自当前筛选范围内的已同步订单，非实时目录价</small>
+                            </div>
+                            <div id="productSourcePrices" class="table-responsive" style="max-height:260px;overflow:auto;">
+                                <span style="color:#cbd5e1;">未找到</span>
                             </div>
                         </div>
                     </div>
@@ -1059,10 +1068,104 @@
     }
 
     // Product Mapping Functions
-    function openProductMapping(productName, currentBrand, currentPuffs, currentFlavor) {
+    function productModalEscape(value) {
+        return String(value ?? '').replace(/[&<>"']/g, function (character) {
+            return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character];
+        });
+    }
+
+    function productModalSourceIdentity(row, displayMode) {
+        const parts = [];
+        if (row.manager) {
+            parts.push('<span class="badge me-1" style="background:rgba(23,162,184,0.3);color:#17a2b8;">'
+                + productModalEscape(row.manager) + '</span>');
+        }
+        if (displayMode !== 'manager_only') {
+            parts.push('<span class="badge bg-success bg-opacity-25 text-success me-1">'
+                + productModalEscape(row.site) + '</span>');
+        }
+        return parts.join('') || '<span class="text-white-50">已授权站点</span>';
+    }
+
+    function renderProductSourcePrices(sourcePrices) {
+        const priceBox = document.getElementById('productSourcePrices');
+        const displayMode = "{{ source_display_mode }}";
+        if (!Array.isArray(sourcePrices) || !sourcePrices.length) {
+            priceBox.innerHTML = '<span class="text-white-50">当前筛选范围内没有可用价格</span>';
+            return;
+        }
+        const rows = sourcePrices.map(function (row) {
+            const currency = productModalEscape(row.currency || '');
+            const latestPrice = row.latest_price == null
+                ? '<span class="text-white-50">—</span>'
+                : '<strong class="text-warning">' + productModalEscape(row.latest_price)
+                    + ' ' + currency + '</strong>';
+            let priceRange = '<span class="text-white-50">—</span>';
+            if (row.min_price != null && row.max_price != null) {
+                priceRange = row.min_price === row.max_price
+                    ? productModalEscape(row.min_price) + ' ' + currency
+                    : productModalEscape(row.min_price) + '–'
+                        + productModalEscape(row.max_price) + ' ' + currency;
+            }
+            return '<tr><td>' + productModalSourceIdentity(row, displayMode)
+                + '</td><td class="text-nowrap">' + latestPrice
+                + '</td><td class="text-nowrap">' + priceRange
+                + '</td><td class="text-nowrap">' + productModalEscape(row.latest_date || '—')
+                + '</td><td class="text-end text-nowrap">' + productModalEscape(row.quantity || 0)
+                + ' 件 / ' + productModalEscape(row.order_count || 0) + ' 单</td></tr>';
+        }).join('');
+        priceBox.innerHTML = '<table class="table table-dark table-sm align-middle mb-0">'
+            + '<thead class="position-sticky top-0"><tr><th>来源网站</th><th>最近单价</th>'
+            + '<th>价格范围</th><th>最近成交</th><th class="text-end">销量 / 订单</th>'
+            + '</tr></thead><tbody>' + rows + '</tbody></table>';
+    }
+
+    function renderProductSourcesAndOrders(product) {
+        const sourcePrices = product.source_prices || [];
+        const recentOrders = product.recent_orders || [];
+        const displayMode = "{{ source_display_mode }}";
+        if (sourcePrices.length > 0) {
+            const uniqueSources = [];
+            const seenSources = new Set();
+            sourcePrices.forEach(source => {
+                const key = String(source.source || source.site) + '|' + String(source.manager || '');
+                if (!seenSources.has(key)) {
+                    seenSources.add(key);
+                    uniqueSources.push(productModalSourceIdentity(source, displayMode));
+                }
+            });
+            document.getElementById('productSources').innerHTML = uniqueSources.join('');
+        } else {
+            document.getElementById('productSources').innerHTML = '<span class="text-muted">未找到</span>';
+        }
+
+        if (recentOrders.length > 0) {
+            document.getElementById('productOrders').innerHTML = recentOrders.map(order => {
+                const visibleSource = displayMode === 'manager_only'
+                    ? (order.manager || '已授权站点')
+                    : order.source;
+                const title = String(visibleSource || '') + (order.date ? ' · ' + order.date : '');
+                return '<span class="badge bg-secondary bg-opacity-50 me-1 mb-1" title="'
+                    + productModalEscape(title) + '">#'
+                    + productModalEscape(order.order_number) + '</span>';
+            }).join('');
+        } else {
+            document.getElementById('productOrders').innerHTML = '<span class="text-muted">未找到</span>';
+        }
+    }
+
+    function openProductMapping(productIndex) {
+        const product = topProducts[Number(productIndex)] || {};
+        const productName = product.name || '';
+        const currentBrand = product.brand || '';
+        const currentPuffs = product.puffs || '';
+        const currentFlavor = product.flavor || '';
+
         // Populate original data section
         document.getElementById('originalProductName').textContent = productName;
         document.getElementById('mappingProductName').value = productName;
+        renderProductSourcePrices(product.source_prices);
+        renderProductSourcesAndOrders(product);
 
         // Populate auto-parsed results section
         document.getElementById('autoParsedBrand').textContent = currentBrand || '-';
@@ -1103,6 +1206,7 @@
         fetch('/api/products/mapping?name=' + encodeURIComponent(productName))
             .then(r => r.json())
             .then(saved => {
+                if (document.getElementById('mappingProductName').value !== productName) return;
                 if (saved.brand_id) {
                     for (var i = 0; i < brandSelect.options.length; i++) {
                         if (brandSelect.options[i].value == saved.brand_id) { brandSelect.selectedIndex = i; break; }
@@ -1111,54 +1215,14 @@
                 if (saved.puff_count) document.getElementById('mappingPuffs').value = saved.puff_count;
                 if (saved.flavor) document.getElementById('mappingFlavor').value = saved.flavor;
                 loadMappingSeries().then(() => {
+                    if (document.getElementById('mappingProductName').value !== productName) return;
                     if (saved.series_id) document.getElementById('mappingSeries').value = saved.series_id;
                 });
             })
-            .catch(() => { loadMappingSeries(); });
-
-        // Load sources and orders info
-        document.getElementById('productSources').innerHTML = '<span class="text-muted">加载中...</span>';
-        document.getElementById('productOrders').innerHTML = '<span class="text-muted">加载中...</span>';
-
-        // Build query params for searching by brand+puffs+flavor combination
-        const params = new URLSearchParams();
-        params.set('name', productName);
-        if (currentBrand && currentBrand !== 'Unknown') params.set('brand', currentBrand);
-        if (currentPuffs) params.set('puffs', currentPuffs);
-        if (currentFlavor) params.set('flavor', currentFlavor);
-
-        fetch('/api/products/samples?' + params.toString())
-            .then(res => res.json())
-            .then(data => {
-                // Display sources
-                if (data.sources && data.sources.length > 0) {
-                    const displayMode = "{{ source_display_mode }}";
-                    document.getElementById('productSources').innerHTML = data.sources.map(s => {
-                        let content = '';
-                        if (s.manager) {
-                            content += `<span class="badge me-1" style="background:rgba(23,162,184,0.3);color:#17a2b8;">${s.manager}</span>`;
-                        }
-                        if (displayMode !== 'manager_only') {
-                            content += `<span class="badge bg-success bg-opacity-25 text-success me-1">${s.site}</span>`;
-                        }
-                        return content;
-                    }).join('');
-                } else {
-                    document.getElementById('productSources').innerHTML = '<span class="text-muted">未找到</span>';
+            .catch(() => {
+                if (document.getElementById('mappingProductName').value === productName) {
+                    loadMappingSeries();
                 }
-
-                // Display order numbers
-                if (data.orders && data.orders.length > 0) {
-                    document.getElementById('productOrders').innerHTML = data.orders.map(o =>
-                        '<span class="badge bg-secondary bg-opacity-50 me-1 mb-1" title="' + o.source + ' - ' + o.date + '">#' + o.order_number + '</span>'
-                    ).join('');
-                } else {
-                    document.getElementById('productOrders').innerHTML = '<span class="text-muted">未找到</span>';
-                }
-            })
-            .catch(err => {
-                document.getElementById('productSources').innerHTML = '<span class="text-danger">加载失败</span>';
-                document.getElementById('productOrders').innerHTML = '<span class="text-danger">加载失败</span>';
             });
 
         new bootstrap.Modal(document.getElementById('productMappingModal')).show();

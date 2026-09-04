@@ -66,6 +66,10 @@ from product_clone_jobs import (
     init_product_clone_jobs,
 )
 from product_clone_sku import build_clone_sku, make_clone_suffix, normalize_clone_suffix
+from product_analysis_drilldown import (
+    finalize_product_drilldown,
+    record_product_drilldown,
+)
 from sync_runtime_status import (
     init_sync_runtime_status,
     load_sync_runtime_status,
@@ -15480,7 +15484,7 @@ def products():
     
     # Get all orders with line items (including currency and shipping)
     orders = conn.execute(f'''
-        SELECT id, line_items, source, currency, total, shipping_total, date_created
+        SELECT id, number, line_items, source, currency, total, shipping_total, date_created
         FROM orders {where_clause}
     ''', params).fetchall()
     
@@ -15641,6 +15645,12 @@ def products():
             product_stats[product_key]['revenue_by_currency'][currency] += total
             product_stats[product_key]['gross_revenue_by_currency'][currency] += gross_total
             product_stats[product_key]['order_count'] += 1
+            # The mapping modal needs these same classified rows. Aggregate its
+            # source prices and recent samples now so a click never repeats the
+            # expensive full-order product parser.
+            record_product_drilldown(
+                product_stats[product_key], order, item, quantity
+            )
             
             # Brand level stats
             if brand not in brand_stats:
@@ -15731,6 +15741,8 @@ def products():
     # Get site managers mapping
     sites = conn.execute('SELECT url, manager FROM sites').fetchall()
     site_managers = {s['url']: s['manager'] or '' for s in sites}
+    for product in top_products:
+        finalize_product_drilldown(product, site_managers)
     
     # Calculate totals with revenue by currency
     total_revenue_by_currency = {}
