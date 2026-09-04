@@ -62,7 +62,16 @@ def test_shipping_2xx_response_must_contain_or_verify_exact_tracking():
 
     assert "if resp.status_code in (200, 201):\n            remote_success = True" not in source
     assert "if _remote_order_applied(resp.json()):" in source
+    assert "return status_ok and _remote_order_has_tracking(payload)" not in source
+    assert "remote_order_status or expected_status" in source
     assert "成功响应未确认运单已写入" in source
+
+
+def test_shipping_reconciliation_error_keeps_json_through_the_cdn():
+    source = _function_source("ship_order")
+
+    assert "}), 409 if remote_state_uncertain else 422" in source
+    assert "}), 504 if remote_state_uncertain else 502" not in source
 
 
 def test_shipping_local_mirror_retries_without_repeating_remote_side_effects():

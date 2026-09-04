@@ -848,3 +848,122 @@ def test_mock_shipping_and_delivery_confirmation_never_repeat_remote_effects(mon
         ).fetchone()[0] == 2
     finally:
         connection.close()
+
+
+def test_ast_gateway_error_accepts_verified_tracking_after_completed_status_hook(monkeypatch):
+    """A completed status hook must not turn a committed parcel into a replay."""
+    import app as app_module
+
+    connection = _connection()
+    try:
+        site = connection.execute("SELECT * FROM sites ORDER BY id LIMIT 1").fetchone()
+        carrier = connection.execute(
+            "SELECT slug FROM shipping_carriers ORDER BY id LIMIT 1"
+        ).fetchone()
+        admin = connection.execute(
+            "SELECT id FROM users WHERE username='admin' LIMIT 1"
+        ).fetchone()
+        assert site and carrier and admin
+        woo_id = 991230102
+        upsert_orders_in_transaction(
+            [_synthetic_order(site["url"], woo_id)], connection
+        )
+        connection.commit()
+        order_id = make_oid(int(site["id"]), woo_id)
+    finally:
+        connection.close()
+
+    calls = {"post": 0, "get": 0, "put": 0}
+    tracking = "PYTEST-AST-COMPLETED-HOOK"
+
+    class GatewayResponse:
+        status_code = 504
+        text = "<html>gateway timeout</html>"
+
+        @staticmethod
+        def json():
+            raise ValueError("edge returned HTML")
+
+    class VerifiedOrderResponse:
+        status_code = 200
+        text = "{}"
+
+        @staticmethod
+        def json():
+            return {
+                "id": woo_id,
+                "status": "completed",
+                "meta_data": [
+                    {"key": "_tracking_number", "value": tracking},
+                ],
+                "line_items": [],
+            }
+
+    def fake_post(*_args, **_kwargs):
+        calls["post"] += 1
+        return GatewayResponse()
+
+    def fake_get(*_args, **_kwargs):
+        calls["get"] += 1
+        return VerifiedOrderResponse()
+
+    def fake_put(*_args, **_kwargs):
+        calls["put"] += 1
+        raise AssertionError("AST shipment must not use the generic PUT path")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(requests, "put", fake_put)
+    monkeypatch.setattr(app_module, "detect_site_tracking_format", lambda *_args: "ast")
+    monkeypatch.setattr(
+        app_module, "_manual_partner_only_warehouse_scope", lambda *_args: False
+    )
+    app_module.app.config.update(TESTING=True)
+    client = app_module.app.test_client()
+    with client.session_transaction() as session:
+        session["_user_id"] = str(admin["id"])
+        session["_fresh"] = True
+
+    response = client.post(
+        "/api/shipping/ship",
+        json={
+            "order_id": order_id,
+            "tracking_number": tracking,
+            "carrier_slug": carrier["slug"],
+            "send_email": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["success"] is True
+    assert calls == {"post": 1, "get": 1, "put": 0}
+
+    connection = _connection()
+    try:
+        stored = connection.execute(
+            "SELECT status FROM orders WHERE id=?", (order_id,)
+        ).fetchone()
+        assert stored["status"] == "completed"
+        shipping_log = connection.execute(
+            """
+            SELECT status FROM shipping_logs
+            WHERE order_id=? AND tracking_number=?
+            """,
+            (order_id, tracking),
+        ).fetchone()
+        assert shipping_log["status"] == "shipped"
+        operation = connection.execute(
+            """
+            SELECT status,external_evidence FROM external_operations
+            WHERE order_id=? AND operation_type='ship_order'
+            """,
+            (order_id,),
+        ).fetchone()
+        assert operation["status"] == "local_committed"
+        evidence = operation["external_evidence"]
+        if isinstance(evidence, str):
+            evidence = json.loads(evidence)
+        assert evidence["confirmation"] == "verified_get"
+        assert evidence["remote_status"] == "completed"
+    finally:
+        connection.close()
