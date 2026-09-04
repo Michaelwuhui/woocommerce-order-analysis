@@ -38,7 +38,6 @@ from shipment_split import (
 )
 from order_shipments import (
     build_shipping_log_parcels,
-    detect_tracking_format_rows,
     extract_tracking_candidates,
     find_duplicate_tracking,
     is_pending_shipping_candidate,
@@ -18285,15 +18284,15 @@ def find_orders_by_tracking():
 # ============================================================================
 
 def detect_site_tracking_format(conn, site_url):
-    """Look at recent shipped orders for this site to figure out which plugin
-    holds the tracking. Returns 'ast' | 'villatheme' | 'custom_lineitem' | 'unknown'."""
-    rows = conn.execute("""
-        SELECT meta_data, line_items FROM orders
-        WHERE source = ? AND status IN ('on-hold','shipped','completed')
-        ORDER BY date_modified DESC LIMIT 10
-    """, (site_url,)).fetchall()
+    """Detect the site's tracking plugin without mutating WooCommerce.
 
-    return detect_tracking_format_rows(rows)
+    Local shipment history remains authoritative.  Brand-new sites have no
+    such history, so the shared detector falls back to public REST namespaces
+    and can select AST before their first shipment.
+    """
+    from tracking_format import detect_site_tracking_format as detect_format
+
+    return detect_format(conn, site_url)
 
 
 def _carrier_tracking_url(carrier_slug, tracking_number, tracking_url_template=''):
