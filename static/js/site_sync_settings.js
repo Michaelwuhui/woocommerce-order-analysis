@@ -79,7 +79,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await parseJsonResponse(response, '同步状态');
             statusText.textContent = data.message || '同步进行中...';
             setLogs(data.logs);
-            if (data.status === 'success' || data.status === 'error') {
+            if (['success', 'error', 'cancelled', 'interrupted'].includes(data.status)) {
                 finish(data.status, data.message, data.logs);
                 return;
             }
@@ -127,7 +127,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             const response = await fetch(endpoint, options);
             const data = await parseJsonResponse(response, title);
-            const statusId = data.sync_id || siteId;
+            // Durable PostgreSQL runs return run_id. Keep siteId only for the
+            // explicitly supported SQLite rollback path.
+            const statusId = data.run_id || data.sync_id || siteId;
             statusText.textContent = data.message || '同步任务已启动';
             progressBar.style.width = '35%';
             pollTimer = window.setTimeout(() => pollStatus(statusId), 500);

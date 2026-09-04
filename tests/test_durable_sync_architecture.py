@@ -372,6 +372,21 @@ def test_global_sync_has_one_frontend_binding_and_one_post_site():
         assert field in runtime
 
 
+def test_single_site_sync_polls_the_durable_run_id_and_handles_all_terminals():
+    settings = (ROOT / "templates/settings.html").read_text()
+    restricted = (ROOT / "static/js/site_sync_settings.js").read_text()
+
+    assert "const syncId = result.run_id || result.sync_id || siteId" in settings
+    assert "sync/status/${encodeURIComponent(syncId)}" in settings
+    assert "sync/status/${siteId}" not in settings
+    assert "['error', 'cancelled', 'interrupted']" in settings
+    assert "任务已中断/正在恢复" in settings
+
+    assert "data.run_id || data.sync_id || siteId" in restricted
+    for status in ("success", "error", "cancelled", "interrupted"):
+        assert status in restricted
+
+
 def test_postgres_latest_note_queries_and_request_cleanup_are_deterministic():
     source = (ROOT / "app.py").read_text()
     assert "GROUP BY order_id HAVING date_created = MAX(date_created)" not in source

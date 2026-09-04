@@ -1,5 +1,14 @@
 """Tracking-plugin detection shared by the shipping workflow and tests."""
 
+from order_shipments import detect_tracking_format_rows
+
+
+AST_NAMESPACE_PREFIXES = (
+    "wc-ast-pro/",
+    "wc-ast/",
+    "wc-shipment-tracking/",
+)
+
 
 def detect_site_tracking_format(conn, site_url):
     """Return ast, villatheme, custom_lineitem, or unknown for a site.
@@ -16,23 +25,9 @@ def detect_site_tracking_format(conn, site_url):
         (site_url,),
     ).fetchall()
 
-    ast = villa = custom = 0
-    for row in rows:
-        metadata = row["meta_data"] or ""
-        line_items = row["line_items"] or ""
-        if "_wc_shipment_tracking_items" in metadata:
-            ast += 1
-        if "_vi_wot_order_item_tracking_data" in line_items:
-            villa += 1
-        elif '"key":"tracking_number"' in line_items or '"key": "tracking_number"' in line_items:
-            custom += 1
-
-    if ast and ast >= max(villa, custom):
-        return "ast"
-    if villa and villa >= custom:
-        return "villatheme"
-    if custom:
-        return "custom_lineitem"
+    detected = detect_tracking_format_rows(rows)
+    if detected != "unknown":
+        return detected
 
     try:
         import requests
@@ -44,7 +39,10 @@ def detect_site_tracking_format(conn, site_url):
         )
         if root.status_code == 200:
             namespaces = root.json().get("namespaces") or []
-            if any(str(ns).lower().startswith("wc-shipment-tracking/") for ns in namespaces):
+            if any(
+                str(namespace).strip().lower().startswith(AST_NAMESPACE_PREFIXES)
+                for namespace in namespaces
+            ):
                 return "ast"
     except Exception:
         # The caller retains its established safe fallback: AST-shaped

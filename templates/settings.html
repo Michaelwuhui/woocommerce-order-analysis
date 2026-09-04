@@ -2680,6 +2680,7 @@
                 progressBar.classList.remove('bg-success', 'bg-danger');
                 progressBar.classList.add('bg-primary');
                 statusText.textContent = '正在启动同步任务...';
+                statusText.classList.remove('text-success', 'text-danger', 'text-warning');
                 logConsole.innerHTML = '';
                 closeBtn.disabled = true;
                 const startTime = Date.now();
@@ -2695,60 +2696,87 @@
                     .then(response => parseMutationJsonResponse(response, '订单同步'))
                     .then(result => {
                         if (result.success) {
-                            // Start Polling
-                            const syncPollInterval = setInterval(() => {
+                            // PostgreSQL synchronization is keyed by a durable UUID.
+                            // The numeric site id is only a rollback-compatible fallback.
+                            const syncId = result.run_id || result.sync_id || siteId;
+                            localStorage.setItem('wooAnalysisActiveSyncRun', String(syncId));
+                            let syncPollTimer = null;
+                            let pollingStopped = false;
+                            const activeStatuses = new Set(['queued', 'running', 'recovering', 'cancelling']);
+                            const failedStatuses = new Set(['error', 'cancelled', 'interrupted']);
+
+                            const stopPolling = () => {
+                                pollingStopped = true;
+                                if (syncPollTimer) clearTimeout(syncPollTimer);
+                                syncPollTimer = null;
+                            };
+                            const finishPolling = (success, message) => {
+                                stopPolling();
+                                localStorage.removeItem('wooAnalysisActiveSyncRun');
+                                progressBar.classList.remove('progress-bar-animated', 'bg-primary', 'bg-warning');
+                                progressBar.classList.add(success ? 'bg-success' : 'bg-danger');
+                                progressBar.style.width = '100%';
+                                statusText.textContent = message;
+                                statusText.classList.remove('text-warning', 'text-success', 'text-danger');
+                                statusText.classList.add(success ? 'text-success' : 'text-danger');
+                                closeBtn.disabled = false;
+                                closeBtn.textContent = '完成并刷新';
+                                closeBtn.onclick = () => location.reload();
+                                localStorage.setItem('syncCompleted', Date.now().toString());
+                            };
+                            const pollSyncStatus = () => {
+                                if (pollingStopped) return;
                                 // Update timer
                                 const elapsed = Math.floor((Date.now() - startTime) / 1000);
                                 const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
                                 const secs = (elapsed % 60).toString().padStart(2, '0');
                                 timeText.textContent = `${mins}:${secs}`;
 
-                                fetch(`/api/sync/status/${siteId}`)
+                                fetch(`/api/sync/status/${encodeURIComponent(syncId)}`)
                                     .then(res => parseMutationJsonResponse(res, '订单同步状态'))
                                     .then(status => {
+                                        if (!status || !status.status) {
+                                            throw new Error(status?.error || '同步状态响应缺少任务状态');
+                                        }
                                         // Update Logs
                                         if (status.logs && status.logs.length > 0) {
-                                            logConsole.innerHTML = status.logs.map(log =>
-                                                `<div class="text-white-50 mb-1">${log}</div>`
-                                            ).join('');
+                                            logConsole.replaceChildren();
+                                            status.logs.forEach(log => {
+                                                const item = document.createElement('div');
+                                                item.className = 'text-white-50 mb-1';
+                                                item.textContent = String(log);
+                                                logConsole.appendChild(item);
+                                            });
                                             logConsole.scrollTop = logConsole.scrollHeight;
                                         }
 
                                         // Update Status
-                                        statusText.textContent = status.message;
+                                        statusText.textContent = status.message || '同步进行中...';
 
-                                        if (status.status === 'running') {
-                                            if (progressBar.style.width === '0%') progressBar.style.width = '100%';
+                                        if (status.interruption_state === 'recovering') {
+                                            statusText.textContent = '任务已中断/正在恢复';
+                                            statusText.classList.add('text-warning');
+                                            progressBar.classList.remove('bg-primary');
+                                            progressBar.classList.add('bg-warning');
+                                        }
+
+                                        if (activeStatuses.has(status.status)) {
+                                            if (progressBar.style.width === '0%') progressBar.style.width = '65%';
+                                            syncPollTimer = setTimeout(pollSyncStatus, 1000);
                                         } else if (status.status === 'success') {
-                                            clearInterval(syncPollInterval);
-                                            progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                            progressBar.classList.add('bg-success');
-                                            progressBar.style.width = '100%';
-                                            statusText.textContent = '同步完成！';
-                                            statusText.classList.add('text-success');
-                                            closeBtn.disabled = false;
-                                            closeBtn.textContent = '完成并刷新';
-                                            // Broadcast sync completion to other tabs
-                                            localStorage.setItem('syncCompleted', Date.now().toString());
-                                            closeBtn.onclick = () => location.reload();
-                                        } else if (status.status === 'error') {
-                                            clearInterval(syncPollInterval);
-                                            progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                            progressBar.classList.add('bg-danger');
-                                            progressBar.style.width = '100%';
-                                            statusText.textContent = '同步出错';
-                                            statusText.classList.add('text-danger');
-                                            closeBtn.disabled = false;
+                                            finishPolling(true, status.message || '同步完成！');
+                                        } else if (failedStatuses.has(status.status)) {
+                                            finishPolling(false, status.message || '同步已中断');
+                                        } else {
+                                            throw new Error(`未知同步状态: ${status.status}`);
                                         }
                                     })
                                     .catch(error => {
-                                        clearInterval(syncPollInterval);
-                                        progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-                                        progressBar.classList.add('bg-danger');
-                                        statusText.textContent = '同步状态读取失败: ' + error.message;
-                                        closeBtn.disabled = false;
+                                        finishPolling(false, '同步状态读取失败: ' + error.message);
                                     });
-                            }, 1000);
+                            };
+                            // Poll immediately: a small/new site may finish before one second.
+                            pollSyncStatus();
                         } else {
                             statusText.textContent = '启动失败: ' + (result.message || result.error || '未知错误');
                             progressBar.classList.remove('bg-primary');
@@ -2758,7 +2786,11 @@
                         }
                     })
                     .catch(error => {
-                        statusText.textContent = '请求错误: ' + error;
+                        progressBar.classList.remove('progress-bar-animated', 'bg-primary');
+                        progressBar.classList.add('bg-danger');
+                        progressBar.style.width = '100%';
+                        statusText.classList.add('text-danger');
+                        statusText.textContent = '请求错误: ' + error.message;
                         closeBtn.disabled = false;
                     });
             }
