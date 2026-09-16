@@ -217,6 +217,7 @@
                         </a>
                         <ul class="dropdown-menu dropdown-menu-dark">
                             <li><a class="dropdown-item" href="{{ url_for('inv_inv.stock_page') }}"><i class="bi bi-clipboard-data me-2"></i>库存台账</a></li>
+                            <li><a class="dropdown-item" href="{{ url_for('inv_inv.inv_workflows.page') }}"><i class="bi bi-box-arrow-in-down me-2"></i>补货 / 调拨 / 盘点</a></li>
                             <li><a class="dropdown-item" href="{{ url_for('inv_batch.batches_page') }}"><i class="bi bi-calendar-x me-2"></i>批次/保质期</a></li>
                             <li><a class="dropdown-item" href="{{ url_for('inv_ord.orders_page') }}"><i class="bi bi-arrow-left-right me-2"></i>订单库存联动</a></li>
                             {% if can_sync_inventory %}<li><a class="dropdown-item" href="{{ url_for('inv_push.push_page') }}"><i class="bi bi-cloud-upload me-2"></i>Woo库存同步</a></li>{% endif %}
@@ -1188,7 +1189,7 @@
                     html += '<div class="card-body p-0"><table class="table product-table mb-0">';
                     html += '<thead><tr><th>产品名称</th><th>SKU</th><th class="text-center">数量</th><th class="text-end">单价</th><th class="text-end">小计</th></tr></thead><tbody>';
                     lineItems.forEach(function (item) {
-                        html += '<tr><td>' + (item.name || '-') + '</td><td><code style="color: #94a3b8; background: rgba(99,102,241,0.1); padding: 2px 6px; border-radius: 4px;">' + (item.sku || '-') + '</code></td>';
+                        html += '<tr><td>' + trackingEsc(item.display_name || item.name || '-') + '</td><td><code style="color: #94a3b8; background: rgba(99,102,241,0.1); padding: 2px 6px; border-radius: 4px;">' + (item.sku || '-') + '</code></td>';
                         html += '<td class="text-center">' + (item.quantity || 0) + '</td>';
                         html += '<td class="text-end">' + parseFloat(item.price || 0).toFixed(2) + '</td>';
                         html += '<td class="text-end" style="color: #e2e8f0; font-weight: 500;">' + parseFloat(item.total || 0).toFixed(2) + '</td></tr>';

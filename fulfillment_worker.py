@@ -1523,7 +1523,12 @@ def handle_reconcile(conn, job: dict, payload: dict):
     return {"issues": issues}
 
 
+from inventory_replan import handle_restocked_order, handle_restocked_warehouse
+
+
 HANDLERS = {
+    "REPLAN_RESTOCKED_WAREHOUSE": handle_restocked_warehouse,
+    "REPLAN_ORDER_AFTER_RESTOCK": handle_restocked_order,
     "PLAN_ORDER": lambda c, j, p: plan_order(c, p.get("order_id") or j["aggregate_id"]),
     "REFRESH_HU_STOCK": handle_refresh_stock,
     "SUBMIT_HU_FULFILLMENT": handle_submit_wms,

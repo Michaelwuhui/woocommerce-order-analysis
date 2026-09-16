@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}补货、调拨与盘点{% endblock %}
+{% block content %}
+<div class="container-fluid py-4" id="inventoryOperations">
+  <h5>补货 / 调拨 / 盘点</h5>
+  <p class="text-white-50">普通单据由另一名库存负责人审核入账；临时修改库存按有效授权自动生成盘点单并审批。不会改变发货流程，也不会自动开启站点库存同步。</p>
+  <div id="opError" class="alert alert-danger d-none" role="alert"></div>
+  <div class="d-flex gap-2 flex-wrap mb-3">
+    <button class="btn btn-primary" data-create="replenishment">新建补货单</button>
+    <button class="btn btn-outline-info" data-create="transfer">仓间调拨</button>
+    <button class="btn btn-outline-warning" data-create="stocktake">库存盘点</button>
+    <button class="btn btn-warning d-none" id="opTemporaryStock" data-create="temporary_stocktake">临时修改库存（自动盘点入账）</button>
+    <a class="btn btn-outline-light" href="{{ url_for('inv_inv.stock_page') }}">库存台账 / 流水</a>
+    {% if current_user.username == 'admin' %}<button class="btn btn-outline-light" id="opPermissions">按仓授权</button><a class="btn btn-outline-warning" href="/settings/inventory-access">临时库存修改授权</a>{% endif %}
+  </div>
+  <div class="d-flex gap-2 flex-wrap mb-3">
+    <select class="form-select bg-dark text-white w-auto" id="filterWarehouse" aria-label="筛选仓库"><option value="">全部授权仓库</option></select>
+    <select class="form-select bg-dark text-white w-auto" id="filterKind" aria-label="筛选类型"><option value="">全部单据</option><option value="replenishment">补货单</option><option value="transfer">调拨单</option><option value="receipt">收货单</option><option value="stocktake">盘点单</option></select>
+    <select class="form-select bg-dark text-white w-auto" id="filterStatus" aria-label="筛选状态"><option value="">全部状态</option><option value="submitted">待审核</option><option value="open">待到货</option><option value="in_transit">在途</option><option value="partial">部分收货</option><option value="approved">已入账</option><option value="completed">已完成</option><option value="completed_with_difference">差异结案</option><option value="rejected">已驳回</option><option value="cancelled">已撤销</option></select>
+    <button class="btn btn-outline-light" id="opReload">刷新</button>
+  </div>
+  <div class="table-responsive"><table class="table table-dark table-hover align-middle"><thead><tr><th>单号 / 类型</th><th>仓库</th><th>凭证 / 到货批次</th><th>状态</th><th>提交人 / 时间</th><th>审核人</th><th>操作</th></tr></thead><tbody id="opRows"></tbody></table></div>
+  <div class="text-white-50 small">显示最近300条符合条件的单据。已入账单据不删除、不覆盖；更正需新建关联说明的反向调拨或盘点单。</div>
+</div>
+<div class="modal fade" id="opModal" tabindex="-1"><div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content bg-dark text-white">
+  <div class="modal-header"><h5 class="modal-title" id="opTitle"></h5><button class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="关闭"></button></div>
+  <div class="modal-body"><div id="opModalError" class="alert alert-danger d-none" role="alert"></div><div id="opBody"></div></div>
+  <div class="modal-footer" id="opFooter"></div>
+</div></div></div>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const $ = id => document.getElementById(id);
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const kinds = {replenishment:'补货单',transfer:'调拨单',receipt:'实收登记',stocktake:'库存盘点'};
+  const states = {open:'待到货',submitted:'待审核',in_transit:'在途',partial:'部分收货',approved:'已入账',completed:'已完成',completed_with_difference:'差异结案',rejected:'已驳回',cancelled:'已撤销'};
+  const time = value => value ? new Date(value).toLocaleString('zh-CN',{hour12:false}) : '—';
+  function auditSummary(event) {
+    let info={};try{info=JSON.parse(event.detail);}catch(e){return '审计详情暂无法解析';}
+    return [info.reference?'凭证：'+info.reference:'',info.note?'意见：'+info.note:'',info.status?'状态：'+(states[info.status]||info.status):'',info.receipt_id?'关联收货单 #'+info.receipt_id:'',info.qty?'确认调出 '+info.qty+' 件（凭证记录，未修改对方库存）':''].filter(Boolean).join('；');
+  }
+  let ctx = {warehouses:[]}, catalog = [], draft = null, busy = false, listVersion = 0, catalogVersion = 0;
+  const modal = new bootstrap.Modal($('opModal'));
+  async function api(path, method='GET', body) {
+    const response = await fetch('/api/inv/operations'+path, {method, headers:{'Content-Type':'application/json'}, body:body === undefined ? undefined : JSON.stringify(body)});
+    const type = response.headers.get('content-type') || '';
+    if (!type.includes('application/json')) throw new Error('登录可能已过期或服务暂不可用，请刷新后重试。');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '请求失败，请核查单据后重试。');
+    return data;
+  }
+  function error(message, inside=false) {const box=$(inside?'opModalError':'opError');box.textContent=message;box.classList.toggle('d-none',!message);}
+  function options(rows, selected='') {return rows.map(w=>`<option value="${w.id}" ${Number(selected)===w.id?'selected':''}>${esc(w.name)}${w.authority!=='local'?'（凭证调出，不改对方库存）':''}</option>`).join('');}
+  function whName(id) {return ctx.warehouses.find(w=>w.id===id)?.name || '另一关联仓库';}
+  async function load() {
+    const version = ++listVersion;
+    const query = new URLSearchParams();
+    for (const [key,id] of [['warehouse_id','filterWarehouse'],['kind','filterKind'],['status','filterStatus']]) if ($(id).value) query.set(key,$(id).value);
+    const rows = await api('?'+query);
+    if(version!==listVersion)return;
+    $('opRows').innerHTML=rows.length?rows.map(d=>`<tr><td>#${d.id} · ${esc(kinds[d.kind])}${d.parent_id?`<br><small>关联 #${d.parent_id}</small>`:''}</td><td>${d.source_name?esc(d.source_name)+' → ':''}${esc(d.warehouse_name)}</td><td>${esc(d.reference)}</td><td><span class="badge ${d.status==='submitted'?'bg-warning text-dark':'bg-secondary'}">${esc(states[d.status])}</span></td><td>${esc(d.created_name)}<br><small>${esc(time(d.created_at))}</small></td><td>${esc(d.reviewed_name || '—')}</td><td><button class="btn btn-sm btn-outline-info" data-detail="${d.id}">查看 / 处理</button></td></tr>`).join(''):'<tr><td colspan="7" class="text-center py-4">暂无符合条件的单据</td></tr>';
+  }
+  function open(title) {error('',true);$('opTitle').textContent=title;$('opFooter').innerHTML='<button class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>';modal.show();}
+  function action(label, handler, cls='btn-primary') {const b=document.createElement('button');b.type='button';b.className='btn '+cls;b.textContent=label;b.onclick=()=>run(handler,true);$('opFooter').append(b);}
+  async function run(fn, inside=false) {
+    if(busy)return;
+    busy=true;error('',inside);
+    const buttons=[...document.querySelectorAll('#opFooter button, #inventoryOperations button')];
+    buttons.forEach(b=>b.disabled=true);
+    try {await fn();} catch(e) {error(e.message,inside);} finally {busy=false;buttons.forEach(b=>b.disabled=false);}
+  }
+  async function form(kind, parent=null) {
+    const automatic=kind==='temporary_stocktake';
+    if(automatic)kind='stocktake';
+    ctx=await api('/context');
+    draft={kind,parent,automatic,request_key:crypto.randomUUID(), frozen:null};
+    const cap=kind==='stocktake'?'can_stocktake':'can_receive';
+    const targets=ctx.warehouses.filter(w=>w.authority==='local' && (kind==='transfer'||w[cap]) && (!automatic||w.auto_stocktake_grant));
+    const sources=ctx.warehouses.filter(w=>w.can_transfer);
+    if(!targets.length || (kind==='transfer'&&!sources.length))throw new Error('没有对应仓库的操作授权，请联系管理员。');
+    open((automatic?'临时修改库存（自动盘点入账）':kinds[kind])+(parent?' · 关联 #'+parent.id:''));
+    $('opBody').innerHTML=`<p class="alert alert-info">${kind==='stocktake'?'填写实盘总数，不填差额；请在同一截止时间核对待发包裹。盘点期间有出入库或预留变化，系统会拒绝按旧账面入账，需重新盘点。':kind==='receipt'?'只把实收完好的商品计入库存；破损隔离不计可售。分批到货时“确认少收”填0，只有确定不会再到货的差额才填写少收。':kind==='transfer'?'审核调出后进入在途；目标仓实收审核后增加库存。外部WMS或人工合作仓只确认调出凭证，不调用外部系统，也不创建虚拟库存。':'新建补货单不会增加库存。货到后点“登记本批实收”，可分多批登记。'}</p>
+      <div class="row g-3"><div class="col-md-6"><label class="form-label">${kind==='transfer'?'调入仓':'仓库'}</label><select class="form-select bg-dark text-white" id="formWarehouse" ${parent?'disabled':''}>${options(parent?targets.filter(w=>w.id===parent.warehouse_id):targets,parent?.warehouse_id)}</select></div>
+      ${kind==='transfer'?`<div class="col-md-6"><label class="form-label">调出仓</label><select class="form-select bg-dark text-white" id="formSource">${options(sources)}</select></div>`:''}
+      <div class="col-md-6"><label class="form-label">${kind==='receipt'?'本次到货批次（不可重复）':'补货 / 调拨凭证 / 盘点编号'}</label><input class="form-control bg-dark text-white" id="formReference" maxlength="200"></div>
+      <div class="col-12"><label class="form-label">说明 / 差异原因（必填）</label><textarea class="form-control bg-dark text-white" id="formNote" maxlength="2000" rows="2"></textarea></div></div>
+      <div class="my-3"><input class="form-control bg-dark text-white" id="skuSearch" placeholder="搜索口味 / SKU；筛选不会取消已勾选项"><button type="button" class="btn btn-sm btn-outline-light mt-2" id="selectVisible">勾选当前筛选结果</button><button type="button" class="btn btn-sm btn-outline-light mt-2 ms-2" id="clearSelection">取消全部勾选</button></div>
+      <div class="table-responsive"><table class="table table-dark align-middle"><thead><tr><th>选择</th><th>SKU / 商品</th><th>${parent?'待收数量':'账面现存 / 预留'}</th><th>${kind==='stocktake'?'实盘总数':parent?'本批实收完好':'计划数量'}</th>${parent?'<th>破损</th><th>确认少收</th>':''}</tr></thead><tbody id="formLines"></tbody></table></div>`;
+    $('formWarehouse').onchange=()=>run(loadCatalog,true);
+    if(automatic)$('opBody').insertAdjacentHTML('afterbegin','<p class="alert alert-warning" id="autoStockNotice"></p>');
+    $('selectVisible').onclick=()=>{for(const row of $('formLines').querySelectorAll('tr[data-sku]'))if(!row.hidden)row.querySelector('.choose').checked=true;};
+    $('clearSelection').onclick=()=>{for(const box of $('formLines').querySelectorAll('.choose'))box.checked=false;};
+    $('skuSearch').oninput=()=>{const q=$('skuSearch').value.trim().toLowerCase();for(const row of $('formLines').rows)row.hidden=!row.textContent.toLowerCase().includes(q);};
+    await loadCatalog();
+    action(automatic?'确认修改库存并自动生成盘点单':kind==='replenishment'?'保存补货单（不增库存）':'提交审核（暂不入账）', submit);
+  }
+  async function loadCatalog() {
+    const version=++catalogVersion;
+    const items=await api('/catalog/'+$('formWarehouse').value);
+    if(version!==catalogVersion)return;
+    catalog=items;
+    if(draft.automatic){const w=ctx.warehouses.find(w=>w.id===Number($('formWarehouse').value));$('autoStockNotice').textContent=`本仓临时授权 #${w.auto_stocktake_grant}，到期：${time(w.auto_stocktake_expires_at)}。提交后立即修改库存，系统自动审批并留存操作记录。`;}
+    if(draft.parent)catalog=catalog.filter(k=>Number(draft.parent.remaining[k.id])>0);
+    $('formLines').innerHTML=catalog.map(k=>`<tr data-sku="${k.id}"><td><input type="checkbox" class="form-check-input choose" aria-label="选择 ${esc(k.sku_code)}"></td><td>${esc(k.sku_code)}<br><small>${esc(k.name)}</small></td><td>${draft.parent?draft.parent.remaining[k.id]:`${k.on_hand} / ${k.reserved}`}</td><td><input type="number" class="form-control form-control-sm bg-dark text-white qty" style="min-width:90px" min="${['stocktake','receipt'].includes(draft.kind)?0:1}" step="1" value="${draft.kind==='stocktake'?k.on_hand:0}" aria-label="数量 ${esc(k.sku_code)}"></td>${draft.parent?'<td><input class="form-control form-control-sm bg-dark text-white damaged" type="number" min="0" step="1" value="0" aria-label="破损数量"></td><td><input class="form-control form-control-sm bg-dark text-white short" type="number" min="0" step="1" value="0" aria-label="确认少收数量"></td>':''}</tr>`).join('')||'<tr><td colspan="6">该仓没有已映射的受管SKU。请先由库存负责人维护仓库产品映射。</td></tr>';
+  }
+  async function submit() {
+    if(!draft.frozen){
+      const items=[...$('formLines').querySelectorAll('tr[data-sku]')].filter(r=>r.querySelector('.choose').checked).map(r=>{
+        const k=catalog.find(k=>k.id===Number(r.dataset.sku));
+        return {sku_id:k.id,qty:r.querySelector('.qty').value,damaged_qty:r.querySelector('.damaged')?.value||0,short_qty:r.querySelector('.short')?.value||0,baseline:k.on_hand,baseline_reserved:k.reserved,baseline_movement:k.movement};
+      });
+      if(!items.length)throw new Error('请勾选本次需要登记的SKU。');
+      if(!$('formReference').value.trim()||!$('formNote').value.trim())throw new Error('请填写凭证编号和说明。');
+      draft.frozen={kind:draft.kind,warehouse_id:Number($('formWarehouse').value),source_warehouse_id:$('formSource')?Number($('formSource').value):null,parent_id:draft.parent?.id||null,request_key:draft.request_key,reference:$('formReference').value.trim(),note:$('formNote').value.trim(),items};
+      if(draft.automatic){if(!confirm('确认按实盘总数修改库存？系统将自动生成盘点单、自动审批并立即入账。')){draft.frozen=null;return;}draft.frozen.auto_approve=true;draft.frozen.grant_id=ctx.warehouses.find(w=>w.id===draft.frozen.warehouse_id).auto_stocktake_grant;}
+    }
+    try {
+      const result=await api('','POST',draft.frozen);
+      await showDetail(result.id);await load();
+    } catch(e) {
+      // Keep the request key/payload when the result is uncertain; retries cannot duplicate stock.
+      $('opBody').querySelectorAll('input,select,textarea').forEach(el=>el.disabled=true);
+      throw new Error(e.message+'。本次内容已锁定；可用原内容重试。需修改时请关闭后重新创建，并先检查列表是否已生成单据。');
+    }
+  }
+  async function showDetail(id) {
+    const d=await api('/'+id);draft=null;
+    open('#'+d.id+' · '+kinds[d.kind]+' · '+states[d.status]);
+    $('opBody').innerHTML=`<p>${d.source_warehouse_id?esc(whName(d.source_warehouse_id))+' → ':''}${esc(whName(d.warehouse_id))}</p><p><b>凭证：</b>${esc(d.reference)}<br><b>说明：</b>${esc(d.note)}</p>
+      ${d.kind==='transfer'?'<p class="text-warning">外部WMS / 人工合作仓只登记调出凭证，对方自行核对其库存。本地数量仓则按台账扣减。未收数量保留在途，不能当作目标仓可售库存。</p>':''}
+      <div class="table-responsive"><table class="table table-dark"><thead><tr><th>SKU / 商品</th><th>${d.kind==='stocktake'?'实盘':'数量'}</th><th>${d.kind==='stocktake'?'原现存 / 差异':d.remaining?'累计完好 / 破损 / 少收 / 待收':'破损 / 少收'}</th></tr></thead><tbody>${d.lines.map(l=>`<tr><td>${esc(l.sku_code)}<br>${esc(l.name)}</td><td>${l.qty}</td><td>${d.kind==='stocktake'?`${l.baseline} / ${l.qty-l.baseline}`:d.remaining?`${d.received[l.sku_id]?.good||0} / ${d.received[l.sku_id]?.damaged||0} / ${d.received[l.sku_id]?.short||0} / ${d.remaining[l.sku_id]}`:`${l.damaged_qty} / ${l.short_qty}`}</td></tr>`).join('')}</tbody></table></div>
+      ${d.receipts?.length?'<h6>分批收货记录</h6>'+d.receipts.map(r=>`<button class="btn btn-sm btn-outline-info me-2 mb-2" data-detail="${r.id}">#${r.id} ${esc(states[r.status])} · ${esc(r.created_name)}</button>`).join(''):''}
+      <h6>操作审计</h6><ul>${d.events.map(e=>`<li>${esc(time(e.created_at))} · ${esc(e.actor_name)} · ${esc(({created:'提交',approve:'审核通过',auto_approved:'临时授权自动审批',reject:'驳回',cancelled:'撤销',receipt_approved:'实收入账',external_dispatch_confirmed:'外部调出凭证确认'})[e.action]||e.action)}<br><small>${esc(auditSummary(e))}</small></li>`).join('')}</ul>`;
+    if(d.can_receive)action('登记本批实收',()=>form('receipt',d));
+    if(d.can_review){
+      $('opBody').insertAdjacentHTML('beforeend','<label class="form-label">审核意见（必填）</label><textarea id="reviewNote" class="form-control bg-dark text-white" maxlength="2000"></textarea>');
+      action('审核通过并入账',async()=>{if(!confirm('确认已核对凭证和实物？审核后会立即修改库存，不能重复入账。'))return;await api('/'+id+'/review','POST',{decision:'approve',note:$('reviewNote').value});await showDetail(id);await load();},'btn-success');
+      action('驳回',async()=>{await api('/'+id+'/review','POST',{decision:'reject',note:$('reviewNote').value});await showDetail(id);await load();},'btn-outline-danger');
+    }else if(d.status==='submitted')$('opBody').insertAdjacentHTML('beforeend','<p class="text-warning">等待另一名有本仓审核权限的负责人处理。提交人不能审核自己的单据。</p>');
+    if(['submitted','open'].includes(d.status)&&(d.created_by===ctx.user_id||ctx.can_admin))action('撤销未入账单',async()=>{const note=prompt('请输入撤销原因');if(!note)return;await api('/'+id+'/cancel','POST',{note});await showDetail(id);await load();},'btn-outline-warning');
+  }
+  async function permissionForm() {
+    const data=await api('/permissions');open('按仓授权');
+    $('opBody').innerHTML=`<p class="alert alert-warning">授权只适用于选定仓库。收货/盘点只允许提交；审核可以改变库存，且不能自审。原有全仓库存管理员仍具有全仓权限，不受此处取消勾选影响。</p><label>账号</label><select id="grantUser" class="form-select bg-dark text-white">${data.users.map(u=>`<option value="${u.id}">${esc(u.name)} (${esc(u.username)})${u.can_manage_inventory||u.username==='admin'?' · 全仓库存管理':''}</option>`).join('')}</select><label class="mt-3">仓库</label><select id="grantWh" class="form-select bg-dark text-white">${options(ctx.warehouses)}</select><div class="mt-3">${[['can_receive','补货 / 收货提交'],['can_transfer','调拨提交'],['can_stocktake','盘点提交'],['can_approve','审核入账']].map(([key,label])=>`<label class="form-check"><input id="grant_${key}" class="form-check-input" type="checkbox">${label}</label>`).join('')}</div>`;
+    const sync=()=>{const p=data.permissions.find(p=>p.user_id===Number($('grantUser').value)&&p.warehouse_id===Number($('grantWh').value));for(const key of ['can_receive','can_transfer','can_stocktake','can_approve'])$('grant_'+key).checked=!!p?.[key];};
+    $('grantUser').onchange=sync;$('grantWh').onchange=sync;sync();
+    action('保存该仓授权',async()=>{const payload={user_id:Number($('grantUser').value),warehouse_id:Number($('grantWh').value)};for(const key of ['can_receive','can_transfer','can_stocktake','can_approve'])payload[key]=$('grant_'+key).checked?1:0;if(!confirm('确认保存该账号在此仓库的操作权限？'))return;await api('/permissions','PUT',payload);await permissionForm();},'btn-warning');
+  }
+  $('inventoryOperations').addEventListener('click',e=>{const b=e.target.closest('button');if(b?.dataset.create)run(()=>form(b.dataset.create));if(b?.dataset.detail)run(()=>showDetail(Number(b.dataset.detail)),true);});
+  $('opBody').addEventListener('click',e=>{const b=e.target.closest('[data-detail]');if(b)run(()=>showDetail(Number(b.dataset.detail)),true);});
+  for(const id of ['filterWarehouse','filterKind','filterStatus'])$(id).onchange=()=>run(load);
+  $('opReload').onclick=()=>run(load);
+  if($('opPermissions'))$('opPermissions').onclick=()=>run(permissionForm,true);
+  run(async()=>{ctx=await api('/context');$('opTemporaryStock').classList.toggle('d-none',!ctx.warehouses.some(w=>w.auto_stocktake_grant&&w.authority==='local'));$('filterWarehouse').insertAdjacentHTML('beforeend',options(ctx.warehouses));const kind=new URLSearchParams(location.search).get('kind');if(kinds[kind])$('filterKind').value=kind;await load();});
+});
+</script>
+{% endblock %}

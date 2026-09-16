@@ -165,9 +165,13 @@ def fetch_candidates(conn, min_age_days, limit, recheck_hours, live, au_sites=No
     return rows[:limit] if limit else rows
 
 
-def write_status(conn, order_id, outcome):
+def write_status(conn, order_id, outcome, tracking_number=None):
     conn.execute("UPDATE orders SET carrier_status=?, carrier_status_at=datetime('now') WHERE id=?",
                  (outcome, order_id))
+    if tracking_number and outcome in ('delivered', 'returned'):
+        from carrier_outcome_bridge import bridge_outcome
+        observed = conn.execute("SELECT carrier_status_at FROM orders WHERE id=?", (order_id,)).fetchone()[0]
+        bridge_outcome(conn, order_id, outcome, tracking_number, observed)
 
 
 def main():
@@ -238,7 +242,7 @@ def main():
             continue
         outcomes['inpost:' + info['outcome']] += 1
         if live:
-            write_status(conn, oid, info['outcome'])
+            write_status(conn, oid, info['outcome'], num)
             written += 1
         time.sleep(args.throttle)
 
@@ -262,7 +266,7 @@ def main():
                 continue
             outcomes['inpost718:' + r['outcome']] += 1
             if live:
-                write_status(conn, oid, r['outcome'])
+                write_status(conn, oid, r['outcome'], num)
                 written += 1
 
     # ---- DPD (Track718, async: add -> crawl -> query) ----
@@ -292,7 +296,7 @@ def main():
                     continue
                 outcomes['dpd:' + r['outcome']] += 1
                 if live:
-                    write_status(conn, oid, r['outcome'])
+                    write_status(conn, oid, r['outcome'], num)
                     written += 1
 
     # ---- Other carriers (EMS/中国邮政, Australia Post, GLS, …) via Track718 ----
@@ -314,7 +318,7 @@ def main():
                 oc = res.get('outcome')
                 if oc and oc != 'unknown':
                     outcomes['other:' + oc] += 1
-                    write_status(conn, oid, oc)
+                    write_status(conn, oid, oc, num)
                     written += 1
                 else:
                     outcomes['other:no_info'] += 1

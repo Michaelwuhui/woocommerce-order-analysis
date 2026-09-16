@@ -1,5 +1,4 @@
-"""Auto-confirm carrier-delivered COD orders — automation on top of the
-「待确认结局」queue.
+"""Auto-confirm terminal carrier outcomes on top of the 「待确认结局」 queue.
 
 When enabled (settings.auto_confirm_delivered_enabled), every COD order sitting
 in the 待确认结局 queue whose carrier_status is 'delivered' (🟢物流已签收) is
@@ -9,9 +8,12 @@ automatically confirmed — the unattended equivalent of a human clicking 已签
   2. pushes WooCommerce status -> 'completed' (this fires WC's 'completed'
      customer email, same as a manual 已签收), adding an order note.
 
-ONLY carrier-confirmed deliveries are touched. returned / in_transit / unknown /
-problem-return / undelivered / already-confirmed orders are NEVER auto-confirmed.
-Default OFF — nothing happens until the operator turns the switch on.
+Delivery and return automation have independent, default-OFF switches.  The
+delivery path only touches carrier-confirmed deliveries.  The return path only
+touches ``carrier_status='returned'`` orders and mirrors the human ``拒收``
+action: it marks the order undelivered and uses the order shipping fee as the
+shipping loss.  attention / in_transit / unknown / problem-return outcomes are
+never auto-resolved.
 
 Ordering vs the manual confirm: a manual confirm sets the local flag FIRST
 (best-effort WC after), because a human is present to reconcile. Here, unattended,
@@ -29,18 +31,18 @@ from datetime import datetime
 from oid_utils import woo_post_id  # raw WC post id for REST write-back
 
 ENABLE_KEY = 'auto_confirm_delivered_enabled'
+RETURNED_ENABLE_KEY = 'auto_confirm_returned_enabled'
 DEFAULT_PENDING_OUTCOME_DAYS = 7
 COUNTRY_PENDING_OUTCOME_DAYS = {
     'PL': 1,
     'AU': 14,
 }
-# Forward-only "effective start" timestamp, stamped (via SQL datetime('now'), so
-# it matches DB timestamps) every time the switch is turned on. It is kept for
-# audit/visibility, but auto-confirm now follows the queue state itself: if a COD
-# order is already old enough to be in 待确认结局 and the carrier says delivered,
-# it can be confirmed. This matches the operator workflow after the PL gate moved
-# from 14 days to next-day review.
+# Activation timestamp, stamped (via SQL datetime('now'), so it matches DB
+# timestamps) every time a switch is turned on. It is kept for audit/visibility
+# and guards against a raw setting change bypassing the admin endpoint. Once
+# activated, automation follows the queue state itself, including a safe backlog.
 SINCE_KEY = 'auto_confirm_delivered_since'
+RETURNED_SINCE_KEY = 'auto_confirm_returned_since'
 
 # Per-run cap. When first switched on there can be a large backlog of delivered
 # orders; draining at most this many per hourly run spreads the WooCommerce
@@ -56,6 +58,7 @@ _API_HEADERS = {
 }
 
 _NOTE = "系统自动确认「已签收」（物流已签收 / carrier delivered）。"
+_RETURNED_NOTE_PREFIX = "系统自动确认「未送达/退回」（物流明确退回 / carrier returned）"
 
 
 def is_enabled(conn):
@@ -68,15 +71,31 @@ def is_enabled(conn):
     return str(row[0]).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
+def is_returned_enabled(conn):
+    """Return auto-confirm switch. Independent from delivered automation."""
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (RETURNED_ENABLE_KEY,)
+    ).fetchone()
+    if not row:
+        return False
+    return str(row[0]).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 def get_since(conn):
-    """Forward-only effective-start (settings.auto_confirm_delivered_since).
-    None if never set. Only deliveries with carrier_status_at >= this are
-    auto-confirmed."""
+    """Activation/audit timestamp for delivered automation; None if never set."""
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (SINCE_KEY,)).fetchone()
     return row[0] if row and row[0] else None
 
 
-def find_confirmable_orders(conn, since):
+def get_returned_since(conn):
+    """Audit timestamp written whenever automatic return confirmation is enabled."""
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (RETURNED_SINCE_KEY,)
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def find_confirmable_orders(conn, since, order_id=None, include_completed=False):
     """COD orders in the 待确认结局 queue whose carrier status is delivered.
 
     Same candidate definition as /api/shipping/pending-outcome, narrowed to
@@ -93,7 +112,7 @@ def find_confirmable_orders(conn, since):
         LEFT JOIN shipping_logs sl ON sl.id = (
             SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
         )
-        WHERE o.status IN ('on-hold', 'shipped', 'partial-shipped')
+        WHERE o.status IN (""" + ("'completed'," if include_completed else "") + """'on-hold', 'shipped', 'partial-shipped')
           AND o.payment_method = 'cod'
           AND COALESCE(o.is_undelivered, 0) = 0
           AND COALESCE(o.is_problem_return, 0) = 0
@@ -106,9 +125,9 @@ def find_confirmable_orders(conn, since):
                  SELECT 1 FROM oms_order_fulfillment_state ofs
                  WHERE ofs.order_id=o.id AND ofs.aggregate_status='delivered'
                ))
-          AND """ + ready_sql + """
+          AND """ + ready_sql + (" AND o.id=?" if order_id is not None else "") + """
         ORDER BY o.date_created ASC
-        """
+        """, (str(order_id),) if order_id is not None else ()
     ).fetchall()
 
 
@@ -141,6 +160,159 @@ def count_confirmable(conn, since):
           AND """ + ready_sql + """
         """
     ).fetchone()[0]
+
+
+def _source_scope(allowed_sources):
+    """Return an optional source SQL suffix and its bound parameters."""
+    if allowed_sources is None:
+        return '', []
+    sources = list(allowed_sources)
+    if not sources:
+        return ' AND 1=0', []
+    placeholders = ','.join('?' for _ in sources)
+    return f' AND o.source IN ({placeholders})', sources
+
+
+def _returned_safety_sql():
+    """Only auto-resolve an unambiguous whole-order return.
+
+    Legacy orders must have at most one unique tracking number. Managed OMS
+    orders are eligible only when every active fulfillment has shipments and
+    every one of those shipments is returned/cancelled, with at least one real
+    return. A split parcel whose first tracking number returned therefore stays
+    in the queue for human review instead of incorrectly failing the whole order.
+    """
+    return """
+      AND (
+        (
+          NOT EXISTS (
+            SELECT 1 FROM oms_order_fulfillment_state ofs
+            WHERE ofs.order_id = o.id
+          )
+          AND (
+            SELECT COUNT(DISTINCT NULLIF(trim(slg.tracking_number), ''))
+            FROM shipping_logs slg WHERE slg.order_id = o.id
+          ) <= 1
+        )
+        OR
+        (
+          EXISTS (
+            SELECT 1 FROM oms_order_fulfillment_state ofs
+            WHERE ofs.order_id=o.id AND ofs.aggregate_status='returned'
+              AND COALESCE(ofs.manual_review,0)=0 AND COALESCE(ofs.has_shortage,0)=0
+          )
+          AND NOT EXISTS (SELECT 1 FROM oms_fulfillments f WHERE f.order_id=o.id)
+          AND EXISTS (
+            SELECT 1 FROM oms_domain_events ev WHERE ev.aggregate_type='order'
+              AND ev.aggregate_id=o.id AND ev.event_type='legacy_carrier_outcome_reconciled'
+              AND ev.to_status='returned' AND ev.actor_type='system'
+          )
+        )
+        OR
+        (
+          EXISTS (
+            SELECT 1
+            FROM oms_order_fulfillment_state ofs
+            JOIN oms_fulfillments f
+              ON f.order_id = ofs.order_id AND f.revision = ofs.revision
+            JOIN oms_shipments osh ON osh.fulfillment_id = f.id
+            WHERE ofs.order_id = o.id
+              AND f.status != 'superseded'
+              AND osh.status = 'returned'
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM oms_order_fulfillment_state ofs
+            JOIN oms_fulfillments f
+              ON f.order_id = ofs.order_id AND f.revision = ofs.revision
+            WHERE ofs.order_id = o.id
+              AND f.status != 'superseded'
+              AND (
+                NOT EXISTS (
+                  SELECT 1 FROM oms_shipments osh
+                  WHERE osh.fulfillment_id = f.id
+                )
+                OR EXISTS (
+                  SELECT 1 FROM oms_shipments osh
+                  WHERE osh.fulfillment_id = f.id
+                    AND osh.status NOT IN ('returned', 'cancelled')
+                )
+              )
+          )
+        )
+      )
+    """
+
+
+def _returned_candidate_sql(select_clause, allowed_sources=None):
+    source_sql, params = _source_scope(allowed_sources)
+    sql = f"""
+        SELECT {select_clause}
+        FROM orders o
+        LEFT JOIN sites s ON o.source = s.url
+        LEFT JOIN shipping_logs sl ON sl.id = (
+            SELECT id FROM shipping_logs WHERE order_id = o.id ORDER BY id DESC LIMIT 1
+        )
+        WHERE o.status IN ('on-hold', 'shipped', 'partial-shipped')
+          AND o.payment_method = 'cod'
+          AND COALESCE(o.is_undelivered, 0) = 0
+          AND COALESCE(o.is_problem_return, 0) = 0
+          AND COALESCE(o.delivery_confirmed, 0) = 0
+          AND o.carrier_status = 'returned'
+          AND o.carrier_status_at IS NOT NULL
+          {_returned_safety_sql()}
+          AND {_ready_sql()}
+          {source_sql}
+    """
+    return sql, params
+
+
+def find_returnable_orders(conn, since, allowed_sources=None):
+    """Unambiguous carrier-returned orders currently in 待确认结局.
+
+    ``since`` is an activation/audit guard, matching the existing delivered
+    switch. Once the switch has an activation timestamp, both the current safe
+    backlog and future returned outcomes are eligible.
+    """
+    if not since:
+        return []
+    return list_returnable_orders(conn, allowed_sources)
+
+
+def list_returnable_orders(conn, allowed_sources=None):
+    """Return the current safe whole-order return candidates.
+
+    Unlike :func:`find_returnable_orders`, this operator-facing helper does not
+    depend on the automation switch having been activated.  It powers the
+    explicit ``批量确认所有物流退回`` action while sharing the exact same status,
+    age and split-parcel safety rules as the background worker.
+    """
+    sql, params = _returned_candidate_sql(
+        "o.id, o.number, o.source, o.status, o.shipping_total, o.currency",
+        allowed_sources,
+    )
+    return conn.execute(sql + " ORDER BY o.date_created ASC", params).fetchall()
+
+
+def returnable_stats(conn, allowed_sources=None):
+    """Count safe return candidates and the loss implied by the manual default."""
+    sql, params = _returned_candidate_sql(
+        "COUNT(*) AS candidate_count, "
+        "COALESCE(SUM(COALESCE(o.shipping_total, 0)), 0) AS shipping_loss",
+        allowed_sources,
+    )
+    row = conn.execute(sql, params).fetchone()
+    return {
+        'candidates': int(row[0] or 0),
+        'shipping_loss': round(float(row[1] or 0), 2),
+    }
+
+
+def count_returnable(conn, since, allowed_sources=None):
+    """Cheap UI count; disabled until the switch has an activation timestamp."""
+    if not since:
+        return 0
+    return returnable_stats(conn, allowed_sources)['candidates']
 
 
 def _pending_age_case_sql():
@@ -272,4 +444,180 @@ def enforce(conn, progress=None, dry_run=False, actor='auto'):
             summary['errors'] += 1
             _log(f"[auto-confirm] 失败 #{num} @ {o['source']}: {detail}（保持未确认，下次重试）")
 
+    return summary
+
+
+def _mark_returned_local(
+    conn,
+    order,
+    now,
+    *,
+    actor_name='系统自动确认',
+    actor_user_id=None,
+    batch=False,
+):
+    """Atomically mirror the manual 拒收 action for one carrier return."""
+    loss = round(float(order['shipping_total'] or 0), 2)
+    currency = str(order['currency'] or '').strip()
+    actor_name = str(actor_name or '系统自动确认').strip()
+    if batch:
+        short_note = (
+            f"订单被 {actor_name} 批量确认为「未送达/物流退回」"
+            "（物流明确退回 / carrier returned）"
+            f"，运费损失 {loss:.2f}"
+        )
+    else:
+        short_note = f"{_RETURNED_NOTE_PREFIX}，运费损失 {loss:.2f}"
+    if currency:
+        short_note += f" {currency}"
+    cursor = conn.execute(
+        """
+        UPDATE orders
+           SET is_undelivered = 1,
+               shipping_loss_amount = COALESCE(shipping_total, 0),
+               undelivered_at = ?,
+               undelivered_by = ?,
+               undelivered_note = ?
+         WHERE id = ?
+           AND status IN ('on-hold', 'shipped', 'partial-shipped')
+           AND payment_method = 'cod'
+           AND COALESCE(is_undelivered, 0) = 0
+           AND COALESCE(is_problem_return, 0) = 0
+           AND COALESCE(delivery_confirmed, 0) = 0
+           AND carrier_status = 'returned'
+        """,
+        (now, actor_user_id, short_note, order['id']),
+    )
+    changed = int(cursor.rowcount or 0) == 1
+    if not changed:
+        return False, 0.0
+    conn.execute(
+        """
+        INSERT INTO order_notes
+            (order_id, note, date_created, customer_note, author, added_by_user)
+        VALUES (?, ?, ?, 0, ?, 1)
+        """,
+        (order['id'], short_note, now, actor_name),
+    )
+    return True, loss
+
+
+def confirm_returned_batch(
+    conn,
+    *,
+    actor_name,
+    actor_user_id,
+    allowed_sources=None,
+    dry_run=False,
+):
+    """Confirm every currently safe carrier return for an operator.
+
+    This is deliberately independent of the automatic-return switch.  The
+    candidate query and conditional update make the operation idempotent and
+    safe to run while the background worker is active.  No WooCommerce status
+    or customer notification is changed.
+    """
+    candidates = list_returnable_orders(conn, allowed_sources)
+    summary = {
+        'checked': len(candidates),
+        'marked': 0,
+        'skipped': 0,
+        'shipping_loss': 0.0,
+        'shipping_loss_by_currency': {},
+        'dry_run': dry_run,
+    }
+
+    for order in candidates:
+        loss = round(float(order['shipping_total'] or 0), 2)
+        if not dry_run:
+            changed, loss = _mark_returned_local(
+                conn,
+                order,
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                actor_name=actor_name,
+                actor_user_id=actor_user_id,
+                batch=True,
+            )
+            if not changed:
+                summary['skipped'] += 1
+                continue
+
+        currency = str(order['currency'] or 'N/A').strip() or 'N/A'
+        summary['marked'] += 1
+        summary['shipping_loss'] += loss
+        summary['shipping_loss_by_currency'][currency] = (
+            summary['shipping_loss_by_currency'].get(currency, 0.0) + loss
+        )
+
+    summary['shipping_loss'] = round(summary['shipping_loss'], 2)
+    summary['shipping_loss_by_currency'] = {
+        currency: round(amount, 2)
+        for currency, amount in sorted(summary['shipping_loss_by_currency'].items())
+    }
+    if not dry_run:
+        conn.commit()
+    return summary
+
+
+def enforce_returned(conn, progress=None, dry_run=False, actor='auto'):
+    """Auto-mark unambiguous carrier returns as undelivered.
+
+    This is local and idempotent: the conditional update owns the transition,
+    while ``is_undelivered=1`` removes the order from future candidate scans.
+    It intentionally does not alter WooCommerce status or generate a customer
+    email. Generated reconciliation statements remain snapshots and are not
+    silently regenerated by this automation.
+    """
+    def _log(message):
+        if progress:
+            progress(message)
+
+    since = get_returned_since(conn)
+    if not since:
+        if not dry_run:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, datetime('now'))",
+                (RETURNED_SINCE_KEY,),
+            )
+            conn.commit()
+        _log("[auto-return] 无生效起点，已设为 now，本次不处理")
+        return {
+            'checked': 0, 'marked': 0, 'shipping_loss': 0.0,
+            'skipped': 0, 'capped': 0, 'dry_run': dry_run, 'no_since': True,
+        }
+
+    candidates = find_returnable_orders(conn, since)
+    summary = {
+        'checked': len(candidates), 'marked': 0, 'shipping_loss': 0.0,
+        'skipped': 0, 'capped': 0, 'dry_run': dry_run, 'since': since,
+    }
+    if len(candidates) > MAX_PER_RUN:
+        summary['capped'] = len(candidates) - MAX_PER_RUN
+        candidates = candidates[:MAX_PER_RUN]
+        _log(
+            f"[auto-return] 候选 {summary['checked']} 单 > 单次上限 {MAX_PER_RUN}，"
+            f"本次处理 {MAX_PER_RUN} 单，剩余 {summary['capped']} 单下次继续。"
+        )
+
+    for order in candidates:
+        if dry_run:
+            summary['marked'] += 1
+            summary['shipping_loss'] += round(float(order['shipping_total'] or 0), 2)
+            continue
+        changed, loss = _mark_returned_local(
+            conn, order, datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        )
+        if not changed:
+            conn.rollback()
+            summary['skipped'] += 1
+            continue
+        conn.commit()
+        summary['marked'] += 1
+        summary['shipping_loss'] += loss
+        _log(
+            f"[auto-return] #{order['number']} 已标记未送达，"
+            f"运费损失 {loss:.2f} {order['currency'] or ''}".rstrip()
+        )
+
+    summary['shipping_loss'] = round(summary['shipping_loss'], 2)
     return summary

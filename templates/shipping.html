@@ -276,7 +276,7 @@
                     {% if current_user.is_admin() %}
                     <div class="form-check form-switch mb-0 px-2 py-1 rounded border border-warning border-opacity-50 d-flex align-items-center"
                          style="background:rgba(255,193,7,0.08);"
-                         title="开启后：系统会从发货后开始查物流（PL 次日、AU 14天、其它7天进入确认队列），新检测到🟢物流已签收的 COD 订单会被每小时自动确认（本地标记签收 + 同步站点为已完成 + 发完成邮件）。退回/在途/查无/问题退货一律不动。">
+                         title="开启后：物流明确显示🟢已签收的 COD 订单会被自动确认（本地标记签收 + 同步站点为已完成 + 发完成邮件）。其它结局不动。">
                         <input class="form-check-input mt-0" type="checkbox" role="switch" id="autoConfirmToggle"
                                onchange="toggleAutoConfirm(this)" style="cursor:pointer;"
                                {% if auto_confirm_enabled %}checked{% endif %}>
@@ -285,12 +285,32 @@
                         </label>
                     </div>
                     <span class="badge bg-dark text-white-50 border border-secondary border-opacity-50"
-                          title="自动候选会按最新发货时间起算：PL 发货后次日，AU 14天，其它7天。只自动确认🟢已签收；🔴退回不会自动确认。">
+                          title="自动候选会按最新发货时间起算：PL 发货后次日，AU 14天，其它7天。">
                         自动候选 {{ auto_confirm_stats.candidates if auto_confirm_stats else 0 }}
                         · 存量 {{ auto_confirm_stats.backlog if auto_confirm_stats else 0 }}
-                        · 退回 {{ auto_confirm_stats.returned if auto_confirm_stats else 0 }}
+                    </span>
+                    <div class="form-check form-switch mb-0 px-2 py-1 rounded border border-danger border-opacity-50 d-flex align-items-center"
+                         style="background:rgba(220,53,69,0.08);"
+                         title="开启后：只把当前及以后物流明确显示🔴退回的 COD 单自动标记为未送达；运费损失默认取订单运费。问题退货、异常、在途、查无全部保留人工处理。已生成对账单不会自动重算。">
+                        <input class="form-check-input mt-0" type="checkbox" role="switch" id="autoConfirmReturnedToggle"
+                               onchange="toggleAutoConfirmReturned(this)" style="cursor:pointer;"
+                               data-candidates="{{ auto_confirm_returned_stats.total if auto_confirm_returned_stats else 0 }}"
+                               {% if auto_confirm_returned_enabled %}checked{% endif %}>
+                        <label class="form-check-label text-danger small ms-2 mb-0" for="autoConfirmReturnedToggle" style="cursor:pointer; white-space:nowrap;">
+                            <i class="bi bi-robot me-1"></i>自动确认「🔴退回」
+                        </label>
+                    </div>
+                    <span class="badge bg-dark text-white-50 border border-danger border-opacity-50" id="returnedCandidateBadge"
+                          title="只统计可以安全自动确认的整单退回；多包裹状态不一致的订单仍留给人工。">
+                        退回候选 {{ auto_confirm_returned_stats.candidates if auto_confirm_returned_stats else 0 }}
+                        · 存量 {{ auto_confirm_returned_stats.backlog if auto_confirm_returned_stats else 0 }}
                     </span>
                     {% endif %}
+                    <button class="ship-action btn btn-sm btn-danger" id="batchConfirmReturnedBtn"
+                            onclick="batchConfirmReturned()"
+                            title="把所有明确为物流退回、且多包裹状态无冲突的订单批量标记为未送达；运费损失默认取订单运费，不修改站点状态">
+                        <i class="bi bi-arrow-return-left me-1"></i>批量确认所有「🔴 物流退回」
+                    </button>
                     <button class="ship-action btn btn-sm btn-outline-success" onclick="batchConfirmDelivered(30)" title="只确认已挂满30天及以上的🟢物流已签收订单——超过这个时长基本不会再退回">
                         <i class="bi bi-check2-all me-1"></i>批量确认满30天的「🟢 已签收」
                     </button>
@@ -1306,7 +1326,7 @@
                     <td>
                         ${o.products.map(p => `
                         <div class="product-item" style="font-size: 0.9em;">
-                            <span class="product-name">${p.name}</span>
+                            <span class="product-name">${shipEscape(p.name)}${p.shortage_quantity ? ` <span class="badge bg-danger">缺货 ${p.shortage_quantity} 支</span>` : ''}</span>
                             <span class="product-qty">×${p.quantity}</span>
                             <span class="product-total">${p.total.toFixed(2)} ${o.currency}</span>
                         </div>
@@ -1382,7 +1402,7 @@
                     <td>
                         ${o.products.map(p => `
                         <div class="product-item" style="font-size: 0.9em;">
-                            <span class="product-name">${p.name}</span>
+                            <span class="product-name">${shipEscape(p.name)}</span>
                             <span class="product-qty">×${p.quantity}</span>
                             <span class="product-total">${p.total.toFixed(2)} ${o.currency}</span>
                         </div>
@@ -1495,7 +1515,10 @@
                     tbody.innerHTML = orders.map(o => {
                         const riskBadge = renderRiskBadge(o.customer_risk, { compact: true });
                         const cs = o.carrier_status || '';
-                        const carrierB = renderCarrierBadge(cs);
+                        const blocker = o.outcome_blocker || '';
+                        const carrierB = o.fulfillment_status === 'partially_delivered'
+                            ? '<span class="badge bg-warning text-dark">部分包裹已签收</span>'
+                            : renderCarrierBadge(cs);
                         // 查无（无任何物流状态）→ 直接给 InPost 官网核对链接（再点查物流也是查无，没意义）
                         const tn = (o.tracking_number || '').trim();
                         const isInpost = /inpost|paczko/i.test(o.carrier_slug || '') || (tn.length === 24 && /^\d+$/.test(tn));
@@ -1515,7 +1538,7 @@
                                     ? `<span class="badge bg-warning text-dark">${o.days_pending} 天</span>`
                                     : `<span class="text-light">${o.days_pending} 天</span>`));
                         return `
-                <tr data-editsrc="${o.source || ''}"${rowStyle} data-order-id="${o.id}" data-carrier="${cs}" data-days="${o.days_pending == null ? '' : o.days_pending}">
+                <tr data-editsrc="${o.source || ''}"${rowStyle} data-order-id="${o.id}" data-carrier="${cs}" data-confirm-blocked="${blocker ? '1' : '0'}" data-days="${o.days_pending == null ? '' : o.days_pending}">
                     <td class="ps-3">
                         <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a></div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
@@ -1528,7 +1551,7 @@
                         <small class="text-muted d-block text-truncate" style="max-width:16vw" title="${(o.customer_address || '').replace(/"/g, '&quot;')}">${fmtAuAddr(o.customer_address)}</small>
                     </td>
                     <td>
-                        ${(o.products || []).map(p => `<div class="small"><span class="text-white">${p.name}</span> <span class="text-muted">×${p.quantity}</span></div>`).join('')}
+                        ${(o.products || []).map(p => `<div class="small"><span class="text-white">${shipEscape(p.name)}</span> <span class="text-muted">×${p.quantity}</span></div>`).join('')}
                     </td>
                     <td class="text-end"><strong>${(o.total || 0).toFixed(2)} ${o.currency || ''}</strong></td>
                     <td class="text-center">${aging}</td>
@@ -1537,9 +1560,10 @@
                     </td>
                     <td class="text-center pe-3 text-nowrap">
                         ${carrierB ? `<div class="mb-1">${carrierB}</div>` : ''}
+                        ${blocker ? `<div class="small text-warning text-wrap mb-1" style="max-width:22rem">${shipEscape(blocker)}</div>` : ''}
                         ${officialUrl ? `<a class="btn btn-sm btn-outline-light me-1 mb-1" href="${officialUrl}" target="_blank" rel="noopener" title="系统查不到此单，去 InPost 官网核对"><i class="bi bi-box-arrow-up-right"></i> 官网</a>` : ''}
                         <button class="btn btn-sm btn-outline-info me-1 mb-1" onclick="queryCarrier('${o.id}', '${o.number}')" title="实时查询物流签收状态"><i class="bi bi-truck"></i> 查物流</button>
-                        <button class="ship-action btn btn-sm btn-success me-1 mb-1" onclick="confirmDelivery('${o.id}', '${o.number}')" title="确认签收：本地标记 + 同步站点为已完成"><i class="bi bi-check-lg"></i> 已签收</button>
+                        <button class="ship-action btn btn-sm btn-success me-1 mb-1" onclick="confirmDelivery('${o.id}', '${o.number}')" ${blocker ? 'disabled' : ''} title="确认签收：本地标记 + 同步站点为已完成"><i class="bi bi-check-lg"></i> 已签收</button>
                         <button class="ship-action btn btn-sm btn-warning me-1 mb-1" onclick="openUndeliveredModal('${o.id}', '${o.number}', ${o.shipping_total || 0}, '${(o.currency || '').replace(/'/g, "\\'")}', '${(o.tracking_number || '').replace(/'/g, "\\'")}')" title="客户拒收/包裹退回"><i class="bi bi-arrow-return-left"></i> 拒收</button>
                         <button class="ship-action btn btn-sm btn-outline-danger mb-1" onclick="openProblemReturnModal('${o.id}', '${o.number}', '${(o.currency || '').replace(/'/g, "\\'")}')" title="调包/少件/损坏"><i class="bi bi-box-seam"></i> 问题退货</button>
                     </td>
@@ -1626,12 +1650,10 @@
         let batchCancelled = false;
 
         // ── Auto-confirm switch (待确认结局 → 已签收) ───────────────────────────
-        // Persists settings.auto_confirm_delivered_enabled. FORWARD-ONLY: turning
-        // it on stamps an effective-start (server-side), and only deliveries
-        // detected AFTER that get auto-confirmed — the existing backlog is never
-        // touched (no retro email blast). The headless work runs hourly in
-        // auto_sync.py (auto_confirm.enforce). The existing 批量确认 buttons stay
-        // for manually clearing the backlog.
+        // Persists settings.auto_confirm_delivered_enabled. Turning it on stamps
+        // an audit/effective-start value server-side; the existing delivered
+        // backlog and future delivered outcomes are eligible. Existing batch
+        // buttons remain available for operator-controlled close-out.
         function toggleAutoConfirm(el) {
             const on = el.checked;
             fetch('/api/settings', {
@@ -1640,11 +1662,97 @@
                 body: JSON.stringify({ auto_confirm_delivered_enabled: on ? '1' : '0' })
             }).then(r => r.json()).then(() => {
                 if (on) {
-                    showToast('已开启：系统会按发货时间自动追踪，PL 次日起新检测到🟢已签收的 COD 单会自动确认；退回/在途/查无不自动处理。', 'success', 7000);
+                    showToast('已开启：当前及以后检测到🟢已签收的 COD 单会自动确认；退回/在途/查无不由此开关处理。', 'success', 7000);
                 } else {
                     showToast('已关闭自动确认', 'info');
                 }
             }).catch(() => { alert('保存失败，请重试'); el.checked = !on; });
+        }
+
+        function toggleAutoConfirmReturned(el) {
+            const on = el.checked;
+            const currentCandidates = parseInt(el.dataset.candidates || '0', 10) || 0;
+            if (on && currentCandidates > 0 && !confirm(
+                `当前有 ${currentCandidates} 个符合条件的整单退回。开启后系统会自动把它们标记为未送达，运费损失按各订单运费计入；已生成对账单不会自动重算。确定开启？`
+            )) {
+                el.checked = false;
+                return;
+            }
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ auto_confirm_returned_enabled: on ? '1' : '0' })
+            }).then(r => r.json()).then(data => {
+                if (!data.success) throw new Error(data.error || '保存失败');
+                if (on) {
+                    showToast('已开启：当前及以后物流明确显示🔴退回的 COD 单将自动标记为未送达，运费损失取订单运费；问题退货/异常/在途/查无仍由人工处理。已生成对账单不会自动重算。', 'success', 9000);
+                } else {
+                    showToast('已关闭自动确认退回', 'info');
+                }
+            }).catch(err => { alert('保存失败：' + err.message); el.checked = !on; });
+        }
+
+        function formatReturnedLosses(losses) {
+            const parts = Object.entries(losses || {}).map(([currency, amount]) =>
+                `${Number(amount || 0).toFixed(2)} ${currency}`
+            );
+            return parts.length ? parts.join(' + ') : '0.00';
+        }
+
+        // Operator-controlled counterpart to the automatic return switch. The
+        // server previews and re-evaluates the authoritative safe candidate set,
+        // so this covers all permitted sites rather than only rows loaded in the
+        // browser, and remains idempotent if the background worker runs at once.
+        async function batchConfirmReturned() {
+            const btn = document.getElementById('batchConfirmReturnedBtn');
+            const originalHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>核对退回订单…';
+            try {
+                const previewResp = await fetch('/api/shipping/pending-outcome/confirm-returned-batch');
+                const preview = await previewResp.json();
+                if (!previewResp.ok || !preview.success) throw new Error(preview.error || '候选查询失败');
+                if (!preview.candidates) {
+                    alert('当前没有可安全批量确认的物流退回订单。多包裹状态不一致、问题退货、异常、在途和查无仍需人工处理。');
+                    return;
+                }
+
+                const lossText = formatReturnedLosses(preview.shipping_loss_by_currency);
+                if (!confirm(
+                    `将批量确认当前所有 ${preview.candidates} 个「🔴 物流退回」订单：\n\n` +
+                    `• 标记为未送达\n• 预计运费损失：${lossText}\n` +
+                    `• 不修改 WooCommerce 状态，不发客户邮件\n` +
+                    `• 已生成的对账单不会自动重算\n\n` +
+                    `多包裹状态冲突及其它问题单不会处理；本操作没有批量撤销。确定继续？`
+                )) return;
+
+                btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>批量确认中…';
+                const runResp = await fetch('/api/shipping/pending-outcome/confirm-returned-batch', { method: 'POST' });
+                const result = await runResp.json();
+                if (!runResp.ok || !result.success) throw new Error(result.error || '批量确认失败');
+
+                const actualLoss = formatReturnedLosses(result.shipping_loss_by_currency);
+                const skipped = result.skipped ? `，跳过 ${result.skipped} 单（状态已变化）` : '';
+                showToast(
+                    `已批量确认 ${result.marked} 个物流退回订单，运费损失 ${actualLoss}${skipped}。已生成对账单未重算。`,
+                    'success',
+                    9000
+                );
+                const badge = document.getElementById('returnedCandidateBadge');
+                const autoToggle = document.getElementById('autoConfirmReturnedToggle');
+                if (badge) {
+                    badge.textContent = autoToggle && autoToggle.checked
+                        ? `退回候选 ${result.remaining || 0} · 存量 0`
+                        : `退回候选 0 · 存量 ${result.remaining || 0}`;
+                }
+                if (autoToggle) autoToggle.dataset.candidates = String(result.remaining || 0);
+                refreshActiveViews();
+            } catch (err) {
+                alert('操作失败：' + err.message);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            }
         }
 
         // Batch-confirm rows whose carrier badge says delivered (🟢物流已签收).
@@ -1654,6 +1762,7 @@
             const ids = [];
             document.querySelectorAll('#outcomeOrdersBody tr').forEach(tr => {
                 if (tr.dataset.carrier !== 'delivered') return;
+                if (tr.dataset.confirmBlocked === '1') return;
                 if (minDays != null) {
                     const d = parseInt(tr.dataset.days, 10);
                     if (isNaN(d) || d < minDays) return;
@@ -2484,7 +2593,7 @@
                         <small class="text-muted text-break">${fmtAuAddr(o.customer_address)}</small>
                     </td>
                     <td>
-                        ${(o.products || []).slice(0, 4).map(p => `<div class="small text-light">${p.name} <span class="text-muted">×${p.quantity}</span></div>`).join('')}
+                        ${(o.products || []).slice(0, 4).map(p => `<div class="small text-light">${shipEscape(p.name)} <span class="text-muted">×${p.quantity}</span></div>`).join('')}
                         ${o.products && o.products.length > 4 ? `<div class="text-muted small">…还有 ${o.products.length - 4} 件</div>` : ''}
                     </td>
                     <td>
@@ -2685,7 +2794,7 @@
                                 ${data.products.map((p, i) => `
                                 <tr>
                                     <td>${i + 1}</td>
-                                    <td>${p.name}</td>
+                                    <td>${shipEscape(p.name)}</td>
                                     <td class="text-center"><strong>×${p.qty}</strong></td>
                                     <td class="text-end">${p.total ? p.total.toFixed(2) + ' ' + data.currency : '-'}</td>
                                 </tr>
@@ -2788,7 +2897,7 @@
                                 </td>
                                 <td>
                                     <ul class="mb-0 ps-3" style="list-style: none; padding-left: 0;">
-                                        ${o.products.map(p => `<li style="margin-bottom: 4px;">• ${p.name} <strong>×${p.qty}</strong></li>`).join('')}
+                                        ${o.products.map(p => `<li style="margin-bottom: 4px;">• ${shipEscape(p.name)} <strong>×${p.qty}</strong></li>`).join('')}
                                     </ul>
                                 </td>
                                 <td class="text-end"><strong>${o.total}</strong></td>
@@ -2880,7 +2989,7 @@
                                 </td>
                                 <td>
                                     <ul class="mb-0 ps-3" style="list-style: none; padding-left: 0;">
-                                        ${o.products.map(p => `<li style="margin-bottom: 4px;">• ${p.name} <strong>×${p.qty}</strong></li>`).join('')}
+                                        ${o.products.map(p => `<li style="margin-bottom: 4px;">• ${shipEscape(p.name)} <strong>×${p.qty}</strong></li>`).join('')}
                                     </ul>
                                 </td>
                                 <td class="text-end"><strong>${o.total}</strong></td>

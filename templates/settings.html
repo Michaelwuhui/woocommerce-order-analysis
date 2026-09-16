@@ -81,6 +81,7 @@
                 <a href="/users" class="btn btn-outline-light">
                     <i class="bi bi-people me-1"></i> 用户管理
                 </a>
+                {% if current_user.username == 'admin' %}<a href="/settings/inventory-access" class="btn btn-outline-warning">临时库存修改授权</a>{% endif %}
                 <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addSiteModal">
                     <i class="bi bi-plus-lg me-1"></i> 添加站点
                 </button>
@@ -1692,6 +1693,7 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='js/site_api_checks.js') }}?v=20260914"></script>
 {% if site_sync_only %}
 <script src="{{ url_for('static', filename='js/site_sync_settings.js') }}"></script>
 {% else %}
@@ -1923,81 +1925,8 @@
             });
         });
 
-        // Check All APIs Button
-        const checkAllApisBtn = document.getElementById('checkAllApisBtn');
-        if (checkAllApisBtn) {
-            checkAllApisBtn.addEventListener('click', function () {
-                const btn = this;
-                const originalHtml = btn.innerHTML;
-
-                btn.disabled = true;
-                btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> 检测中...';
-
-                fetch('/api/sites/check-all', { method: 'POST' })
-                    .then(async res => {
-                        if (res.redirected || res.status === 302 || res.status === 401) {
-                            throw new Error('登录已过期，请刷新页面重新登录');
-                        }
-                        const data = await res.json().catch(() => ({}));
-                        if (!res.ok) {
-                            throw new Error(data.error || `服务器错误 (HTTP ${res.status})`);
-                        }
-                        return data;
-                    })
-                    .then(data => {
-                        if (data.success && data.check_id) {
-                            // Start polling for status
-                            const checkId = data.check_id;
-                            const pollInterval = setInterval(() => {
-                                fetch(`/api/sites/check-status/${checkId}`)
-                                    .then(res => res.json())
-                                    .then(status => {
-                                        // Update button text with progress
-                                        if (status.total > 0) {
-                                            btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span> 检测中 (${status.progress}/${status.total})...`;
-                                        }
-
-                                        if (status.status === 'success') {
-                                            clearInterval(pollInterval);
-                                            btn.disabled = false;
-                                            btn.innerHTML = originalHtml;
-
-                                            const okCount = status.results.filter(r => r.read === 'ok' && r.write === 'ok').length;
-                                            const errorCount = status.results.filter(r => r.read === 'error' || r.write === 'error').length;
-
-                                            if (errorCount > 0) {
-                                                alert(`检测完成！\n✅ 正常: ${okCount} 个\n❌ 异常: ${errorCount} 个`);
-                                            } else {
-                                                alert(`检测完成！所有 ${okCount} 个站点连接正常 ✅`);
-                                            }
-                                            location.reload();
-                                        } else if (status.status === 'error') {
-                                            clearInterval(pollInterval);
-                                            btn.disabled = false;
-                                            btn.innerHTML = originalHtml;
-                                            alert('检测失败: ' + status.message);
-                                        }
-                                    })
-                                    .catch(err => {
-                                        clearInterval(pollInterval);
-                                        btn.disabled = false;
-                                        btn.innerHTML = originalHtml;
-                                        alert('状态查询失败: ' + err.message);
-                                    });
-                            }, 2000);
-                        } else {
-                            btn.disabled = false;
-                            btn.innerHTML = originalHtml;
-                            alert('检测启动失败: ' + (data.error || '未知错误'));
-                        }
-                    })
-                    .catch(err => {
-                        btn.disabled = false;
-                        btn.innerHTML = originalHtml;
-                        alert('检测失败: ' + err.message);
-                    });
-            });
-        }
+        // Each request checks one site and saves its result across workers.
+        SiteApiChecks.bind(document.getElementById('checkAllApisBtn'));
 
         // Sync Logs Button
         const viewSyncLogsBtn = document.getElementById('viewSyncLogsBtn');
