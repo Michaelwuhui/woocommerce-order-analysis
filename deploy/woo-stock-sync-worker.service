@@ -1,0 +1,22 @@
+[Unit]
+Description=Woo cross-site inventory sync worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www
+WorkingDirectory=/www/wwwroot/woo-analysis
+EnvironmentFile=/etc/woo-analysis/woo-analysis.env
+EnvironmentFile=-/etc/woo-analysis/stock-sync.env
+ExecStart=/www/wwwroot/woo-analysis/venv/bin/python -u stock_sync_worker.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -22,6 +22,8 @@ wheels/
 MANIFEST
 
 # Virtual environments
+.test-stock-sync/
+.venv/
 venv/
 env/
 ENV/

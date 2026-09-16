@@ -25887,6 +25887,9 @@ def set_order_warehouse(order_id):
         conn.close()
 
 
+from stock_sync_api import bp as stock_sync_bp
+app.register_blueprint(stock_sync_bp)
+
 # ─────────────────────── 进销存(库存)模块 ───────────────────────
 # 库存功能拆到独立的 inv_*.py 模块(Blueprint),避免继续膨胀 app.py。
 # 只读关联现有表,全部走 inv_migrations.py 的可回滚迁移建表。
