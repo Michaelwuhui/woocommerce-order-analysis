@@ -38,9 +38,9 @@
   }
   const sleep = ms => new Promise(resolve=>setTimeout(resolve,ms));
   function invalidate(){ generation++; plan=null;$('execute').disabled=true;$('plan').replaceChildren();$('plan-summary').classList.remove('ss-bad');$('plan-summary').setAttribute('role','status');$('plan-summary').textContent='选择已改变，请重新生成差异预览。';$('plan-scope').textContent=''; }
-  function sourceChange(){scanGeneration++;clearInterval(scanTimer);$('scan-progress-wrap').hidden=true;$('scan').disabled=false;$('scan').textContent='读取商品目录';$('scan-info').classList.remove('ss-bad');invalidate();$('scan-info').textContent='操作或来源已改变，请重新读取目录。';snapshot=null;complete=false;catalog=[];selected.clear();renderProducts();const ref=$('operation').value==='reference_status';$('source-wrap').classList.toggle('ss-hidden',!ref);$('available-wrap').classList.toggle('ss-hidden',$('operation').value!=='release_hold');$('controls-wrap').classList.toggle('ss-hidden',$('operation').value!=='release_hold');if(ref)targets.delete(Number($('source').value));renderSites();loadControls().catch(error);}
+  function sourceChange(){scanGeneration++;clearInterval(scanTimer);$('scan-progress-wrap').hidden=true;$('scan').disabled=!options;$('scan').textContent='读取商品目录';$('scan-info').classList.remove('ss-bad');invalidate();$('scan-info').textContent='操作或来源已改变，请重新读取目录。';snapshot=null;complete=false;catalog=[];selected.clear();renderProducts();const ref=$('operation').value==='reference_status';$('source-wrap').classList.toggle('ss-hidden',!ref);$('available-wrap').classList.toggle('ss-hidden',$('operation').value!=='release_hold');$('controls-wrap').classList.toggle('ss-hidden',$('operation').value!=='release_hold');if(ref)targets.delete(Number($('source').value));renderSites();loadControls().catch(error);}
   function option(select,value,text){const o=el('option',text);o.value=value;select.append(o);}
-  function visibleSites(){return options.target_sites.filter(s=>(!$('manager').value||s.manager===$('manager').value)&&(!$('country').value||s.country===$('country').value));}
+  function visibleSites(){return (options?.target_sites||[]).filter(s=>(!$('manager').value||s.manager===$('manager').value)&&(!$('country').value||s.country===$('country').value));}
   function renderSites(){
     $('sites').replaceChildren();
     for(const s of visibleSites()){
@@ -171,7 +171,7 @@
   act('retry',async()=>{try{const ids=[...$('job').querySelectorAll('input:checked')].map(n=>n.value);invalidate();const g=generation,r=await api('/jobs/'+job+'/retry-plan','POST',{item_ids:ids});await waitPlan(r.id,g);$('plan-summary').scrollIntoView({behavior:'smooth'});}catch(e){previewError(e);}});
   async function init(){options=await api('/options');csrf=options.csrf_token;for(const s of options.reference_sites)option($('source'),s.id,s.url);for(const m of new Set(options.target_sites.map(s=>s.manager).filter(Boolean)))option($('manager'),m,m);for(const c of new Set(options.target_sites.map(s=>s.country).filter(Boolean)))option($('country'),c,c);renderSites();renderProducts();await loadHistory();await loadControls();
     if(options.superadmin){$('admin').classList.remove('ss-hidden');for(const s of options.target_sites){const label=el('label'),box=el('input');box.type='checkbox';box.checked=options.reference_settings.some(r=>r.site_id===s.id&&r.enabled);box.onchange=async()=>{try{await api('/reference-sites/'+s.id,'PUT',{enabled:box.checked});message('共享参照设置已保存。');}catch(e){box.checked=!box.checked;error(e);}};label.append(box,el('span',s.url));$('reference-settings').append(label);}}
-    message('请选择操作方式，读取本次商品目录。');}
+    $('scan').disabled=false;message('请选择操作方式，读取本次商品目录。');}
   const mappingScope=()=>({source_site_id:$('operation').value==='reference_status'?Number($('source').value):null,target_scope:{mode:'explicit_sites',site_ids:[...targets].sort((a,b)=>a-b)}});
   window.stockSyncMappingBridge={api,scope:mappingScope,reason:()=>$('reason').value,allowed:()=>!!options?.can_manage_mappings,
     refresh:async expected=>{
