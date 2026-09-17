@@ -107,6 +107,32 @@ def test_duplicate_identifiers_and_ambiguous_recognition_require_review(mapped_s
     assert item['state']=='review' and set(item['candidates'])=={1,2} and item['proposed_sku_id'] is None
 
 
+def test_variation_marketing_title_matches_legacy_sku_without_changing_master(mapped_system):
+    s=mapped_system
+    s.sql('CREATE TABLE brands(id INTEGER PRIMARY KEY,name TEXT,aliases TEXT)')
+    s.sql('CREATE TABLE series(id INTEGER PRIMARY KEY,brand_id INTEGER,name TEXT)')
+    s.sql('INSERT INTO brands VALUES(7,?,?)', ('Canonical Brand', dumps(['RecognizedAlias'])))
+    s.sql("INSERT INTO series VALUES(8,7,'Blade')")
+    s.sql("UPDATE inv_skus SET name='Canonical Brand Blade 30000 Puffs - Blueberry' WHERE id=1")
+    root='https://target.test/wp-json/wc/v3/products/2001'
+    parent=s.http.products[root]
+    parent.update(type='variable',variations=[2011],name='RecognizedAlias Blade 30000 Puffs – Bestseller | Screen 2.1 inch')
+    s.http.products[root+'/variations/2011']=dict(parent,id=2011,type='variation',parent_id=2001,sku='',attributes=[{'name':'pa_smak','option':'Blueberry'}])
+    item=next(i for i in scan(s)['items'] if i['id']=='2:2001:2011')
+    assert item['state']=='suggested' and item['proposed_sku_id']==1 and not item['certain']
+    assert item['recognition']=={'brand_id':7,'series_id':8,'puff_count':30000,'flavor':'Blueberry'}
+    assert s.sql('SELECT brand_id,series_id,puff_count,flavor FROM inv_skus WHERE id=1')[0]=={'brand_id':None,'series_id':None,'puff_count':None,'flavor':None}
+    assert not s.http.puts
+
+
+def test_multiple_flavor_attributes_are_not_resolved_by_title(mapped_system):
+    s=mapped_system;root='https://target.test/wp-json/wc/v3/products/2001'
+    parent=s.http.products[root];parent.update(type='variable',variations=[2011],name='Parent')
+    s.http.products[root+'/variations/2011']=dict(parent,id=2011,type='variation',parent_id=2001,sku='SKU-1',attributes=[{'name':'pa_smak','option':'Blueberry'},{'name':'flavor','option':'Strawberry'}])
+    item=next(i for i in scan(s)['items'] if i['id']=='2:2001:2011')
+    assert item['state']=='review' and not item['certain'] and item['proposed_sku_id'] is None
+
+
 def test_variation_ids_and_attribute_conflicts_are_preserved(mapped_system):
     s=mapped_system; root='https://target.test/wp-json/wc/v3/products/2001'
     parent=s.http.products[root];parent.update(type='variable',variations=[2011],name='Parent')

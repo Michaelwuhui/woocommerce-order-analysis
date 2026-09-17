@@ -34,7 +34,9 @@
         const opt=el('option',`${candidates.has(s.id)?'建议 · ':''}${s.sku_code} · ${s.name}`);opt.value=s.id;select.append(opt);
       }
       select.value=choice.sku_id||'';select.disabled=busy||!editable(item);
-      select.onchange=()=>{choice.sku_id=Number(select.value)||null;changed();};skuCell.append(select);tr.append(skuCell);
+      const chosenName=el('div');chosenName.className='ss-muted ss-map-chosen';
+      const showChosen=()=>{const chosen=data.skus.find(s=>s.id===choice.sku_id);chosenName.textContent=chosen?`${chosen.sku_code} · ${chosen.name}`:'';};showChosen();
+      select.onchange=()=>{choice.sku_id=Number(select.value)||null;showChosen();changed();};skuCell.append(select,chosenName);tr.append(skuCell);
       const quantityCell=el('td'),quantity=el('input');quantity.type='number';quantity.min='1';quantity.max='100000';quantity.step='1';quantity.value=choice.quantity;quantity.style.width='95px';quantity.disabled=busy||!editable(item);quantity.setAttribute('aria-label','每件折合数量 '+item.id);
       quantity.oninput=()=>{choice.quantity=Number(quantity.value);changed();};quantityCell.append(quantity);tr.append(quantityCell);body.append(tr);
     }
