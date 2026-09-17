@@ -821,6 +821,16 @@
             bootstrap.Modal.getOrCreateInstance(el).show();
         }
 
+        function renderShipmentReconciliation(state) {
+            if (!state || state.outcome === 'completed') return '';
+            const escape = value => String(value == null ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+            const style = state.outcome === 'verified' ? 'success' : 'warning';
+            const checked = state.checked_at ? ' · 最近核验：' + new Date(state.checked_at).toLocaleString() : '';
+            return `<div class="col-12"><div class="alert alert-${style} py-2 mb-2"><strong>发货同步${escape(state.label)}</strong>：${escape(state.reason)}<span class="small">${escape(checked)}</span></div></div>`;
+        }
+
         function showOrderDetail(orderId) {
             var modal = new bootstrap.Modal(document.getElementById('orderDetailModal'));
             document.getElementById('modalOrderNumber').textContent = orderId;
@@ -1229,6 +1239,7 @@
                     }
 
                     // Order Notes Timeline
+                    html += renderShipmentReconciliation(order.shipment_reconciliation);
                     if (order.order_notes && order.order_notes.length > 0) {
                         html += '<div class="col-12">';
                         html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-clock-history me-2"></i>订单动态</h6></div>';

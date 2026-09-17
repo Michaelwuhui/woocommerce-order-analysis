@@ -17,7 +17,7 @@ BROKER_URL = (
 celery_app = Celery(
     "woo_analysis",
     broker=BROKER_URL,
-    include=["sync_tasks"],
+    include=["sync_tasks", "shipment_reconciliation_tasks"],
 )
 
 celery_app.conf.update(
@@ -61,6 +61,8 @@ celery_app.conf.update(
         ),
     ),
     task_routes={
+        "woo_sync.scan_shipment_reconciliation": {"queue": "sync_write", "routing_key": "sync_write"},
+        "woo_sync.reconcile_shipment": {"queue": "sync_fetch", "routing_key": "sync_fetch"},
         "woo_sync.fetch_page": {"queue": "sync_fetch", "routing_key": "sync_fetch"},
         "woo_sync.write_page": {"queue": "sync_write", "routing_key": "sync_write"},
         "woo_sync.post_commit_page": {"queue": "sync_write", "routing_key": "sync_write"},
@@ -72,6 +74,10 @@ celery_app.conf.update(
         "woo_sync.schedule_deep": {"queue": "sync_write", "routing_key": "sync_write"},
     },
     beat_schedule={
+        "shipment-result-reconciliation": {
+            "task": "woo_sync.scan_shipment_reconciliation",
+            "schedule": 60.0,
+        },
         "sync-recovery-and-outbox": {
             "task": "woo_sync.maintenance",
             "schedule": 30.0,

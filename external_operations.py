@@ -7,6 +7,7 @@ import json
 import uuid
 from typing import Any
 
+SHIPMENT_LOCK_NAMESPACE = 1936222576
 
 ALLOWED_TRANSITIONS = {
     "pending": {"external_success", "reconciliation_required", "failed", "cancelled"},
@@ -54,6 +55,9 @@ def begin_operation(
 ) -> dict[str, Any]:
     """Create a pending operation or return the matching prior operation."""
 
+    if operation_type == 'ship_order':
+        connection.execute('SELECT pg_advisory_xact_lock(?,hashtext(?))',
+                           (SHIPMENT_LOCK_NAMESPACE, str(order_id)))
     request_hash = canonical_hash(request_payload)
     key = make_idempotency_key(operation_type, order_id, request_payload)
     operation_id = str(uuid.uuid4())
