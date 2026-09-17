@@ -139,7 +139,7 @@ class Woo:
         if item.get('backorders') not in ('no','notify','yes'):
             raise SyncError('BACKORDER_POLICY_CONFLICT')
 
-    def pages(self, site, path):
+    def pages(self, site, path, on_page=None):
         page, count, expected = 1, 0, None
         while page <= 10000:
             data, headers = self.request('GET', site, path, params={'per_page':100,'page':page,'status':'any','orderby':'id','order':'asc'})
@@ -155,6 +155,8 @@ class Woo:
                     raise SyncError('SOURCE_INCOMPLETE', '目录扫描期间商品总数变化，请重新扫描')
                 expected = total
             count += len(data)
+            if on_page:
+                on_page({'page': page, 'total': expected, 'read': count})
             yield data
             if len(data) < 100 or (expected is not None and count >= expected):
                 if expected is not None and count != expected:
