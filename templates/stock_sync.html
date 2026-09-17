@@ -26,9 +26,25 @@
     <div class="ss-row"><button id="ss-prev" class="btn btn-sm btn-outline-secondary">上一页</button><span id="ss-page"></span><button id="ss-next" class="btn btn-sm btn-outline-secondary">下一页</button></div>
   </section>
   <section class="ss-card"><h4>3 · 目标站点范围</h4><div class="ss-row"><label>负责人 <select id="ss-manager"><option value="">全部负责人</option></select></label><label>国家 <select id="ss-country"><option value="">全部国家</option></select></label><button id="ss-select-sites" class="btn btn-outline-primary">选择筛选后的全部站点</button><button id="ss-clear-sites" class="btn btn-outline-secondary">清空目标</button></div><div id="ss-sites" class="ss-list"></div></section>
+  <section id="ss-mapping-assistant" class="ss-card">
+    <h4>3.1 · 补齐商品映射</h4>
+    <p class="ss-muted">读取参照站和已勾选目标站的完整商品目录，复用已有产品识别生成 SKU 建议。勾选并确认后保存对应关系，再生成库存差异预览。</p>
+    <div class="ss-row"><button id="ss-map-scan" class="btn btn-outline-primary" disabled>读取并生成映射建议</button><a href="/inventory/skus" target="_blank" rel="noopener">SKU 主档与映射管理</a></div>
+    <p id="ss-map-status" role="status" aria-live="polite">先选择第 3 步的目标站点。</p>
+    <div id="ss-map-results" hidden>
+      <div class="ss-row"><input id="ss-map-search" aria-label="搜索映射商品" placeholder="搜索站点、商品或 SKU"><select id="ss-map-filter" aria-label="映射状态"><option value="pending">待处理</option><option value="all">全部商品</option></select><button id="ss-map-select" class="btn btn-outline-primary">选择当前筛选中的明确匹配</button><button id="ss-map-clear" class="btn btn-outline-secondary">清空映射选择</button></div>
+      <p id="ss-map-selection" class="ss-summary"></p>
+      <div id="ss-map-table" class="ss-scroll"></div>
+      <div class="ss-row"><button id="ss-map-prev" class="btn btn-sm btn-outline-secondary">映射上一页</button><span id="ss-map-page"></span><button id="ss-map-next" class="btn btn-sm btn-outline-secondary">映射下一页</button></div>
+      <p><label><input id="ss-map-reviewed" type="checkbox"> 我已核对所选商品的口味、规格和每件折合数量</label></p>
+      <button id="ss-map-confirm" class="btn btn-primary" disabled>确认保存所选映射</button>
+      <p class="ss-muted">这里只保存商品对应关系。库存同步仍需在第 4 步预览并确认；主子站库存联动冲突需单独核实。</p>
+    </div>
+  </section>
   <section class="ss-card"><h4>4 · 差异预览与确认</h4><button id="ss-preview" class="btn btn-primary">生成差异预览</button><p id="ss-plan-summary" class="ss-summary" role="status" aria-live="polite">选择改变后，需要重新生成预览。</p><div id="ss-plan-scope" class="ss-muted"></div><div id="ss-plan" class="ss-scroll"></div><button id="ss-execute" disabled class="btn btn-danger">确认执行所选项目</button></section>
   <section class="ss-card"><h4>5 · 后台进度与结果</h4><p id="ss-job-summary">尚无执行任务</p><div id="ss-job" class="ss-scroll"></div><button id="ss-cancel" disabled class="btn btn-outline-warning">取消尚未执行项目</button><button id="ss-retry" disabled class="btn btn-outline-primary">为所选失败项生成重试预览</button><p class="ss-muted">关闭页面不影响已排队任务。取消不会撤销已保存的控制或已完成的写入；待核实项目需先完成远端核实。</p><h5>操作记录</h5><div id="ss-history"></div></section>
   <section id="ss-admin" class="ss-card ss-hidden"><h4>共享参照设置</h4><p class="ss-muted">仅向其他负责人开放商品身份与库存状态读取，不授予目标站写入权限。</p><div id="ss-reference-settings" class="ss-list"></div></section>
 </div>
-<script src="{{ url_for('static', filename='js/stock_sync.js', v='20260917-preview-feedback') }}" defer></script>
+<script src="{{ url_for('static', filename='js/stock_sync.js', v='20260917-mapping-assist') }}" defer></script>
+<script src="{{ url_for('static', filename='js/stock_sync_mapping.js', v='20260917-mapping-assist') }}" defer></script>
 {% endblock %}

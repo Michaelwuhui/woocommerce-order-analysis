@@ -128,5 +128,16 @@
   async function init(){options=await api('/options');csrf=options.csrf_token;for(const s of options.reference_sites)option($('source'),s.id,s.url);for(const m of new Set(options.target_sites.map(s=>s.manager).filter(Boolean)))option($('manager'),m,m);for(const c of new Set(options.target_sites.map(s=>s.country).filter(Boolean)))option($('country'),c,c);renderSites();renderProducts();await loadHistory();await loadControls();
     if(options.superadmin){$('admin').classList.remove('ss-hidden');for(const s of options.target_sites){const label=el('label'),box=el('input');box.type='checkbox';box.checked=options.reference_settings.some(r=>r.site_id===s.id&&r.enabled);box.onchange=async()=>{try{await api('/reference-sites/'+s.id,'PUT',{enabled:box.checked});message('共享参照设置已保存。');}catch(e){box.checked=!box.checked;error(e);}};label.append(box,el('span',s.url));$('reference-settings').append(label);}}
     message('请选择操作方式，读取本次商品目录。');}
-  init().catch(error);
+  const mappingScope=()=>({source_site_id:$('operation').value==='reference_status'?Number($('source').value):null,target_scope:{mode:'explicit_sites',site_ids:[...targets].sort((a,b)=>a-b)}});
+  window.stockSyncMappingBridge={api,scope:mappingScope,reason:()=>$('reason').value,allowed:()=>!!options?.can_manage_mappings,
+    refresh:async expected=>{
+      if(JSON.stringify(mappingScope())!==expected)return false;
+      const key=i=>`${i.site_id}:${i.product_id}:${i.variation_id||0}`;
+      const chosen=new Set(catalog.filter(i=>selected.has(i.id)).map(key));
+      await scan();
+      if(JSON.stringify(mappingScope())!==expected)return false;
+      selected=new Set(catalog.filter(i=>chosen.has(key(i))).map(i=>i.id));selectionMode='explicit';invalidate();renderProducts();
+      message('映射已保存，目录已更新；请重新生成库存差异预览。');return true;
+    }};
+  init().then(()=>document.dispatchEvent(new Event('stock-sync-ready'))).catch(error);
 })();

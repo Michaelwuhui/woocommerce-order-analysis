@@ -11,6 +11,7 @@ from stock_sync_permissions import actor, target_sites, reference_site, visible_
 from stock_sync_catalog import create_scan, enqueue
 from stock_sync_planner import create_plan
 from stock_sync_jobs import confirm, cancel, RETRYABLE
+import stock_sync_mapping as mapping_assist
 
 bp=Blueprint('stock_sync',__name__)
 PREFIX='/api/product-manager/stock-sync'
@@ -117,7 +118,7 @@ def options(c,u):
         except SyncError:
             pass
     return jsonify(target_sites=[{**visible_site(s),'available':bool(s.get('consumer_key') and s.get('consumer_secret') and s.get('is_active',1))} for s in targets],
-        reference_sites=refs,superadmin=u['superadmin'],csrf_token=csrf_token(),
+        reference_sites=refs,superadmin=u['superadmin'],can_manage_mappings=mapping_assist.permitted(u),csrf_token=csrf_token(),
         reference_settings=rows(c,'SELECT site_id,enabled,version FROM stock_sync_reference_sites') if u['superadmin'] else [],
         worker=rows(c,"SELECT worker_id,heartbeat_at,kind FROM stock_sync_work WHERE status='running' ORDER BY created_at DESC LIMIT 3"))
 
@@ -146,6 +147,8 @@ def accessible_scan(c,u,id_):
     snap=one(c,'SELECT * FROM stock_sync_catalog_snapshots WHERE id=?',(id_,))
     if not snap: raise SyncError('NOT_FOUND',status=404)
     scope=loads(snap['scope_json'])
+    if scope.get('purpose'):
+        raise SyncError('NOT_FOUND',status=404)
     require_object(c,u,snap,scope['site_ids'],snap['site_id'])
     return snap
 
@@ -168,6 +171,30 @@ def catalog_items(c,u,id_):
     page=max(1,int(request.args.get('page',1)))
     size=min(100,max(1,int(request.args.get('per_page',50))))
     return jsonify(items=filtered[(page-1)*size:page*size],total=len(filtered),catalog_total=len(items),complete=bool(snap['complete']),page=page)
+
+
+@bp.route(PREFIX+'/mapping-scans',methods=['POST'])
+@api
+def mapping_scans(c,u):
+    return jsonify(id=mapping_assist.create(c,u,request.get_json())),202
+
+
+@bp.route(PREFIX+'/mapping-scans/<id_>')
+@api
+def mapping_scan_status(c,u,id_):
+    return jsonify(mapping_assist.status(c,u,id_))
+
+
+@bp.route(PREFIX+'/mapping-scans/<id_>/confirm',methods=['POST'])
+@api
+def mapping_confirm(c,u,id_):
+    return jsonify(id=mapping_assist.confirm(c,u,id_,request.get_json())),202
+
+
+@bp.route(PREFIX+'/mapping-confirmations/<id_>')
+@api
+def mapping_confirmation_status(c,u,id_):
+    return jsonify(mapping_assist.status(c,u,id_,confirmation=True))
 
 
 @bp.route(PREFIX+'/plans',methods=['POST'])
