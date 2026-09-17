@@ -31,6 +31,19 @@ def key(value):
     return re.sub(r'\s+', ' ', unicodedata.normalize('NFKC', html.unescape(str(value or '')))).strip().casefold()
 
 
+def sku_recognition(sku, rules):
+    """Recognize missing legacy SKU metadata for suggestions, without saving it."""
+    value = {f: sku.get(f) for f in ('brand_id', 'series_id', 'puff_count', 'flavor')}
+    parsed = parse_product_name(sku['name'], rules['brands'], rules['series'])
+    if value['brand_id'] and parsed.get('brand_id') and value['brand_id'] != parsed['brand_id']:
+        return value
+    for field, source in (('brand_id', 'brand_id'), ('series_id', 'series_id'),
+                          ('puff_count', 'puffs'), ('flavor', 'flavor')):
+        if value[field] in (None, ''):
+            value[field] = parsed.get(source)
+    return value
+
+
 def master_data(c):
     skus = rows(c, 'SELECT * FROM inv_skus WHERE is_active=1 ORDER BY id')
     rules = rows(c, 'SELECT * FROM product_mappings ORDER BY id') if exists(c, 'product_mappings') else []
@@ -48,6 +61,8 @@ def master_data(c):
             aliases = []
         brand['patterns'] = [str(brand['name']).upper()] + [a.upper() for a in aliases if isinstance(a, str)]
     rules = {'mappings':rules, 'brands':brands, 'series':series}
+    for sku in skus:
+        sku['recognition'] = sku_recognition(sku, rules)
     return skus, rules, digest([skus, rules])
 
 
@@ -86,14 +101,18 @@ def recognition(item, site, rules):
     if values:
         value = values[0]
     else:
-        parsed = parse_product_name(item['name'], rules['brands'], rules['series'])
+        parsed = parse_product_name(item['parent_name'] if item['variation_id'] else item['name'], rules['brands'], rules['series'])
         value = {'brand_id':parsed.get('brand_id'), 'series_id':parsed.get('series_id'),
                  'puff_count':parsed.get('puffs'), 'flavor':parsed.get('flavor')}
     flavors = {key(v): v for n, v in item['attributes']
                if any(t in key(n) for t in ('smak','flavor','flavour','口味','taste','aroma'))}
+    if len(flavors) > 1:
+        return {}, '站点包含多个不同的口味属性，请人工核对'
     if len(flavors) == 1:
         flavor = next(iter(flavors.values()))
-        if value.get('flavor') and key(value['flavor']) != key(flavor):
+        # Stored classification is explicit evidence; parsed title suffixes may
+        # be marketing copy. Variation attributes take precedence over parsing.
+        if values and value.get('flavor') and key(value['flavor']) != key(flavor):
             return {}, '已有识别口味与站点变体口味不同'
         value = dict(value, flavor=flavor)
     return value, ''
@@ -122,9 +141,9 @@ def suggest(item, site, skus, rules, aliases, sku_counts):
     named = [s for s in skus if key(s['name']) in {key(item['name']), key(item['parent_name'] + ' - ' + ' - '.join(v for _, v in item['attributes']))}]
     classified = []
     if tax.get('brand_id') and tax.get('puff_count') and tax.get('flavor'):
-        classified = [s for s in skus if s['brand_id'] == tax['brand_id'] and s['puff_count'] == tax['puff_count']
-                      and key(s['flavor']) == key(tax['flavor'])
-                      and (not tax.get('series_id') or s['series_id'] == tax['series_id'])]
+        classified = [s for s in skus if s['recognition']['brand_id'] == tax['brand_id'] and s['recognition']['puff_count'] == tax['puff_count']
+                      and key(s['recognition']['flavor']) == key(tax['flavor'])
+                      and (not tax.get('series_id') or s['recognition']['series_id'] == tax['series_id'])]
     chosen = direct or named or classified
     method = 'SKU / 条码精确匹配' if direct else ('完整名称精确匹配' if named else '复用已有品牌、系列、口数和口味识别')
     # Conflicting independent evidence must never be silently resolved by priority.
@@ -133,7 +152,7 @@ def suggest(item, site, skus, rules, aliases, sku_counts):
     if disagreement:
         chosen = list({s['id']: s for s in direct + other}.values())
         method = 'SKU 标识与完整名称或已有产品识别结果不一致'
-    flavor_mismatch = bool(direct and tax.get('flavor') and any(s.get('flavor') and key(s['flavor']) != key(tax['flavor']) for s in direct))
+    flavor_mismatch = bool(direct and tax.get('flavor') and any(s['recognition'].get('flavor') and key(s['recognition']['flavor']) != key(tax['flavor']) for s in direct))
     if flavor_mismatch:
         method = 'SKU 标识与口味属性不一致，请人工核对'
     result['candidates'] = [s['id'] for s in chosen]
