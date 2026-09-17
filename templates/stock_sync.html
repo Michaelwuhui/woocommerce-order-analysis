@@ -5,6 +5,7 @@
 .ss-wrap{max-width:1500px;margin:auto}.ss-card{border:1px solid #475569;border-radius:12px;padding:20px;margin:18px 0;background:rgba(30,41,59,.28)}
 .ss-row{display:flex;gap:14px;flex-wrap:wrap;align-items:center}.ss-row label{display:flex;gap:8px;align-items:center}.ss-row select,.ss-row input[type=text]{min-width:200px;max-width:100%;padding:7px}.ss-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;margin-top:14px}.ss-list label{display:flex;gap:8px;align-items:flex-start}.ss-scroll{overflow:auto;max-height:550px}.ss-table{width:100%;min-width:800px}.ss-table th,.ss-table td{padding:10px;border-bottom:1px solid #475569;vertical-align:top}.ss-muted{color:#94a3b8}.ss-alert{padding:12px;border-radius:8px;background:#334155;color:#f8fafc;white-space:pre-wrap}.ss-bad{color:#fca5a5}.ss-good{color:#86efac}.ss-group{padding:10px;border-bottom:1px solid #475569}.ss-leaves{padding-left:24px;display:flex;flex-direction:column;gap:7px;margin-top:8px}button:disabled{opacity:.45;cursor:not-allowed}.ss-wrap button{margin:3px}.ss-summary{font-size:1.05rem;margin:12px 0}.ss-hidden{display:none!important}
 #ss-map-table .ss-table{table-layout:fixed;min-width:960px}#ss-map-table th:first-child{width:55px}#ss-map-table th:nth-child(2){width:32%}#ss-map-table th:nth-child(3){width:24%}#ss-map-table th:last-child{width:140px}#ss-map-table td{overflow-wrap:anywhere}#ss-map-table select{width:100%;min-width:0;padding:7px}.ss-map-chosen{margin-top:6px;font-size:.9rem;white-space:normal}
+.ss-progress-wrap{margin-top:16px}.ss-progress-line{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.ss-progress-wrap progress{display:block;width:100%;height:12px;margin:10px 0;accent-color:#9b8afb}.ss-progress-wrap progress::-webkit-progress-bar{background:#334155;border-radius:8px}.ss-progress-wrap progress::-webkit-progress-value{background:#9b8afb;border-radius:8px;transition:width .3s}.ss-progress-wrap progress:not([value]){animation:ss-pulse 1.5s ease-in-out infinite}@keyframes ss-pulse{50%{opacity:.5}}@media(prefers-reduced-motion:reduce){.ss-progress-wrap progress{animation:none!important}}
 </style>
 <div class="ss-wrap" id="stock-sync" data-csrf="{{ stock_sync_token }}">
   <div class="ss-row"><h2>跨站库存同步</h2><a href="/product-manager" class="btn btn-outline-secondary">返回产品管理</a></div>
@@ -15,9 +16,15 @@
       <label id="ss-source-wrap" class="ss-hidden">参照站 <select id="ss-source"></select></label>
       <label id="ss-available-wrap" class="ss-hidden"><input type="checkbox" id="ss-available">确认人工状态商品已恢复供货</label>
     </div>
-    <div class="ss-row" style="margin-top:12px"><label>操作原因（必填） <input id="ss-reason" type="text" maxlength="500" required aria-required="true" aria-describedby="ss-reason-help ss-reason-error" placeholder="例如：供应商通知本次产品缺货"></label><button id="ss-scan" class="btn btn-primary">读取商品目录</button></div>
+    <div class="ss-row" style="margin-top:12px"><label>操作原因（必填） <input id="ss-reason" type="text" maxlength="500" required aria-required="true" aria-describedby="ss-reason-help ss-reason-error" placeholder="例如：供应商通知本次产品缺货"></label><button id="ss-scan" class="btn btn-primary" disabled>读取商品目录</button></div>
     <p id="ss-reason-help" class="ss-muted">生成预览前请填写操作原因，用于记录本次库存调整的依据。</p>
     <p id="ss-reason-error" class="ss-bad" role="alert" hidden></p>
+    <div id="ss-scan-progress-wrap" class="ss-progress-wrap" hidden>
+      <div class="ss-progress-line"><strong id="ss-scan-phase"></strong><span id="ss-scan-elapsed" class="ss-muted"></span></div>
+      <progress id="ss-scan-progress" max="100" aria-label="商品目录读取进度"></progress>
+      <div class="ss-progress-line"><span id="ss-scan-counts"></span><span id="ss-scan-percent" class="ss-muted"></span></div>
+      <p id="ss-scan-wait" class="ss-muted" hidden></p>
+    </div>
     <p id="ss-scan-info" class="ss-muted" aria-live="polite">读取完成后选择全部款式或部分口味。</p>
     <div id="ss-controls-wrap" class="ss-hidden"><h5>选择需要解除的具体停售控制</h5><div id="ss-controls" class="ss-list"></div></div>
   </section>
@@ -46,6 +53,6 @@
   <section class="ss-card"><h4>5 · 后台进度与结果</h4><p id="ss-job-summary">尚无执行任务</p><div id="ss-job" class="ss-scroll"></div><button id="ss-cancel" disabled class="btn btn-outline-warning">取消尚未执行项目</button><button id="ss-retry" disabled class="btn btn-outline-primary">为所选失败项生成重试预览</button><p class="ss-muted">关闭页面不影响已排队任务。取消不会撤销已保存的控制或已完成的写入；待核实项目需先完成远端核实。</p><h5>操作记录</h5><div id="ss-history"></div></section>
   <section id="ss-admin" class="ss-card ss-hidden"><h4>共享参照设置</h4><p class="ss-muted">仅向其他负责人开放商品身份与库存状态读取，不授予目标站写入权限。</p><div id="ss-reference-settings" class="ss-list"></div></section>
 </div>
-<script src="{{ url_for('static', filename='js/stock_sync.js', v='20260917-mapping-assist-2') }}" defer></script>
-<script src="{{ url_for('static', filename='js/stock_sync_mapping.js', v='20260917-mapping-assist-2') }}" defer></script>
+<script src="{{ url_for('static', filename='js/stock_sync.js', v='20260917-read-progress') }}" defer></script>
+<script src="{{ url_for('static', filename='js/stock_sync_mapping.js', v='20260917-read-progress') }}" defer></script>
 {% endblock %}

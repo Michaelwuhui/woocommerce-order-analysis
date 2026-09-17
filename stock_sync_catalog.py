@@ -32,21 +32,37 @@ def scan(c, id_, woo=None):
     woo.connection = c
     snap = one(c,'SELECT * FROM stock_sync_catalog_snapshots WHERE id=?',(id_,))
     items, error = [], None
+    scope = loads(snap['scope_json'])
+    detail = {'phase': 'starting', 'products_read': 0, 'total_products': None,
+              'current_product': '', 'variations_read': 0, 'total_variations': None,
+              'started_at': stamp()}
+
+    def report(phase, save_items=False, **changes):
+        detail.update(changes, phase=phase, updated_at=stamp())
+        scope['scan_progress'] = detail
+        c.execute("UPDATE stock_sync_catalog_snapshots SET status='scanning',progress=?,scope_json=? WHERE id=?",
+                  (len(items), dumps(scope), id_))
+        if save_items:
+            c.execute('UPDATE stock_sync_catalog_snapshots SET items_json=? WHERE id=?', (dumps(items), id_))
+        c.commit()
+
     try:
         u = actor(c,snap['actor_id'])
-        scope = loads(snap['scope_json'])
         site_id = snap['site_id']
         if not site_id:
             sites = target_sites(c,u,scope)
+            report('mappings')
             for m in mappings(c,[s['id'] for s in sites]):
                 items.append({'id':m['id'],'site_id':m['site_id'],'product_id':m['wc_product_id'],
                     'variation_id':m['wc_variation_id'] or 0,'name':m['sku_name'],'sku_code':m['sku_code'],
                     'map_ids':[m['id']],'mapping_hashes':{str(m['id']):mapping_hash(m)},'sku_id':m['sku_id'],
                     'qty_per_item':m['qty_per_item'],'complete':True})
+            detail['products_read'] = len({(i['site_id'], i['product_id']) for i in items})
+            detail['total_products'] = detail['products_read']
         else:
             site = reference_site(c,u,site_id)
             maps = mappings(c,[site_id])
-            c.commit()
+            report('products', site_url=site['url'])
             seen = set()
             def append(product, leaf, variation_id):
                 key = (product['id'],variation_id)
@@ -62,13 +78,22 @@ def scan(c, id_, woo=None):
                     'sku_id':ms[0]['sku_id'] if len(ms)==1 else None,'qty_per_item':ms[0]['qty_per_item'] if len(ms)==1 else None,
                     'map_ids':[m['id'] for m in ms],'mapping_hashes':{str(m['id']):mapping_hash(m) for m in ms},
                     'state':stock_state(leaf),'complete':True})
-            for page in woo.pages(site,'products'):
+            def product_page(info):
+                report('products', total_products=info['total'], page=info['page'])
+
+            def variation_page(info):
+                report('variations', variations_read=info['read'], total_variations=info['total'])
+
+            for page in woo.pages(site,'products',on_page=product_page):
                 reference_site(c,actor(c,snap['actor_id']),site_id)
                 c.commit()
                 for product in page:
+                    report('variations' if product.get('type') == 'variable' else 'products',
+                           current_product=product.get('name', ''), variations_read=0,
+                           total_variations=len(product.get('variations', [])) if product.get('type') == 'variable' else None)
                     if product.get('type') == 'variable':
                         leaves = []
-                        for variations in woo.pages(site,f'products/{product["id"]}/variations'):
+                        for variations in woo.pages(site,f'products/{product["id"]}/variations',on_page=variation_page):
                             leaves.extend(variations)
                         if set(product.get('variations',[])) != {v['id'] for v in leaves}:
                             raise SyncError('SOURCE_INCOMPLETE','口味列表在扫描期间发生变化')
@@ -76,16 +101,20 @@ def scan(c, id_, woo=None):
                             append(product,leaf,leaf['id'])
                     else:
                         append(product,product,0)
-                c.execute("UPDATE stock_sync_catalog_snapshots SET status='scanning',progress=?,items_json=? WHERE id=?", (len(items),dumps(items),id_))
-                c.commit()
+                    report('products', save_items=True, products_read=detail['products_read'] + 1,
+                           current_product='', variations_read=0, total_variations=None)
+            report('validating')
     except SyncError as exc:
+        c.rollback()
         error = exc.code
     except Exception:
         c.rollback()
         logging.getLogger(__name__).exception('Catalog snapshot %s failed', id_)
         error = 'CATALOG_READ_FAILED'
-    c.execute('''UPDATE stock_sync_catalog_snapshots SET status=?,complete=?,items_json=?,progress=?,error=?,observed_at=? WHERE id=?''',
-        ('incomplete' if error else 'complete',0 if error else 1,dumps(items),len(items),error,stamp(),id_))
+    detail.update(phase='failed' if error else 'complete', updated_at=stamp())
+    scope['scan_progress'] = detail
+    c.execute('''UPDATE stock_sync_catalog_snapshots SET status=?,complete=?,items_json=?,progress=?,error=?,observed_at=?,scope_json=? WHERE id=?''',
+        ('incomplete' if error else 'complete',0 if error else 1,dumps(items),len(items),error,stamp(),dumps(scope),id_))
     c.commit()
 
 

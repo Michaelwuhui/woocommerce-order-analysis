@@ -157,6 +157,7 @@ def accessible_scan(c,u,id_):
 @api
 def scan_status(c,u,id_):
     snap=accessible_scan(c,u,id_)
+    snap['read_progress'] = loads(snap['scope_json']).get('scan_progress', {})
     snap.pop('items_json');snap.pop('scope_json')
     return jsonify(snap)
 
