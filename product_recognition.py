@@ -5,7 +5,7 @@ import re
 def parse_product_name(name, brands_cache, series_cache):
     """
     Parse product name to extract brand, series, puff count, and flavor.
-    
+
     Examples:
     - "IGET ONE 12000 puffs - Mixed Berries" → brand: IGET, puffs: 12000, flavor: Mixed Berries
     - "Crystal Blind 25000 Puffs" → brand: Crystal Blind, puffs: 25000
@@ -13,9 +13,9 @@ def parse_product_name(name, brands_cache, series_cache):
     """
     if not name:
         return {'brand': None, 'series': None, 'puffs': None, 'flavor': None, 'normalized': None}
-    
+
     result = {'brand': None, 'series': None, 'puffs': None, 'flavor': None, 'normalized': None}
-    
+
     # 1. Extract puff count
     # Handle optional "+" and Polish term "zaciągnięć"
     # Support spaced/dotted/comma'd thousands: "50 000", "50.000", "50,000"
@@ -30,7 +30,7 @@ def parse_product_name(name, brands_cache, series_cache):
         if disposable_match and int(re.sub(r'[\s.,]', '', disposable_match.group(1))) >= 100:
             result['puffs'] = int(re.sub(r'[\s.,]', '', disposable_match.group(1)))
             puffs_end = disposable_match.end()
-    
+
     # 3. Match brand (earliest position first, then longest match)
     name_upper = name.upper()
     matched_brand = None
@@ -44,7 +44,7 @@ def parse_product_name(name, brands_cache, series_cache):
                 matched_brand = brand
                 matched_pos = pos
                 matched_len = len(pattern)
-    
+
     if matched_brand:
         result['brand'] = matched_brand['name']
         result['brand_id'] = matched_brand['id']
@@ -99,7 +99,7 @@ def parse_product_name(name, brands_cache, series_cache):
                 flavor = cleaned
 
     result['flavor'] = flavor
-    
+
     # 5. Build normalized name
     parts = []
     if result['brand']:
@@ -108,9 +108,7 @@ def parse_product_name(name, brands_cache, series_cache):
         parts.append(f"{result['puffs']} Puffs")
     if result['flavor']:
         parts.append(result['flavor'])
-    
+
     result['normalized'] = ' - '.join(parts) if parts else name
-    
+
     return result
-
-
