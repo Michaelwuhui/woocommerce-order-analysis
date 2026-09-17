@@ -435,11 +435,10 @@ def test_bulk_api_check_has_no_live_write_probe_or_postgres_web_thread():
         source.index("def check_all_sites_api") :
         source.index("def get_check_status")
     ]
-    assert "sqlite3.is_postgres_backend()" in route
-    assert route.index("sqlite3.is_postgres_backend()") < route.index(
-        "threading.Thread"
-    )
-    assert "new_sync_runtime_status_id()" in route
+    # Bulk checks now return a read-only site manifest; there is no background
+    # thread on either backend to guard or runtime job ID to allocate.
+    assert "threading.Thread" not in route
+    assert "'mode': 'sequential'" in route
     assert "888888" not in route
     assert "wcapi.post" not in route
     assert "wcapi.delete" not in route
@@ -463,7 +462,6 @@ def test_postgres_guards_every_legacy_gunicorn_background_thread():
     assert threaded_functions == [
         "sync_data",
         "deep_sync_site",
-        "check_all_sites_api",
         "clean_sync_site",
         "sync_all_data",
         "trigger_deep_sync",

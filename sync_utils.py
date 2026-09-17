@@ -435,6 +435,15 @@ def run_post_commit_sync_actions(planning_candidates, *, strict=False):
 
     _enqueue_fulfillment_plans(planning_candidates, raise_on_error=strict)
     _enqueue_order_notifications(planning_candidates, raise_on_error=strict)
+    if sqlite3.is_postgres_backend():
+        try:
+            from shipment_reconciliation_tasks import enqueue_orders
+            enqueue_orders([str(row['order_id']) for row in planning_candidates])
+        except Exception:
+            # Ordinary sync must succeed during broker outages; the minute
+            # sweep rediscovers the persisted shipment operations afterwards.
+            import logging
+            logging.getLogger(__name__).exception('Shipment reconciliation enqueue deferred to sweep')
 
 
 def save_orders_to_db(orders_data, connection=None):

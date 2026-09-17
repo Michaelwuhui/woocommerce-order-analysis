@@ -5342,6 +5342,8 @@ def get_order_details(order_id):
     order_dict['shipment_parcels'] = build_shipping_log_parcels(
         shipping_logs, order_dict['line_items'] or []
     )
+    from shipment_reconciliation import public_statuses
+    order_dict['shipment_reconciliation'] = public_statuses(conn, [str(order_id)]).get(str(order_id))
     if getattr(current_user, 'username', None) == 'admin':
         try:
             from order_notification_service import notification_schema_exists, notification_summary
@@ -17480,6 +17482,19 @@ def get_pending_orders():
             else:
                 parcels_map.setdefault(r['order_id'], []).append(confirmed[0])
 
+    from shipment_reconciliation import public_statuses
+    reconciliation_map = public_statuses(conn, order_ids)
+    for oid, state in reconciliation_map.items():
+        if state['pending'] and oid not in shipping_state_rows_map and oid not in fulfillment_state_map:
+            pending_shipments_map[oid] = {
+                'tracking_number': state['tracking_number'], 'carrier_slug': state['carrier_slug'],
+                'shipped_at': state['shipped_at'], 'status': 'pending_sync', 'items': [], 'is_partial': False,
+            }
+    for oid, shipment in pending_shipments_map.items():
+        shipment['reconciliation'] = reconciliation_map.get(oid) or {
+            'label': '需处理', 'reason': '缺少原发货操作记录，请管理员核对原运单', 'retry_allowed': False,
+        }
+
     # A full parcel is not a partial shipment merely because WooCommerce later
     # drifted back to processing.  Returned/delivered outcomes also leave the
     # ordinary shipping queue.  Pending-sync rows remain visible for retry.
@@ -18517,6 +18532,37 @@ def build_custom_lineitem_payload(tracking_number, carrier_slug, tracking_url, l
     return out
 
 
+@app.route('/api/shipping/reconcile', methods=['POST'])
+@login_required
+@shipper_required
+@order_site_editable
+def request_shipment_reconciliation():
+    """Queue a bounded source read, never resubmit a shipment."""
+    order_id = str((request.json or {}).get('order_id') or '')
+    if not order_id:
+        return jsonify({'success': False, 'error': '缺少订单号'}), 400
+    if not sqlite3.is_postgres_backend():
+        return jsonify({'success': False, 'error': '当前数据库不支持后台对账'}), 409
+    conn = get_db_connection()
+    try:
+        if not conn.execute('SELECT id FROM orders WHERE id=?', (order_id,)).fetchone():
+            return jsonify({'success': False, 'error': '订单不存在'}), 404
+        from shipment_reconciliation import public_statuses
+        state = public_statuses(conn, [order_id]).get(order_id)
+    finally:
+        conn.close()
+    from shipment_reconciliation_tasks import enqueue_orders
+    try:
+        queued = enqueue_orders([order_id])
+    except Exception:
+        app.logger.exception('Manual reconciliation enqueue failed')
+        return jsonify({'success': False, 'error': '暂时无法排队，系统将自动重查'}), 503
+    return jsonify({'success': True, 'queued': queued, 'reconciliation': state,
+                    'message': '已安排后台核对，请稍后刷新订单' if queued else
+                    ('已完成对账，请刷新订单' if state and state['outcome'] == 'verified' else
+                     '系统会按等待时间自动核对；请勿重复发货。可刷新订单查看最近核验原因。')})
+
+
 @app.route('/api/shipping/ship', methods=['POST'])
 @login_required
 @shipper_required
@@ -18834,7 +18880,7 @@ def ship_order():
                 conn.close()
                 return jsonify({
                     'success': False, 'uncertain': True, 'retry_safe': False,
-                    'error': '该运单尚未确认同步结果，请勿重复提交；请先完成远端对账。',
+                    'error': '该运单尚未确认同步结果，请勿重复提交；系统会自动对账，可点击“核对同步”查看。',
                 }), 409
         try:
             external_operation = begin_operation(
@@ -19148,7 +19194,9 @@ def ship_order():
                 warnings.append(f"本地待同步记录写入失败: {local_err}")
         # A failed reship must NOT stash/overwrite the original tracking row.
         if remote_state_uncertain:
-            action_note = '远端最终状态尚未确认，请勿重复提交；请先刷新并核对该订单。'
+            from shipment_reconciliation_tasks import enqueue_after_uncertain
+            enqueue_after_uncertain(external_operation_id)
+            action_note = '远端最终状态尚未确认，请勿重复提交；系统会自动对账，请稍后刷新订单。'
         else:
             action_note = '远端明确未成功，可核对后再试。'
         stash_note = '运单号已暂存为待同步。' if pending_saved else ''

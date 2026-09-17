@@ -1270,7 +1270,7 @@
                     return `
                 <tr data-editsrc="${o.source || ''}"${rowStyle}>
                     <td class="ps-3">
-                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.high_risk_postcode ? ` <span class="badge bg-danger border border-light" title="该邮编地区曾发生拒收退回后包裹内产品丢失"><i class="bi bi-shield-fill-exclamation me-1"></i>高危邮编 ${o.high_risk_postcode}</span>` : ''}${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.shipment_sync_pending ? ' <span class="badge bg-danger"><i class="bi bi-cloud-slash me-1"></i>发货同步失败</span>' : (o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : '')}${o.has_shortage ? ' <span class="badge bg-danger"><i class="bi bi-exclamation-octagon-fill me-1"></i>缺货</span>' : ''}${o.manual_review ? ` <span class="badge bg-danger" title="${o.manual_reason || ''}">人工处理</span>` : ''}</div>
+                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.high_risk_postcode ? ` <span class="badge bg-danger border border-light" title="该邮编地区曾发生拒收退回后包裹内产品丢失"><i class="bi bi-shield-fill-exclamation me-1"></i>高危邮编 ${o.high_risk_postcode}</span>` : ''}${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.shipment_sync_pending ? ` <span class="badge bg-warning text-dark"><i class="bi bi-cloud-slash me-1"></i>同步${shipEscape(o.pending_shipment && o.pending_shipment.reconciliation ? o.pending_shipment.reconciliation.label : '待核验')}</span>` : (o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : '')}${o.has_shortage ? ' <span class="badge bg-danger"><i class="bi bi-exclamation-octagon-fill me-1"></i>缺货</span>' : ''}${o.manual_review ? ` <span class="badge bg-danger" title="${o.manual_reason || ''}">人工处理</span>` : ''}</div>
                         <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
                         ${o.fulfillment_warehouses && o.fulfillment_warehouses.length ? `<small class="d-block text-warning"><i class="bi bi-boxes me-1"></i>${o.fulfillment_warehouses.join(' + ')}</small>` : ''}
                         <small class="text-muted d-block"><i class="bi bi-calendar3 me-1"></i>下单 ${o.date_created ? o.date_created.replace('T', ' ').substring(0, 16) : '-'}</small>
@@ -1363,7 +1363,7 @@
                         <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="printLabel('${o.id}')" title="打印">
                             <i class="bi bi-printer"></i>
                         </a>
-                        <button class="ship-action btn btn-sm ${o.fulfillment_status || o.parcels_shipped || o.shipment_sync_pending ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal("${o.id}", ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source_url || o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])}, ${JSON.stringify(encodeURIComponent(JSON.stringify(o.products || [])))}, ${JSON.stringify(o.fulfillment_status || "")}, ${JSON.stringify(o.pending_shipment || null)}, ${JSON.stringify(o.high_risk_postcode || "")})'><i class="bi bi-truck me-1"></i>${o.fulfillment_status ? '发货' : (o.shipment_sync_pending ? '重试同步' : (o.parcels_shipped ? '继续发货' : '发货'))}</button>
+                        <button class="ship-action btn btn-sm ${o.fulfillment_status || o.parcels_shipped || o.shipment_sync_pending ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal("${o.id}", ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source_url || o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])}, ${JSON.stringify(encodeURIComponent(JSON.stringify(o.products || [])))}, ${JSON.stringify(o.fulfillment_status || "")}, ${JSON.stringify(o.pending_shipment || null)}, ${JSON.stringify(o.high_risk_postcode || "")})'><i class="bi bi-truck me-1"></i>${o.fulfillment_status ? '发货' : (o.shipment_sync_pending ? (o.pending_shipment && o.pending_shipment.reconciliation && !o.pending_shipment.reconciliation.retry_allowed ? '查看对账' : '重试同步') : (o.parcels_shipped ? '继续发货' : '发货'))}</button>
                     </td>
                 </tr>
             `;
@@ -1884,6 +1884,24 @@
         let _shipFulfillmentLoading = false;
         let _shipUsesFulfillment = false;
         let _shipSource = '';
+        let _shipReconciliationPending = false;
+
+        async function recheckShipment(button) {
+            button.disabled = true;
+            try {
+                const response = await fetch('/api/shipping/reconcile', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({order_id: document.getElementById('shipOrderId').value})
+                });
+                const result = await parseMutationJsonResponse(response, '发货对账');
+                alert(result.message || result.error || '核对请求已处理');
+                loadOrders();
+            } catch (error) {
+                alert('暂时无法核对：' + error.message);
+            } finally {
+                button.disabled = false;
+            }
+        }
 
         function shipEscape(value) {
             return String(value == null ? '' : value)
@@ -1907,8 +1925,10 @@
             // goods are fulfilled from (drives the default carrier choice).
             const whHint = warehouseName ? `<small class="text-info d-block">出库: ${warehouseName}</small>` : '';
             pendingShipment = pendingShipment || null;
+            const reconciliation = pendingShipment && pendingShipment.reconciliation;
+            _shipReconciliationPending = !!(pendingShipment && reconciliation && !reconciliation.retry_allowed);
             const syncWarning = pendingShipment
-                ? '<div class="alert alert-danger py-2 mt-2 mb-0"><b>上次发货未同步到站点。</b>请核对预填运单号后重试；这不是分批发货。</div>'
+                ? `<div class="alert alert-warning py-2 mt-2 mb-0"><b>发货同步${shipEscape(reconciliation ? reconciliation.label : '待核验')}。</b>${shipEscape(reconciliation ? reconciliation.reason : '请核对原运单的同步结果，避免重复发货。')}${reconciliation && reconciliation.checked_at ? `<div class="small">最近核验：${shipEscape(new Date(reconciliation.checked_at).toLocaleString())}</div>` : ''}${_shipReconciliationPending ? '<button type="button" class="btn btn-sm btn-outline-dark mt-2" onclick="recheckShipment(this)">核对同步</button>' : ''}</div>`
                 : '';
             // Surface the prior-freeloader risk as a prominent banner BEFORE
             // the shipper can pick a carrier — they should pause and verify
@@ -2128,7 +2148,7 @@
 
         function updateShipBtnState() {
             const fulfillmentBlocked = _shipFulfillmentLoading || (_shipUsesFulfillment && !_shipFulfillmentId);
-            const disabled = !document.getElementById('bigOrderAck').checked || fulfillmentBlocked;
+            const disabled = !document.getElementById('bigOrderAck').checked || fulfillmentBlocked || _shipReconciliationPending;
             ['confirmShipBtn', 'shipContinueBtn', 'shipFinalBtn'].forEach(id => {
                 const b = document.getElementById(id);
                 if (b) b.disabled = disabled;
@@ -2259,6 +2279,10 @@
         // mode: 'single' (normal/correction), 'continue' (split, more to come),
         // 'final' (split, last batch). Maps to the backend new_parcel/more_batches.
         function shipOrder(mode) {
+            if (_shipReconciliationPending) {
+                alert('原运单正在核对，请使用“核对同步”查看结果。');
+                return;
+            }
             mode = mode || 'single';
             const orderId = document.getElementById('shipOrderId').value;
             const carrier = document.getElementById('shipCarrier').value;
