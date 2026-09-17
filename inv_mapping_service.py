@@ -13,6 +13,7 @@ import json
 import re
 import unicodedata
 from collections import Counter, defaultdict
+import stock_sync_identity as product_identity
 
 
 def normalize_identifier(value):
@@ -82,7 +83,7 @@ def _managed_family(notes, name):
 
 def warehouse_skus(conn, warehouse_id):
     rows = conn.execute(
-        """SELECT k.id,k.sku_code,k.name,k.barcode,k.flavor,k.notes,k.is_active,
+        """SELECT k.*,
                   COALESCE(st.on_hand,0) AS on_hand,COALESCE(st.reserved,0) AS reserved
            FROM oms_sku_warehouses sw
            JOIN inv_skus k ON k.id=sw.sku_id
@@ -92,6 +93,8 @@ def warehouse_skus(conn, warehouse_id):
         (warehouse_id,),
     ).fetchall()
     result = []
+    rules = product_identity.classification_rules(conn)
+    source = conn.execute('SELECT inventory_authority FROM oms_warehouse_integrations WHERE warehouse_id=?', (warehouse_id,)).fetchone()
     for row in rows:
         item = dict(row)
         item["family"] = _managed_family(item.get("notes"), item.get("name"))
@@ -102,6 +105,8 @@ def warehouse_skus(conn, warehouse_id):
         item["sku_key"] = normalize_identifier(item.get("sku_code"))
         item["barcode_key"] = normalize_identifier(item.get("barcode"))
         item["available"] = int(item.get("on_hand") or 0) - int(item.get("reserved") or 0)
+        item['inventory_authority'] = source['inventory_authority'] if source else 'local'
+        item['product_identity'] = product_identity.profile(item['name'], item['sku_code'], [], rules, item)
         result.append(item)
     return result
 
@@ -158,7 +163,7 @@ def serving_sites(conn, warehouse_id):
     ]
 
 
-def _candidate_for_product(product, skus):
+def _candidate_for_product(product, skus, rules=None):
     sku_key = normalize_identifier(product.get("wc_sku"))
     name_key = normalize_identifier(product.get("name"))
     flavor_name_key = _flavor_key(product.get("name"))
@@ -171,6 +176,16 @@ def _candidate_for_product(product, skus):
     exact = [s for s in skus if name_key and s["name_key"] == name_key]
     if len(exact) == 1:
         return exact[0]["id"], "exact_name", 98
+
+    if rules:
+        p = product_identity.profile(product.get('name'), product.get('wc_sku'), [], rules)
+        if p:
+            if p.get('sku_conflict'):
+                return None, 'identity_conflict', 0
+            identified = [s for s in skus if product_identity.compatible(p, s.get('product_identity'))]
+            if len(identified) == 1:
+                return identified[0]['id'], 'review_identity', 95
+            return None, 'identity_conflict' if identified else 'recognized_no_sku', 0
 
     review = []
     for sku in skus:
@@ -309,8 +324,9 @@ def scan_site_catalog(conn, site_id, warehouse_id, session=None):
             "DELETE FROM inv_site_product_catalog WHERE site_id=? AND warehouse_id=?",
             (site_id, warehouse_id),
         )
+        rules = product_identity.classification_rules(conn)
         for item in cached:
-            candidate_id, method, confidence = _candidate_for_product(item, skus)
+            candidate_id, method, confidence = _candidate_for_product(item, skus, rules)
             conn.execute(
                 """INSERT INTO inv_site_product_catalog
                      (site_id,warehouse_id,wc_product_id,wc_variation_id,wc_sku,name,
@@ -355,7 +371,17 @@ def _catalog_rows_with_map(conn, site_id, warehouse_id):
            ORDER BY c.name,c.wc_variation_id""",
         (site_id, warehouse_id),
     ).fetchall()
-    return [dict(row) for row in rows]
+    result = [dict(row) for row in rows]
+    skus = warehouse_skus(conn, warehouse_id)
+    rules = product_identity.classification_rules(conn)
+    for item in result:
+        if not item.get('map_id') and rules['brands']:
+            candidate, method, confidence = _candidate_for_product(item, skus, rules)
+            item.update(candidate_sku_id=candidate, match_method=method, match_confidence=confidence)
+            item['recognition_message'] = {'recognized_no_sku':'产品已识别，当前仓库缺少对应主档；可自动补建',
+                                           'identity_conflict':'商品身份或主档存在冲突，请核对',
+                                           'review_identity':'品牌、型号、口数和口味已匹配'}.get(method, '信息不足，需要人工核对')
+    return result
 
 
 def mapping_overview(conn, warehouse_id):
@@ -375,10 +401,10 @@ def mapping_overview(conn, warehouse_id):
         )
         review = sum(
             1 for row in catalog
-            if not row.get("map_id") and row.get("match_method") == "review_family_flavor"
+            if not row.get("map_id") and row.get("match_method") in ("review_family_flavor", "review_identity")
         )
         unresolved = sum(
-            1 for row in catalog if not row.get("map_id") and not row.get("candidate_sku_id")
+            1 for row in catalog if not row.get("map_id") and not row.get("candidate_sku_id") and row.get('match_method') not in ('recognized_no_sku','identity_conflict')
         )
         mapped_skus = conn.execute(
             """SELECT COUNT(DISTINCT m.sku_id)
@@ -406,6 +432,8 @@ def mapping_overview(conn, warehouse_id):
             "exact_candidate_count": exact,
             "review_candidate_count": review,
             "unresolved_count": unresolved,
+            "recognized_without_sku_count": sum(not r.get('map_id') and r.get('match_method')=='recognized_no_sku' for r in catalog),
+            "identity_conflict_count": sum(not r.get('map_id') and r.get('match_method')=='identity_conflict' for r in catalog),
             "readiness": readiness,
             "scan": dict(scan) if scan else None,
         })

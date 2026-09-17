@@ -57,7 +57,8 @@
           </table>
         </div></div></div>
         <div id="unresolvedCatalogBox" class="d-none">
-          <h6 class="text-warning"><i class="bi bi-exclamation-triangle me-1"></i>该站已上架但系统无法判断的商品</h6>
+          <h6 class="text-warning"><i class="bi bi-exclamation-triangle me-1"></i>待补建主档或核对的站点商品</h6>
+          <p class="text-white-50 small">商品识别与仓库余额分别处理。跨站自动识别会参考订单信息，自动选好明确匹配并补建缺少的产品主档。</p>
           <div class="card data-card"><div class="card-body p-0"><div class="table-responsive">
             <table class="table table-dark table-hover align-middle mb-0"><thead><tr class="text-white-50 small"><th>商品/变体</th><th>WC ID</th><th>WC SKU</th><th class="text-end">操作</th></tr></thead><tbody id="unresolvedCatalogTb"></tbody></table>
           </div></div></div>
@@ -307,7 +308,9 @@ function renderMappingOverview(){
     let products=s.scan?`${s.mapped_catalog_count}/${s.catalog_count} 已映射`:'尚未读取';
     if(s.exact_candidate_count)products+=` · <span class="text-success">${s.exact_candidate_count} 可安全匹配</span>`;
     if(s.review_candidate_count)products+=` · <span class="text-warning">${s.review_candidate_count} 待确认</span>`;
-    if(s.unresolved_count)products+=` · <span class="text-danger">${s.unresolved_count} 无法识别</span>`;
+    if(s.recognized_without_sku_count)products+=` · <span class="text-info">${s.recognized_without_sku_count} 已识别待建档</span>`;
+    if(s.identity_conflict_count)products+=` · <span class="text-warning">${s.identity_conflict_count} 身份或主档冲突</span>`;
+    if(s.unresolved_count)products+=` · <span class="text-danger">${s.unresolved_count} 信息不足</span>`;
     return `<tr><td><button class="btn btn-link btn-sm p-0 text-info text-decoration-none" onclick="chooseMappingSiteById(${s.id})">${esc(s.url)}</button><div class="small text-white-50">${esc(s.manager||'')}</div></td>
       <td>${esc(s.country||'')}</td><td>${s.mapped_sku_count} 个</td><td class="small">${products}</td>
       <td><span class="badge bg-${meta[1]}">${meta[0]}</span></td><td class="small text-white-50">${esc(s.scan?.finished_at||s.scan?.started_at||'从未')}</td>
@@ -323,9 +326,10 @@ function renderMappingDetail(){const data=window._mappingDetail;if(!data)return;
   tb.innerHTML=rows.length?rows.map(s=>{const mappings=s.mappings||[],cands=s.candidates||[];let product='<span class="text-white-50">该站扫描范围内未发现此 SKU</span>',status='<span class="badge bg-secondary">未上架/未发现</span>',action='',selector='<span class="text-white-50">—</span>';
     if(mappings.length){product=mappings.map(m=>`#${m.wc_product_id}${m.wc_variation_id?('/'+m.wc_variation_id):''} · ${esc(m.wc_sku||m.raw_name||'')}`).join('<br>');status='<span class="badge bg-success">已映射</span>';action=mappings.map(m=>`<button class="btn btn-sm btn-outline-danger" onclick="delMapAndRefresh(${m.id})">解绑</button>`).join(' ');}
     else if(cands.length){const c=cands[0];selector=`<input class="form-check-input mapping-candidate-check" type="checkbox" ${window._selectedCandidateIds.has(Number(c.id))?'checked':''} onchange="toggleCandidate(${c.id},this.checked)" aria-label="选择 ${esc(s.sku_code)}">`;product=`${esc(c.name)}<div class="small text-white-50">#${c.wc_product_id}${c.wc_variation_id?('/'+c.wc_variation_id):''} · ${esc(c.wc_sku||'无 WC SKU')}</div>`;const safe=['exact_sku','exact_name'].includes(c.match_method);status=safe?'<span class="badge bg-success">唯一精确候选</span>':'<span class="badge bg-warning text-dark">名称候选·需确认</span>';action=`<button class="btn btn-sm btn-outline-primary" onclick="openCandidateById(${c.id},${s.id})">单条核对</button>`;}
-    return `<tr><td class="text-center">${selector}</td><td><code class="text-info">${esc(s.sku_code)}</code><div class="small">${esc(s.name)}</div></td><td><span class="${s.available>0?'text-success':'text-danger'}">可用 ${s.available}</span><div class="small text-white-50">现存 ${s.on_hand} / 预留 ${s.reserved}</div></td><td>${product}</td><td>${status}</td><td class="text-end">${action}</td></tr>`}).join(''):'<tr><td colspan="6" class="text-center text-white-50 py-4">当前筛选下没有记录</td></tr>';
+    const stock=s.inventory_authority==='manual_partner'?'<span class="text-info">人工供货</span><div class="small text-white-50">不维护库存数量</div>':`<span class="${s.available>0?'text-success':'text-danger'}">可用 ${s.available}</span><div class="small text-white-50">现存 ${s.on_hand} / 预留 ${s.reserved}</div>`;
+    return `<tr><td class="text-center">${selector}</td><td><code class="text-info">${esc(s.sku_code)}</code><div class="small">${esc(s.name)}</div></td><td>${stock}</td><td>${product}</td><td>${status}</td><td class="text-end">${action}</td></tr>`}).join(''):'<tr><td colspan="6" class="text-center text-white-50 py-4">当前筛选下没有记录</td></tr>';
   const unresolved=(data.site_products||[]).filter(p=>!p.map_id&&!p.candidate_sku_id),box=document.getElementById('unresolvedCatalogBox'),utb=document.getElementById('unresolvedCatalogTb');box.classList.toggle('d-none',!unresolved.length);
-  utb.innerHTML=unresolved.map(p=>`<tr><td>${esc(p.name)}</td><td>#${p.wc_product_id}${p.wc_variation_id?('/'+p.wc_variation_id):''}</td><td>${esc(p.wc_sku||'')}</td><td class="text-end"><button class="btn btn-sm btn-outline-primary" onclick="openCandidateById(${p.id},null)">人工选择 SKU</button></td></tr>`).join('');
+  utb.innerHTML=unresolved.map(p=>`<tr><td>${esc(p.name)}<div class="small text-info">${esc(p.recognition_message||'信息不足，需要人工核对')}</div></td><td>#${p.wc_product_id}${p.wc_variation_id?('/'+p.wc_variation_id):''}</td><td>${esc(p.wc_sku||'')}</td><td class="text-end"><a class="btn btn-sm btn-outline-info" href="/product-manager/stock-sync?source_site_id=${Number(window._mappingSiteId)}#ss-mapping-assistant">订单辅助自动识别</a> <button class="btn btn-sm btn-outline-primary" onclick="openCandidateById(${p.id},null)">人工选择 SKU</button></td></tr>`).join('');
   const exact=(data.site_products||[]).filter(p=>!p.map_id&&['exact_sku','exact_name'].includes(p.match_method)).length;document.getElementById('safeAutoBtn').disabled=!exact;document.getElementById('safeAutoBtn').innerHTML=`<i class="bi bi-link-45deg"></i> 安全自动映射${exact?('（'+exact+'）'):''}`;
   updateBatchControls();
 }

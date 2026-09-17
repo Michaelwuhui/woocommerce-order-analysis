@@ -235,6 +235,24 @@ class WarehouseMappingTests(unittest.TestCase):
         )
         self.assertEqual((15, 'review_family_flavor', 85), candidate)
 
+    def test_known_products_without_skus_are_not_reported_as_unrecognized(self):
+        self.db.executescript("""
+            CREATE TABLE brands(id INTEGER PRIMARY KEY,name TEXT,aliases TEXT);
+            CREATE TABLE series(id INTEGER PRIMARY KEY,brand_id INTEGER,name TEXT);
+            INSERT INTO brands VALUES(9,'FUMOT','[]');
+            INSERT INTO oms_warehouse_integrations VALUES(1,'manual_partner');
+        """)
+        scan_site_catalog(self.db, 10, 1, session=FakeWooSession())
+        overview=mapping_overview(self.db, 1)[0]
+        self.assertEqual(1, overview['recognized_without_sku_count'])
+        self.assertEqual(0, overview['unresolved_count'])
+        detail=mapping_detail(self.db, 1, 10)
+        self.assertTrue(all(s['inventory_authority']=='manual_partner' for s in detail['skus']))
+        missing=next(p for p in detail['site_products'] if p['wc_variation_id']==503)
+        self.assertEqual('recognized_no_sku', missing['match_method'])
+        self.assertIn('已识别', missing['recognition_message'])
+        self.assertEqual(0, self.db.execute('SELECT COUNT(*) FROM inv_site_sku_map').fetchone()[0])
+
 
 if __name__ == '__main__':
     unittest.main()
