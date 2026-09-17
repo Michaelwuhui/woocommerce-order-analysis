@@ -11,14 +11,27 @@
   const el = (tag, text, cls) => { const n=document.createElement(tag); if(text!==undefined)n.textContent=text; if(cls)n.className=cls; return n; };
   const message = (text,bad=false) => { $('message').textContent=text; $('message').classList.toggle('ss-bad',bad); };
   const error = e => message(e.message || String(e),true);
+  function clearReasonError(){
+    $('reason').removeAttribute('aria-invalid');$('reason-error').textContent='';$('reason-error').hidden=true;
+  }
+  function previewError(e){
+    error(e);plan=null;$('execute').disabled=true;
+    $('plan-summary').textContent=e.message || String(e);$('plan-summary').classList.add('ss-bad');$('plan-summary').setAttribute('role','alert');
+    if(e.code==='REASON_REQUIRED'){
+      $('reason').setAttribute('aria-invalid','true');$('reason-error').textContent='请填写操作原因后再生成差异预览。';$('reason-error').hidden=false;
+      $('reason').focus({preventScroll:true});$('reason').scrollIntoView({behavior:'smooth',block:'center'});
+    }else{
+      $('plan-summary').scrollIntoView({behavior:'smooth',block:'center'});
+    }
+  }
   async function api(path,method='GET',body) {
     const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body===undefined?undefined:JSON.stringify(body)});
     let data;try{data=await r.json();}catch{throw new Error('登录已失效或服务未返回 JSON，请刷新页面。');}
-    if(!r.ok)throw new Error(`${data.error || '请求失败'}${data.code?' ('+data.code+')':''}`);
+    if(!r.ok){const e=new Error(data.error || reasons[data.code] || '请求失败');e.code=data.code;throw e;}
     return data;
   }
   const sleep = ms => new Promise(resolve=>setTimeout(resolve,ms));
-  function invalidate(){ generation++; plan=null;$('execute').disabled=true;$('plan').replaceChildren();$('plan-summary').textContent='选择已改变，请重新生成差异预览。';$('plan-scope').textContent=''; }
+  function invalidate(){ generation++; plan=null;$('execute').disabled=true;$('plan').replaceChildren();$('plan-summary').classList.remove('ss-bad');$('plan-summary').setAttribute('role','status');$('plan-summary').textContent='选择已改变，请重新生成差异预览。';$('plan-scope').textContent=''; }
   function sourceChange(){invalidate();$('scan-info').textContent='操作或来源已改变，请重新读取目录。';snapshot=null;complete=false;catalog=[];selected.clear();renderProducts();const ref=$('operation').value==='reference_status';$('source-wrap').classList.toggle('ss-hidden',!ref);$('available-wrap').classList.toggle('ss-hidden',$('operation').value!=='release_hold');$('controls-wrap').classList.toggle('ss-hidden',$('operation').value!=='release_hold');if(ref)targets.delete(Number($('source').value));renderSites();loadControls().catch(error);}
   function option(select,value,text){const o=el('option',text);o.value=value;select.append(o);}
   function visibleSites(){return options.target_sites.filter(s=>(!$('manager').value||s.manager===$('manager').value)&&(!$('country').value||s.country===$('country').value));}
@@ -65,9 +78,17 @@
   }
   const checkedControls=()=>[...$('controls').querySelectorAll('input:checked')].map(n=>n.value);
   async function preview(){
-    if(!snapshot||!selected.size||!targets.size)throw new Error('请读取目录，并选择商品和目标站点。');
-    invalidate();const g=generation;$('preview').disabled=true;
-    try{const body={operation:$('operation').value,source_site_id:$('operation').value==='reference_status'?Number($('source').value):null,catalog_snapshot_id:snapshot,selection:selection(),target_scope:{mode:'explicit_sites',site_ids:[...targets]},reason:$('reason').value,control_ids:checkedControls(),confirm_available:$('available').checked};const r=await api('/plans','POST',body);await waitPlan(r.id,g);}finally{$('preview').disabled=false;}
+    try{
+      if(!$('reason').value.trim()){const e=new Error('请填写第 1 步的操作原因后再生成差异预览。');e.code='REASON_REQUIRED';throw e;}
+      clearReasonError();
+      if(!snapshot)throw new Error('请先在第 1 步读取商品目录。');
+      if(!selected.size)throw new Error('请先在第 2 步选择商品或口味。');
+      if(!targets.size)throw new Error('请先在第 3 步勾选目标站点；筛选负责人或国家不会自动勾选站点。');
+      invalidate();const g=generation;$('preview').disabled=true;$('preview').textContent='正在生成差异预览…';
+      $('plan-summary').textContent='正在提交预览请求…';$('plan-summary').scrollIntoView({behavior:'smooth',block:'center'});
+      const body={operation:$('operation').value,source_site_id:$('operation').value==='reference_status'?Number($('source').value):null,catalog_snapshot_id:snapshot,selection:selection(),target_scope:{mode:'explicit_sites',site_ids:[...targets]},reason:$('reason').value.trim(),control_ids:checkedControls(),confirm_available:$('available').checked};
+      const r=await api('/plans','POST',body);await waitPlan(r.id,g);
+    }catch(e){previewError(e);}finally{$('preview').disabled=false;$('preview').textContent='生成差异预览';}
   }
   function table(headers){const t=el('table',undefined,'ss-table'),head=el('tr');for(const h of headers)head.append(el('th',h));const th=el('thead');th.append(head);t.append(th);const body=el('tbody');t.append(body);return [t,body];}
   function state(s){if(!s)return '—';return `${s.stock_status==='instock'?'有货':s.stock_status==='outofstock'?'售完':s.stock_status||'未知'} / ${s.manage_stock===true?'数量 '+(s.stock_quantity??'未知'):'状态管理'} / 预订 ${s.backorders||'未知'}`;}
@@ -79,7 +100,10 @@
     $('plan-scope').textContent=plan.scope.target_sites.map(s=>`${s.url}（${s.manager||'无负责人'}）`).join('；');
     const [t,b]=table(['执行','站点 / 商品 / SKU','来源与控制','当前状态','预计状态','处理结论']);
     for(const i of plan.items){const tr=el('tr'),select=el('td'),box=el('input');box.type='checkbox';box.value=i.id;box.checked=['change','unchanged'].includes(i.decision);box.disabled=!box.checked;select.append(box);tr.append(select,el('td',`${i.site_id} / ${i.name} / ${i.sku_code||''}${i.qty_per_item?' · '+i.qty_per_item+' 单位':''}`),el('td',i.source?.length?`参照站 ${plan.scope.source_site_id}`:(i.controls?.length?i.controls.map(c=>`${c.kind}：${c.reason}`).join('；'):'当前供货来源')),el('td',state(i.before)),el('td',state(i.intended)),el('td',`${labels[i.decision]} · ${reasons[i.reason]||i.reason}${i.mode_changed?'；库存管理模式改变':''}${i.backorders_changed?'；预订规则改变':''}${i.restores_sales?'；将恢复销售':''}`,i.decision==='conflict'?'ss-bad':''));b.append(tr);}
-    $('plan').replaceChildren(t);$('execute').disabled=!plan.items.some(i=>['change','unchanged'].includes(i.decision));message('请核对具体站点、商品及库存管理方式后确认执行。');
+    const executable=plan.items.some(i=>['change','unchanged'].includes(i.decision));
+    $('plan').replaceChildren(t);$('execute').disabled=!executable;$('plan-summary').classList.toggle('ss-bad',!executable);
+    if(executable){message('请核对具体站点、商品及库存管理方式后确认执行。');}
+    else{const text='本次没有可执行项目。请检查商品与目标站点是否对应，并处理下方的映射或冲突提示后重新预览。';$('plan-summary').textContent+=' '+text;message(text,true);}
   }
   async function execute(){
     if(!plan)throw new Error('请重新预览。');const ids=[...$('plan').querySelectorAll('input:checked')].map(n=>n.value);if(!ids.length)throw new Error('没有选中可执行项目。');$('execute').disabled=true;
@@ -95,12 +119,12 @@
   async function loadHistory(){const h=await api('/jobs');$('history').replaceChildren();for(const j of h.items){const b=el('button',`${new Date(j.created_at).toLocaleString()} · ${labels[j.status]||j.status} · ${j.id.slice(0,8)}`,'btn btn-sm btn-outline-secondary');b.onclick=()=>watchJob(j.id).catch(error);$('history').append(b);}}
   async function loadControls(){const r=await api('/controls');$('controls').replaceChildren();for(const c of r.items.filter(c=>c.kind==='manual_hold')){const label=el('label'),box=el('input');box.type='checkbox';box.value=c.id;box.disabled=c.protection==='superadmin'&&!options.superadmin;box.onchange=invalidate;label.append(box,el('span',`站点 ${c.site_id} / ${c.sku_name}：${c.reason}（${c.protection==='superadmin'?'超级管理员保护':'负责人控制'}）`));$('controls').append(label);}}
   const act=(id,fn)=>$(id).addEventListener('click',()=>Promise.resolve().then(fn).catch(error));
-  $('operation').onchange=sourceChange;$('source').onchange=sourceChange;$('reason').oninput=invalidate;$('available').onchange=invalidate;
+  $('operation').onchange=sourceChange;$('source').onchange=sourceChange;$('reason').oninput=()=>{invalidate();if($('reason').value.trim())clearReasonError();};$('available').onchange=invalidate;
   $('manager').onchange=renderSites;$('country').onchange=renderSites;$('search').oninput=()=>{page=1;renderProducts();};
   act('scan',scan);act('all',()=>{selected=new Set(catalog.map(i=>i.id));selectionMode='all';invalidate();renderProducts();});act('filtered',()=>{selected=new Set(filtered().map(i=>i.id));selectionMode='filtered_all';frozenFilter=$('search').value.trim();invalidate();renderProducts();});act('clear',()=>{selected.clear();selectionMode='explicit';invalidate();renderProducts();});act('prev',()=>{page--;renderProducts();});act('next',()=>{page++;renderProducts();});
   act('select-sites',()=>{for(const s of visibleSites())if(!($('operation').value==='reference_status'&&s.id===Number($('source').value)))targets.add(s.id);invalidate();renderSites();});act('clear-sites',()=>{targets.clear();invalidate();renderSites();});act('preview',preview);act('execute',execute);
   act('cancel',async()=>{await api('/jobs/'+job+'/cancel','POST',{});await watchJob(job);});
-  act('retry',async()=>{const ids=[...$('job').querySelectorAll('input:checked')].map(n=>n.value);invalidate();const g=generation,r=await api('/jobs/'+job+'/retry-plan','POST',{item_ids:ids});await waitPlan(r.id,g);$('plan-summary').scrollIntoView({behavior:'smooth'});});
+  act('retry',async()=>{try{const ids=[...$('job').querySelectorAll('input:checked')].map(n=>n.value);invalidate();const g=generation,r=await api('/jobs/'+job+'/retry-plan','POST',{item_ids:ids});await waitPlan(r.id,g);$('plan-summary').scrollIntoView({behavior:'smooth'});}catch(e){previewError(e);}});
   async function init(){options=await api('/options');csrf=options.csrf_token;for(const s of options.reference_sites)option($('source'),s.id,s.url);for(const m of new Set(options.target_sites.map(s=>s.manager).filter(Boolean)))option($('manager'),m,m);for(const c of new Set(options.target_sites.map(s=>s.country).filter(Boolean)))option($('country'),c,c);renderSites();renderProducts();await loadHistory();await loadControls();
     if(options.superadmin){$('admin').classList.remove('ss-hidden');for(const s of options.target_sites){const label=el('label'),box=el('input');box.type='checkbox';box.checked=options.reference_settings.some(r=>r.site_id===s.id&&r.enabled);box.onchange=async()=>{try{await api('/reference-sites/'+s.id,'PUT',{enabled:box.checked});message('共享参照设置已保存。');}catch(e){box.checked=!box.checked;error(e);}};label.append(box,el('span',s.url));$('reference-settings').append(label);}}
     message('请选择操作方式，读取本次商品目录。');}

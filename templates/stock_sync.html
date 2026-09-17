@@ -14,7 +14,9 @@
       <label id="ss-source-wrap" class="ss-hidden">参照站 <select id="ss-source"></select></label>
       <label id="ss-available-wrap" class="ss-hidden"><input type="checkbox" id="ss-available">确认人工状态商品已恢复供货</label>
     </div>
-    <div class="ss-row" style="margin-top:12px"><label>操作原因 <input id="ss-reason" type="text" maxlength="500" placeholder="例如：供应商通知本次产品缺货"></label><button id="ss-scan" class="btn btn-primary">读取商品目录</button></div>
+    <div class="ss-row" style="margin-top:12px"><label>操作原因（必填） <input id="ss-reason" type="text" maxlength="500" required aria-required="true" aria-describedby="ss-reason-help ss-reason-error" placeholder="例如：供应商通知本次产品缺货"></label><button id="ss-scan" class="btn btn-primary">读取商品目录</button></div>
+    <p id="ss-reason-help" class="ss-muted">生成预览前请填写操作原因，用于记录本次库存调整的依据。</p>
+    <p id="ss-reason-error" class="ss-bad" role="alert" hidden></p>
     <p id="ss-scan-info" class="ss-muted" aria-live="polite">读取完成后选择全部款式或部分口味。</p>
     <div id="ss-controls-wrap" class="ss-hidden"><h5>选择需要解除的具体停售控制</h5><div id="ss-controls" class="ss-list"></div></div>
   </section>
@@ -24,9 +26,9 @@
     <div class="ss-row"><button id="ss-prev" class="btn btn-sm btn-outline-secondary">上一页</button><span id="ss-page"></span><button id="ss-next" class="btn btn-sm btn-outline-secondary">下一页</button></div>
   </section>
   <section class="ss-card"><h4>3 · 目标站点范围</h4><div class="ss-row"><label>负责人 <select id="ss-manager"><option value="">全部负责人</option></select></label><label>国家 <select id="ss-country"><option value="">全部国家</option></select></label><button id="ss-select-sites" class="btn btn-outline-primary">选择筛选后的全部站点</button><button id="ss-clear-sites" class="btn btn-outline-secondary">清空目标</button></div><div id="ss-sites" class="ss-list"></div></section>
-  <section class="ss-card"><h4>4 · 差异预览与确认</h4><button id="ss-preview" class="btn btn-primary">生成差异预览</button><p id="ss-plan-summary" class="ss-summary">选择改变后，需要重新生成预览。</p><div id="ss-plan-scope" class="ss-muted"></div><div id="ss-plan" class="ss-scroll"></div><button id="ss-execute" disabled class="btn btn-danger">确认执行所选项目</button></section>
+  <section class="ss-card"><h4>4 · 差异预览与确认</h4><button id="ss-preview" class="btn btn-primary">生成差异预览</button><p id="ss-plan-summary" class="ss-summary" role="status" aria-live="polite">选择改变后，需要重新生成预览。</p><div id="ss-plan-scope" class="ss-muted"></div><div id="ss-plan" class="ss-scroll"></div><button id="ss-execute" disabled class="btn btn-danger">确认执行所选项目</button></section>
   <section class="ss-card"><h4>5 · 后台进度与结果</h4><p id="ss-job-summary">尚无执行任务</p><div id="ss-job" class="ss-scroll"></div><button id="ss-cancel" disabled class="btn btn-outline-warning">取消尚未执行项目</button><button id="ss-retry" disabled class="btn btn-outline-primary">为所选失败项生成重试预览</button><p class="ss-muted">关闭页面不影响已排队任务。取消不会撤销已保存的控制或已完成的写入；待核实项目需先完成远端核实。</p><h5>操作记录</h5><div id="ss-history"></div></section>
   <section id="ss-admin" class="ss-card ss-hidden"><h4>共享参照设置</h4><p class="ss-muted">仅向其他负责人开放商品身份与库存状态读取，不授予目标站写入权限。</p><div id="ss-reference-settings" class="ss-list"></div></section>
 </div>
-<script src="{{ url_for('static', filename='js/stock_sync.js') }}" defer></script>
+<script src="{{ url_for('static', filename='js/stock_sync.js', v='20260917-preview-feedback') }}" defer></script>
 {% endblock %}
