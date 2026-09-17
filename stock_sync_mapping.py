@@ -15,6 +15,7 @@ from stock_sync_permissions import actor, can_write, reference_site, require_obj
 from stock_sync_catalog import enqueue
 from stock_sync_woo import Woo, site_identity
 from product_recognition import parse_product_name
+import stock_sync_identity as identities
 
 
 def permitted(u):
@@ -47,7 +48,7 @@ def sku_recognition(sku, rules):
 def master_data(c):
     skus = rows(c, 'SELECT * FROM inv_skus WHERE is_active=1 ORDER BY id')
     rules = rows(c, 'SELECT * FROM product_mappings ORDER BY id') if exists(c, 'product_mappings') else []
-    fields = ('id','sku_code','name','barcode','brand_id','series_id','puff_count','flavor','unit','is_active')
+    fields = ('id','sku_code','name','barcode','brand_id','series_id','puff_count','flavor','unit','is_active','notes')
     skus = [{f: s.get(f) for f in fields} for s in skus]
     rules = [{f: r.get(f) for f in ('id','raw_name','source','brand_id','series_id','puff_count','flavor')} for r in rules]
     brands = rows(c, 'SELECT id,name,aliases FROM brands ORDER BY id') if exists(c, 'brands') else []
@@ -104,8 +105,7 @@ def recognition(item, site, rules):
         parsed = parse_product_name(item['parent_name'] if item['variation_id'] else item['name'], rules['brands'], rules['series'])
         value = {'brand_id':parsed.get('brand_id'), 'series_id':parsed.get('series_id'),
                  'puff_count':parsed.get('puffs'), 'flavor':parsed.get('flavor')}
-    flavors = {key(v): v for n, v in item['attributes']
-               if any(t in key(n) for t in ('smak','flavor','flavour','口味','taste','aroma'))}
+    flavors = {key(v): v for n, v in item['attributes'] if identities.is_flavor_attribute(n)}
     if len(flavors) > 1:
         return {}, '站点包含多个不同的口味属性，请人工核对'
     if len(flavors) == 1:
@@ -203,14 +203,25 @@ def status(c, u, id_, confirmation=False):
     sites = {s['id']: s for s in rows(c, 'SELECT * FROM sites')}
     for item in items:
         item.pop('identity_hash', None)
+        item.pop('order_evidence', None)
+        item.pop('expected_mapping', None)
         item['writable'] = can_write(u, sites[item['site_id']])
         item['site_url'] = sites[item['site_id']]['url']
     result = {k: snap[k] for k in ('id','status','complete','progress','error','expires_at')}
     result.update(items=items, counts=dict(Counter(i['state'] for i in items)),
                   site_ids=scope['site_ids'], source_site_id=snap['site_id'])
+    result['identity_summary'] = scope.get('identity_summary', {})
+    result['auto_ready'] = sum(bool(i.get('certain') and i['writable'] and i['state'] in ('suggested','new','align')) for i in items)
+    result['manual_required'] = sum(i['state'] in ('unmatched','review','conflict') for i in items)
     if not confirmation:
         result['skus'] = master_data(c)[0]
     return result
+
+
+def identity_context(c, u, skus, rules):
+    sites = rows(c, 'SELECT * FROM sites ORDER BY id')
+    sources = {s['url'] for s in sites if can_write(u, s)}
+    return identities.context(c, skus, rules, sites, sources)
 
 
 def scan(c, id_, woo=None):
@@ -245,6 +256,12 @@ def scan(c, id_, woo=None):
         counts = Counter((i['site_id'], key(i['wc_sku'])) for i in items if i['wc_sku'])
         by_site = {s['id']: s for s in sites}
         items = [suggest(i, by_site[i['site_id']], skus, rules, aliases, counts) for i in items]
+        ctx = identity_context(c, u, skus, rules)
+        items = identities.enrich(items, skus, rules, aliases, ctx)
+        scope['identity_summary'] = {'order_products':len(ctx['orders']),
+            'recognized':sum(bool(i.get('product_identity')) for i in items),
+            'new_products':len({i['new_sku']['identity_key'] for i in items if i.get('new_sku')}),
+            'manual_sku_aliases':len(ctx['canonical'])}
         if master_data(c)[2] != fingerprint:
             raise SyncError('MAPPING_INPUT_CHANGED', 'SKU 主档或产品识别规则已改变，请重新读取')
         c.execute("UPDATE stock_sync_catalog_snapshots SET status='complete',complete=1,items_json=?,scope_json=?,progress=?,observed_at=? WHERE id=?",
@@ -271,8 +288,6 @@ def confirm(c, u, id_, data):
     if not isinstance(choices, list) or not choices or len(choices) > 1000:
         raise SyncError('INVALID_SELECTION', '请选择 1 至 1000 项映射', 400)
     skus, _, fingerprint = master_data(c)
-    if fingerprint != scope['master_hash']:
-        raise SyncError('MAPPING_INPUT_CHANGED', 'SKU 主档或产品识别规则已改变，请重新读取')
     sku_ids = {s['id'] for s in skus}
     original = {i['id']: i for i in loads(snap['items_json'], [])}
     approved, seen = [], set()
@@ -280,16 +295,20 @@ def confirm(c, u, id_, data):
         if not isinstance(choice, dict) or not isinstance(choice.get('id'), str):
             raise SyncError('INVALID_SELECTION', status=400)
         item = original.get(choice['id'])
-        if not item or item['id'] in seen or item['state'] not in ('unmatched','suggested','review'):
+        if not item or item['id'] in seen or item['state'] not in ('unmatched','suggested','review','new','align'):
             raise SyncError('INVALID_SELECTION', '选择项不属于待处理映射', 400)
         target_sites(c, u, {'mode':'explicit_sites', 'site_ids':[item['site_id']]})
         sku, quantity = choice.get('sku_id'), choice.get('qty_per_item')
-        if type(sku) is not int or sku not in sku_ids or type(quantity) is not int or not 1 <= quantity <= 100000:
+        create_sku = choice.get('create_sku') is True
+        valid_sku = (create_sku and sku is None and item.get('new_sku') and item['state'] == 'new') or (not create_sku and type(sku) is int and sku in sku_ids)
+        if not valid_sku or type(quantity) is not int or not 1 <= quantity <= 100000:
             raise SyncError('INVALID_INPUT', '请选择有效 SKU，并填写正整数的每件折合数量', 400)
-        approved.append(dict(item, chosen_sku_id=sku, chosen_quantity=quantity, state='pending'))
+        if item['state'] == 'align' and (sku != item['proposed_sku_id'] or quantity != item['qty_per_item']):
+            raise SyncError('INVALID_SELECTION', '统一临时主档只能使用已核对的同一产品和原包装数量', 400)
+        approved.append(dict(item, chosen_sku_id=sku, create_sku=create_sku, chosen_quantity=quantity, state='pending'))
         seen.add(item['id'])
     # Same immutable selection/reason is idempotent even after a response is lost.
-    selection_hash = digest([id_, sorted([(i['id'], i['chosen_sku_id'], i['chosen_quantity']) for i in approved]), reason.strip()])
+    selection_hash = digest([id_, sorted([(i['id'], i['chosen_sku_id'], i['chosen_quantity'], i['create_sku']) for i in approved]), reason.strip()])
     confirmation_id = digest(['mapping_confirmation', u['id'], selection_hash])[:32]
     begin(c)
     c.execute('SELECT id FROM stock_sync_catalog_snapshots WHERE id=?'+lock_clause(c), (id_,)).fetchone()
@@ -297,6 +316,9 @@ def confirm(c, u, id_, data):
     if previous:
         c.commit()
         return confirmation_id
+    if fingerprint != scope['master_hash']:
+        c.rollback()
+        raise SyncError('MAPPING_INPUT_CHANGED', 'SKU 主档或产品识别规则已改变，请重新读取')
     new_scope = dict(scope, purpose='mapping_confirmation', parent_id=id_, reason=reason.strip())
     c.execute('''INSERT INTO stock_sync_catalog_snapshots(id,actor_id,site_id,scope_json,status,items_json,created_at,expires_at)
                  VALUES(?,?,?,?,'queued',?,?,?)''',
@@ -310,6 +332,8 @@ def confirm(c, u, id_, data):
 def apply(c, id_, woo=None):
     woo = woo or Woo(); woo.connection = c
     snap = one(c, 'SELECT * FROM stock_sync_catalog_snapshots WHERE id=?', (id_,))
+    if snap['complete'] and snap['status'] == 'complete':
+        return
     scope = loads(snap['scope_json']); items = loads(snap['items_json'], [])
     try:
         u = actor(c, snap['actor_id']); accessible(c, u, id_, 'mapping_confirmation')
@@ -332,8 +356,31 @@ def apply(c, id_, woo=None):
         u = actor(c, snap['actor_id']); accessible(c, u, id_, 'mapping_confirmation')
         if parse_time(snap['expires_at']) <= now():
             raise SyncError('CATALOG_EXPIRED', '映射建议已过期，请重新读取')
-        if master_data(c)[2] != scope['master_hash']:
+        # Serialize canonical master creation and duplicate alignment across sites.
+        if hasattr(c, '_raw'):
+            c._raw.execute('SELECT pg_advisory_xact_lock(%s,%s)', (194761, 0))
+        skus, rules, fingerprint = master_data(c)
+        if fingerprint != scope['master_hash']:
             raise SyncError('MAPPING_INPUT_CHANGED', 'SKU 主档或产品识别规则已改变，请重新读取')
+        ctx = identity_context(c, u, skus, rules)
+        for item in items:
+            for evidence in item.get('order_evidence', []):
+                current = ctx['by_identity'].get((evidence['source'], evidence['product_id'], evidence['variation_id']), [])
+                current_records = [{k: e[k] for k in evidence} for e in current]
+                if evidence not in current_records:
+                    raise SyncError('MAPPING_INPUT_CHANGED', '用于识别的订单商品记录或读取权限已改变，请重新读取')
+                if item.get('certain') and any(e['profile'] and not identities.compatible(item.get('product_identity'), e['profile']) for e in current):
+                    raise SyncError('MAPPING_INPUT_CHANGED', '订单商品身份出现新冲突，请重新读取')
+            if item.get('expected_mapping'):
+                old = item['expected_mapping']
+                if ctx['canonical'].get(old['sku_id']) != item['chosen_sku_id'] or old['id'] in ctx['protected']:
+                    raise SyncError('MAPPING_INPUT_CHANGED', '临时主档的库存、供货来源或控制状态已改变，不能自动统一')
+            if item['create_sku']:
+                proposal = item['new_sku']
+                site = ctx['sites'][item['site_id']]
+                sources = [w for w in ctx['manual_sources'] if site.get('country') in w['markets']]
+                if len(sources) != 1 or sources[0]['warehouse_id'] != proposal['warehouse_id']:
+                    raise SyncError('MAPPING_INPUT_CHANGED', '人工供货仓配置已改变，请重新读取')
         # Cooperating requests serialize by site; the table's unique key also
         # protects against mappings created by the existing inventory screens.
         for sid in sorted({i['site_id'] for i in items}):
@@ -343,9 +390,19 @@ def apply(c, id_, woo=None):
             if hasattr(c, '_raw'):
                 c._raw.execute('SELECT pg_advisory_xact_lock(%s,%s)', (194761, sid))
         for item in items:
+            if item['create_sku']:
+                item['chosen_sku_id'] = identities.create_master(c, item['new_sku'], u['id'], id_)
             previous = rows(c, 'SELECT * FROM inv_site_sku_map WHERE site_id=? AND wc_product_id=? AND COALESCE(wc_variation_id,0)=?'+lock_clause(c),
                             (item['site_id'], item['product_id'], item['variation_id']))
             if previous:
+                if item.get('expected_mapping') and previous == [item['expected_mapping']]:
+                    c.execute('UPDATE inv_site_sku_map SET sku_id=?,updated_at=? WHERE id=?',
+                              (item['chosen_sku_id'], stamp(), previous[0]['id']))
+                    item.update(state='aligned', map_id=previous[0]['id'])
+                    event(c, 'mapping_identity_aligned', u['id'], str(previous[0]['id']),
+                          {'confirmation_id':id_, 'previous_sku_id':previous[0]['sku_id'],
+                           'sku_id':item['chosen_sku_id'], 'reason':scope['reason']})
+                    continue
                 if len(previous) != 1 or not previous[0]['is_active'] or previous[0]['sku_id'] != item['chosen_sku_id'] or previous[0]['qty_per_item'] != item['chosen_quantity']:
                     raise SyncError('MAPPING_CHANGED', '部分商品已被其他操作绑定，本批未保存，请重新读取')
                 item.update(state='unchanged', map_id=previous[0]['id'])
@@ -359,7 +416,8 @@ def apply(c, id_, woo=None):
             event(c, 'mapping_created', u['id'], str(inserted['id']), {'confirmation_id':id_,
                 'site_id':item['site_id'], 'product_id':item['product_id'], 'variation_id':item['variation_id'],
                 'sku_id':item['chosen_sku_id'], 'qty_per_item':item['chosen_quantity'],
-                'recognition':item.get('recognition'), 'reason':scope['reason']})
+                'recognition':item.get('recognition'), 'new_sku':item.get('new_sku') if item['create_sku'] else None,
+                'reason':scope['reason']})
         c.execute("UPDATE stock_sync_catalog_snapshots SET status='complete',complete=1,items_json=?,progress=?,observed_at=? WHERE id=?",
                   (dumps(items), len(items), stamp(), id_)); c.commit()
     except Exception as exc:

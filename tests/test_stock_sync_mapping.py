@@ -119,7 +119,7 @@ def test_variation_marketing_title_matches_legacy_sku_without_changing_master(ma
     parent.update(type='variable',variations=[2011],name='RecognizedAlias Blade 30000 Puffs – Bestseller | Screen 2.1 inch')
     s.http.products[root+'/variations/2011']=dict(parent,id=2011,type='variation',parent_id=2001,sku='',attributes=[{'name':'pa_smak','option':'Blueberry'}])
     item=next(i for i in scan(s)['items'] if i['id']=='2:2001:2011')
-    assert item['state']=='suggested' and item['proposed_sku_id']==1 and not item['certain']
+    assert item['state']=='suggested' and item['proposed_sku_id']==1 and item['certain']
     assert item['recognition']=={'brand_id':7,'series_id':8,'puff_count':30000,'flavor':'Blueberry'}
     assert s.sql('SELECT brand_id,series_id,puff_count,flavor FROM inv_skus WHERE id=1')[0]=={'brand_id':None,'series_id':None,'puff_count':None,'flavor':None}
     assert not s.http.puts
