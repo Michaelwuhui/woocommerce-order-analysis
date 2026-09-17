@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}临时库存修改授权{% endblock %}
+{% block content %}
+<div class="container-fluid py-4">
+  <div class="d-flex gap-2 flex-wrap justify-content-between mb-3"><h5>临时库存修改授权</h5><a href="/users" class="btn btn-outline-light">返回用户管理</a></div>
+  <p class="alert alert-warning">仅授权指定仓库，必须设置到期时间，可随时撤销。获授权人员在“库存管理 → 补货 / 调拨 / 盘点 → 临时修改库存”填写实盘总数和原因，系统自动生成盘点单并审批入账。不授予全仓管理、发货或站点库存同步权限。普通盘点仍需另一人审批。</p>
+  <div id="accessError" class="alert alert-danger d-none" role="alert"></div>
+  <form id="accessForm" class="row g-3 mb-4">
+    <div class="col-md-3"><label for="accessUser" class="form-label">人员</label><select id="accessUser" class="form-select bg-dark text-white" required></select></div>
+    <div class="col-md-3"><label for="accessWarehouse" class="form-label">本地数量仓库</label><select id="accessWarehouse" class="form-select bg-dark text-white" required></select></div>
+    <div class="col-md-3"><label for="accessExpiry" class="form-label">到期时间（当前浏览器时区）</label><input id="accessExpiry" class="form-control bg-dark text-white" type="datetime-local" required></div>
+    <div class="col-12"><label for="accessReason" class="form-label">授权原因</label><textarea id="accessReason" class="form-control bg-dark text-white" maxlength="2000" required></textarea></div>
+    <div class="col-12"><button class="btn btn-warning" type="submit">确认临时授权</button><a href="/inventory/operations?kind=stocktake" class="btn btn-outline-info ms-2">查看盘点与库存修改记录</a></div>
+  </form>
+  <h6>授权及撤销记录（最近500条）</h6>
+  <div class="table-responsive"><table class="table table-dark align-middle"><thead><tr><th>编号 / 人员</th><th>仓库</th><th>到期 / 状态</th><th>授权依据</th><th>撤销记录</th><th>操作</th></tr></thead><tbody id="accessRows"></tbody></table></div>
+</div>
+<script>
+document.addEventListener('DOMContentLoaded',()=>{
+  const $=id=>document.getElementById(id), esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const time=v=>v?new Date(v).toLocaleString('zh-CN',{hour12:false}):'—';
+  let busy=false, frozen=null;
+  async function api(path='',body){const r=await fetch('/api/inv/operations/temporary-access'+path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!(r.headers.get('content-type')||'').includes('application/json'))throw new Error('登录已过期或服务暂不可用，请刷新后核查。');const d=await r.json();if(!r.ok)throw new Error(d.error||'请求失败');return d;}
+  function error(e){$('accessError').textContent=e||'';$('accessError').classList.toggle('d-none',!e);}
+  async function load(){const d=await api();if(!$('accessUser').options.length){$('accessUser').innerHTML=d.users.map(u=>`<option value="${u.id}">${esc(u.name)} (${esc(u.username)})</option>`).join('');$('accessWarehouse').innerHTML=d.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join('');}
+    $('accessRows').innerHTML=d.grants.map(g=>`<tr><td>#${g.id} ${esc(g.user_name)}<br>${esc(g.username)}</td><td>${esc(g.warehouse_name)}</td><td>${esc(time(g.expires_at))}<br><span class="badge ${g.active?'bg-success':'bg-secondary'}">${g.revoked_at?'已撤销':g.active?'有效':'已到期'}</span></td><td>${esc(g.reason)}<br><small>${esc(g.created_name)} · ${esc(time(g.created_at))}</small></td><td>${esc(g.revoke_reason||'—')}<br><small>${g.revoked_at?'管理员 #'+g.revoked_by+' · '+esc(time(g.revoked_at)):''}</small></td><td>${g.active?`<button class="btn btn-sm btn-outline-danger" data-revoke="${g.id}">撤销</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6">尚未授予任何临时权限</td></tr>';}
+  $('accessForm').onsubmit=async e=>{e.preventDefault();if(busy)return;error('');if(!frozen){const expiry=new Date($('accessExpiry').value);if(!Number.isFinite(expiry.getTime())||expiry<=new Date())return error('请选择未来的到期时间');if(!confirm('确认临时授权？有效期内，此人在选定仓库提交的临时库存修改会自动审批入账。'))return;frozen={user_id:Number($('accessUser').value),warehouse_id:Number($('accessWarehouse').value),expires_at:expiry.toISOString(),reason:$('accessReason').value.trim(),request_key:crypto.randomUUID()};}
+    busy=true;$('accessForm').querySelectorAll('input,select,textarea,button').forEach(e=>e.disabled=true);try{await api('',frozen);frozen=null;await load();}catch(e){error(e.message+'；结果不确定时请用原内容重试，不要重新授权。');}finally{busy=false;$('accessForm').querySelectorAll('input,select,textarea').forEach(e=>e.disabled=!!frozen);$('accessForm').querySelector('button').disabled=false;}};
+  $('accessRows').onclick=async e=>{const b=e.target.closest('[data-revoke]');if(!b||busy)return;const reason=prompt('请输入撤销原因');if(!reason)return;busy=true;b.disabled=true;error('');try{await api('/'+b.dataset.revoke+'/revoke',{reason});await load();}catch(e){error(e.message);}finally{busy=false;b.disabled=false;}};
+  load().catch(e=>error(e.message));
+});
+</script>
+{% endblock %}

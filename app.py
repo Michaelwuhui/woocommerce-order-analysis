@@ -43,7 +43,8 @@ from order_shipments import (
     is_pending_shipping_candidate,
     partition_shipping_logs,
 )
-from external_operations import begin_operation, transition_operation
+from external_operations import begin_operation, operation_by_key, transition_operation
+from shipment_retry import ShipmentRetryError, classify_retry_preflight
 from partner_site_scope import (
     EFFECTIVE_PARTNER_SITES,
     get_partner_site_scope,
@@ -895,10 +896,12 @@ def extract_flavor_from_meta(item):
     for meta in meta_data:
         if not isinstance(meta, dict):
             continue
-        key = meta.get('key', '').lower()
+        key = str(meta.get('key') or '').strip().lower()
         if key in flavor_keys:
             # Prefer display_value over value for human-readable format
-            return meta.get('display_value', '') or meta.get('value', '')
+            for value in (meta.get('display_value'), meta.get('value')):
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
     
     return ''
 
@@ -921,7 +924,7 @@ def extract_puffs_from_meta(item):
     for meta in meta_data:
         if not isinstance(meta, dict):
             continue
-        key = meta.get('key', '').lower()
+        key = str(meta.get('key') or '').strip().lower()
         if key in puffs_keys:
             value = meta.get('display_value', '') or meta.get('value', '')
             # Extract numeric value from strings like "15000 puffs" or "15000"
@@ -995,13 +998,13 @@ def get_full_product_name(item):
     Combines the product name with any variation flavor found in meta_data.
     Returns: (full_name, flavor_only, puffs_from_meta)
     """
-    name = item.get('name', '')
+    name = str(item.get('name') or '')
     flavor = extract_flavor_from_meta(item)
     puffs = extract_puffs_from_meta(item)
     
     if flavor:
         # If flavor is not already in the name, append it
-        if flavor.upper() not in name.upper():
+        if html.unescape(flavor).upper() not in html.unescape(name).upper():
             full_name = f"{name} - {flavor}"
         else:
             full_name = name
@@ -1010,6 +1013,11 @@ def get_full_product_name(item):
         flavor = ''
     
     return full_name, flavor, puffs
+
+
+def get_display_product_name(item):
+    """Human-readable order item name, including separately stored flavor."""
+    return html.unescape(get_full_product_name(item)[0])
 
 
 def get_user_allowed_sources(user_id, is_admin=False, is_viewer=False):
@@ -2578,7 +2586,7 @@ def orders():
             od['products'] = [{
                 # WooCommerce stores line-item names HTML-encoded (e.g. "&amp;");
                 # decode so Jinja's autoescape doesn't double-encode them.
-                'name': html.unescape(i.get('name', '') or ''),
+                'name': get_display_product_name(i),
                 'quantity': i.get('quantity', 0),
                 'total': float(i.get('total', 0))
             } for i in items]
@@ -5214,6 +5222,9 @@ def get_order_details(order_id):
     order_dict['billing'] = parse_json_field(order['billing'])
     order_dict['shipping'] = parse_json_field(order['shipping'])
     order_dict['line_items'] = parse_json_field(order['line_items'])
+    for item in order_dict['line_items'] or []:
+        if isinstance(item, dict):
+            item['display_name'] = get_display_product_name(item)
     order_dict['shipping_lines'] = parse_json_field(order['shipping_lines'])
     order_dict['meta_data'] = parse_json_field(order['meta_data'])
     order_dict['customer_inpost_id'] = extract_custom_billing_fields(
@@ -9609,16 +9620,21 @@ def deep_sync_site(site_id):
 @app.route('/api/site/<int:site_id>/check', methods=['POST'])
 @login_required
 def check_site_api(site_id):
-    """Check API connectivity for a site"""
+    """Verify order API access with one read-only request, then save the result."""
     from woocommerce import API
-    
+
+    if not _can_manage_site_sync(current_user, site_id):
+        return jsonify({'success': False, 'error': '无权检测该站点'}), 403
     conn = get_db_connection()
-    site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
-    
-    if not site:
+    try:
+        site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
+    finally:
         conn.close()
+    if not site:
         return jsonify({'success': False, 'error': 'Site not found'}), 404
-    
+
+    read_status = 'error'
+    error_msg = None
     try:
         wcapi = API(
             url=site['url'],
@@ -9626,60 +9642,42 @@ def check_site_api(site_id):
             consumer_secret=site['consumer_secret'],
             version="wc/v3",
             timeout=15,
-            user_agent="WooCommerce API Client-Python/3.0.0" # Critical for WAF bypass
+            user_agent="WooCommerce API Client-Python/3.0.0",
         )
-        
-        read_status = 'unknown'
-        write_status = 'unknown'
-        error_msg = None
-        
-        # Test connectivity with a read-only request.  Write permission is
-        # verified by actual product operations through authoritative read-back;
-        # do not create/delete notes on real customer orders just to probe it.
-        try:
-            response = wcapi.get("orders", params={"per_page": 1})
-            if response.status_code == 200:
+        response = wcapi.get("orders", params={"per_page": 1, "_fields": "id"})
+        if response.status_code == 200:
+            if isinstance(response.json(), list):
                 read_status = 'ok'
-                write_status = 'unknown'
-            elif response.status_code in (401, 403):
-                read_status = 'error'
-                write_status = 'unknown'
-                error_msg = "读权限被拒绝"
             else:
-                read_status = 'error'
-                write_status = 'unknown'
-                error_msg = f"连接异常 HTTP {response.status_code}"
-                
-        except Exception as e:
-            read_status = 'error'
-            write_status = 'unknown'
-            error_msg = f"连接失败: {str(e)}"
+                error_msg = '订单 API 返回格式异常'
+        elif response.status_code in (401, 403):
+            error_msg = f"读权限被拒绝 (HTTP {response.status_code})"
+        else:
+            error_msg = f"连接异常 HTTP {response.status_code}"
+    except Exception as exc:
+        # Exception text may contain upstream URLs or credentials.
+        error_msg = f"连接失败: {type(exc).__name__}"
 
-        # Update DB
+    # Release the database connection during network I/O. Write permission
+    # remains unknown: a connectivity probe must never mutate customer orders.
+    conn = get_db_connection()
+    try:
         conn.execute('''
-            UPDATE sites 
+            UPDATE sites
             SET api_read_status = ?, api_write_status = ?, last_api_error = ?
             WHERE id = ?
-        ''', (read_status, write_status, error_msg, site_id))
+        ''', (read_status, 'unknown', error_msg, site_id))
         conn.commit()
+    finally:
         conn.close()
 
-        status = 'ok' if read_status == 'ok' else 'error'
-        if read_status == 'ok':
-            message = 'API连接正常（读权限已验证；写权限将在实际业务写入时回读验证）'
-        else:
-            message = error_msg or 'API连接异常'
-        
-        return jsonify({
-            'success': True, 
-            'status': status,
-            'message': message,
-            'read': read_status,
-            'write': write_status
-        })
-
-    except Exception as e:
-        return jsonify({'success': False, 'error': f"系统错误: {str(e)}"}), 500
+    return jsonify({
+        'success': True,
+        'status': 'ok' if read_status == 'ok' else 'error',
+        'message': error_msg or 'API连接正常（只读检测通过，写权限未测试）',
+        'read': read_status,
+        'write': 'unknown',
+    })
 
 
 @app.route('/api/site/<int:site_id>/check-tracking-api', methods=['POST'])
@@ -9837,144 +9835,30 @@ def get_site_email_stats(site_id):
         return jsonify({'success': False, 'error': f'请求失败: {str(e)}'})
 
 
-# Global status dict for API check progress
-CHECK_STATUS = {}
-
 @app.route('/api/sites/check-all', methods=['POST'])
-@login_required
+@all_site_sync_required
 def check_all_sites_api():
-    """Run the legacy SQLite bulk connectivity check without write probes."""
-    if sqlite3.is_postgres_backend():
-        return jsonify({
-            'error': (
-                '批量 API 检测的旧 Gunicorn 后台线程已停用；'
-                '请使用各站点的只读连接检测。'
-            )
-        }), 409
+    """List sites for bounded, sequential read-only checks by the settings page.
 
-    import threading
-
-    # The rollback-only implementation still needs a per-request ID so a new
-    # check can never inherit another worker's stale terminal state.
-    check_id = new_sync_runtime_status_id()
-
-    CHECK_STATUS[check_id] = {
-        'status': 'running',
-        'message': '正在启动API检测...',
-        'results': [],
-        'progress': 0,
-        'total': 0
-    }
-    
-    def run_check_all(app_context, status_id):
-        from woocommerce import API
-        
-        with app_context:
-            try:
-                conn = get_db_connection()
-                sites = conn.execute('SELECT * FROM sites').fetchall()
-                
-                total_sites = len(sites)
-                CHECK_STATUS[status_id]['total'] = total_sites
-                results = []
-                
-                for index, site in enumerate(sites):
-                    site_id = site['id']
-                    site_url = site['url']
-                    read_status = 'unknown'
-                    write_status = 'unknown'
-                    error_msg = None
-                    
-                    CHECK_STATUS[status_id]['message'] = f'正在检测 {site_url} ({index+1}/{total_sites})...'
-                    CHECK_STATUS[status_id]['progress'] = index + 1
-                    
-                    try:
-                        wcapi = API(
-                            url=site_url,
-                            consumer_key=site['consumer_key'],
-                            consumer_secret=site['consumer_secret'],
-                            version="wc/v3",
-                            timeout=15,
-                            user_agent="WooCommerce API Client-Python/3.0.0"
-                        )
-                        
-                        # Test READ permission
-                        try:
-                            response = wcapi.get("orders", params={"per_page": 1})
-                            
-                            if response.status_code == 200:
-                                read_status = 'ok'
-                            elif response.status_code in (401, 403):
-                                read_status = 'error'
-                                error_msg = f"读权限认证失败 (HTTP {response.status_code})"
-                                try:
-                                    error_data = response.json()
-                                    if 'message' in error_data:
-                                        error_msg = f"{error_msg}: {error_data['message']}"
-                                except:
-                                    pass
-                            else:
-                                read_status = 'error'
-                                error_msg = f"读取失败 HTTP {response.status_code}"
-                        except Exception as e:
-                            read_status = 'error'
-                            error_msg = f"读权限测试失败: {str(e)}"
-                        
-                        # Never create/delete notes on a real customer order to
-                        # probe write permission.  Business writes are verified
-                        # by their durable operation ledger and read-back path.
-                        write_status = 'unknown'
-                            
-                    except Exception as e:
-                        read_status = 'error'
-                        write_status = 'unknown'
-                        error_msg = f"连接失败: {str(e)}"
-                    
-                    # Update database
-                    conn.execute('''
-                        UPDATE sites 
-                        SET api_read_status = ?, api_write_status = ?, last_api_error = ?
-                        WHERE id = ?
-                    ''', (read_status, write_status, error_msg, site_id))
-                    conn.commit()
-                    
-                    results.append({
-                        'site_id': site_id,
-                        'url': site_url,
-                        'read': read_status,
-                        'write': write_status,
-                        'message': error_msg
-                    })
-                    
-                    CHECK_STATUS[status_id]['results'] = results
-                
-                conn.close()
-                
-                # Calculate final stats
-                ok_count = sum(1 for r in results if r['read'] == 'ok')
-                error_count = sum(1 for r in results if r['read'] == 'error')
-                
-                CHECK_STATUS[status_id]['status'] = 'success'
-                CHECK_STATUS[status_id]['message'] = f'检测完成！正常: {ok_count} 个，异常: {error_count} 个'
-                
-            except Exception as e:
-                CHECK_STATUS[status_id]['status'] = 'error'
-                CHECK_STATUS[status_id]['message'] = f'检测失败: {str(e)}'
-    
-    thread = threading.Thread(target=run_check_all, args=(app.app_context(), check_id))
-    thread.start()
-
-    return jsonify({'success': True, 'check_id': check_id, 'message': 'API检测已启动'})
+    Each check uses the single-site endpoint and persists its own result. No
+    process-local job state or long-lived Gunicorn background thread is needed.
+    """
+    conn = get_db_connection()
+    try:
+        sites = [dict(row) for row in conn.execute(
+            'SELECT id, url FROM sites ORDER BY id'
+        ).fetchall()]
+    finally:
+        conn.close()
+    return jsonify({'success': True, 'mode': 'sequential', 'sites': sites})
 
 
 @app.route('/api/sites/check-status/<int:check_id>')
-@login_required
+@all_site_sync_required
 def get_check_status(check_id):
-    """Get the status of an ongoing API check operation"""
-    if check_id not in CHECK_STATUS:
-        return jsonify({'status': 'unknown', 'message': '检测任务不存在'})
-    
-    return jsonify(CHECK_STATUS[check_id])
+    """Tell an old, already-open settings page to reload the current checker."""
+    return jsonify({'status': 'error', 'message': '请刷新系统设置页面后重新检测'}), 410
+
 
 @app.route('/api/sync/clean/<int:site_id>', methods=['POST'])
 @login_required
@@ -16757,20 +16641,27 @@ def settings_api():
                         continue
                     v = '1' if str(value).strip().lower() in ('1', 'true', 'yes', 'on') else '0'
                     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, v))
-                elif key == 'auto_confirm_delivered_enabled':
-                    # Auto-confirm master switch (待确认结局 → 已签收). Admin-only
-                    # (governs an automated action that completes orders + fires
-                    # WC 'completed' emails). Read by the hourly auto_sync.py cron
-                    # via auto_confirm.is_enabled().
+                elif key in ('auto_confirm_delivered_enabled', 'auto_confirm_returned_enabled'):
+                    # Independent outcome automation switches. Admin-only because
+                    # delivered completes the WooCommerce order, while returned
+                    # changes revenue/loss accounting by marking it undelivered.
                     if not current_user.is_admin():
                         continue
                     v = '1' if str(value).strip().lower() in ('1', 'true', 'yes', 'on') else '0'
                     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, v))
                     if v == '1':
-                        # Forward-only: stamp the effective-start (same datetime('now')
-                        # format as carrier_status_at) so ONLY deliveries detected after
-                        # turning on get auto-confirmed — never the existing backlog.
-                        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_confirm_delivered_since', datetime('now'))")
+                        since_key = (
+                            'auto_confirm_delivered_since'
+                            if key == 'auto_confirm_delivered_enabled'
+                            else 'auto_confirm_returned_since'
+                        )
+                        # Activation timestamp is retained for audit and prevents
+                        # automation when a setting was enabled directly without
+                        # going through this guarded endpoint.
+                        conn.execute(
+                            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, datetime('now'))",
+                            (since_key,),
+                        )
             conn.commit()
             
             # 如果自动同步设置发生变更，同步更新 Crontab 定时任务
@@ -16914,13 +16805,17 @@ def shipping():
     all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
     all_countries = [c['country'] for c in all_countries]
     
-    # Auto-confirm switch state (待确认结局 → 已签收), for the toolbar toggle.
+    # Independent auto-confirm switches for terminal carrier outcomes.
     _ac_row = conn.execute("SELECT value FROM settings WHERE key='auto_confirm_delivered_enabled'").fetchone()
     auto_confirm_enabled = bool(_ac_row) and str(_ac_row['value']).strip().lower() in ('1', 'true', 'yes', 'on')
     _ac_since_row = conn.execute("SELECT value FROM settings WHERE key='auto_confirm_delivered_since'").fetchone()
     auto_confirm_since = _ac_since_row['value'] if _ac_since_row and _ac_since_row['value'] else ''
+    _ar_row = conn.execute("SELECT value FROM settings WHERE key='auto_confirm_returned_enabled'").fetchone()
+    auto_confirm_returned_enabled = bool(_ar_row) and str(_ar_row['value']).strip().lower() in ('1', 'true', 'yes', 'on')
+    _ar_since_row = conn.execute("SELECT value FROM settings WHERE key='auto_confirm_returned_since'").fetchone()
+    auto_confirm_returned_since = _ar_since_row['value'] if _ar_since_row and _ar_since_row['value'] else ''
 
-    auto_confirm_stats = {'candidates': 0, 'backlog': 0, 'returned': 0, 'since': auto_confirm_since}
+    auto_confirm_stats = {'candidates': 0, 'backlog': 0, 'since': auto_confirm_since}
     outcome_scope_sql = ''
     outcome_scope_params = []
     if allowed_sources is None:
@@ -16963,16 +16858,27 @@ def shipping():
             f"SELECT COUNT(*) {outcome_base} AND o.carrier_status = 'delivered'{ready_sql}{outcome_scope_sql}",
             outcome_scope_params
         ).fetchone()[0]
-    auto_confirm_stats['returned'] = conn.execute(
-        f"SELECT COUNT(*) {outcome_base} AND o.carrier_status = 'returned'{ready_sql}{outcome_scope_sql}",
-        outcome_scope_params
-    ).fetchone()[0]
+    # Returned candidates use stricter whole-order safety checks (especially for
+    # split parcels), shared with the background enforcer to keep UI and worker
+    # counts identical.
+    import auto_confirm as outcome_auto_confirm
+    returned_preview = outcome_auto_confirm.returnable_stats(conn, allowed_sources)
+    auto_confirm_returned_stats = {
+        'total': returned_preview['candidates'],
+        'candidates': returned_preview['candidates'] if auto_confirm_returned_since else 0,
+        'backlog': 0 if auto_confirm_returned_since else returned_preview['candidates'],
+        'shipping_loss': returned_preview['shipping_loss'],
+        'since': auto_confirm_returned_since,
+    }
 
     conn.close()
     return render_template('shipping.html', carriers=carriers, managers=managers, sites=sites,
                            all_countries=all_countries, is_super_admin=(current_user.username == 'admin'),
                            has_au_access=_has_au_access(), auto_confirm_enabled=auto_confirm_enabled,
-                           auto_confirm_stats=auto_confirm_stats, has_pl_access=has_pl_access)
+                           auto_confirm_stats=auto_confirm_stats,
+                           auto_confirm_returned_enabled=auto_confirm_returned_enabled,
+                           auto_confirm_returned_stats=auto_confirm_returned_stats,
+                           has_pl_access=has_pl_access)
 
 
 def _has_au_access():
@@ -17519,11 +17425,12 @@ def get_pending_orders():
     
     orders = conn.execute(query, params).fetchall()
 
-    # V2 warehouse scope is row-level.  Once an order has a fulfillment plan,
-    # explicitly scoped operators only receive the items allocated to their
-    # warehouse (for example, a PL operator never sees HU items).
+    # Market/site permissions above govern shortage visibility. Warehouse scope
+    # still governs allocated items and every shipping action; shortages are
+    # visible for checking even when no warehouse could reserve their quantity.
     fulfillment_state_map = {}
     fulfillment_products_map = {}
+    fulfillment_shortages_map = {}
     fulfillment_warehouses_map = {}
     fulfillment_statuses_map = {}
     preplan_products_map = {}
@@ -17551,6 +17458,14 @@ def get_pending_orders():
             conn, current_user.id, 'can_view'
         )
         allowed_warehouse_ids = [r['warehouse_id'] for r in permission_rows if r['can_view']]
+        fulfillment_shortages_map = {
+            (r['order_id'], str(r['woo_line_item_id'])): int(r['shortage_qty'] or 0)
+            for r in conn.execute(
+                f'''SELECT order_id, woo_line_item_id, shortage_qty
+                    FROM oms_order_items WHERE order_id IN ({scope_ph})''',
+                order_ids_for_scope,
+            ).fetchall()
+        }
         fulfillment_query = f'''SELECT f.id, f.order_id, f.warehouse_id,
                                        f.status AS fulfillment_status,
                                        w.name AS warehouse_name
@@ -17578,7 +17493,7 @@ def get_pending_orders():
             fid_ph = ','.join('?' for _ in visible_fids)
             for r in conn.execute(
                 f'''SELECT f.order_id, w.name AS warehouse_name, fi.allocated_qty,
-                           oi.name, oi.raw_json
+                           oi.name, oi.raw_json, oi.woo_line_item_id
                     FROM oms_fulfillment_items fi
                     JOIN oms_fulfillments f ON f.id=fi.fulfillment_id
                     JOIN oms_order_items oi ON oi.id=fi.order_item_id
@@ -17589,13 +17504,30 @@ def get_pending_orders():
                 raw_item = parse_json_field(r['raw_json'])
                 ordered = max(1, int(raw_item.get('quantity') or 1)) if isinstance(raw_item, dict) else 1
                 total = float(raw_item.get('total') or 0) if isinstance(raw_item, dict) else 0
+                display_item = dict(raw_item) if isinstance(raw_item, dict) else {}
+                display_item['name'] = r['name']
+                product_name = get_display_product_name(display_item)
                 fulfillment_products_map.setdefault(r['order_id'], []).append({
-                    'name': f"{r['name']}（{r['warehouse_name'] or '仓库'}）",
+                    'id': r['woo_line_item_id'],
+                    'name': f"{product_name}（{r['warehouse_name'] or '仓库'}）",
                     'quantity': int(r['allocated_qty'] or 0),
                     'total': total * int(r['allocated_qty'] or 0) / ordered,
                 })
         if explicit_warehouse_scope:
-            visible_order_ids = set(fulfillment_warehouses_map)
+            from pending_order_products import include_market_shortages
+            shortage_order_ids = set()
+            for order in orders:
+                if order['id'] not in fulfillment_state_map:
+                    continue
+                shortages = {str(item.get('id')): fulfillment_shortages_map.get(
+                    (order['id'], str(item.get('id'))), 0)
+                    for item in (parse_json_field(order['line_items']) or [])}
+                if any(shortages.values()):
+                    shortage_order_ids.add(order['id'])
+                    fulfillment_products_map[order['id']] = include_market_shortages(
+                        parse_json_field(order['line_items']) or [],
+                        fulfillment_products_map.get(order['id'], []), shortages)
+            visible_order_ids = set(fulfillment_warehouses_map) | shortage_order_ids
             orders = [o for o in orders if o['id'] not in fulfillment_state_map or o['id'] in visible_order_ids]
 
         # A just-synced order may be visible for a few seconds before the
@@ -17687,7 +17619,15 @@ def get_pending_orders():
     for order in orders:
         billing = parse_json_field(order['billing'])
         shipping_info = parse_json_field(order['shipping'])
-        if order['id'] in fulfillment_products_map:
+        if order['id'] in fulfillment_state_map and not explicit_warehouse_scope:
+            # Allocation rows omit shortage quantities. The full-order view must
+            # retain WooCommerce lines and amounts; warehouse views stay scoped.
+            line_items = parse_json_field(order['line_items']) or []
+            for item in line_items:
+                item['shortage_quantity'] = fulfillment_shortages_map.get(
+                    (order['id'], str(item.get('id'))), 0
+                )
+        elif order['id'] in fulfillment_products_map:
             line_items = fulfillment_products_map[order['id']]
         elif order['id'] in preplan_products_map:
             line_items = preplan_products_map[order['id']]
@@ -17764,9 +17704,10 @@ def get_pending_orders():
                 'item_id': item.get('id'),
                 'product_id': item.get('product_id'),
                 'variation_id': item.get('variation_id'),
-                'name': item.get('name', ''),
+                'name': get_display_product_name(item),
                 'quantity': item.get('quantity', 1),
                 'total': float(item.get('total', 0)),
+                'shortage_quantity': item.get('shortage_quantity', 0),
             } for item in (line_items or [])],
             'shipping_total': float(order['shipping_total'] or 0),
             'shipping_method': shipping_method,
@@ -17892,6 +17833,8 @@ def get_pending_outcome_orders():
                             ELSE 4 END, o.date_created ASC"""
 
     orders = conn.execute(query, params).fetchall()
+    from fulfillment_outcome_recovery import pending_outcome_blockers
+    blockers = pending_outcome_blockers(conn, [o['id'] for o in orders if o['carrier_status'] == 'delivered'])
     risk_idx = _build_risk_index(conn)
     conn.close()
 
@@ -17926,6 +17869,8 @@ def get_pending_outcome_orders():
             'currency': order['currency'],
             'date_created': order['date_created'],
             'days_pending': days_pending,
+            'outcome_blocker': blockers.get(order['id'], {}).get('reason', ''),
+            'fulfillment_status': blockers.get(order['id'], {}).get('status', ''),
             'carrier_status': order['carrier_status'] or '',
             'carrier_status_at': order['carrier_status_at'] or '',
             'source': order['source'].replace('https://www.', '').replace('https://', ''),
@@ -17936,7 +17881,7 @@ def get_pending_outcome_orders():
             'customer_address': customer_address,
             'state_mismatch': _au_state_mismatch(addr),
             'shipping_total': float(order['shipping_total'] or 0),
-            'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1)} for item in (line_items or [])],
+            'products': [{'name': get_display_product_name(item), 'quantity': item.get('quantity', 1)} for item in (line_items or [])],
             'tracking_number': order['tracking_number'] or '',
             'carrier_slug': order['carrier_slug'] or '',
             'warehouse_name': order['warehouse_name'] or '',
@@ -17947,6 +17892,65 @@ def get_pending_outcome_orders():
         })
 
     return jsonify(result)
+
+
+@app.route('/api/shipping/pending-outcome/confirm-returned-batch', methods=['GET', 'POST'])
+@login_required
+@shipper_required
+def batch_confirm_returned_orders():
+    """Preview or confirm every safe carrier-returned order in the user's scope.
+
+    This explicit operator action works independently of the automatic-return
+    switch.  It only writes the local undelivered/loss fields and an attributed
+    audit note; it does not change WooCommerce status, email customers, or
+    regenerate an existing reconciliation statement.
+    """
+    import auto_confirm as outcome_auto_confirm
+
+    visible_sources = get_user_allowed_sources(
+        current_user.id, current_user.is_admin(), current_user.is_viewer()
+    )
+    editable_sources = get_user_editable_sources(current_user)
+    if visible_sources is None:
+        batch_sources = editable_sources
+    elif editable_sources is None:
+        batch_sources = visible_sources
+    else:
+        batch_sources = sorted(set(visible_sources) & set(editable_sources))
+    conn = get_db_connection()
+    try:
+        result = outcome_auto_confirm.confirm_returned_batch(
+            conn,
+            actor_name=current_user.name or current_user.username,
+            actor_user_id=int(current_user.id),
+            allowed_sources=batch_sources,
+            dry_run=(request.method == 'GET'),
+        )
+        if request.method == 'GET':
+            return jsonify({
+                'success': True,
+                'candidates': result['marked'],
+                'shipping_loss': result['shipping_loss'],
+                'shipping_loss_by_currency': result['shipping_loss_by_currency'],
+            })
+
+        remaining = outcome_auto_confirm.returnable_stats(conn, batch_sources)
+        return jsonify({
+            'success': True,
+            'checked': result['checked'],
+            'marked': result['marked'],
+            'skipped': result['skipped'],
+            'shipping_loss': result['shipping_loss'],
+            'shipping_loss_by_currency': result['shipping_loss_by_currency'],
+            'remaining': remaining['candidates'],
+            'message': f"已批量确认 {result['marked']} 个物流退回订单",
+        })
+    except Exception as exc:
+        conn.rollback()
+        app.logger.exception('Batch confirm carrier returns failed')
+        return jsonify({'success': False, 'error': f'批量确认失败：{exc}'}), 500
+    finally:
+        conn.close()
 
 
 @app.route('/api/shipping/pending-outcome/ids-before')
@@ -18730,20 +18734,31 @@ def ship_order():
         """,
         (order_id, tracking_number, carrier_slug),
     ).fetchone()
-    if existing_tracking:
+    if existing_tracking and str(existing_tracking['status'] or '') != 'pending_sync':
         conn.close()
-        if str(existing_tracking['status'] or '') == 'pending_sync':
-            return jsonify({
-                'success': False,
-                'uncertain': True,
-                'retry_safe': False,
-                'error': '该运单已有待核对记录，请勿重复提交；请先完成远端对账。',
-            }), 409
         return jsonify({
             'success': True,
             'idempotent': True,
             'message': '该订单已保存相同运单，本次未再次发货或通知客户。',
         })
+
+    pending_tracking = conn.execute(
+        """SELECT tracking_number,carrier_slug,shipped_at FROM shipping_logs
+           WHERE order_id=? AND status='pending_sync' ORDER BY id DESC LIMIT 1""",
+        (order_id,),
+    ).fetchone()
+    retry_pending_sync = pending_tracking is not None
+    if retry_pending_sync and (
+        not sqlite3.is_postgres_backend()
+        or pending_tracking['tracking_number'] != tracking_number
+        or pending_tracking['carrier_slug'] != carrier_slug
+        or new_parcel or more_batches or is_reship
+    ):
+        conn.close()
+        return jsonify({
+            'success': False, 'uncertain': True, 'retry_safe': False,
+            'error': '该订单有待核对运单，请使用原运单重试同步；不能直接新增或替换包裹。',
+        }), 409
 
     # Customer-facing tracking URL — resolve placeholders from the DB template.
     # No carrier-specific hardcoding here; if a new carrier needs a URL, add a
@@ -18803,6 +18818,9 @@ def ship_order():
             except Exception:
                 pass
         return new_ds
+
+    if retry_pending_sync:
+        new_ds = _shipped_at_unix(pending_tracking['shipped_at'])
 
     prior_parcels = []
     if new_parcel:
@@ -18916,6 +18934,14 @@ def ship_order():
             'reship_reason': reship_reason,
             'items': current_products,
         }
+        if retry_pending_sync:
+            prior = operation_by_key(conn, 'ship_order', str(order['id']), operation_request)
+            if not prior or prior['status'] != 'failed':
+                conn.close()
+                return jsonify({
+                    'success': False, 'uncertain': True, 'retry_safe': False,
+                    'error': '该运单尚未确认同步结果，请勿重复提交；请先完成远端对账。',
+                }), 409
         try:
             external_operation = begin_operation(
                 conn,
@@ -19051,67 +19077,101 @@ def ship_order():
     # before any network call so this request can never retain a DB transaction
     # while waiting for WooCommerce or the mail endpoint.
     conn.close()
-    try:
-        request_url = ast_api_url if ast_api_payload is not None else status_url
-        request_payload = ast_api_payload if ast_api_payload is not None else put_payload
-        request_method = req.post if ast_api_payload is not None else req.put
-        app.logger.info(
-            "[SHIP] start site=%s order=%s fmt=%s user=%s",
-            site['url'], order['id'], fmt, current_user.id,
-        )
-        resp = request_method(
-            request_url,
-            json=request_payload,
-            auth=(site['consumer_key'], site['consumer_secret']),
-            timeout=WC_MUTATION_TIMEOUT,
-            headers=api_headers
-        )
-        remote_http_status = resp.status_code
-        app.logger.info(
-            "[SHIP] response site=%s order=%s fmt=%s status=%s",
-            site['url'], order['id'], fmt, resp.status_code,
-        )
+    if retry_pending_sync:
         try:
-            if _remote_order_applied(resp.json()):
+            check = req.get(
+                status_url, auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=WC_VERIFY_TIMEOUT, headers=api_headers,
+            )
+            if check.status_code != 200:
+                raise ShipmentRetryError('来源站点暂时无法核对运单，请稍后重试同步')
+            remote = check.json()
+            decision = classify_retry_preflight(
+                remote, woo_post_id(order['id']), line_items, tracking_number,
+            )
+            if decision == 'saved':
                 remote_success = True
-                remote_confirmation = 'response_body'
-                if resp.status_code not in (200, 201):
-                    warnings.append(f"远程返回 {resp.status_code}，但返回内容确认运单已写入")
-        except Exception:
-            pass
-        verify_reason = (
-            "成功响应后，二次查询确认运单已写入"
-            if resp.status_code in (200, 201)
-            else f"远程返回 {resp.status_code}，但二次查询确认运单已写入"
-        )
-        if not remote_success and _verify_remote_saved(verify_reason):
-            remote_success = True
-        if not remote_success:
-            body = (resp.text or '')[:300]
-            if resp.status_code in (200, 201):
-                remote_state_uncertain = True
-                warnings.append("成功响应未确认运单已写入，二次查询也未找到该运单号")
-            elif body.lstrip().startswith(('<!', '<html')):
-                remote_state_uncertain = True
-                warnings.append(f"WP 返回 HTML（疑似 WAF 拦截 / 认证失败），HTTP {resp.status_code}")
+                remote_order_status = remote['status']
+                remote_confirmation = 'preflight_get'
+                send_email = False
+                warnings.append('来源站点已有相同运单，本次仅恢复本地记录，未重复发货或通知客户')
+        except Exception as exc:
+            try:
+                _transition_external_operation(
+                    external_operation_id, 'failed',
+                    evidence={'phase': 'retry_preflight', 'write_performed': False},
+                    error='retry preflight did not authorize a new write',
+                )
+            except Exception:
+                app.logger.exception('[SHIP] unable to record rejected retry preflight')
+            return jsonify({
+                'success': False, 'retry_safe': False,
+                'error': str(exc) if isinstance(exc, ShipmentRetryError)
+                         else '来源站点暂时无法核对运单，请稍后重试同步',
+            }), 409
+
+    if not remote_success:
+        try:
+            request_url = ast_api_url if ast_api_payload is not None else status_url
+            request_payload = ast_api_payload if ast_api_payload is not None else put_payload
+            request_method = req.post if ast_api_payload is not None else req.put
+            app.logger.info(
+                "[SHIP] start site=%s order=%s fmt=%s user=%s",
+                site['url'], order['id'], fmt, current_user.id,
+            )
+            resp = request_method(
+                request_url,
+                json=request_payload,
+                auth=(site['consumer_key'], site['consumer_secret']),
+                timeout=WC_MUTATION_TIMEOUT,
+                headers=api_headers
+            )
+            remote_http_status = resp.status_code
+            app.logger.info(
+                "[SHIP] response site=%s order=%s fmt=%s status=%s",
+                site['url'], order['id'], fmt, resp.status_code,
+            )
+            try:
+                if _remote_order_applied(resp.json()):
+                    remote_success = True
+                    remote_confirmation = 'response_body'
+                    if resp.status_code not in (200, 201):
+                        warnings.append(f"远程返回 {resp.status_code}，但返回内容确认运单已写入")
+            except Exception:
+                pass
+            verify_reason = (
+                "成功响应后，二次查询确认运单已写入"
+                if resp.status_code in (200, 201)
+                else f"远程返回 {resp.status_code}，但二次查询确认运单已写入"
+            )
+            if not remote_success and _verify_remote_saved(verify_reason):
+                remote_success = True
+            if not remote_success:
+                body = (resp.text or '')[:300]
+                if resp.status_code in (200, 201):
+                    remote_state_uncertain = True
+                    warnings.append("成功响应未确认运单已写入，二次查询也未找到该运单号")
+                elif body.lstrip().startswith(('<!', '<html')):
+                    remote_state_uncertain = True
+                    warnings.append(f"WP 返回 HTML（疑似 WAF 拦截 / 认证失败），HTTP {resp.status_code}")
+                else:
+                    remote_state_uncertain = resp.status_code >= 500
+                    warnings.append(f"远程返回 {resp.status_code}: {body}")
+        except req.exceptions.RequestException as e:
+            app.logger.warning(
+                "[SHIP] response uncertain site=%s order=%s fmt=%s error=%s",
+                site['url'], order['id'], fmt, e,
+            )
+            # Verify once by GET. Never repeat the write: the first request may have
+            # committed even though its response did not reach this process.
+            if _verify_remote_saved("写入响应超时，但二次查询确认运单已写入"):
+                remote_success = True
             else:
-                remote_state_uncertain = resp.status_code >= 500
-                warnings.append(f"远程返回 {resp.status_code}: {body}")
-    except req.exceptions.RequestException as e:
-        app.logger.warning(
-            "[SHIP] response uncertain site=%s order=%s fmt=%s error=%s",
-            site['url'], order['id'], fmt, e,
-        )
-        # Verify once by GET. Never repeat the write: the first request may have
-        # committed even though its response did not reach this process.
-        if _verify_remote_saved("写入响应超时，但二次查询确认运单已写入"):
-            remote_success = True
-        else:
+                remote_state_uncertain = True
+                warnings.append("远程响应超时，二次查询仍无法确认写入结果")
+        except Exception as e:
             remote_state_uncertain = True
-            warnings.append("远程响应超时，二次查询仍无法确认写入结果")
-    except Exception as e:
-        remote_state_uncertain = True
-        warnings.append(f"远程异常: {e}")
+            warnings.append(f"远程异常: {e}")
 
     if remote_success and external_operation_id:
         try:
@@ -19173,7 +19233,8 @@ def ship_order():
                 if existing_log:
                     local_conn.execute(
                         """UPDATE shipping_logs
-                           SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now'),
+                           SET tracking_number=?, carrier_slug=?, shipped_by=?,
+                               shipped_at=CASE WHEN status='pending_sync' THEN shipped_at ELSE datetime('now') END,
                                items_json=?, is_partial=0, status='pending_sync'
                            WHERE order_id=?""",
                         (tracking_number, carrier_slug, current_user.id, current_items_json, order_id)
@@ -19257,7 +19318,8 @@ def ship_order():
             if existing_log:
                 local_conn.execute(
                     """UPDATE shipping_logs
-                       SET tracking_number=?, carrier_slug=?, shipped_by=?, shipped_at=datetime('now'),
+                       SET tracking_number=?, carrier_slug=?, shipped_by=?,
+                               shipped_at=CASE WHEN status='pending_sync' THEN shipped_at ELSE datetime('now') END,
                            items_json=?, is_partial=0, status='shipped'
                        WHERE order_id=?""",
                     (tracking_number, carrier_slug, current_user.id, current_items_json, order_id)
@@ -21402,7 +21464,7 @@ def print_shipping_label(order_id):
         'customer_note': order['customer_note'] or '',
         'customer_address_2': addr.get('address_2', ''),
         'shipping_method': shipping_method,
-        'products': [{'name': item.get('name', ''), 'qty': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (line_items or [])],
+        'products': [{'name': get_display_product_name(item), 'qty': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (line_items or [])],
         'currency': order['currency'],
         'total': f"{float(order['total'] or 0):.2f} {order['currency']}",
         'shipping_total': f"{float(order['shipping_total'] or 0):.2f}",
@@ -22333,7 +22395,7 @@ def process_shipped_order(order, conn, carriers, ast_provider_mapping):
         'undelivered_note': order['undelivered_note'] if 'undelivered_note' in keys else None,
         'undelivered_by_name': order['undelivered_by_name'] if 'undelivered_by_name' in keys else None,
         'is_problem_return': bool(order['is_problem_return']) if 'is_problem_return' in keys else False,
-        'products': [{'name': item.get('name', ''), 'quantity': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (parse_json_field(order['line_items']) or [])],
+        'products': [{'name': get_display_product_name(item), 'quantity': item.get('quantity', 1), 'total': float(item.get('total', 0))} for item in (parse_json_field(order['line_items']) or [])],
         'shipping_total': float(order['shipping_total'] or 0),
         'product_count': sum(item.get('quantity', 1) for item in (parse_json_field(order['line_items']) or [])),
         'latest_note': (order['latest_note'] if 'latest_note' in keys else '') or '',
@@ -22411,9 +22473,7 @@ def export_orders():
         if isinstance(line_items, list):
             for item in line_items:
                 qty = item.get('quantity', 0)
-                name = item.get('name', 'Unknown')
-                # Extract simplified name if possible or use full name ?? 
-                # For now use the name from line_item
+                name = get_display_product_name(item) or 'Unknown'
                 product_details.append(f"{name} x{qty}")
                 total_quantity += qty
         
@@ -25826,6 +25886,9 @@ def set_order_warehouse(order_id):
     finally:
         conn.close()
 
+
+from stock_sync_api import bp as stock_sync_bp
+app.register_blueprint(stock_sync_bp)
 
 # ─────────────────────── 进销存(库存)模块 ───────────────────────
 # 库存功能拆到独立的 inv_*.py 模块(Blueprint),避免继续膨胀 app.py。

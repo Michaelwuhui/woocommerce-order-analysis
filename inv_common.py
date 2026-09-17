@@ -40,6 +40,9 @@ def get_conn():
 
 
 def _table_exists(conn, name):
+    if hasattr(conn, '_raw'):
+        return bool(conn.execute('''SELECT 1 FROM information_schema.tables
+            WHERE table_schema=current_schema() AND table_name=?''', (name,)).fetchone())
     return bool(conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone())
@@ -216,8 +219,15 @@ def record_movement(conn, *, warehouse_id, sku_id, movement_type,
     if movement_type not in MOVEMENT_TYPES:
         raise ValueError(f'未知的 movement_type: {movement_type}')
 
+    # Serialize with approved receipts/counts and concurrent shipping on PostgreSQL.
+    # A row must exist before locking; creation remains in the caller's transaction.
+    lock_sql = ''
+    if apply_stock and hasattr(conn, '_raw'):
+        conn.execute('''INSERT INTO inv_stock(warehouse_id,sku_id,on_hand,reserved)
+            VALUES (?,?,0,0) ON CONFLICT(warehouse_id,sku_id) DO NOTHING''', (warehouse_id, sku_id))
+        lock_sql = ' FOR UPDATE'
     row = conn.execute(
-        'SELECT on_hand, reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?',
+        'SELECT on_hand, reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?' + lock_sql,
         (warehouse_id, sku_id)
     ).fetchone()
     on_hand_before = row['on_hand'] if row else 0
@@ -250,6 +260,12 @@ def record_movement(conn, *, warehouse_id, sku_id, movement_type,
                 'VALUES (?,?,?,?)',
                 (warehouse_id, sku_id, on_hand_after, reserved_after))
         refresh_restock_notification(conn, warehouse_id, sku_id)
+        if (qty_delta or 0) > 0 and on_hand_after - reserved_after > 0:
+            from inventory_replan import queue_restock_replan
+            queue_restock_replan(
+                conn, warehouse_id=warehouse_id, sku_id=sku_id,
+                movement_id=movement_id, ref_type=ref_type, ref_id=ref_id,
+            )
 
     return movement_id
 
@@ -373,6 +389,25 @@ def explicit_warehouse_permission_ids(capability='can_view'):
         return []
 
 
+def operation_warehouse_ids():
+    """Warehouse-scoped reporting/approval grants also permit viewing that warehouse."""
+    from flask_login import current_user
+    if not getattr(current_user, 'is_authenticated', False):
+        return []
+    conn = get_conn()
+    try:
+        from inv_temporary_access import active_grants
+        ids = {r['warehouse_id'] for r in active_grants(conn, current_user.id)}
+        if not _table_exists(conn, 'inv_operation_permissions'):
+            return sorted(ids)
+        ids.update(int(r[0]) for r in conn.execute('''SELECT warehouse_id FROM inv_operation_permissions
+            WHERE user_id=? AND (can_receive=1 OR can_transfer=1 OR can_stocktake=1 OR can_approve=1)''',
+            (current_user.id,)).fetchall())
+        return sorted(ids)
+    finally:
+        conn.close()
+
+
 def visible_warehouse_ids():
     """当前用户可见仓库范围。None=全部;list=受限(合伙人只看自己仓)。
 
@@ -382,6 +417,7 @@ def visible_warehouse_ids():
     if _is_admin() or can_view_inventory() or can_manage_inventory():
         return None
     scoped = set(explicit_warehouse_permission_ids('can_view'))
+    scoped.update(operation_warehouse_ids())
     if is_partner_user():
         scoped.update(partner_warehouse_ids())
     if scoped:
@@ -406,7 +442,8 @@ def warehouse_scope_clause(col='warehouse_id'):
 def can_view_inventory_any():
     """是否能进入库存模块(任一内部库存角色 或 合伙人)。"""
     return bool(_is_admin() or can_view_inventory() or can_manage_inventory()
-                or is_partner_user())
+                or is_partner_user() or explicit_warehouse_permission_ids('can_view')
+                or operation_warehouse_ids())
 
 
 def _deny(message='您没有权限访问库存管理。', code=403, json=False):

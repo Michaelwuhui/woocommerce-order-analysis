@@ -458,6 +458,17 @@ def _get_stock_state(api_url, ck, cs, product_id, variation_id):
 
 
 def _put_stock(api_url, ck, cs, product_id, variation_id, qty):
+    from stock_sync_guard import legacy_write
+    from stock_sync_common import SyncError
+    try:
+        with legacy_write(_resource_url(api_url, product_id, variation_id),
+                          {"manage_stock": True, "stock_quantity": qty}):
+            return _put_unmanaged_stock(api_url, ck, cs, product_id, variation_id, qty)
+    except SyncError as exc:
+        return False, f'{exc.code}: {exc}'
+
+
+def _put_unmanaged_stock(api_url, ck, cs, product_id, variation_id, qty):
     import requests as req
     from app import _build_product_update_payload, _parse_wc_response
 
@@ -626,6 +637,9 @@ def push_site(
             status = "dry"
             result["dry"] += 1
         else:
+            # Release earlier audit writes before the stock-sync guard acquires
+            # its separate resource lease, including on SQLite.
+            conn.commit()
             status, previous, remote, error = _sync_one_stock(
                 api_url, consumer_key, consumer_secret, item, only_changed=only_changed
             )

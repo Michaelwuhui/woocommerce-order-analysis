@@ -78,10 +78,10 @@ FULFILLMENT_TRANSITIONS = {
 SHIPMENT_TRANSITIONS = {
     "label_pending": {"label_ready", "shipped", "cancelled", "exception"},
     "label_ready": {"shipped", "cancelled", "exception"},
-    "shipped": {"in_transit", "pickup_ready", "delivered", "undelivered", "exception", "expired", "cancelled"},
+    "shipped": {"in_transit", "pickup_ready", "delivered", "returned", "undelivered", "exception", "expired", "cancelled"},
     "not_found": {"shipped", "in_transit", "exception", "expired"},
-    "in_transit": {"pickup_ready", "delivered", "undelivered", "exception", "expired", "returning"},
-    "pickup_ready": {"in_transit", "delivered", "undelivered", "exception", "expired", "returning"},
+    "in_transit": {"pickup_ready", "delivered", "undelivered", "exception", "expired", "returning", "returned"},
+    "pickup_ready": {"in_transit", "delivered", "undelivered", "exception", "expired", "returning", "returned"},
     "undelivered": {"in_transit", "delivered", "returning", "returned", "exception"},
     "exception": {"in_transit", "pickup_ready", "delivered", "returning", "returned"},
     "expired": {"in_transit", "delivered", "returning", "returned"},
@@ -469,9 +469,14 @@ def _apply_managed_transfer_stock_once(
     if quantity <= 0 or _movement_recorded(conn, movement_type, ref_id):
         return
     stock = conn.execute(
-        "SELECT on_hand,reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?",
+        "SELECT on_hand,reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?"
+        + (" FOR UPDATE" if hasattr(conn, "_raw") else ""),
         (warehouse_id, sku_id),
     ).fetchone()
+    # Receipt/stocktake approval may run while a shipper allocates this SKU.
+    # Recheck idempotency and quantities only after acquiring the stock-row lock.
+    if _movement_recorded(conn, movement_type, ref_id):
+        return
     on_hand = int(stock["on_hand"] if stock else 0)
     reserved = int(stock["reserved"] if stock else 0)
     if movement_type == "reserve":
@@ -2384,6 +2389,7 @@ def recompute_order_status(
     *,
     actor: dict | None = None,
     commit: bool = True,
+    enqueue_completion: bool = True,
 ) -> dict:
     state = conn.execute(
         "SELECT * FROM oms_order_fulfillment_state WHERE order_id=?", (order_id,)
@@ -2425,7 +2431,7 @@ def recompute_order_status(
 
     old = state["aggregate_status"]
     completion_status = state["completion_sync_status"]
-    if aggregate == "delivered" and completion_status not in {"pending", "synced"}:
+    if enqueue_completion and aggregate == "delivered" and completion_status not in {"pending", "synced"}:
         completion_status = "pending"
         enqueue_job(
             conn,

@@ -65,6 +65,9 @@ celery_app.conf.update(
         "woo_sync.write_page": {"queue": "sync_write", "routing_key": "sync_write"},
         "woo_sync.post_commit_page": {"queue": "sync_write", "routing_key": "sync_write"},
         "woo_sync.maintenance": {"queue": "sync_write", "routing_key": "sync_write"},
+        "woo_sync.auto_confirm_returned": {"queue": "sync_write", "routing_key": "sync_write"},
+        "woo_sync.auto_confirm_delivered": {"queue": "sync_write", "routing_key": "sync_write"},
+        "woo_sync.confirm_delivered_order": {"queue": "sync_fetch", "routing_key": "sync_fetch"},
         "woo_sync.schedule_auto": {"queue": "sync_write", "routing_key": "sync_write"},
         "woo_sync.schedule_deep": {"queue": "sync_write", "routing_key": "sync_write"},
     },
@@ -72,6 +75,14 @@ celery_app.conf.update(
         "sync-recovery-and-outbox": {
             "task": "woo_sync.maintenance",
             "schedule": 30.0,
+        },
+        "auto-confirm-carrier-returns": {
+            "task": "woo_sync.auto_confirm_returned",
+            "schedule": 60.0,
+        },
+        "auto-confirm-carrier-deliveries": {
+            "task": "woo_sync.auto_confirm_delivered",
+            "schedule": 60.0,
         },
         "automatic-sync-due-check": {
             "task": "woo_sync.schedule_auto",

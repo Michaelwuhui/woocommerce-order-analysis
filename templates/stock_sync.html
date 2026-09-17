@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}跨站库存同步 - 苍赋管理系统{% endblock %}
+{% block content %}
+<style>
+.ss-wrap{max-width:1500px;margin:auto}.ss-card{border:1px solid #475569;border-radius:12px;padding:20px;margin:18px 0;background:rgba(30,41,59,.28)}
+.ss-row{display:flex;gap:14px;flex-wrap:wrap;align-items:center}.ss-row label{display:flex;gap:8px;align-items:center}.ss-row select,.ss-row input[type=text]{min-width:200px;max-width:100%;padding:7px}.ss-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;margin-top:14px}.ss-list label{display:flex;gap:8px;align-items:flex-start}.ss-scroll{overflow:auto;max-height:550px}.ss-table{width:100%;min-width:800px}.ss-table th,.ss-table td{padding:10px;border-bottom:1px solid #475569;vertical-align:top}.ss-muted{color:#94a3b8}.ss-alert{padding:12px;border-radius:8px;background:#334155;color:#f8fafc;white-space:pre-wrap}.ss-bad{color:#fca5a5}.ss-good{color:#86efac}.ss-group{padding:10px;border-bottom:1px solid #475569}.ss-leaves{padding-left:24px;display:flex;flex-direction:column;gap:7px;margin-top:8px}button:disabled{opacity:.45;cursor:not-allowed}.ss-wrap button{margin:3px}.ss-summary{font-size:1.05rem;margin:12px 0}.ss-hidden{display:none!important}
+</style>
+<div class="ss-wrap" id="stock-sync" data-csrf="{{ stock_sync_token }}">
+  <div class="ss-row"><h2>跨站库存同步</h2><a href="/product-manager" class="btn btn-outline-secondary">返回产品管理</a></div>
+  <p class="ss-muted">按已确认的 SKU 映射同步。只有所选商品与目标站点的交集会被修改；仓库实物库存不变。</p>
+  <div id="ss-message" class="ss-alert" role="status" aria-live="polite">正在加载权限和站点…</div>
+  <section class="ss-card"><h4>1 · 操作与来源</h4>
+    <div class="ss-row"><label>操作方式 <select id="ss-operation"><option value="manual_hold">统一设为售完</option><option value="release_hold">解除人工售完并同步</option><option value="quantity">按实际库存同步</option><option value="reference_status">以站点为参照同步状态</option></select></label>
+      <label id="ss-source-wrap" class="ss-hidden">参照站 <select id="ss-source"></select></label>
+      <label id="ss-available-wrap" class="ss-hidden"><input type="checkbox" id="ss-available">确认人工状态商品已恢复供货</label>
+    </div>
+    <div class="ss-row" style="margin-top:12px"><label>操作原因 <input id="ss-reason" type="text" maxlength="500" placeholder="例如：供应商通知本次产品缺货"></label><button id="ss-scan" class="btn btn-primary">读取商品目录</button></div>
+    <p id="ss-scan-info" class="ss-muted" aria-live="polite">读取完成后选择全部款式或部分口味。</p>
+    <div id="ss-controls-wrap" class="ss-hidden"><h5>选择需要解除的具体停售控制</h5><div id="ss-controls" class="ss-list"></div></div>
+  </section>
+  <section class="ss-card"><h4>2 · 选择产品与口味</h4>
+    <div class="ss-row"><input id="ss-search" type="text" aria-label="搜索商品或 SKU" placeholder="搜索款式、口味或 SKU"><button id="ss-all" class="btn btn-outline-primary">全选目录全部产品</button><button id="ss-filtered" class="btn btn-outline-primary">全选当前筛选结果</button><button id="ss-clear" class="btn btn-outline-secondary">清空选择</button></div>
+    <p id="ss-selection" class="ss-summary">尚未选择商品</p><div id="ss-products" class="ss-scroll"></div>
+    <div class="ss-row"><button id="ss-prev" class="btn btn-sm btn-outline-secondary">上一页</button><span id="ss-page"></span><button id="ss-next" class="btn btn-sm btn-outline-secondary">下一页</button></div>
+  </section>
+  <section class="ss-card"><h4>3 · 目标站点范围</h4><div class="ss-row"><label>负责人 <select id="ss-manager"><option value="">全部负责人</option></select></label><label>国家 <select id="ss-country"><option value="">全部国家</option></select></label><button id="ss-select-sites" class="btn btn-outline-primary">选择筛选后的全部站点</button><button id="ss-clear-sites" class="btn btn-outline-secondary">清空目标</button></div><div id="ss-sites" class="ss-list"></div></section>
+  <section class="ss-card"><h4>4 · 差异预览与确认</h4><button id="ss-preview" class="btn btn-primary">生成差异预览</button><p id="ss-plan-summary" class="ss-summary">选择改变后，需要重新生成预览。</p><div id="ss-plan-scope" class="ss-muted"></div><div id="ss-plan" class="ss-scroll"></div><button id="ss-execute" disabled class="btn btn-danger">确认执行所选项目</button></section>
+  <section class="ss-card"><h4>5 · 后台进度与结果</h4><p id="ss-job-summary">尚无执行任务</p><div id="ss-job" class="ss-scroll"></div><button id="ss-cancel" disabled class="btn btn-outline-warning">取消尚未执行项目</button><button id="ss-retry" disabled class="btn btn-outline-primary">为所选失败项生成重试预览</button><p class="ss-muted">关闭页面不影响已排队任务。取消不会撤销已保存的控制或已完成的写入；待核实项目需先完成远端核实。</p><h5>操作记录</h5><div id="ss-history"></div></section>
+  <section id="ss-admin" class="ss-card ss-hidden"><h4>共享参照设置</h4><p class="ss-muted">仅向其他负责人开放商品身份与库存状态读取，不授予目标站写入权限。</p><div id="ss-reference-settings" class="ss-list"></div></section>
+</div>
+<script src="{{ url_for('static', filename='js/stock_sync.js') }}" defer></script>
+{% endblock %}

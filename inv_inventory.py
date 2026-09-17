@@ -22,9 +22,13 @@ from inv_common import (
     get_conn, inv_view_required, inv_manage_required,
     record_movement, current_operator, warehouse_scope_clause,
     replenishment_metrics,
+    _table_exists,
 )
 
 inv_inv_bp = Blueprint('inv_inv', __name__)
+
+from inv_workflows import workflow_bp
+inv_inv_bp.register_blueprint(workflow_bp)
 
 
 # ───────────────────────────── 页面 ─────────────────────────────
@@ -334,6 +338,8 @@ def receive_po(pid):
     uid, uname = current_operator()
     conn = get_conn()
     try:
+        if _table_exists(conn, 'inv_documents'):
+            return jsonify({'error': '请使用“补货收货”提交实收并由另一位负责人审核；旧采购单仅保留查阅。'}), 409
         po = conn.execute('SELECT * FROM inv_purchase_orders WHERE id=?', (pid,)).fetchone()
         if not po:
             return jsonify({'error': '采购单不存在'}), 404
@@ -422,6 +428,8 @@ def adjust_stock():
     uid, uname = current_operator()
     conn = get_conn()
     try:
+        if _table_exists(conn, 'inv_documents'):
+            return jsonify({'error': '请使用“库存盘点”提交实盘数量并审核，不能直接覆盖库存。'}), 409
         cur = conn.execute('SELECT on_hand, reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?', (wid, sku_id)).fetchone()
         on_hand = cur['on_hand'] if cur else 0
         reserved = cur['reserved'] if cur else 0

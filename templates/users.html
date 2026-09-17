@@ -10,6 +10,7 @@
             <p class="text-white-50 mb-0">管理系统用户和权限</p>
         </div>
         <div class="d-flex gap-2">
+            {% if is_super_admin %}<a href="/settings/inventory-access" class="btn btn-outline-warning">临时库存修改授权</a>{% endif %}
             <a href="/settings" class="btn btn-outline-secondary">
                 <i class="bi bi-arrow-left me-1"></i> 返回设置
             </a>

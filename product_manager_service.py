@@ -105,6 +105,16 @@ def product_payload_mismatches(item, payload):
 
 
 def wc_product_update_verified(req, resource_url, auth, payload):
+    from stock_sync_guard import legacy_write
+    from stock_sync_common import SyncError
+    try:
+        with legacy_write(resource_url, payload):
+            return _wc_product_update_verified(req, resource_url, auth, payload)
+    except SyncError as exc:
+        return None, f'{exc.code}: {exc}', {"phases": [], "final_state": None}
+
+
+def _wc_product_update_verified(req, resource_url, auth, payload):
     """Write a product/variation and GET it back before reporting success."""
     headers = {
         "User-Agent": "WooCommerce API Client-Python/3.0.0",

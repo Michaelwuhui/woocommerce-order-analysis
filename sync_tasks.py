@@ -9,7 +9,7 @@ import random
 import socket
 from datetime import datetime
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -134,6 +134,24 @@ def _http_json_list(session, url: str, *, auth, params=None):
                 "User-Agent": "WooCommerce API Client-Python/3.0.0",
             },
         )
+        if response.status_code in {401, 403}:
+            origin = urlsplit(url)
+            target = urlsplit(getattr(response, 'url', '') or '')
+            # Requests drops Basic auth across a bare/www redirect. Only
+            # retry the same HTTPS store alias, retaining the original query.
+            if (origin.scheme == target.scheme == 'https'
+                    and origin.hostname and target.hostname
+                    and origin.hostname != target.hostname
+                    and origin.hostname.removeprefix('www.') == target.hostname.removeprefix('www.')
+                    and origin.port == target.port and origin.path == target.path
+                    and not target.username and not target.password):
+                canonical_url = origin._replace(netloc=target.netloc).geturl()
+                response = session.get(
+                    canonical_url, auth=auth, params=params,
+                    timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
+                    headers={'Accept': 'application/json', 'User-Agent': 'WooCommerce API Client-Python/3.0.0'},
+                    allow_redirects=False,
+                )
     except (requests.Timeout, requests.ConnectionError) as exc:
         raise TransientFetchError(type(exc).__name__) from exc
     status = int(response.status_code)
@@ -982,6 +1000,99 @@ def post_commit_page(self, payload: dict[str, Any]):
 )
 def maintenance():
     return recover_stale_work()
+
+
+@celery_app.task(
+    name="woo_sync.auto_confirm_returned",
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def auto_confirm_returned():
+    """Periodically apply the admin-controlled carrier-return rule.
+
+    The operation is a short, idempotent local database transition and runs on
+    the single write queue. It deliberately does not regenerate reconciliation
+    statements or make a WooCommerce/customer-notification network call.
+    """
+    import auto_confirm
+    from fulfillment_outcome_recovery import recover_terminal_states
+
+    connection = get_connection()
+    try:
+        if not auto_confirm.is_returned_enabled(connection):
+            return {'enabled': False, 'checked': 0, 'marked': 0}
+        recovered = recover_terminal_states(connection, outcome='returned')
+        result = auto_confirm.enforce_returned(
+            connection, actor='celery-beat:auto-return'
+        )
+        return {'enabled': True, 'recovered_states': len(recovered), **result}
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+@celery_app.task(name="woo_sync.auto_confirm_delivered", acks_late=True, reject_on_worker_lost=True)
+def auto_confirm_delivered():
+    """Reconcile parcel evidence, then dispatch bounded, deduplicated I/O work."""
+    import redis
+    import auto_confirm
+    from celery_app import BROKER_URL
+    from carrier_outcome_bridge import reconcile_cached_outcomes
+    from delivery_automation import dispatch_candidates
+    from fulfillment_outcome_recovery import recover_terminal_states
+
+    connection = get_connection()
+    broker = redis.Redis.from_url(BROKER_URL)
+    try:
+        if not auto_confirm.is_enabled(connection):
+            return {'enabled': False, 'dispatched': 0}
+        linked = reconcile_cached_outcomes(connection)
+        recovered = recover_terminal_states(connection, outcome='delivered')
+        prefix = celery_app.conf.broker_transport_options.get('global_keyprefix', '')
+        capacity = max(0, 48 - broker.llen(prefix + 'sync_fetch'))
+        if not capacity:
+            return {"linked_shipments": linked, "recovered_states": len(recovered), "dispatched": 0, "queue_full": True}
+        # Look past already queued rows so a backlog continues to drain.
+        candidates = dispatch_candidates(connection, limit=1000)
+        connection.rollback()
+        dispatched = 0
+        for order_id in candidates:
+            key = "woo-analysis:auto-delivered:queued:" + order_id
+            if not broker.set(key, "1", nx=True, ex=600):
+                continue
+            try:
+                confirm_delivered_order.apply_async(args=[order_id], expires=540)
+            except Exception:
+                broker.delete(key)
+                raise
+            dispatched += 1
+            if dispatched >= capacity:
+                break
+        return {"linked_shipments": linked, "recovered_states": len(recovered), "dispatched": dispatched}
+    finally:
+        connection.close()
+        broker.close()
+
+
+@celery_app.task(name="woo_sync.confirm_delivered_order", acks_late=True,
+                 reject_on_worker_lost=True, soft_time_limit=60, time_limit=75)
+def confirm_delivered_order(order_id):
+    import redis
+    from celery_app import BROKER_URL
+    from delivery_automation import process_delivered_order
+
+    connection = get_connection()
+    try:
+        return process_delivered_order(connection, str(order_id))
+    finally:
+        connection.close()
+        broker = redis.Redis.from_url(BROKER_URL)
+        try:
+            broker.delete("woo-analysis:auto-delivered:queued:" + str(order_id))
+        finally:
+            broker.close()
 
 
 def _sync_settings(*keys: str) -> dict[str, str]:
