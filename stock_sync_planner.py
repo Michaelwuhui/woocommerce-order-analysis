@@ -32,6 +32,8 @@ def create_plan(c,u,data):
     snap = one(c,'SELECT * FROM stock_sync_catalog_snapshots WHERE id=?',(data.get('catalog_snapshot_id'),))
     if not snap or (snap['actor_id'] != u['id'] and not u['superadmin']):
         raise SyncError('FORBIDDEN','无权使用该目录',403)
+    if loads(snap['scope_json']).get('purpose'):
+        raise SyncError('INVALID_INPUT','请使用库存同步商品目录生成预览',400)
     if parse_time(snap['expires_at']) < now():
         raise SyncError('CATALOG_EXPIRED','目录过期，请重新扫描')
     if snap['site_id'] != source_id:

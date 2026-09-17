@@ -17,6 +17,7 @@ from stock_sync_catalog import scan
 from stock_sync_planner import build_plan, evaluate
 from stock_sync_woo import Woo, stock_state
 from stock_sync_jobs import claim, acquire, release, finish, SUCCESS
+import stock_sync_mapping as mapping_assist
 
 
 def control_hash(c,map_id):
@@ -219,7 +220,8 @@ def run_once(c,worker_id,woo=None):
     if not work:
         return False
     try:
-        {'catalog':scan,'plan':build_plan,'publish':process_job}[work['kind']](c,work['object_id'],woo)
+        {'catalog':scan,'plan':build_plan,'publish':process_job,
+         'mapping':mapping_assist.scan,'mapping_confirm':mapping_assist.apply}[work['kind']](c,work['object_id'],woo)
         unresolved = work['kind']=='publish' and one(c,"SELECT id FROM stock_sync_job_items WHERE job_id=? AND status IN ('running','uncertain') LIMIT 1",(work['object_id'],))
         if not unresolved:
             c.execute("UPDATE stock_sync_work SET status='done',heartbeat_at=? WHERE id=?",(stamp(),work['id']));c.commit()
