@@ -695,6 +695,11 @@ def transition_fulfillment(
     )
     if conn.execute("SELECT changes()").fetchone()[0] != 1:
         raise DomainError("履约单被其他操作更新，请刷新后重试", "optimistic_lock")
+    if to_status == "cancelled":
+        conn.execute(
+            """UPDATE oms_fulfillment_items SET cancelled_qty=allocated_qty-fulfilled_qty,
+               updated_at=CURRENT_TIMESTAMP WHERE fulfillment_id=?""", (fulfillment_id,),
+        )
     record_event(
         conn,
         "fulfillment",
@@ -1375,7 +1380,10 @@ def plan_order(
     actor: dict | None = None,
     commit: bool = True,
 ) -> dict:
-    order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    order = conn.execute(
+        "SELECT * FROM orders WHERE id=?" + (" FOR UPDATE" if hasattr(conn, "_raw") else ""),
+        (order_id,),
+    ).fetchone()
     if not order:
         raise DomainError("订单不存在", "order_not_found")
     site = conn.execute("SELECT id, country, url FROM sites WHERE url=?", (order["source"],)).fetchone()
@@ -1390,6 +1398,13 @@ def plan_order(
     old_state = conn.execute(
         "SELECT * FROM oms_order_fulfillment_state WHERE order_id=?", (order_id,)
     ).fetchone()
+    if old_state and old_state["aggregate_status"] == "cancelled":
+        # Includes cancellation awaiting WooCommerce confirmation and orders
+        # with no allocations. A queued planning job must not restart them.
+        if commit:
+            conn.commit()
+        return {"order_id": order_id, "revision": old_state["revision"],
+                "aggregate_status": "cancelled", "action": "locked_noop"}
     old_revision = int(old_state["revision"] if old_state else 0)
     current_fulfillments = conn.execute(
         "SELECT id, status FROM oms_fulfillments WHERE order_id=? AND revision=?",
@@ -2402,7 +2417,9 @@ def recompute_order_status(
         (order_id, revision),
     ).fetchall()
     if not fulfillments:
-        aggregate = "allocation_blocked"
+        aggregate = "cancelled" if state["aggregate_status"] == "cancelled" else "allocation_blocked"
+    elif all(f["status"] == "cancelled" for f in fulfillments):
+        aggregate = "cancelled"
     elif state["manual_review"] or state["has_shortage"]:
         aggregate = "manual_review" if state["manual_review"] else "stock_shortage"
     else:

@@ -858,6 +858,10 @@ def api_cancel_fulfillment(fulfillment_id):
                 "message": "已标记人工处理；请联系对方运营拦截该外部单据",
             }), 202
         # Not yet sent to an external warehouse: local cancellation is final.
+        if fulfillment["mode"] == "internal" and fulfillment["status"] in {"picking", "packed"}:
+            transition_fulfillment(
+                conn, fulfillment_id, "manual_hold", actor=_actor(), reason=reason
+            )
         transition_fulfillment(
             conn, fulfillment_id, "cancelled", actor=_actor(), reason=reason
         )
