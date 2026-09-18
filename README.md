@@ -2,13 +2,15 @@
 
 库存补货、分批实收、仓间调拨、盘点审核和按仓授权的操作说明见 [库存作业流程](INVENTORY_OPERATIONS.md)。
 
+代码以 GitHub `main` 为统一发布基线。2026-09-18 的旧分支整理、遗漏测试与后续开发约定见 [代码统一记录](docs/code-consolidation-20260918.md)。生产使用 PostgreSQL、Redis 和 Celery，配置及运维说明见 [生产手册](deploy/POSTGRES_CELERY_OPERATIONS.md)。
+
 当前版本：`2.1.0`（2026-08-29）
 
 Woo Analysis 是面向多 WooCommerce 独立站的内部订单运营系统。它把订单同步、订单分析、人工发货、库存映射、多仓履约、物流跟踪、客户通知、COD 分配与供应商对账集中在同一套数据和权限体系中。
 
 本仓库不只是数据看板。`v2.0.0` 的核心变化是引入可审计的多仓履约领域模型，同时保留波兰人工合作仓“选择承运商 + 录入运单号”的简单操作体验。
 
-> 本项目包含真实订单与外部系统集成能力。任何生产部署都必须使用仓库外的密钥文件、先备份 SQLite 数据库、先验证迁移，再开启 WMS 自动提交或客户通知。
+> 本项目包含真实订单与外部系统集成能力。生产部署使用仓库外的密钥文件；变更前备份代码和 PostgreSQL 数据库、验证恢复清单。启用 WMS 自动提交或客户通知需要对应业务授权。
 
 ## v2.1.0 重点能力
 
@@ -55,7 +57,7 @@ Gunicorn + Flask (app.py)
   ├── 发货、AST 与物流查询
   └── 通知、商品克隆和只读集成 API
   │
-SQLite (woocommerce_orders.db)
+PostgreSQL（业务状态） + Redis/Celery（同步任务）
   ├── WooCommerce REST API
   ├── 履约后台任务 / 商品克隆任务
   ├── 匈牙利 WMS / 新波兰 WMS（受开关控制）
@@ -152,13 +154,13 @@ Order
 - 人工发货员：使用原有发货弹窗，看到本次发货仓提示，只录入承运商和运单号。
 - 管理型操作：库存调整、映射批量确认、WMS 配置、手工重试等使用独立权限。
 - Woo 库存同步：超级管理员控制全局和批量开关；库存管理员按站点授权范围配置，库存查看者只可演练，仓库合作方不能进入。
-- 邮件中心只读 API：独立文件令牌、站点白名单和只读数据库连接，不复用 Web 登录态。
+- 邮件中心只读 API：独立文件令牌、站点白名单和受限字段查询，不复用 Web 登录态。
 
 ## 数据库与迁移
 
-默认数据库是项目目录下的 `woocommerce_orders.db`。Worker 可通过 `OMS_DB_FILE`/`INV_DB_FILE` 指向同一数据库。
+生产 Web 和 Worker 通过受保护配置中的 `WOO_DB_BACKEND=postgres` 与 `WOO_DB_*` 连接同一 PostgreSQL 数据库；目录中的旧 `woocommerce_orders.db` 不代表当前生产数据。迁移与恢复按 [生产手册](deploy/POSTGRES_CELERY_OPERATIONS.md) 执行。
 
-基础订单表由主初始化脚本和应用启动过程维护；库存与履约表由 `inv_migrations.py` 管理。当前迁移版本到 `021 per_site_automatic_inventory_sync`。
+SQLite 保留为离线兼容与单元测试后端。下面的 `inv_migrations.py` 命令仅用于已备份的离线 SQLite 数据库：
 
 ```bash
 # 查看迁移状态（只读）
@@ -171,7 +173,7 @@ python inv_migrations.py up
 python inv_migrations.py down
 ```
 
-迁移命令会生成数据库副本，但生产发布仍应先用 SQLite 在线备份脚本制作独立、校验过的备份。
+生产发布前使用 PostgreSQL 备份并检查 `pg_restore --list`；不要把 SQLite 备份当作当前生产库备份。
 
 ## 安装与本地运行
 
@@ -227,7 +229,7 @@ systemd 示例位于 `deploy/woo-fulfillment-worker.service` 和 `deploy/woo-pro
 | `WOO_DB_*` | PostgreSQL 最小权限应用连接；真实密码只存于 0600 环境文件 |
 | `CELERY_BROKER_URL` | 仅指向本机 Redis 的 Celery broker URL |
 | `WOO_SYNC_*` | 同步超时、IPv4、心跳与恢复参数 |
-| `OMS_DB_FILE`, `INV_DB_FILE` | 订单/履约数据库绝对路径 |
+| `OMS_DB_FILE`, `INV_DB_FILE` | SQLite 离线兼容路径；PostgreSQL 使用 `WOO_DB_*` |
 | `WMS_BASE_URL`, `WMS_SALT` | 匈牙利 WMS 地址与签名密钥 |
 | `WMS_WEBHOOK_TOKEN` | WMS 回调独立令牌 |
 | `WMS_ALLOW_INSECURE_HTTP` | 明文 HTTP 风险开关，默认必须为 `0` |
@@ -240,28 +242,29 @@ systemd 示例位于 `deploy/woo-fulfillment-worker.service` 和 `deploy/woo-pro
 | `ORDER_NOTIFICATION_IMAGE_DIR` | 私有订单图片目录，不得放在公开静态目录 |
 | `ORDER_NOTIFICATION_CHROMIUM_PATH` | Chromium 可执行文件路径 |
 | `MAIL_CENTER_ORDER_API_TOKEN_FILE` | 邮件中心 API 的只读令牌文件 |
-| `MAIL_CENTER_ORDER_DB_PATH` | 邮件中心只读数据库路径 |
+| `MAIL_CENTER_ORDER_DB_PATH` | 仅 SQLite 离线测试使用；生产沿用 PostgreSQL 连接配置 |
 | `MAIL_CENTER_ORDER_ALLOWED_SITES` | 邮件中心允许访问的站点白名单 |
 
 示例文件：
 
 - `deploy/fulfillment.env.example`
 - `deploy/order-notification.env.example`
+- `deploy/mail-center-readonly.env.example`
 - `deploy/validate_wms_env.sh`
 
 ## 测试
 
-完整回归测试不访问真实 WMS，也不会创建真实发货单：
+离线单元测试使用临时 SQLite 数据库和模拟外部响应。PostgreSQL 集成测试在此命令中跳过，需另行使用空测试库运行，步骤见 [代码统一记录](docs/code-consolidation-20260918.md)：
 
 ```bash
-python -m pytest -q tests
+WOO_DB_BACKEND=sqlite python -m pytest -q
+node --test tests/site_api_checks.test.cjs
 ```
 
 发布前最低检查：
 
 ```bash
 python -m py_compile app.py fulfillment_worker.py product_clone_worker.py
-python inv_migrations.py status
 git diff --check
 ```
 

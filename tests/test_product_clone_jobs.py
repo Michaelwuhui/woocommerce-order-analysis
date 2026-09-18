@@ -50,6 +50,7 @@ def enqueue(conn, product_ids=(11, 12)):
             "include_variations": True,
             "include_images": True,
             "status_on_target": "draft",
+            "collision_mode": "skip_existing",
         },
         target_url="https://target.example",
         created_by_id="1",
@@ -63,6 +64,7 @@ def test_enqueue_claim_and_serialize(tmp_path):
     assert queued["status"] == "queued"
     assert queued["product_ids"] == [11, 12]
     assert queued["options"]["status_on_target"] == "draft"
+    assert queued["options"]["collision_mode"] == "skip_existing"
     assert queued["terminal"] is False
 
     claimed = claim_clone_job(conn, "test-worker")
@@ -145,4 +147,31 @@ def test_worker_site_resolver_does_not_require_flask_current_user(tmp_path):
     )
     assert site["id"] == 35
     assert (api_url, ck, cs) == ("https://source.example", "ck", "cs")
+    conn.close()
+
+
+def test_serialized_counts_separate_created_from_skipped(tmp_path):
+    conn = make_conn(tmp_path)
+    queued = enqueue(conn, product_ids=(11, 12))
+    job = claim_clone_job(conn, "test-worker")
+
+    def resolve_site(_conn, site_id):
+        return ({"id": site_id}, f"https://site-{site_id}.example", "ck", "cs")
+
+    def clone_one(_su, _sck, _scs, _tu, _tck, _tcs, product_id, _options):
+        return {
+            "new_id": 1000 + product_id,
+            "name": f"Product {product_id}",
+            "sku": f"SKU-{product_id}",
+            "permalink": "",
+            "warnings": [],
+            "skipped_existing": product_id == 12,
+        }
+
+    process_clone_job(conn, job, clone_one=clone_one, resolve_site=resolve_site)
+    saved = get_clone_job(conn, queued["id"])
+    assert saved["success_count"] == 2
+    assert saved["created_count"] == 1
+    assert saved["skipped_count"] == 1
+    assert saved["failed_count"] == 0
     conn.close()

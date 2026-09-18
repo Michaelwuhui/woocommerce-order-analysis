@@ -1,123 +1,60 @@
-import shutil
-import sqlite3
-import threading
-from pathlib import Path
+"""Settings permissions through real routes on an empty PostgreSQL schema copy."""
+import os
 
 import pytest
+import requests
 
-import app as app_module
-from sync_runtime_status import save_sync_runtime_status
-
-
-ROOT = Path(__file__).resolve().parents[1]
+import db_backend as db
+import sync_service
 
 
-class _PausedThread:
-    def __init__(self, *args, **kwargs):
-        self.args = args
-        self.kwargs = kwargs
-
-    def start(self):
-        return None
+pytestmark = pytest.mark.skipif(
+    not db.is_postgres_backend(), reason="isolated PostgreSQL required"
+)
 
 
 @pytest.fixture()
-def permission_app(tmp_path, monkeypatch):
-    db_path = tmp_path / "site-sync-permissions.db"
-    shutil.copyfile(ROOT / "woocommerce_orders.db", db_path)
-    monkeypatch.setattr(app_module, "DB_FILE", str(db_path))
-    monkeypatch.setattr(threading, "Thread", _PausedThread)
+def permission_app(monkeypatch):
+    test_database = os.environ.get("WOO_DB_NAME_OVERRIDE", "")
+    assert test_database.startswith("woo_return_loss_test_"), "Use an empty isolated test database"
+    monkeypatch.setattr(requests.sessions.Session, "request",
+                        lambda *a, **k: pytest.fail("Real network calls forbidden"))
+    monkeypatch.setattr(sync_service, "publish_pending_outbox", lambda **kw: 0)
+    import app as app_module
     app_module.app.config.update(TESTING=True)
-    app_module.SYNC_STATUS.clear()
-
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    existing_user_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()
-    }
-    for column in (
-        "can_view_report",
-        "can_view_inventory",
-        "can_manage_inventory",
-        "can_view_reconciliation",
-        "can_edit_reconciliation",
-        "can_view_costs",
-        "can_edit_costs",
-        "can_manage_blocklist",
-        "can_manage_products",
-        "can_manage_own_products",
-        "can_view_own_sales_board",
-        "can_view_shipping",
-    ):
-        if column not in existing_user_columns:
-            conn.execute(f"ALTER TABLE users ADD COLUMN {column} INTEGER DEFAULT 0")
-    existing_site_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(sites)").fetchall()
-    }
-    for definition in (
-        "mask_id TEXT",
-        "api_read_status TEXT",
-        "api_write_status TEXT",
-    ):
-        column = definition.split()[0]
-        if column not in existing_site_columns:
-            conn.execute(f"ALTER TABLE sites ADD COLUMN {definition}")
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS exchange_rates (
-            id INTEGER PRIMARY KEY,
-            year_month TEXT,
-            currency TEXT,
-            rate_to_cny REAL,
-            updated_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS product_masters (
-            id INTEGER PRIMARY KEY,
-            label TEXT,
-            url TEXT,
-            consumer_key TEXT,
-            api_status TEXT,
-            last_api_error TEXT,
-            last_tested_at TEXT,
-            created_at TEXT,
-            updated_at TEXT
-        );
-        """
-    )
-    conn.execute("DELETE FROM users")
-    conn.execute("DELETE FROM sites")
-    conn.execute("DELETE FROM sync_runtime_status")
+    conn = db.connect()
+    assert conn.execute("SELECT current_database()").fetchone()[0] == test_database
+    # These tests own only synthetic users/sites. No SQLite business snapshot is needed.
+    for table in ("sync_task_outbox", "sync_runs"):
+        conn.execute(f"DELETE FROM {table}")
     users = [
-        (1, "admin", "Admin", "admin", 1, 0),
-        (2, "alice", "金毅", "user", 0, 1),
-        (3, "bob", "王渝淞", "user", 0, 1),
-        (4, "plain", "无权限", "user", 0, 0),
-        (5, "operator-admin", "运营管理员", "admin", 1, 0),
+        (1, "admin", "Admin", "admin", True, False),
+        (2, "alice", "Alice Test", "user", False, True),
+        (3, "bob", "Bob Test", "user", False, True),
+        (4, "plain", "No Permission", "user", False, False),
+        (5, "operator-admin", "Operator Test", "admin", True, False),
     ]
-    conn.executemany(
-        """
-        INSERT INTO users (
-            id, username, password_hash, name, role,
-            can_manage_users, can_manage_own_site_sync
-        ) VALUES (?, ?, 'test-only', ?, ?, ?, ?)
-        """,
-        users,
-    )
-    conn.executemany(
-        """
-        INSERT INTO sites (
-            id, url, consumer_key, consumer_secret, manager, country, last_sync
-        ) VALUES (?, ?, ?, ?, ?, 'PL', '2026-09-01 12:00:00')
-        """,
-        [
-            (11, "https://alice.example", "ck_alice_secret", "cs_alice_secret", "金毅"),
-            (22, "https://bob.example", "ck_bob_secret", "cs_bob_secret", "王渝淞"),
-        ],
-    )
+    for row in users:
+        conn.execute("""
+            INSERT INTO users (id,username,password_hash,name,role,
+                               can_manage_users,can_manage_own_site_sync)
+            VALUES (?,?,'test-only',?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,
+                can_manage_users=excluded.can_manage_users,
+                can_manage_own_site_sync=excluded.can_manage_own_site_sync
+        """, row)
+    for row in [
+        (11, "https://alice.example.invalid", "ck_alice_secret", "cs_alice_secret", "Alice Test"),
+        (22, "https://bob.example.invalid", "ck_bob_secret", "cs_bob_secret", "Bob Test"),
+    ]:
+        conn.execute("""
+            INSERT INTO sites (id,url,consumer_key,consumer_secret,manager,country,last_sync)
+            VALUES (?,?,?,?,?,'PL','2026-09-01 12:00:00')
+            ON CONFLICT(id) DO UPDATE SET manager=excluded.manager
+        """, row)
     conn.commit()
     conn.close()
     yield app_module.app
-    app_module.SYNC_STATUS.clear()
 
 
 def _client_for(flask_app, user_id):
@@ -176,41 +113,37 @@ def test_own_site_sync_is_allowed_but_cross_site_and_global_sync_are_denied(perm
     other = client.post("/api/sync", json={"site_id": 22})
     global_sync = client.post("/api/sync/all", json={})
 
-    assert own.status_code == 200
+    assert own.status_code == 202
     assert other.status_code == 403
     assert global_sync.status_code == 403
 
 
-def test_deep_and_clean_sync_create_site_bound_status(permission_app):
+def test_deep_sync_creates_site_bound_status(permission_app):
     client = _client_for(permission_app, 2)
+    response = client.post("/api/sync/deep/11")
+    assert response.status_code == 202
+    status_id = response.get_json()["sync_id"]
+    status = client.get(f"/api/sync/status/{status_id}")
+    assert status.status_code == 200
+    assert [site["site_id"] for site in status.get_json()["sites"]] == [11]
 
-    deep = client.post("/api/sync/deep/11")
-    clean = client.post("/api/sync/clean/11")
 
-    assert deep.status_code == 200
-    assert clean.status_code == 200
-    for response in (deep, clean):
-        status_id = response.get_json()["sync_id"]
-        status = client.get(f"/api/sync/status/{status_id}")
-        assert status.status_code == 200
-        assert status.get_json()["site_id"] == 11
+def test_destructive_clean_sync_stays_disabled_on_postgres(permission_app):
+    client = _client_for(permission_app, 2)
+    response = client.post("/api/sync/clean/11")
+    assert response.status_code == 409
+    assert "停用" in response.get_json()["error"]
+    conn = db.connect()
+    assert conn.execute("SELECT COUNT(*) FROM sync_runs").fetchone()[0] == 0
+    conn.close()
 
 
 def test_sync_status_cannot_be_read_through_another_owned_site(permission_app):
-    conn = sqlite3.connect(app_module.DB_FILE)
-    save_sync_runtime_status(
-        conn,
-        1234567,
-        {
-            "site_id": 22,
-            "status": "running",
-            "message": "Bob site",
-            "logs": ["private status"],
-        },
+    status, created = sync_service.start_sync(
+        mode="quick", created_by="pytest:permissions", site_ids=[22], publish=False
     )
-    conn.close()
-
-    response = _client_for(permission_app, 2).get("/api/sync/status/1234567")
+    assert created
+    response = _client_for(permission_app, 2).get(f"/api/sync/status/{status['run_id']}")
 
     assert response.status_code == 403
     assert "private status" not in response.get_data(as_text=True)
@@ -219,7 +152,7 @@ def test_sync_status_cannot_be_read_through_another_owned_site(permission_app):
 def test_only_super_admin_can_grant_or_revoke_own_site_sync(permission_app):
     super_admin = _client_for(permission_app, 1)
     base_payload = {
-        "name": "金毅",
+        "name": "Alice Test",
         "role": "user",
         "can_manage_own_site_sync": 1,
         "reconciliation_scope": "all",
@@ -231,11 +164,11 @@ def test_only_super_admin_can_grant_or_revoke_own_site_sync(permission_app):
     operator_admin = _client_for(permission_app, 5)
     attempted_revoke = operator_admin.put(
         "/api/users/2",
-        json={"name": "金毅", "role": "user", "can_manage_own_site_sync": 0},
+        json={"name": "Alice Test", "role": "user", "can_manage_own_site_sync": 0},
     )
     assert attempted_revoke.status_code == 200
 
-    conn = sqlite3.connect(app_module.DB_FILE)
+    conn = db.connect()
     stored = conn.execute(
         "SELECT can_manage_own_site_sync FROM users WHERE id=2"
     ).fetchone()[0]
@@ -247,7 +180,7 @@ def test_permission_cannot_be_granted_without_an_owned_site(permission_app):
     response = _client_for(permission_app, 1).put(
         "/api/users/4",
         json={
-            "name": "无权限",
+            "name": "No Permission",
             "role": "user",
             "can_manage_own_site_sync": 1,
             "reconciliation_scope": "all",
