@@ -8702,47 +8702,6 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
                     'resumed_existing_clone': clone_as_new,
                 }
 
-        # A timed-out web request may already have created the target product.
-        # Reusing the exact SKU makes retries safe and prevents unwanted -COPY
-        # duplicates.  Drafts are also given a best-effort inline-image repair,
-        # because that is the final phase most likely to be cut off by timeout.
-        try:
-            existing_resp = req.get(
-                f'{tgt_url}/wp-json/wc/v3/products',
-                auth=(tgt_ck, tgt_cs), params={'sku': src_sku, 'per_page': 10},
-                timeout=30, headers=_WC_HEADERS,
-            )
-            existing_products, existing_err = _parse_wc_response(existing_resp)
-        except Exception as e:
-            existing_products, existing_err = None, str(e)
-        if not existing_err and isinstance(existing_products, list):
-            existing = next(
-                (p for p in existing_products
-                 if (p.get('sku') or '').strip().casefold() == src_sku.casefold()),
-                None,
-            )
-            if existing and existing.get('id'):
-                warnings.append(
-                    f'SKU "{src_sku}" 已存在于目标站产品 #{existing["id"]}，'
-                    '已跳过创建以避免重复'
-                )
-                if options.get('include_images') and existing.get('status') == 'draft':
-                    try:
-                        _migrate_inline_images_after_clone(
-                            src, existing, src_url, tgt_url, tgt_ck, tgt_cs,
-                            existing['id'], warnings,
-                        )
-                    except Exception as e:
-                        warnings.append(f'现有草稿文案内图片修复异常：{e}')
-                return {
-                    'new_id': existing['id'],
-                    'name': existing.get('name'),
-                    'sku': existing.get('sku', ''),
-                    'permalink': existing.get('permalink', ''),
-                    'warnings': warnings,
-                    'skipped_existing': True,
-                }
-
     # Images — WC fetches these from URL on POST
     if options.get('include_images'):
         imgs = src.get('images') or []
