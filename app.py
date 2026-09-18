@@ -20481,23 +20481,17 @@ def update_order_status(order_id):
             conn.close()
             return jsonify({'success': False, 'error': completion_error}), 409
     if has_fulfillment and new_status == 'cancelled':
-        shipped = conn.execute(
-            "SELECT COUNT(*) AS n FROM oms_fulfillments WHERE order_id=? AND status IN ('shipped','delivered')",
-            (order_id,),
-        ).fetchone()['n']
-        if shipped:
-            from fulfillment_service import mark_manual_review
-            mark_manual_review(
-                conn, order_id, '已有仓库发货，整单取消必须人工处理',
+        from fulfillment_api import _allowed_warehouse_ids
+        from order_cancellation import cancel_fulfillment_order
+        try:
+            result, http_status = cancel_fulfillment_order(
+                conn, order_id,
                 actor={'type': 'user', 'id': current_user.id, 'name': current_user.name},
+                allowed_warehouse_ids=_allowed_warehouse_ids('can_cancel'),
             )
+            return jsonify(result), http_status
+        finally:
             conn.close()
-            return jsonify({'success': False, 'error': '已有仓库发货，订单已标记人工处理'}), 409
-        conn.close()
-        return jsonify({
-            'success': False,
-            'error': '该订单已启用多仓履约，请先在「多仓履约」逐仓取消'
-        }), 409
 
     old_status = order['status']
     

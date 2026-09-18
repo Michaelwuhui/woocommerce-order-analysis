@@ -1956,7 +1956,10 @@
                 'completed': '已完成', 'cancelled': '已取消', 'refunded': '已退款', 'failed': '失败', 'checkout-draft': '草稿'
             };
 
-            if (!confirm('确定要将订单状态修改为 "' + (statusLabels[newStatus] || newStatus) + '" 吗？\n\n此操作将同步到WooCommerce后台，并添加订单备注记录。')) {
+            var confirmation = newStatus === 'cancelled'
+                ? '确定取消整个订单吗？\n\n系统会一并取消尚未发货、未提交外部仓的履约，释放预留库存，并同步网站订单状态。已有发货或外仓待核验记录时，会提示具体处理方式。'
+                : '确定要将订单状态修改为 "' + (statusLabels[newStatus] || newStatus) + '" 吗？\n\n此操作将同步到WooCommerce后台，并添加订单备注记录。';
+            if (!confirm(confirmation)) {
                 return;
             }
 
