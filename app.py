@@ -16484,6 +16484,60 @@ def get_product_samples():
 
 
 
+@app.route('/api/settings/return-shipping-loss', methods=['GET', 'POST'])
+@login_required
+def return_shipping_loss_settings_api():
+    if not _can_manage_all_settings(current_user):
+        return jsonify({'error': '无系统设置管理权限'}), 403
+    from return_shipping_loss import load_policy, save_policy, PolicyConflict
+    conn = get_db_connection()
+    try:
+        if request.method == 'POST':
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({'error': '请提交有效的规则列表'}), 400
+            result = save_policy(conn, data.get('rules'), data.get('version'))
+            conn.commit()
+        else:
+            result = load_policy(conn)
+        result['warehouses'] = [dict(r) for r in conn.execute(
+            'SELECT id,name,country,default_currency,is_active FROM warehouses ORDER BY id'
+        ).fetchall()]
+        return jsonify(result)
+    except PolicyConflict as exc:
+        conn.rollback()
+        return jsonify({'error': str(exc)}), 409
+    except ValueError as exc:
+        conn.rollback()
+        return jsonify({'error': str(exc)}), 400
+    finally:
+        conn.close()
+
+
+@app.route('/api/order/<order_id>/return-shipping-loss', methods=['GET'])
+@login_required
+@shipper_required
+@order_site_editable
+def return_shipping_loss_quote_api(order_id):
+    from return_shipping_loss import quote_loss
+    conn = get_db_connection()
+    try:
+        order = conn.execute('SELECT * FROM orders WHERE id=?', (order_id,)).fetchone()
+        if not order:
+            return jsonify({'error': '订单不存在'}), 404
+        result = quote_loss(conn, order)
+        # Both return flags share one loss field. Preserve a loss already
+        # recorded when adding a problem-return classification.
+        if order['is_undelivered'] or order['is_problem_return']:
+            result.update(amount=float(order['shipping_loss_amount'] or 0),
+                          message='沿用该订单已记录的运费损失；可按实际情况修改')
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    finally:
+        conn.close()
+
+
 @app.route('/api/settings', methods=['GET', 'POST'])
 @login_required
 def settings_api():
@@ -20652,19 +20706,12 @@ def mark_order_undelivered(order_id):
     import requests as req
 
     data = request.get_json(silent=True) or {}
-    raw_amount = data.get('shipping_loss_amount', 0)
+    raw_amount = data.get('shipping_loss_amount')
     note_text = (data.get('note') or '').strip()
-
-    try:
-        loss_amount = float(raw_amount or 0)
-    except (TypeError, ValueError):
-        return jsonify({'success': False, 'error': '运费损失金额格式不正确'}), 400
-    if loss_amount < 0:
-        return jsonify({'success': False, 'error': '运费损失金额不能为负数'}), 400
 
     conn = get_db_connection()
     order = conn.execute(
-        'SELECT id, number, source, is_undelivered FROM orders WHERE id = ?',
+        'SELECT * FROM orders WHERE id = ?',
         (order_id,)
     ).fetchone()
     if not order:
@@ -20674,6 +20721,14 @@ def mark_order_undelivered(order_id):
     if order['is_undelivered']:
         conn.close()
         return jsonify({'success': False, 'error': '该订单已被标记为未送达'}), 409
+
+    from return_shipping_loss import money, required_loss
+    try:
+        loss_amount = (float(money(raw_amount)) if 'shipping_loss_amount' in data
+                       else required_loss(conn, order))
+    except ValueError as exc:
+        conn.close()
+        return jsonify({'success': False, 'error': str(exc)}), 400
 
     try:
         conn.execute('''
@@ -21211,7 +21266,7 @@ def mark_order_problem_return(order_id):
     data = request.get_json(silent=True) or {}
     return_type = (data.get('type') or '').strip()
     raw_amount = data.get('product_loss_amount', 0)
-    raw_shipping_loss = data.get('shipping_loss_amount', 0)
+    raw_shipping_loss = data.get('shipping_loss_amount')
     note_text = (data.get('note') or '').strip()
     evidence_text = (data.get('evidence') or '').strip()
 
@@ -21223,16 +21278,9 @@ def mark_order_problem_return(order_id):
         return jsonify({'success': False, 'error': '货值损失金额格式不正确'}), 400
     if loss_amount < 0:
         return jsonify({'success': False, 'error': '货值损失金额不能为负数'}), 400
-    try:
-        shipping_loss = float(raw_shipping_loss or 0)
-    except (TypeError, ValueError):
-        return jsonify({'success': False, 'error': '运费损失金额格式不正确'}), 400
-    if shipping_loss < 0:
-        return jsonify({'success': False, 'error': '运费损失金额不能为负数'}), 400
-
     conn = get_db_connection()
     order = conn.execute(
-        'SELECT id, number, source, is_problem_return FROM orders WHERE id = ?',
+        'SELECT * FROM orders WHERE id = ?',
         (order_id,)
     ).fetchone()
     if not order:
@@ -21241,6 +21289,15 @@ def mark_order_problem_return(order_id):
     if order['is_problem_return']:
         conn.close()
         return jsonify({'success': False, 'error': '该订单已被标记为问题退货'}), 409
+
+    from return_shipping_loss import money, required_loss
+    try:
+        shipping_loss = (float(money(raw_shipping_loss)) if 'shipping_loss_amount' in data
+                         else float(order['shipping_loss_amount'] or 0) if order['is_undelivered']
+                         else required_loss(conn, order))
+    except ValueError as exc:
+        conn.close()
+        return jsonify({'success': False, 'error': str(exc)}), 400
 
     type_label = PROBLEM_RETURN_TYPES[return_type]
     try:

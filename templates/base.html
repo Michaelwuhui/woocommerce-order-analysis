@@ -401,7 +401,7 @@
                         <label class="form-label text-white-50">运费损失金额 <span id="problemReturnShippingCurrencyLabel" class="text-muted"></span></label>
                         <input type="number" step="0.01" min="0" class="form-control bg-dark text-white border-secondary"
                             id="problemReturnShippingLoss" placeholder="往返运费等运输环节的损失（无则填 0）">
-                        <small class="text-muted">问题退货同样产生的运费损失（与未送达运费损失统一汇总）</small>
+                        <small class="text-muted" id="problemReturnShippingHint">问题退货同样产生的运费损失（与未送达运费损失统一汇总）</small>
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">证据编号 / 位置</label>
@@ -1995,11 +1995,21 @@
                 });
         }
 
-        function openMarkUndeliveredDialog(orderId, currency) {
-            var raw = prompt('运费损失金额（' + (currency || '') + '）：', '0');
+        async function fetchReturnShippingLoss(orderId) {
+            const response = await fetch('/api/order/' + encodeURIComponent(orderId) + '/return-shipping-loss');
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || '退件运费规则加载失败');
+            return data;
+        }
+
+        async function openMarkUndeliveredDialog(orderId, currency) {
+            let quote;
+            try { quote = await fetchReturnShippingLoss(orderId); }
+            catch (error) { alert(error.message); return; }
+            var raw = prompt(quote.message + '\n运费损失金额（' + (currency || '') + '）：', quote.amount == null ? '' : quote.amount.toFixed(2));
             if (raw === null) return;
-            var amount = parseFloat(String(raw).replace(',', '.'));
-            if (isNaN(amount) || amount < 0) {
+            var amount = Number(String(raw).replace(',', '.'));
+            if (!String(raw).trim() || !Number.isFinite(amount) || amount < 0) {
                 alert('金额格式不正确');
                 return;
             }
@@ -2051,7 +2061,10 @@
                 .catch(function (err) { alert('请求失败: ' + err.message); });
         }
 
-        function openProblemReturnModal(orderId, orderNumber, currency) {
+        async function openProblemReturnModal(orderId, orderNumber, currency) {
+            let quote;
+            try { quote = await fetchReturnShippingLoss(orderId); }
+            catch (error) { alert(error.message); return; }
             document.getElementById('problemReturnOrderId').value = orderId;
             document.getElementById('problemReturnOrderInfo').innerHTML = '<strong>#' + orderNumber + '</strong>';
             var curLabel = currency ? '(' + currency + ')' : '';
@@ -2059,7 +2072,8 @@
             document.getElementById('problemReturnShippingCurrencyLabel').textContent = curLabel;
             document.getElementById('problemReturnType').value = 'swap';
             document.getElementById('problemReturnLossAmount').value = '';
-            document.getElementById('problemReturnShippingLoss').value = '';
+            document.getElementById('problemReturnShippingLoss').value = quote.amount == null ? '' : quote.amount.toFixed(2);
+            document.getElementById('problemReturnShippingHint').textContent = quote.message;
             document.getElementById('problemReturnEvidence').value = '';
             document.getElementById('problemReturnNote').value = '';
             bootstrap.Modal.getOrCreateInstance(document.getElementById('problemReturnModal')).show();
@@ -2073,13 +2087,13 @@
             var evidence = document.getElementById('problemReturnEvidence').value.trim();
             var note = document.getElementById('problemReturnNote').value.trim();
             var lossAmount = parseFloat(lossRaw || '0');
-            var shippingLoss = parseFloat(shipLossRaw || '0');
+            var shippingLoss = Number(shipLossRaw);
 
             if (isNaN(lossAmount) || lossAmount < 0) {
                 alert('请输入合法的货值损失金额（≥ 0）');
                 return;
             }
-            if (isNaN(shippingLoss) || shippingLoss < 0) {
+            if (!shipLossRaw || !Number.isFinite(shippingLoss) || shippingLoss < 0) {
                 alert('请输入合法的运费损失金额（≥ 0）');
                 return;
             }

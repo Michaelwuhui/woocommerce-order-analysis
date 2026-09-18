@@ -11,8 +11,8 @@ automatically confirmed — the unattended equivalent of a human clicking 已签
 Delivery and return automation have independent, default-OFF switches.  The
 delivery path only touches carrier-confirmed deliveries.  The return path only
 touches ``carrier_status='returned'`` orders and mirrors the human ``拒收``
-action: it marks the order undelivered and uses the order shipping fee as the
-shipping loss.  attention / in_transit / unknown / problem-return outcomes are
+action: it marks the order undelivered and uses the configured return freight
+policy (falling back to the order shipping fee). attention / in_transit / unknown / problem-return outcomes are
 never auto-resolved.
 
 Ordering vs the manual confirm: a manual confirm sets the local flag FIRST
@@ -27,6 +27,7 @@ it only needs a DB connection (sqlite3.Row factory) handed in.
 """
 import requests
 from datetime import datetime
+from return_shipping_loss import load_policy, quote_loss, required_loss
 
 from oid_utils import woo_post_id  # raw WC post id for REST write-back
 
@@ -295,16 +296,13 @@ def list_returnable_orders(conn, allowed_sources=None):
 
 
 def returnable_stats(conn, allowed_sources=None):
-    """Count safe return candidates and the loss implied by the manual default."""
-    sql, params = _returned_candidate_sql(
-        "COUNT(*) AS candidate_count, "
-        "COALESCE(SUM(COALESCE(o.shipping_total, 0)), 0) AS shipping_loss",
-        allowed_sources,
-    )
-    row = conn.execute(sql, params).fetchone()
+    """Count safe return candidates using the same policy as confirmation."""
+    candidates = list_returnable_orders(conn, allowed_sources)
+    policy = load_policy(conn)
+    quotes = [quote_loss(conn, order, policy) for order in candidates]
     return {
-        'candidates': int(row[0] or 0),
-        'shipping_loss': round(float(row[1] or 0), 2),
+        'candidates': sum(q['amount'] is not None for q in quotes),
+        'shipping_loss': round(sum(q['amount'] for q in quotes if q['amount'] is not None), 2),
     }
 
 
@@ -455,9 +453,10 @@ def _mark_returned_local(
     actor_name='系统自动确认',
     actor_user_id=None,
     batch=False,
+    policy=None,
 ):
     """Atomically mirror the manual 拒收 action for one carrier return."""
-    loss = round(float(order['shipping_total'] or 0), 2)
+    loss = required_loss(conn, order, policy)
     currency = str(order['currency'] or '').strip()
     actor_name = str(actor_name or '系统自动确认').strip()
     if batch:
@@ -474,7 +473,7 @@ def _mark_returned_local(
         """
         UPDATE orders
            SET is_undelivered = 1,
-               shipping_loss_amount = COALESCE(shipping_total, 0),
+               shipping_loss_amount = ?,
                undelivered_at = ?,
                undelivered_by = ?,
                undelivered_note = ?
@@ -486,7 +485,7 @@ def _mark_returned_local(
            AND COALESCE(delivery_confirmed, 0) = 0
            AND carrier_status = 'returned'
         """,
-        (now, actor_user_id, short_note, order['id']),
+        (loss, now, actor_user_id, short_note, order['id']),
     )
     changed = int(cursor.rowcount or 0) == 1
     if not changed:
@@ -527,8 +526,13 @@ def confirm_returned_batch(
         'dry_run': dry_run,
     }
 
+    policy = load_policy(conn)
     for order in candidates:
-        loss = round(float(order['shipping_total'] or 0), 2)
+        quote = quote_loss(conn, order, policy)
+        if quote['amount'] is None:
+            summary['skipped'] += 1
+            continue
+        loss = quote['amount']
         if not dry_run:
             changed, loss = _mark_returned_local(
                 conn,
@@ -537,6 +541,7 @@ def confirm_returned_batch(
                 actor_name=actor_name,
                 actor_user_id=actor_user_id,
                 batch=True,
+                policy=policy,
             )
             if not changed:
                 summary['skipped'] += 1
@@ -599,13 +604,19 @@ def enforce_returned(conn, progress=None, dry_run=False, actor='auto'):
             f"本次处理 {MAX_PER_RUN} 单，剩余 {summary['capped']} 单下次继续。"
         )
 
+    policy = load_policy(conn)
     for order in candidates:
+        quote = quote_loss(conn, order, policy)
+        if quote['amount'] is None:
+            summary['skipped'] += 1
+            _log(f"[auto-return] #{order['number']} 需人工处理：{quote['message']}")
+            continue
         if dry_run:
             summary['marked'] += 1
-            summary['shipping_loss'] += round(float(order['shipping_total'] or 0), 2)
+            summary['shipping_loss'] += quote['amount']
             continue
         changed, loss = _mark_returned_local(
-            conn, order, datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            conn, order, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), policy=policy
         )
         if not changed:
             conn.rollback()
