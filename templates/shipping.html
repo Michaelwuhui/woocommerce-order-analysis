@@ -540,8 +540,8 @@
                 <div class="mb-3">
                     <label class="form-label text-white-50">运费损失金额 <span id="undeliveredCurrencyLabel" class="text-muted"></span></label>
                     <input type="number" step="0.01" min="0" class="form-control bg-dark text-white border-secondary"
-                        id="undeliveredLossAmount" placeholder="默认填入订单运费">
-                    <small class="text-muted">已实际产生的运费损失，将计入退货统计；如已退还则填 0</small>
+                        id="undeliveredLossAmount" placeholder="按仓库与收货区域规则填入">
+                    <small class="text-muted" id="undeliveredLossHint">已实际产生的运费损失，将计入退货统计；如已退还则填 0</small>
                 </div>
                 <div class="mb-3">
                     <label class="form-label text-white-50">原因 / 备注</label>
@@ -2640,13 +2640,16 @@
             loadOrders();
         }
 
-        function openUndeliveredModal(orderId, orderNumber, shippingTotal, currency, trackingNumber) {
+        async function openUndeliveredModal(orderId, orderNumber, shippingTotal, currency, trackingNumber) {
+            let quote;
+            try { quote = await fetchReturnShippingLoss(orderId); }
+            catch (error) { alert(error.message); return; }
             document.getElementById('undeliveredOrderId').value = orderId;
             const trackingHtml = trackingNumber ? `<div class="text-muted small mt-1">运单号：<span class="font-monospace">${trackingNumber}</span></div>` : '';
             document.getElementById('undeliveredOrderInfo').innerHTML = `<strong>#${orderNumber}</strong>${trackingHtml}`;
             document.getElementById('undeliveredCurrencyLabel').textContent = currency ? `(${currency})` : '';
-            // Default to the order's shipping fee — most common case for a returned package
-            document.getElementById('undeliveredLossAmount').value = (shippingTotal || 0).toFixed(2);
+            document.getElementById('undeliveredLossAmount').value = quote.amount == null ? '' : quote.amount.toFixed(2);
+            document.getElementById('undeliveredLossHint').textContent = quote.message;
             document.getElementById('undeliveredNote').value = '';
             bootstrap.Modal.getOrCreateInstance(document.getElementById('undeliveredModal')).show();
         }
@@ -2655,9 +2658,9 @@
             const orderId = document.getElementById('undeliveredOrderId').value;
             const lossRaw = document.getElementById('undeliveredLossAmount').value.trim();
             const note = document.getElementById('undeliveredNote').value.trim();
-            const lossAmount = parseFloat(lossRaw || '0');
+            const lossAmount = Number(lossRaw);
 
-            if (isNaN(lossAmount) || lossAmount < 0) {
+            if (!lossRaw || !Number.isFinite(lossAmount) || lossAmount < 0) {
                 alert('请输入合法的运费损失金额（≥ 0）');
                 return;
             }

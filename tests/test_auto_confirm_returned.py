@@ -54,7 +54,13 @@ def _database():
         CREATE TABLE oms_order_fulfillment_state (
             order_id TEXT PRIMARY KEY,
             revision INTEGER,
-            aggregate_status TEXT
+            aggregate_status TEXT,
+            manual_review INTEGER DEFAULT 0,
+            has_shortage INTEGER DEFAULT 0
+        );
+        CREATE TABLE oms_domain_events (
+            aggregate_type TEXT, aggregate_id TEXT, event_type TEXT,
+            to_status TEXT, actor_type TEXT
         );
         CREATE TABLE oms_fulfillments (
             id TEXT PRIMARY KEY,

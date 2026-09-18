@@ -1,0 +1,24 @@
+<div class="card data-card mb-4" id="returnShippingLossSettings">
+    <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
+        <h5 class="card-title text-white mb-0"><i class="bi bi-arrow-return-left me-2"></i>退件运费损失</h5>
+    </div>
+    <div class="card-body">
+        <p class="text-white-50 small">按发货仓库和收货国家设置每单退件损失，合计为正向运费 + 逆向运费。仓库专用规则优先于区域通用规则；未匹配时沿用订单运费。自动确认、批量确认及手动退件使用同一规则，手动操作时可调整实际损失。</p>
+        <p class="text-white-50 small">保存后用于后续退件确认，已记录的历史金额保持不变。币种应与订单一致；多仓发货或币种不一致时需人工核定金额。</p>
+        <div class="table-responsive">
+            <table class="table table-dark align-middle">
+                <thead><tr><th>发货仓库</th><th>收货国家 / 区域</th><th>币种</th><th>正向运费</th><th>逆向运费</th><th>退件合计</th><th>操作</th></tr></thead>
+                <tbody id="returnLossRulesBody"></tbody>
+            </table>
+        </div>
+        <datalist id="returnLossCountries"><option value="CZ">捷克</option><option value="PL">波兰</option><option value="HU">匈牙利</option><option value="AU">澳洲</option><option value="AE">阿联酋</option><option value="DE">德国</option><option value="SK">斯洛伐克</option></datalist>
+        <datalist id="returnLossCurrencies"><option value="CZK"><option value="PLN"><option value="HUF"><option value="AUD"><option value="AED"><option value="EUR"><option value="USD"><option value="CNY"><option value="GBP"></datalist>
+        <div class="d-flex gap-2 flex-wrap">
+            <button type="button" class="btn btn-outline-info btn-sm" id="returnLossAddBtn" disabled>添加规则</button>
+            <button type="button" class="btn btn-primary btn-sm" id="returnLossSaveBtn" disabled>保存退件运费设置</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" id="returnLossReloadBtn">重新加载</button>
+        </div>
+        <div class="small mt-2" id="returnLossSettingsStatus" role="status">正在加载退件运费设置…</div>
+    </div>
+</div>
+<script defer src="{{ url_for('static', filename='return_shipping_loss_settings.js') }}"></script>
