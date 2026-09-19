@@ -390,6 +390,7 @@ def fulfillment_page():
     return render_template(
         "fulfillment.html",
         can_manage_fulfillment=_can_manage_inventory(),
+        can_adjust_fulfillment_stock=_is_super_admin(),
         allowed_warehouses=_allowed_warehouse_ids("can_view"),
     )
 
@@ -492,6 +493,8 @@ def fulfillment_order_detail(order_id):
         if not state:
             return jsonify({"error": "订单尚未建立履约计划"}), 404
         query = '''SELECT f.*, w.name AS warehouse_name, w.country AS warehouse_country,
+                          w.is_active AS warehouse_active,
+                          COALESCE(wi.inventory_authority,'local') AS inventory_authority,
                           ff.cod_collection_role, ff.cod_amount, ff.cod_currency,
                           ff.merchandise_amount, ff.customer_shipping_amount,
                           ff.order_adjustment_amount, ff.source_order_total,
@@ -500,6 +503,7 @@ def fulfillment_order_detail(order_id):
                           ff.warehouse_storage_fee, ff.warehouse_shipping_fee,
                           ff.fee_currency, ff.reconciliation_status
                    FROM oms_fulfillments f LEFT JOIN warehouses w ON w.id=f.warehouse_id
+                   LEFT JOIN oms_warehouse_integrations wi ON wi.warehouse_id=f.warehouse_id
                    LEFT JOIN oms_fulfillment_financials ff ON ff.fulfillment_id=f.id
                    WHERE f.order_id=? AND f.revision=? AND f.status!='superseded' '''
         params = [order_id, state["revision"]]
@@ -527,6 +531,14 @@ def fulfillment_order_detail(order_id):
         output = []
         for fulfillment in fulfillments:
             data = dict(fulfillment)
+            data['stock_adjustment_targets'] = []
+            if (_is_super_admin() and fulfillment['mode'] == 'internal'
+                    and fulfillment['inventory_authority'] == 'local' and fulfillment['warehouse_active']
+                    and fulfillment['status'] not in ('cancelled', 'superseded')):
+                data['stock_adjustment_targets'].append({
+                    'fulfillment_id': fulfillment['id'], 'warehouse_id': fulfillment['warehouse_id'],
+                    'warehouse_name': fulfillment['warehouse_name'],
+                })
             item_rows = conn.execute(
                 '''SELECT fi.*, oi.name AS order_item_name, oi.ordered_qty,
                           oi.shortage_qty, oi.cancelled_qty AS order_cancelled_qty
@@ -601,6 +613,8 @@ def fulfillment_order_detail(order_id):
             primary["dispatch_fulfillment_ids"] = [row["id"] for row in visible_members]
             primary["warehouse_name"] = " + ".join(row["warehouse_name"] for row in visible_members)
             primary["items"] = []
+            primary['stock_adjustment_targets'] = [target for member in visible_members
+                for target in member['stock_adjustment_targets']]
             for member in visible_members:
                 for item in member["items"]:
                     merged_item = dict(item)

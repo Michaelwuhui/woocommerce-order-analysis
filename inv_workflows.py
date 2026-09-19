@@ -245,6 +245,14 @@ def detail(conn, did):
 @transact
 def create(conn):
     data = request.get_json(silent=True)
+    return create_document(conn, data)
+
+
+def create_document(conn, data, *, admin_fulfillment=None):
+    # Only the dedicated, authenticated route supplies this server-side context.
+    # JSON flags on the ordinary document API never enable immediate admin entry.
+    if admin_fulfillment is not None:
+        require(current_user.username == 'admin', '仅 admin 可快速调整库存', 403)
     require(isinstance(data, dict), '请求必须是 JSON 对象')
     key = str(data.get('request_key', ''))
     require(re.fullmatch(r'[A-Za-z0-9_-]{16,80}', key), '请提供有效的防重复提交标识')
@@ -257,11 +265,18 @@ def create(conn):
         require(previous['created_by'] == int(current_user.id) and previous['request_hash'] == digest,
                 '提交标识已被其他内容使用，请刷新后核查', 409)
         document(conn, previous['id'])
-        return {'id': previous['id'], 'replayed': True}
+        return {'id': previous['id'], 'status': previous['status'], 'replayed': True}
     kind = data.get('kind')
     require(kind in ('replenishment', 'transfer', 'receipt', 'stocktake'), '未知单据类型')
     wid = integer(data.get('warehouse_id'), 1)
     warehouse(conn, wid)
+    quick_skus = None
+    if admin_fulfillment is not None:
+        require(kind == 'stocktake' and not data.get('auto_approve'), '快捷调整仅允许管理员盘点')
+        scope = fulfillment_stocktake_context(conn, admin_fulfillment)
+        require(integer(data.get('fulfillment_revision'), 1) == scope['revision'],
+                '履约计划已变化，请重新打开库存调整', 409)
+        quick_skus = {item['sku_id'] for item in scope['items']}
     automatic = data.get('auto_approve', False)
     require(isinstance(automatic, bool), '自动审批参数必须为布尔值')
     require(not automatic or kind == 'stocktake', '临时授权仅允许库存盘点')
@@ -299,7 +314,14 @@ def create(conn):
     balances = remaining(conn, parent) if parent else {}
     for item in items:
         require(isinstance(item, dict), '明细格式错误')
+        if quick_skus is not None:
+            require(all(not isinstance(item.get(field), bool)
+                        and re.fullmatch(r'\d+', str(item.get(field))) for field in
+                        ('sku_id', 'qty', 'baseline', 'baseline_reserved', 'baseline_movement')),
+                    '请提交完整的实盘数量和库存快照')
         sid = integer(item.get('sku_id'), 1)
+        if quick_skus is not None:
+            require(sid in quick_skus, '只能调整该订单在本仓的受管商品', 403)
         require(sid not in seen, '同一单据不能重复填写同一SKU')
         seen.add(sid)
         require(eligible_sku(conn, wid, sid), 'SKU不属于该仓的受管库存；请先由库存负责人确认仓库SKU映射')
@@ -329,7 +351,20 @@ def create(conn):
         conn.execute('''INSERT INTO inv_document_lines(document_id,sku_id,qty,damaged_qty,short_qty,
             baseline,baseline_reserved,baseline_movement) VALUES (?,?,?,?,?,?,?,?)''', (did, *item))
     event(conn, did, 'created', {'status': status, 'reference': reference})
-    if grant:
+    if admin_fulfillment is not None:
+        doc = document(conn, did)
+        doc['order_id'] = admin_fulfillment['order_id']
+        apply_stocktake(conn, doc, lines(conn, did), reviewer='admin 快捷盘点直接入账')
+        status = 'approved'
+        review_note = '内置 admin 在履约详情执行快捷盘点，直接入账'
+        conn.execute('''UPDATE inv_documents SET status=?,reviewed_by=?,reviewed_name=?,review_note=?,reviewed_at=?
+            WHERE id=?''', (status, uid, name, review_note, now(), did))
+        event(conn, did, 'admin_stocktake_approved', {
+            'status': status, 'note': review_note, 'authorization': 'builtin_admin',
+            'order_id': admin_fulfillment['order_id'], 'fulfillment_id': admin_fulfillment['id'],
+            'warehouse_id': wid, 'operator_id': uid,
+        })
+    elif grant:
         # Document, quantity movement and automatic approval are a single transaction.
         require(grant['expires_at'] > utc_now(), '临时库存授权已到期，请重新申请', 403)
         doc = document(conn, did)
@@ -349,7 +384,7 @@ def movement(conn, doc, sid, qty, movement_type, wid, apply=True, reviewer=None)
     uid, name = actor()
     return record_movement(conn, warehouse_id=wid, sku_id=sid, qty_delta=qty,
         movement_type=movement_type, ref_type='inventory_document', ref_id=str(doc['id']),
-        operator_id=uid, operator_name=name,
+        order_id=doc.get('order_id'), operator_id=uid, operator_name=name,
         note=f"单据#{doc['id']} {doc['reference']}；提交:{doc['created_name']}；审核:{reviewer or name}", apply_stock=apply)
 
 
@@ -362,6 +397,69 @@ def apply_stocktake(conn, doc, items, reviewer=None):
         delta = item['qty'] - actual[0]
         if delta:
             movement(conn, doc, item['sku_id'], delta, 'adjust', doc['warehouse_id'], reviewer=reviewer)
+
+
+def fulfillment_stocktake_context(conn, fulfillment):
+    """Read the real order scope, including mapped but unallocated shortage lines."""
+    state = conn.execute('SELECT revision FROM oms_order_fulfillment_state WHERE order_id=?',
+                         (fulfillment['order_id'],)).fetchone()
+    require(state and state['revision'] == fulfillment['revision']
+            and fulfillment['status'] not in ('superseded', 'cancelled'),
+            '履约计划已变化或取消，请重新打开当前履约详情', 409)
+    require(fulfillment['mode'] == 'internal', '外部仓不能在此修改库存', 409)
+    wh = warehouse(conn, fulfillment['warehouse_id'])
+    rows = conn.execute('''SELECT oi.id,oi.sku_id,oi.name,oi.shortage_qty,oi.ordered_qty,
+        k.sku_code,k.name AS sku_name FROM oms_order_items oi
+        LEFT JOIN inv_skus k ON k.id=oi.sku_id WHERE oi.order_id=? AND (
+            oi.shortage_qty>0 OR EXISTS(SELECT 1 FROM oms_fulfillment_items fi
+                WHERE fi.fulfillment_id=? AND fi.order_item_id=oi.id))
+        ORDER BY oi.sku_id,oi.id''', (fulfillment['order_id'], fulfillment['id'])).fetchall()
+    items, unavailable = {}, []
+    for row in rows:
+        sid = row['sku_id']
+        if not sid or not eligible_sku(conn, wh['id'], sid):
+            unavailable.append({'name': row['name'], 'shortage_qty': row['shortage_qty']})
+            continue
+        if sid not in items:
+            on_hand, reserved, last_movement = stock(conn, wh['id'], sid)
+            items[sid] = {'sku_id': sid, 'sku_code': row['sku_code'], 'name': row['sku_name'],
+                          'on_hand': on_hand, 'reserved': reserved, 'available': on_hand-reserved,
+                          'movement': last_movement, 'ordered_qty': 0, 'shortage_qty': 0}
+        items[sid]['ordered_qty'] += int(row['ordered_qty'])
+        items[sid]['shortage_qty'] += int(row['shortage_qty'])
+    return {'fulfillment_id': fulfillment['id'], 'order_id': fulfillment['order_id'],
+            'order_number': fulfillment['order_number'], 'revision': fulfillment['revision'],
+            'warehouse_id': wh['id'], 'warehouse_name': wh['name'],
+            'items': list(items.values()), 'unavailable': unavailable}
+
+
+@workflow_bp.route('/api/inv/operations/fulfillment/<fulfillment_id>/stocktake', methods=['GET', 'POST'])
+@login_required
+@transact
+def fulfillment_stocktake(conn, fulfillment_id):
+    require(current_user.username == 'admin', '仅 admin 可快速调整库存', 403)
+    fulfillment = conn.execute('''SELECT f.*,o.number AS order_number FROM oms_fulfillments f
+        JOIN orders o ON o.id=f.order_id WHERE f.id=?''', (fulfillment_id,)).fetchone()
+    require(fulfillment is not None, '履约单不存在', 404)
+    if request.method == 'GET':
+        return fulfillment_stocktake_context(conn, fulfillment)
+    data = request.get_json(silent=True)
+    require(isinstance(data, dict), '请求必须是 JSON 对象')
+    require(not set(data) - {'request_key', 'note', 'items', 'revision'}, '包含不支持的库存调整参数')
+    items = data.get('items')
+    require(isinstance(items, list) and 0 < len(items) <= 500 and all(isinstance(i, dict) for i in items),
+            '需要1到500条库存明细')
+    require(isinstance(data.get('note'), str) and data['note'].strip(), '请填写库存调整原因')
+    # Deterministic ordering also locks SKU rows in a consistent order on PostgreSQL.
+    items = sorted(items, key=lambda item: integer(item.get('sku_id'), 1))
+    key = data.get('request_key', '')
+    payload = {'kind': 'stocktake', 'warehouse_id': fulfillment['warehouse_id'],
+               'reference': f"履约盘点 {fulfillment['id']} {key}", 'note': data['note'].strip(),
+               'request_key': key, 'items': items, 'fulfillment_id': fulfillment['id'],
+               'fulfillment_revision': data.get('revision'), 'order_id': fulfillment['order_id']}
+    # Existing receipt lookup precedes plan/snapshot checks, so a timed-out request
+    # remains safely replayable even after the restock worker replans the order.
+    return create_document(conn, payload, admin_fulfillment=fulfillment)
 
 
 @workflow_bp.route('/api/inv/operations/<int:did>/review', methods=['POST'])
