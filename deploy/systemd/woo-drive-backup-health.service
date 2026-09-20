@@ -1,0 +1,19 @@
+[Unit]
+Description=Check Woo Analysis daily backup freshness and retry failure email
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/www/wwwroot/woo-analysis
+ExecStart=/www/wwwroot/woo-analysis/venv/bin/python /www/wwwroot/woo-analysis/backup_drive.py check
+TimeoutStartSec=3min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/woo-analysis-backup
+Environment=PYTHONDONTWRITEBYTECODE=1

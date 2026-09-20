@@ -1,0 +1,10 @@
+[Unit]
+Description=Check daily backup freshness every 15 minutes
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=15min
+Unit=woo-drive-backup-health.service
+
+[Install]
+WantedBy=timers.target

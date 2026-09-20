@@ -10102,6 +10102,8 @@ def backup_status():
         except Exception:
             return None
 
+    from backup_alerts import public_status as drive_backup_status
+
     return jsonify({
         'local': {
             'count': len(files),
@@ -10115,6 +10117,7 @@ def backup_status():
         'cron_hourly': cron_on,
         'archived_orders': archived,
         'alerts': alerts,
+        'google_drive': drive_backup_status(),
     })
 
 

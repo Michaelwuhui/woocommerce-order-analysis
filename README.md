@@ -103,6 +103,7 @@ PostgreSQL 保存业务状态、任务进度、操作记录及待投递消息；
 | `woo-product-clone-worker` | 商品克隆队列 |
 | `woo-stock-sync-worker` | 跨站库存目录、映射、预览和执行任务 |
 | `woo-postgres-backup.timer` | 每小时触发 PostgreSQL 在线备份 |
+| `woo-drive-backup.timer` / `woo-drive-backup-health.timer` | Google Drive 日备份、上传校验及失败邮件检查 |
 
 独立 worker 的 unit 位于 [deploy/](deploy/)，Celery、备份 unit 和 PostgreSQL drop-in 位于 [deploy/systemd/](deploy/systemd/)。Gunicorn 的基础 unit 由主机管理，仓库提供相关 drop-in；不要把模板目录当成所有主机配置的完整副本。
 
@@ -243,6 +244,8 @@ curl -fsS http://127.0.0.1:5000/login > /dev/null
 ### 备份与恢复
 
 [backup_db.py](backup_db.py) 在 PostgreSQL 模式下生成 `pg_dump` custom-format 的 `.dump`、SHA256 文件和备份清单；`woo-postgres-backup.timer` 按小时执行。默认本地目录为 `/www/backups/woo-orders`，实际保留和异地策略以配置及读取结果为准。
+
+[backup_drive.py](backup_drive.py) 可将最近的已校验 PostgreSQL 备份、代码版本和运行配置打包，按日上传到私有 Google Drive 目录。上传支持限额退避、续传和云端内容校验；独立健康检查负责失败、超时及恢复邮件，状态在管理员系统设置中展示。启用方式及恢复边界见 [Google Drive 日备份](docs/google-drive-backup.md)。
 
 对选定备份检查 SHA256 和 `pg_restore --list`，定期恢复到隔离库验证可用性。运行备份脚本时必须加载正确的 PostgreSQL 配置；旧 SQLite `.db.gz` 不能作为当前生产库备份。
 

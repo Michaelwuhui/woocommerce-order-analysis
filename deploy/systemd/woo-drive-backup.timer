@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Woo Analysis Google Drive backup at 04:20 Beijing time
+
+[Timer]
+OnCalendar=*-*-* 04:20:00 Asia/Shanghai
+RandomizedDelaySec=180
+Persistent=true
+Unit=woo-drive-backup.service
+
+[Install]
+WantedBy=timers.target

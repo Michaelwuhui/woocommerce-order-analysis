@@ -151,6 +151,7 @@
             <div class="row g-3 mb-3" id="backupStatus">
                 <div class="col-12 text-white-50 small">加载中…</div>
             </div>
+            <div id="driveBackupStatus" class="small mb-3"></div>
             <div>
                 <button class="btn btn-sm btn-outline-info" type="button" id="backupListToggle"><i class="bi bi-list-ul"></i> 查看备份文件</button>
                 <button class="btn btn-sm btn-outline-info" type="button" id="backupOffsiteCheckBtn"><i class="bi bi-cloud-check"></i> 检查异地 R2</button>
@@ -183,7 +184,8 @@
 
             <div class="small text-white-50 mt-3">
                 <i class="bi bi-info-circle me-1"></i>
-                自动策略：每小时一致性热备 → 本地保留约 2 天 → 上传 Cloudflare R2（30 天自动清理）。
+                自动策略：每小时一致性热备 → 本地保留约 2 天 → 上传 Cloudflare R2。
+                Google Drive 日备份及失败邮件以以上实际状态为准。
                 还原：SQLite 使用 <code>.db.gz</code>，PostgreSQL 使用 <code>.dump</code>；先按同名
                 <code>.sha256</code> 校验，再按 backup_db.py 顶部步骤恢复到独立测试库验证。
             </div>
@@ -3810,6 +3812,7 @@ function deleteWarehouse(id, name) {
 // 数据备份与灾备 卡片逻辑（自包含）
 (function () {
     const fmtSize = b => (b == null ? '-' : (b / 1024 / 1024).toFixed(2) + ' MB');
+    const backupEsc = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
     function renderAlerts(alerts) {
         const box = document.getElementById('backupAlerts');
@@ -3854,6 +3857,26 @@ function deleteWarehouse(id, name) {
             <div class="col-md-3"><div class="text-white-50 small">定时 / 归档订单</div>
                 <div>${cronTxt} · 归档 ${d.archived_orders == null ? '-' : d.archived_orders}</div></div>`;
         renderAlerts(d.alerts);
+        const driveBox = document.getElementById('driveBackupStatus');
+        const drive = d.google_drive || {};
+        if (driveBox) {
+            if (!drive.enabled) {
+                driveBox.innerHTML = '<span class="text-white-50">Google Drive 日备份尚未配置</span>';
+            } else {
+                const failed = drive.health === 'failed' || drive.health === 'error';
+                const label = failed ? '需要处理' : (drive.last_success_at ? '最近备份已核验' : '等待首次备份');
+                const time = drive.last_success_at ? new Date(drive.last_success_at).toLocaleString('zh-CN', {timeZone:'Asia/Shanghai', hour12:false}) : '暂无';
+                driveBox.innerHTML = `<div class="border rounded p-3 ${failed ? 'border-danger' : 'border-secondary'}">
+                    <strong>Google Drive 日备份</strong> · <span class="${failed ? 'text-danger' : 'text-success'}">${label}</span><br>
+                    计划：${backupEsc(drive.schedule)}；云端保留 ${backupEsc(drive.retention_days)} 天<br>
+                    最近成功（北京时间）：${backupEsc(time)} · ${fmtSize(drive.last_backup_bytes)}<br>
+                    失败提醒：${backupEsc(drive.alert_recipient)}
+                    ${drive.email_status === 'failed' ? '<span class="text-danger">（邮件发送失败，正在重试）</span>' : ''}
+                    ${failed ? `<div class="text-danger mt-1">${backupEsc(drive.last_error || drive.detail)}</div>` : ''}
+                    ${drive.last_failure_at ? `<div class="text-white-50 mt-1">最近失败记录：${backupEsc(drive.last_failure_at)} ${backupEsc(drive.last_failure_detail)}</div>` : ''}
+                </div>`;
+            }
+        }
     }
 
     function loadBackupStatus() {

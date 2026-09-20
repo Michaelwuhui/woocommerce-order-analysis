@@ -1,0 +1,14 @@
+{
+  "credentials_file": "/etc/woo-analysis/drive-backup-oauth.json",
+  "folder_id": "PRIVATE_DRIVE_FOLDER_ID",
+  "backup_dir": "/www/backups/woo-orders",
+  "app_dir": "/www/wwwroot/woo-analysis",
+  "retention_days": 30,
+  "runtime_files": [
+    "/etc/woo-analysis/woo-analysis.env",
+    "/etc/woo-analysis/drive-backup.json",
+    "/etc/woo-analysis/drive-backup-oauth.json",
+    "/etc/woo-analysis/backup-alerts.json",
+    "/www/wwwroot/woo-analysis/backup_offsite.json"
+  ]
+}
