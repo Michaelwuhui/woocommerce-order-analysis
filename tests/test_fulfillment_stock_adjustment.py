@@ -289,10 +289,13 @@ def test_browser_admin_count_and_lost_response_replay(fulfillment_system, tmp_pa
            'status': 'stock_shortage', 'has_shortage': 1, 'manual_review': 0,
            'items': [], 'shipments': [], 'stock_adjustment_targets': [
                {'fulfillment_id': 'fulfill-one', 'warehouse_id': 2, 'warehouse_name': 'Transit'}]}
+    shortages = [{'name': 'Unallocated item', 'sku_id': 2, 'sku_code': 'SHORT-SKU',
+                  'ordered_qty': 1, 'allocated_qty': 0, 'shortage_qty': 1}]
+    row['shortage_items'] = shortages
     app.view_functions['fulfillment.list_fulfillment_orders'] = lambda: jsonify(
         items=[row], summary={'stock_shortage': 1}, warehouses=[{'id': 2, 'name': 'Transit'}])
     app.view_functions['fulfillment.fulfillment_order_detail'] = lambda order_id: jsonify(
-        state={'has_shortage': 1}, fulfillments=[row])
+        state={'has_shortage': 1}, fulfillments=[row], shortage_items=shortages)
     server = make_server('127.0.0.1', 0, app, threaded=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -312,8 +315,11 @@ def test_browser_admin_count_and_lost_response_replay(fulfillment_system, tmp_pa
                 page.get_by_role('button', name='处理', exact=True).click()
                 return page
             page = page_for(1)
+            expect(page.locator('#ffRows')).to_contain_text('SHORT-SKU 缺 1 件')
+            expect(page.locator('#ffShortageDetails')).to_contain_text('Unallocated item')
             page.get_by_role('button', name='快速调整库存', exact=True).click()
             expect(page.locator('#ffStockQty2')).to_have_value('0')
+            expect(page.locator('#ffStockForm tbody tr').first.locator('input')).to_have_attribute('id', 'ffStockQty2')
             page.locator('#ffStockQty1').fill('12')
             page.locator('#ffStockNote').fill('Isolated browser physical count')
             intercepted = []
@@ -334,6 +340,9 @@ def test_browser_admin_count_and_lost_response_replay(fulfillment_system, tmp_pa
             expect(page.locator('#ffStockQty1')).to_be_disabled()
             page.get_by_role('button', name='重试核对本次调整', exact=True).click()
             expect(page.locator('#ffStockAdjustmentPanel')).to_contain_text('库存已调整')
+            expect(page.locator('#ffStockAdjustmentPanel')).to_contain_text('SHORT-SKU 缺 1 件')
+            page.get_by_role('button', name='刷新缺货状态').click()
+            expect(page.locator('#ffShortageDetails')).to_contain_text('Unallocated item')
             assert intercepted[0] == intercepted[1]
             assert value(system, 'SELECT COUNT(*) FROM inv_documents') == 1
             assert value(system, 'SELECT COUNT(*) FROM inv_movements') == 1

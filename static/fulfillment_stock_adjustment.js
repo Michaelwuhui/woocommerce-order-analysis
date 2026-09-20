@@ -22,8 +22,20 @@ function fulfillmentStocktakeButtons(targets, orderId, permitted, escape) {
   return (targets || []).map(target => `<button type="button" class="btn btn-outline-warning btn-sm" data-ff-stock-id="${escape(target.fulfillment_id)}" data-ff-stock-order="${escape(orderId)}">快速调整库存${targets.length > 1 ? ' · ' + escape(target.warehouse_name) : ''}</button>`).join('');
 }
 
+function fulfillmentStocktakeReceipt(documentId, detail) {
+  const saved = `库存已调整，盘点单 #${documentId}。`;
+  if (!detail?.state || ![true, false, 0, 1].includes(detail.state.has_shortage)) return {text: saved + '订单状态读取失败，请刷新履约详情核对。', warning: true};
+  const shortages = detail.shortage_items || [];
+  if (shortages.length) {
+    const summary = shortages.map(item => `${item.sku_code || item.name} 缺 ${item.shortage_qty} 件`).join('；');
+    return {text: saved + `当前分仓记录仍有缺货：${summary}。请核对对应商品；库存增加后需等待后台重算，再刷新查看。`, warning: true};
+  }
+  if (detail.state?.has_shortage) return {text: saved + '当前订单仍标记缺货，请刷新详情核对。', warning: true};
+  return {text: saved + '当前分仓记录无缺货。', warning: false};
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = {fulfillmentStocktakePayload, fulfillmentStocktakeButtons};
+  module.exports = {fulfillmentStocktakePayload, fulfillmentStocktakeButtons, fulfillmentStocktakeReceipt};
 }
 
 if (typeof document !== 'undefined') {
@@ -49,9 +61,12 @@ if (typeof document !== 'undefined') {
       draft = {id, orderId, context, payload: null, busy: false};
       const missing = context.unavailable.length
         ? `<div class="alert alert-warning">以下商品未映射或未纳入本仓库存，不能在此调整：${context.unavailable.map(i => esc(i.name)).join('、')}</div>` : '';
+      const sorted = [...context.items].sort((a, b) => Number(b.shortage_qty > 0) - Number(a.shortage_qty > 0));
+      const shortageItems = sorted.filter(item => item.shortage_qty > 0);
+      const shortageHint = shortageItems.length ? `<div class="alert alert-warning">当前缺货商品：${shortageItems.map(item => `${esc(item.sku_code)} 缺 ${item.shortage_qty} 件（本仓可用 ${item.available} 件）`).join('；')}。调整其他商品不会补足这些缺货。</div>` : '';
       host.innerHTML = `<section class="card border-warning bg-dark mb-3"><div class="card-header d-flex flex-wrap justify-content-between gap-2"><b>快速调整库存 · ${esc(context.warehouse_name)} · #${esc(context.order_number)}</b><button type="button" class="btn btn-sm btn-outline-light" id="ffStockClose">关闭调整</button></div>
-        <form id="ffStockForm" class="card-body"><p class="text-white-50">填写实盘总数，包含已预留但尚未出库的商品。保存立即入账，预留数量保持不变；实盘不能低于预留。</p>${missing}
-        <div class="table-responsive"><table class="table table-dark table-sm align-middle"><thead><tr><th>商品 / SKU</th><th>本单数量 / 缺货</th><th>现存 / 预留 / 可用</th><th>实盘总数</th><th>增减</th></tr></thead><tbody>${context.items.map(item => `<tr><td>${esc(item.name)}<div class="small text-white-50">${esc(item.sku_code)}</div></td><td>${item.ordered_qty} / ${item.shortage_qty}</td><td>${item.on_hand} / ${item.reserved} / ${item.available}</td><td><input id="ffStockQty${item.sku_id}" data-stock-sku="${item.sku_id}" class="form-control form-control-sm" style="min-width:100px" type="number" step="1" min="${item.reserved}" max="100000000" value="${item.on_hand}" required aria-label="${esc(item.sku_code)} 实盘总数"></td><td id="ffStockDelta${item.sku_id}">0</td></tr>`).join('') || '<tr><td colspan="5">本仓没有可调整的订单商品。</td></tr>'}</tbody></table></div>
+        <form id="ffStockForm" class="card-body"><p class="text-white-50">填写实盘总数，包含已预留但尚未出库的商品。保存立即入账，预留数量保持不变；实盘不能低于预留。</p>${shortageHint}${missing}
+        <div class="table-responsive"><table class="table table-dark table-sm align-middle"><thead><tr><th>商品 / SKU</th><th>本单数量 / 缺货</th><th>现存 / 预留 / 可用</th><th>实盘总数</th><th>增减</th></tr></thead><tbody>${sorted.map(item => `<tr class="${item.shortage_qty > 0 ? 'table-danger' : ''}"><td>${esc(item.name)}<div class="small ${item.shortage_qty > 0 ? 'text-dark' : 'text-white-50'}">${esc(item.sku_code)}</div></td><td>${item.ordered_qty} / <b>${item.shortage_qty}</b></td><td>${item.on_hand} / ${item.reserved} / ${item.available}</td><td><input id="ffStockQty${item.sku_id}" data-stock-sku="${item.sku_id}" class="form-control form-control-sm" style="min-width:100px" type="number" step="1" min="${item.reserved}" max="100000000" value="${item.on_hand}" required aria-label="${esc(item.sku_code)} 实盘总数"></td><td id="ffStockDelta${item.sku_id}">0</td></tr>`).join('') || '<tr><td colspan="5">本仓没有可调整的订单商品。</td></tr>'}</tbody></table></div>
         <label for="ffStockNote" class="form-label">调整原因</label><textarea id="ffStockNote" class="form-control mb-3" rows="2" maxlength="2000" required placeholder="填写盘点依据和差异原因"></textarea><div id="ffStockMessage" role="status"></div>
         <div class="d-flex flex-wrap gap-2"><button type="submit" class="btn btn-warning" id="ffStockSave" ${context.items.length ? '' : 'disabled'}>确认调整库存</button><button type="button" class="btn btn-outline-light" id="ffStockReload">重新读取库存</button></div></form></section>`;
     } catch (error) {
@@ -98,13 +113,14 @@ if (typeof document !== 'undefined') {
       if (result.status !== 'approved' || !Number.isSafeInteger(result.id) || result.id <= 0) {
         throw new Error('尚未收到有效的库存入账确认');
       }
-      const text = `库存已调整，盘点单 #${result.id}。库存增加后，系统会按现有规则重新核对缺货分配。`;
+      let receipt = fulfillmentStocktakeReceipt(result.id, null);
       if (draft === current && form.isConnected) {
         draft = null;
-        await showFulfillment(current.orderId);
-        if (panel()) panel().innerHTML = `<div class="alert alert-success">${esc(text)} <a class="alert-link" href="/inventory/operations?kind=stocktake">查看盘点记录</a></div>`;
+        const detail = await showFulfillment(current.orderId);
+        receipt = fulfillmentStocktakeReceipt(result.id, detail);
+        if (panel()) panel().innerHTML = `<div class="alert ${receipt.warning ? 'alert-warning' : 'alert-success'}">${esc(receipt.text)} <button type="button" class="btn btn-sm btn-outline-dark" id="ffStockRefresh" data-order-id="${esc(current.orderId)}">刷新缺货状态</button> <a class="alert-link" href="/inventory/operations?kind=stocktake">查看盘点记录</a></div>`;
       }
-      ffAlert(text, false);
+      ffAlert(receipt.text, receipt.warning);
       await loadFulfillments();
     } catch (error) {
       if (draft !== current || !form.isConnected) { ffAlert(error.message); return; }
@@ -117,5 +133,8 @@ if (typeof document !== 'undefined') {
       document.getElementById('ffStockClose').disabled = !!uncertain;
       message(error.message + (uncertain ? '；结果尚未确认，请重试核对本次调整，不要重复新建。' : ''));
     } finally { current.busy = false; }
+  });
+  document.getElementById('ffDetail').addEventListener('click', event => {
+    if (event.target.id === 'ffStockRefresh') showFulfillment(event.target.dataset.orderId);
   });
 }
