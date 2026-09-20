@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const {test} = require('node:test');
-const {fulfillmentStocktakePayload: payload, fulfillmentStocktakeButtons: buttons} = require('../static/fulfillment_stock_adjustment.js');
+const {fulfillmentStocktakePayload: payload, fulfillmentStocktakeButtons: buttons, fulfillmentStocktakeReceipt: receipt} = require('../static/fulfillment_stock_adjustment.js');
+const {fulfillmentShortageDetails: shortageDetails} = require('../static/fulfillment_shortages.js');
 const context = {revision: 3, items: [
   {sku_id: 1, sku_code: 'ONE', on_hand: 10, reserved: 2, movement: 99},
   {sku_id: 2, sku_code: 'TWO', on_hand: 0, reserved: 0, movement: 0},
@@ -26,4 +27,24 @@ test('non-admin gets no quick-adjust buttons; joint dispatch preserves warehouse
   assert.match(html, /data-ff-stock-id="two"/);
   assert.match(html, /快速调整库存 · North/);
   assert.match(html, /快速调整库存 · South/);
+});
+
+test('saved stocktake distinguishes remaining shortages, missing status and resolved stock', () => {
+  const remaining = receipt(7, {state: {has_shortage: true}, shortage_items: [{sku_code: 'MISSING', shortage_qty: 1}]});
+  assert.equal(remaining.warning, true);
+  assert.match(remaining.text, /MISSING 缺 1 件/);
+  assert.equal(receipt(7, null).warning, true);
+  assert.match(receipt(7, null).text, /库存已调整/);
+  assert.equal(receipt(7, {state: {has_shortage: true}}).warning, true);
+  assert.equal(receipt(7, {state: {has_shortage: false}, shortage_items: []}).warning, false);
+});
+
+test('unallocated shortage display escapes imported product names and distinguishes mapping', () => {
+  const escape = value => String(value).replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+  const html = shortageDetails([{name: '<img onerror=alert(1)>', sku_code: '<SKU>', sku_id: null,
+    ordered_qty: 1, allocated_qty: 0, shortage_qty: 1}], escape);
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /&lt;SKU&gt;/);
+  assert.match(html, /未建立 SKU 映射/);
+  assert.equal(shortageDetails([], escape), '');
 });

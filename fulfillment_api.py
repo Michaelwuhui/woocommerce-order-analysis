@@ -395,6 +395,42 @@ def fulfillment_page():
     )
 
 
+def _visible_shortage_items(conn, order_ids, allowed):
+    """Unallocated lines have no fulfillment item; read them from the order."""
+    result = {order_id: [] for order_id in order_ids}
+    if not order_ids or allowed == []:
+        return result
+    params = list(order_ids)
+    scope = ""
+    if allowed is not None:
+        slots = ','.join('?' for _ in allowed)
+        scope = f''' AND (
+            EXISTS(SELECT 1 FROM oms_fulfillment_items fi
+                JOIN oms_fulfillments f ON f.id=fi.fulfillment_id
+                JOIN oms_order_fulfillment_state s ON s.order_id=f.order_id
+                WHERE fi.order_item_id=oi.id AND f.revision=s.revision
+                  AND f.status NOT IN ('cancelled','superseded')
+                  AND f.warehouse_id IN ({slots}))
+            OR EXISTS(SELECT 1 FROM oms_sku_warehouses sw
+                WHERE sw.sku_id=oi.sku_id AND sw.is_enabled=1
+                  AND sw.warehouse_id IN ({slots}))
+            OR EXISTS(SELECT 1 FROM inv_stock st WHERE st.sku_id=oi.sku_id
+                  AND st.warehouse_id IN ({slots})))'''
+        params.extend(list(allowed) * 3)
+    rows = conn.execute(
+        f'''SELECT oi.id AS order_item_id,oi.order_id,oi.name,oi.sku_id,
+                   COALESCE(k.sku_code,oi.wc_sku,'') AS sku_code,
+                   oi.ordered_qty,oi.allocated_qty,oi.shortage_qty
+            FROM oms_order_items oi LEFT JOIN inv_skus k ON k.id=oi.sku_id
+            WHERE oi.order_id IN ({','.join('?' for _ in order_ids)})
+              AND oi.shortage_qty>0 {scope}
+            ORDER BY oi.order_id,oi.line_index,oi.id''', params,
+    ).fetchall()
+    for row in rows:
+        result[row['order_id']].append(dict(row))
+    return result
+
+
 @fulfillment_bp.route("/api/fulfillment/orders")
 @login_required
 @fulfillment_view_required
@@ -448,9 +484,11 @@ def list_fulfillment_orders():
                          o.date_created DESC LIMIT ?''',
             (*params, limit),
         ).fetchall()
+        shortages = _visible_shortage_items(conn, list(dict.fromkeys(row['order_id'] for row in rows)), allowed)
         result = []
         for row in rows:
             item = dict(row)
+            item['shortage_items'] = shortages[row['order_id']]
             item["items"] = [dict(x) for x in conn.execute(
                 '''SELECT fi.id, fi.allocated_qty, fi.fulfilled_qty, fi.cancelled_qty,
                           fi.sku_code_snapshot, fi.name_snapshot, oi.name AS order_item_name
@@ -631,7 +669,8 @@ def fulfillment_order_detail(order_id):
         order = conn.execute(
             "SELECT id, number, status, source, date_created FROM orders WHERE id=?", (order_id,)
         ).fetchone()
-        return jsonify({"order": dict(order), "state": dict(state), "fulfillments": output})
+        return jsonify({"order": dict(order), "state": dict(state), "fulfillments": output,
+                        "shortage_items": _visible_shortage_items(conn, [order_id], allowed)[order_id]})
     finally:
         conn.close()
 
