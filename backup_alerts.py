@@ -88,7 +88,16 @@ def record_health(state_dir, *, healthy, detail, sender=send_email, clock=time.t
             state["incident_at"] = now_iso()
         state["last_failure_at"] = now_iso()
         state["last_failure_detail"] = detail
-    atomic_json(path, state)
+    def persist():
+        try:
+            atomic_json(path, state)
+            return True
+        except OSError:
+            # A full backup disk must not prevent the independent SMTP alert.
+            print("Backup health state could not be persisted", flush=True)
+            return False
+
+    persist()
     kind = None
     if not healthy and (not state.get("failure_mail_sent_at") or now - state["failure_mail_sent_at"] >= 6 * 3600):
         kind = "failure"
@@ -105,7 +114,7 @@ def record_health(state_dir, *, healthy, detail, sender=send_email, clock=time.t
             state["email_status"] = "failed"
             # Exception messages may contain credentials or SMTP responses.
             state["email_error"] = type(exc).__name__
-            atomic_json(path, state)
+            persist()
             return False
         state["email_status"] = "accepted_by_smtp"
         state["email_error"] = None
@@ -116,11 +125,14 @@ def record_health(state_dir, *, healthy, detail, sender=send_email, clock=time.t
         else:
             state.pop("failure_mail_sent_at", None)
             state.pop("incident_at", None)
-        atomic_json(path, state)
+        persist()
     if not healthy and (not previously_failed or kind):
-        with (state_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
-            os.chmod(handle.name, 0o600)
-            handle.write(json.dumps({"at": now_iso(), "status": "failed", "detail": detail, "email_status": state.get("email_status")}, ensure_ascii=False) + "\n")
+        try:
+            with (state_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
+                os.chmod(handle.name, 0o600)
+                handle.write(json.dumps({"at": now_iso(), "status": "failed", "detail": detail, "email_status": state.get("email_status")}, ensure_ascii=False) + "\n")
+        except OSError:
+            print("Backup failure event could not be persisted", flush=True)
     return True
 
 

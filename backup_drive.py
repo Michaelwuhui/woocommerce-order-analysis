@@ -379,7 +379,10 @@ def main(argv=None):
             except (OSError, ValueError):
                 status = {}
             status["last_error"] = detail
-            atomic_json(STATE_DIR / "status.json", status)
+            try:
+                atomic_json(STATE_DIR / "status.json", status)
+            except OSError:
+                log("备份状态写入失败，继续尝试发送邮件")
             if not record_health(STATE_DIR, healthy=False, detail=detail):
                 log("失败提醒发送失败；健康检查将继续重试")
             return 1

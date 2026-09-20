@@ -205,6 +205,15 @@ def test_corrupt_health_record_still_sends_failure(tmp_path):
     assert len(sent) == 1
 
 
+def test_full_state_disk_does_not_block_email(tmp_path, monkeypatch):
+    def full(*args):
+        raise OSError("disk full")
+    monkeypatch.setattr(backup_alerts, "atomic_json", full)
+    sent = []
+    assert backup_alerts.record_health(tmp_path, healthy=False, detail="disk full", sender=lambda *a: sent.append(a))
+    assert len(sent) == 1
+
+
 def test_public_status_excludes_private_upload_receipts(tmp_path):
     backup_alerts.atomic_json(tmp_path / "status.json", {"configured_at": "now", "last_success_at": "yesterday", "upload_url": "secret", "credentials": "secret"})
     visible = backup_alerts.public_status(tmp_path)
