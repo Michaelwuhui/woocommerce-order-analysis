@@ -2,6 +2,8 @@ import hashlib
 import json
 import subprocess
 import tarfile
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -262,3 +264,20 @@ def test_bundle_contains_database_source_config_and_verifiable_manifest(tmp_path
     (app / "app.py").write_text("uncommitted")
     with pytest.raises(backup.BackupError, match="未提交"):
         backup.build_bundle({"app_dir": str(app), "runtime_files": []}, tmp_path / "stage2", "2026-09-20")
+
+
+def test_daily_job_waits_for_health_lock_instead_of_skipping(tmp_path, monkeypatch):
+    fcntl = pytest.importorskip("fcntl")
+    monkeypatch.setattr(backup, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(backup, "CONFIG_PATH", tmp_path / "config.json")
+    called = threading.Event()
+    monkeypatch.setattr(backup, "run_backup", lambda *args: called.set())
+    with (tmp_path / "job.lock").open("a") as health_lock:
+        fcntl.flock(health_lock, fcntl.LOCK_EX)
+        job = threading.Thread(target=backup.main, args=(["run"],), daemon=True)
+        job.start()
+        time.sleep(0.1)
+        assert job.is_alive() and not called.is_set()
+        fcntl.flock(health_lock, fcntl.LOCK_UN)
+    job.join(timeout=3)
+    assert not job.is_alive() and called.is_set()

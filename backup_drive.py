@@ -351,7 +351,10 @@ def main(argv=None):
     import fcntl  # production uses Linux; pure functions also test on Windows
     with (STATE_DIR / "job.lock").open("a") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # A short health check must never make the daily job skip its only
+            # scheduled run. Checks may skip an upload; uploads wait for checks.
+            mode = fcntl.LOCK_EX | (fcntl.LOCK_NB if args.action == "check" else 0)
+            fcntl.flock(lock, mode)
         except BlockingIOError:
             log("已有备份任务运行，本次跳过")
             return 0
