@@ -590,6 +590,11 @@ def fulfillment_order_detail(order_id):
                 item["stock"] = replenishment_metrics(
                     conn, fulfillment["warehouse_id"], item_row["sku_id"]
                 )
+                from reconciliation_core import ready as rec_ready
+                if rec_ready(conn):
+                    item['source_batches'] = [dict(r) for r in conn.execute(
+                        'SELECT s.id,s.batch_id,b.batch_no,s.quantity,s.reserved,s.shipped FROM rec_sources s JOIN inv_batches b ON b.id=s.batch_id WHERE s.fulfillment_item_id=? ORDER BY s.batch_id',
+                        (item_row['id'],)).fetchall()]
                 data["items"].append(item)
             shipments = []
             for shipment in conn.execute(

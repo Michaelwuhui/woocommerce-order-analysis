@@ -222,6 +222,10 @@ def process_order(conn, order_id, caches=None, commit=True):
         return {'order_id': order_id, 'error': '订单不存在'}
 
     status = order['status']
+    from reconciliation_core import order_config
+    if order_config(conn, order_id):
+        return {'order_id': order_id, 'status': status, 'action': 'owned_by_oms',
+                'reason': '货权订单由多仓履约处理库存'}
     target = target_effect(status)
     st = conn.execute('SELECT * FROM inv_order_state WHERE order_id=?', (order_id,)).fetchone()
     cur_state = st['inv_state'] if st else 'none'

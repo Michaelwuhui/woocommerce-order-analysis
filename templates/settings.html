@@ -27,6 +27,9 @@
 {% endblock %}
 
 {% block content %}
+{% if current_user.can_edit_reconciliation() and not site_sync_only %}
+<div class="container-fluid mt-3"><a class="btn btn-outline-info" href="{{ url_for('reconciliation_v2.page') }}">合伙人对账规则：货权、合同与管理费配置</a></div>
+{% endif %}
 <!-- Sync Progress Modal -->
 <div class="modal fade" id="syncProgressModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1">
     <div class="modal-dialog modal-lg">
