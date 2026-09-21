@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% block title %}历史对账草稿{% endblock %}
+{% block content %}
+<link rel="stylesheet" href="{{ url_for('static',filename='css/reconciliation_v2.css') }}">
+<style>
+.history-fields{display:flex;gap:14px;flex-wrap:wrap;align-items:end;margin:18px 0}.history-fields label{display:flex;flex-direction:column;gap:7px}.history-fields select,.history-fields input,#history-reships input,#history-reships select{background:#132137;color:#ecf3ff;border:1px solid #526783;padding:9px;border-radius:6px;max-width:100%}#history-rule-form{display:grid;grid-template-columns:1fr 1fr;gap:12px}#history-rule-form label{display:flex;flex-direction:column;gap:6px}#history-rule-form input,#history-rule-form select{background:#0d192a;color:white;padding:9px;border:1px solid #526783;border-radius:6px;width:100%}#history-rule-form fieldset{grid-column:1/-1;border:1px solid #526783;padding:14px}#history-rule-form footer{grid-column:1/-1}@media(max-width:700px){ #history-rule-form{grid-template-columns:1fr}.history-fields label{width:100%}}
+</style>
+<div id="rec-app" data-csrf="{{ rec_csrf }}">
+ <header class="rec-header"><div><div class="rec-kicker">历史出库 · 费用核对 · 原币与人民币</div><h1>历史对账草稿</h1><p>按既有出库记录核算，生成固定快照；不重放库存、不生成付款。</p></div><a class="rec-button secondary" href="/partner-reconciliation/modular">返回模块化对账</a></header>
+ <div class="rec-warning">供货成本未提供时，货值和商品利润显示待定。此处草稿不能锁单或核销，不能与旧账重复结算；收入不代表已回款。</div>
+ <div id="rec-message" role="status"></div>
+ <div class="rec-actions"><button id="history-new-rule">新增历史核算规则</button></div>
+ <details><summary>已保存的历史核算规则</summary><div id="history-rules"></div></details>
+ <div class="history-fields"><label>核算规则<select id="history-rule"></select></label><label>出库月份<input id="history-month" type="month" value="2026-08"></label><label>市场原币<select id="history-currency"><option>PLN</option><option>CZK</option><option>HUF</option></select></label><button id="history-preview">预览核对</button><button id="history-create" disabled>生成草稿对账单</button></div>
+ <section id="history-reships"></section>
+ <section id="history-result"><p>选择已确认的规则和月份，然后预览。</p></section>
+ <h2>已生成的草稿对账单</h2><div id="history-drafts"></div>
+ <dialog id="history-rule-dialog"><h2>新增历史核算规则</h2><p>适用于供货方独资、团队承担全部商品与运费盈亏、货值另账的历史订单。</p><form id="history-rule-form"></form></dialog>
+</div>
+<script src="{{ url_for('static',filename='js/reconciliation_history.js') }}" defer></script>
+{% endblock %}
