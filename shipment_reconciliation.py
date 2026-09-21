@@ -1,7 +1,7 @@
-"""Read-only WooCommerce verification and atomic legacy shipment recovery.
+"""Verify original parcels, restore eligible missing tracking, then reconcile.
 
-Never sends a shipment, customer notification, or inventory movement. Ambiguous
-parcels remain unresolved until the source supplies complete matching evidence.
+Never creates another parcel or calls email/inventory endpoints. Conflicting
+evidence remains unresolved; every restoration requires a separate source GET.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from external_operations import SHIPMENT_LOCK_NAMESPACE, canonical_hash, transit
 from oid_utils import make_oid, woo_post_id
 from order_shipments import extract_tracking_candidates
 from shipment_split import order_products
+from shipment_repair import RepairNotAllowed, restore_payload
 from sync_service import get_connection
 
 LOG = logging.getLogger(__name__)
@@ -128,9 +129,12 @@ def _snapshot(connection, operation_id, *, lock=False):
                               (op['site_id'],)).fetchone()
     oms = connection.execute('SELECT 1 FROM oms_order_fulfillment_state WHERE order_id=?',
                              (op['order_id'],)).fetchone()
+    payload = parsed(op['request_payload'], {})
+    provider = connection.execute('SELECT name,tracking_url FROM shipping_carriers WHERE slug=?',
+                                  (payload.get('carrier_slug'),)).fetchone()
     return {'op': op, 'order': dict(order) if order else None,
             'logs': [dict(r) for r in logs], 'site': dict(site) if site else None,
-            'has_oms': bool(oms)}
+            'has_oms': bool(oms), 'carrier': dict(provider) if provider else None}
 
 
 def validate_local(snapshot):
@@ -167,7 +171,7 @@ def validate_local(snapshot):
     return payload
 
 
-def due_operations(order_ids=None, limit=30):
+def due_operations(order_ids=None, limit=30, *, manual=False):
     if not db.is_postgres_backend():
         return []
     connection = get_connection()
@@ -183,19 +187,28 @@ def due_operations(order_ids=None, limit=30):
             WHERE operation_type='ship_order'
               AND status IN ('pending','external_success','reconciliation_required')
               AND updated_at <= CURRENT_TIMESTAMP - interval '300 seconds'
-              AND COALESCE(NULLIF(external_evidence->'shipment_reconciliation'->>'next_check_at','')
+              AND (? OR COALESCE(NULLIF(external_evidence->'shipment_reconciliation'->>'next_check_at','')
                            ::timestamptz, '-infinity'::timestamptz) <= CURRENT_TIMESTAMP
-            """ + clause + ' ORDER BY updated_at LIMIT ?', (*args, max(1, min(limit, 100)))).fetchall()
+              )
+            """ + clause + ' ORDER BY updated_at LIMIT ?', (bool(manual), *args, max(1, min(limit, 100)))).fetchall()
         return [str(r['operation_id']) for r in rows]
     finally:
         connection.close()
 
 
-def reconcile_operation(operation_id, *, fetch=None):
+def _duplicate_tracking(connection, order_id, payload):
+    return connection.execute(
+        'SELECT 1 FROM shipping_logs WHERE order_id<>? AND lower(trim(tracking_number))=lower(trim(?)) '
+        'AND lower(trim(carrier_slug))=lower(trim(?)) LIMIT 1',
+        (order_id, payload['tracking_number'], payload['carrier_slug'])).fetchone()
+
+
+def reconcile_operation(operation_id, *, fetch=None, put=None, manual=False):
     """Network reads occur outside a transaction; local completion is atomic."""
     if not db.is_postgres_backend():
         return {'outcome': 'disabled'}
     fetch = fetch or requests.get
+    put = put or requests.put
     connection = get_connection()
     locked, order_id = False, None
     try:
@@ -215,29 +228,81 @@ def reconcile_operation(operation_id, *, fetch=None):
         previous = parsed(op['external_evidence'], {}).get(EVIDENCE_KEY, {})
         if op['operation_type'] != 'ship_order' or op['status'] not in ACTIVE:
             return {'outcome': 'already_closed'}
-        if age < GRACE_SECONDS or (previous.get('next_check_at') and
+        if age < GRACE_SECONDS or (not manual and previous.get('next_check_at') and
                 datetime.fromisoformat(previous['next_check_at']) > now):
             return {'outcome': 'not_due'}
         connection.commit()
         outcome, reason, remote = 'needs_review', '', None
+        evidence = parsed(op['external_evidence'], {})
         try:
             payload = validate_local(before)
             site = before['site']
-            response = fetch(site['url'].rstrip('/') + '/wp-json/wc/v3/orders/' + woo_post_id(order_id),
-                             auth=(site['consumer_key'], site['consumer_secret']),
-                             headers={'User-Agent': 'WooCommerce API Client-Python/3.0.0'},
-                             timeout=(5, 15), allow_redirects=False)
+            url = site['url'].rstrip('/') + '/wp-json/wc/v3/orders/' + woo_post_id(order_id)
+            options = {'auth': (site['consumer_key'], site['consumer_secret']),
+                       'headers': {'User-Agent': 'WooCommerce API Client-Python/3.0.0',
+                                   'Cache-Control': 'no-cache'},
+                       'timeout': (5, 30), 'allow_redirects': False}
+            response = fetch(url, **options)
             if response.status_code != 200:
                 outcome, reason = 'read_failed', f'来源站点读取失败（HTTP {response.status_code}），稍后重查'
             else:
                 remote = response.json()
                 outcome = verify_remote(remote, payload)
                 if outcome == 'remote_absent':
-                    reason = '来源站点尚无原运单记录，请核实发货后由管理员处理；系统将继续核对'
+                    reason = '来源站点尚无原运单；等待再次核验后自动补同步'
+                    patch = restore_payload(before, payload, remote, evidence, now)
+                    if patch:
+                        current = _snapshot(connection, operation_id, lock=True)
+                        if current != before:
+                            connection.rollback()
+                            return {'outcome': 'changed_during_check'}
+                        if _duplicate_tracking(connection, order_id, payload):
+                            raise ReviewRequired('原运单同时绑定其他订单，需要核实')
+                        if (current['order']['date_modified'] and remote.get('date_modified') and
+                                str(current['order']['date_modified']).replace(' ', 'T') >
+                                str(remote['date_modified']).replace(' ', 'T')):
+                            raise ReviewRequired('来源站点返回的版本早于本地订单，不能补写')
+                        # Persist BEFORE the PUT. A killed worker must leave a
+                        # durable attempt and cooldown, not a free blind replay.
+                        evidence = parsed(op['external_evidence'], {})
+                        repair = evidence.get('shipment_repair', {})
+                        repair = {**repair, 'attempts': int(repair.get('attempts', 0)) + 1,
+                                  'started_at': datetime.now(timezone.utc).isoformat(),
+                                  'http_status': None, 'confirmation': 'awaiting_readback'}
+                        evidence['shipment_repair'] = repair
+                        connection.execute('UPDATE external_operations SET external_evidence=?::jsonb, '
+                                           'attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?',
+                                           (json.dumps(evidence, ensure_ascii=False), operation_id))
+                        connection.commit()
+                        updated = _snapshot(connection, operation_id)
+                        if any(updated[k] != before[k] for k in before if k != 'op'):
+                            connection.rollback()
+                            return {'outcome': 'changed_during_check'}
+                        before = updated
+                        op = before['op']
+                        connection.commit()
+                        try:
+                            written = put(url, json=patch, **options)
+                            repair['http_status'] = written.status_code
+                        except requests.RequestException:
+                            pass  # A timeout is ambiguous: always read, never replay here.
+                        # Even HTTP 200 with a plausible body is insufficient.
+                        response = fetch(url, **options)
+                        if response.status_code != 200:
+                            outcome, reason = 'read_failed', '原运单已尝试补同步，回读暂时失败，稍后核验'
+                        else:
+                            remote = response.json()
+                            outcome = verify_remote(remote, payload)
+                            reason = '' if outcome == 'verified' else '原运单补同步后尚未确认，稍后重新核验'
+                        repair['confirmation'] = 'verified_get' if outcome == 'verified' else 'not_confirmed'
+                        # Keep post-write evidence in memory until the atomic
+                        # final update; before remains the actual DB snapshot.
+                        evidence['shipment_repair'] = repair
         except requests.RequestException:
             outcome, reason = 'read_failed', '来源站点查询超时或连接失败，稍后重查'
         except (ValueError, TypeError, KeyError) as exc:
-            reason = str(exc) if isinstance(exc, ReviewRequired) else '包裹证据格式不完整，需要核实'
+            outcome = 'needs_review'
+            reason = str(exc) if isinstance(exc, (ReviewRequired, RepairNotAllowed)) else '包裹证据格式不完整，需要核实'
 
         current = _snapshot(connection, operation_id, lock=True)
         if current != before:
@@ -245,10 +310,7 @@ def reconcile_operation(operation_id, *, fetch=None):
             return {'outcome': 'changed_during_check'}
         # Prevent a legacy request from ever binding one tracking to two orders.
         if outcome == 'verified':
-            duplicate = connection.execute(
-                'SELECT 1 FROM shipping_logs WHERE order_id<>? AND tracking_number=? '
-                'AND lower(carrier_slug)=lower(?) LIMIT 1',
-                (order_id, payload['tracking_number'], payload['carrier_slug'])).fetchone()
+            duplicate = _duplicate_tracking(connection, order_id, payload)
             if duplicate:
                 outcome, reason = 'needs_review', '原运单同时绑定其他订单，需要核实'
         if outcome == 'verified' and current['order']['date_modified'] and remote.get('date_modified'):
@@ -256,13 +318,14 @@ def reconcile_operation(operation_id, *, fetch=None):
                 outcome, reason = 'needs_review', '来源站点返回的版本早于本地订单，稍后重新核验'
         checked = datetime.now(timezone.utc)
         checks = int(previous.get('checks', 0)) + 1
-        evidence = parsed(op['external_evidence'], {})
         detail = {'outcome': outcome, 'reason': reason, 'checks': checks,
                   'checked_at': checked.isoformat(), 'remote_status': remote.get('status') if isinstance(remote, dict) else None,
                   'next_check_at': None if outcome == 'verified' else
                   (checked + timedelta(seconds=min(3600, 300 * 2 ** min(checks - 1, 4)))).isoformat()}
         evidence[EVIDENCE_KEY] = detail
         if outcome == 'verified':
+            if evidence.get('shipment_repair'):
+                evidence['shipment_repair']['confirmation'] = 'verified_get'
             order = current['order']
             # Preserve terminal outcomes. No inventory, fulfilment, or email hooks.
             status = 'completed' if order['status'] == 'completed' or order['delivery_confirmed'] else remote['status']
@@ -288,7 +351,8 @@ def reconcile_operation(operation_id, *, fetch=None):
             connection.execute("""INSERT INTO order_notes
                 (order_id,note,date_created,customer_note,author,added_by_user)
                 VALUES (?,?,datetime('now'),0,'系统自动对账',0)""",
-                (order_id, '发货同步对账已补齐：来源站点原运单、物流商及商品数量核验一致；保留原发货时间。'))
+                (order_id, ('原运单已补同步至来源站点并回读确认；' if evidence.get('shipment_repair') else '') +
+                 '发货同步对账已补齐：来源站点原运单、物流商及商品数量核验一致；保留原发货时间。'))
         else:
             connection.execute("""UPDATE external_operations SET status='reconciliation_required',
                 external_evidence=?::jsonb,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?""",

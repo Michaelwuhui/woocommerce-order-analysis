@@ -24,6 +24,7 @@ def operation(monkeypatch):
     monkeypatch.setattr(requests.sessions.Session, 'request',
                         lambda *a, **k: pytest.fail('Real network calls are forbidden in tests'))
     c = get_connection()
+    assert c.execute('SELECT current_database()').fetchone()[0] == os.environ['WOO_DB_NAME_OVERRIDE']
     for table in ('order_notes', 'shipping_logs', 'external_operations'):
         c.execute(f'DELETE FROM {table} WHERE order_id=?', (OID,))
     c.execute('DELETE FROM orders WHERE id=?', (OID,))
@@ -213,3 +214,129 @@ def test_regular_sync_queues_reconciliation_after_commit(operation, monkeypatch)
     monkeypatch.setattr(tasks, 'enqueue_orders', lambda ids: seen.extend(ids))
     sync_utils.run_post_commit_sync_actions([{'order_id': OID}], strict=True)
     assert seen == [OID]
+
+
+def eligible_restoration(operation):
+    from datetime import datetime, timedelta, timezone
+    evidence = {'format': 'villatheme', 'shipment_reconciliation': {
+        'outcome': 'remote_absent', 'checked_at': (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()}}
+    # Real operations persist the target status in their immutable request.
+    c = get_connection()
+    p = rec.parsed(c.execute('SELECT request_payload FROM external_operations WHERE operation_id=?',
+                            (operation,)).fetchone()[0])
+    p['expected_status'] = 'on-hold'
+    c.execute('UPDATE external_operations SET request_payload=?::jsonb,request_hash=?,external_evidence=?::jsonb '
+              'WHERE operation_id=?', (json.dumps(p), rec.canonical_hash(p), json.dumps(evidence), operation))
+    c.commit(); c.close()
+    remote = source('none'); remote['status'] = 'processing'
+    return remote
+
+
+def apply_patch_to_remote(remote, patch):
+    remote['status'] = patch['status']
+    remote['meta_data'] = deepcopy(patch['meta_data'])
+    by_id = {line['id']: line for line in patch['line_items']}
+    for line in remote['line_items']:
+        line['meta_data'] = deepcopy(by_id[line['id']]['meta_data'])
+
+
+@pytest.mark.parametrize('timeout', [False, True])
+def test_missing_remote_restored_once_then_independently_read_back(operation, timeout):
+    remote = eligible_restoration(operation); before = rows(); calls = []
+    def put(url, **kwargs):
+        calls.append('put')
+        assert kwargs['allow_redirects'] is False and url.endswith('/wc/v3/orders/123')
+        # Durable intent precedes the remote side effect.
+        assert rec.parsed(rows()['op']['external_evidence'])['shipment_repair']['attempts'] == 1
+        apply_patch_to_remote(remote, kwargs['json'])
+        if timeout: raise requests.Timeout('response lost after commit')
+        return Response(remote)
+    def fetch(*a, **k): calls.append('get'); return Response(remote)
+    assert rec.reconcile_operation(operation, fetch=fetch, put=put)['outcome'] == 'verified'
+    after = rows()
+    assert calls == ['get', 'put', 'get']
+    assert after['op']['status'] == 'local_committed' and after['op']['attempts'] == 2
+    assert rec.parsed(after['op']['external_evidence'])['shipment_repair']['confirmation'] == 'verified_get'
+    assert len(after['logs']) == 1 and after['logs'][0]['status'] == 'shipped'
+    assert all(after['logs'][0][k] == before['logs'][0][k] for k in before['logs'][0] if k != 'status')
+    assert after['movements'] == 0 and len(after['notes']) == 1 and not after['notes'][0]['customer_note']
+    assert rec.reconcile_operation(operation, fetch=fetch, put=put)['outcome'] == 'already_closed'
+    assert calls == ['get', 'put', 'get']
+
+
+@pytest.mark.parametrize('failure', ['false_200', 'timeout', 'http429', 'read_failed'])
+def test_unconfirmed_restoration_stays_pending_and_never_replays_in_same_run(operation, failure):
+    remote = eligible_restoration(operation); before = rows(); writes = []
+    def put(*a, **k):
+        writes.append(1)
+        if failure == 'timeout': raise requests.Timeout()
+        result = Response(source('villa'))
+        if failure == 'http429': result.status_code = 429
+        return result
+    def fetch(*a, **k):
+        result = Response(remote)
+        if writes and failure == 'read_failed': result.status_code = 503
+        return result
+    assert rec.reconcile_operation(operation, fetch=fetch, put=put)['outcome'] in {'remote_absent', 'read_failed'}
+    assert writes == [1] and rows()['logs'] == before['logs'] and rows()['order'] == before['order']
+    assert rows()['op']['status'] == 'reconciliation_required'
+    assert rec.reconcile_operation(operation, fetch=fetch, put=put)['outcome'] == 'not_due'
+    assert writes == [1]
+
+
+def test_worker_death_after_remote_write_recovers_without_another_write(operation):
+    remote = eligible_restoration(operation)
+    def put(*a, **k):
+        apply_patch_to_remote(remote, k['json'])
+        raise SystemExit('simulated worker death')
+    with pytest.raises(SystemExit): rec.reconcile_operation(operation, fetch=lambda *a, **k: Response(remote), put=put)
+    assert rows()['logs'][0]['status'] == 'pending_sync'
+    assert rec.parsed(rows()['op']['external_evidence'])['shipment_repair']['attempts'] == 1
+    execute("UPDATE external_operations SET updated_at=CURRENT_TIMESTAMP-interval '10 minutes' WHERE operation_id=?", (operation,))
+    assert rec.reconcile_operation(operation, fetch=lambda *a, **k: Response(remote),
+                                   put=lambda *a, **k: pytest.fail('duplicate PUT'))['outcome'] == 'verified'
+
+
+def test_auto_write_cap_still_allows_later_successful_readback(operation):
+    remote = eligible_restoration(operation)
+    execute("UPDATE external_operations SET external_evidence=external_evidence || '{\"shipment_repair\":{\"attempts\":3}}'::jsonb WHERE operation_id=?", (operation,))
+    assert rec.reconcile_operation(operation, fetch=lambda *a, **k: Response(remote),
+                                   put=lambda *a, **k: pytest.fail('write cap exceeded'))['outcome'] == 'needs_review'
+    execute("UPDATE external_operations SET updated_at=CURRENT_TIMESTAMP-interval '10 minutes' WHERE operation_id=?", (operation,))
+    assert rec.reconcile_operation(operation, fetch=lambda *a, **k: Response(source('villa')),
+                                   put=lambda *a, **k: pytest.fail('already saved'), manual=True)['outcome'] == 'verified'
+
+
+def test_concurrent_edit_before_restoration_prevents_remote_write(operation):
+    remote = eligible_restoration(operation)
+    def fetch(*a, **k):
+        execute("UPDATE orders SET status='cancelled' WHERE id=?", (OID,))
+        return Response(remote)
+    assert rec.reconcile_operation(operation, fetch=fetch,
+                                   put=lambda *a, **k: pytest.fail('stale write'))['outcome'] == 'changed_during_check'
+
+
+def test_duplicate_tracking_on_another_order_prevents_restoration(operation):
+    remote = eligible_restoration(operation)
+    other = '99001-124'
+    execute("INSERT INTO orders(id,number,source,status) VALUES (?,'124','https://reconciliation-test.invalid','processing')", (other,))
+    try:
+        execute("INSERT INTO shipping_logs(order_id,woo_order_id,source,tracking_number,carrier_slug) "
+                "VALUES (?,124,'https://reconciliation-test.invalid','TRACK-123','inpost')", (other,))
+        assert rec.reconcile_operation(operation, fetch=lambda *a, **k: Response(remote),
+                                       put=lambda *a, **k: pytest.fail('duplicate parcel'))['outcome'] == 'needs_review'
+    finally:
+        execute('DELETE FROM shipping_logs WHERE order_id=?', (other,))
+        execute('DELETE FROM orders WHERE id=?', (other,))
+
+
+def test_manual_check_bypasses_hourly_backoff_but_keeps_grace_period(operation, monkeypatch):
+    import shipment_reconciliation_tasks as tasks
+    execute("UPDATE external_operations SET external_evidence=jsonb_build_object('shipment_reconciliation',"
+            "jsonb_build_object('next_check_at',CURRENT_TIMESTAMP+interval '1 hour')) WHERE operation_id=?", (operation,))
+    assert operation not in rec.due_operations([OID]) and operation in rec.due_operations([OID], manual=True)
+    sent = []
+    monkeypatch.setattr(tasks.reconcile_shipment, 'apply_async', lambda **kw: sent.append(kw))
+    assert tasks.enqueue_orders([OID], manual=True) == 1
+    assert sent[0]['kwargs'] == {'manual': True}
+    assert rec.reconcile_operation(operation, fetch=lambda *a, **k: Response(), manual=True)['outcome'] == 'verified'
