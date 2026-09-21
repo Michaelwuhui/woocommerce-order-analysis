@@ -18553,7 +18553,7 @@ def build_custom_lineitem_payload(tracking_number, carrier_slug, tracking_url, l
 @shipper_required
 @order_site_editable
 def request_shipment_reconciliation():
-    """Queue a bounded source read, never resubmit a shipment."""
+    """Queue verification/restoration of the unchanged original parcel."""
     order_id = str((request.json or {}).get('order_id') or '')
     if not order_id:
         return jsonify({'success': False, 'error': '缺少订单号'}), 400
@@ -18569,7 +18569,7 @@ def request_shipment_reconciliation():
         conn.close()
     from shipment_reconciliation_tasks import enqueue_orders
     try:
-        queued = enqueue_orders([order_id])
+        queued = enqueue_orders([order_id], manual=True)
     except Exception:
         app.logger.exception('Manual reconciliation enqueue failed')
         return jsonify({'success': False, 'error': '暂时无法排队，系统将自动重查'}), 503

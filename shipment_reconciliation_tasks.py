@@ -1,4 +1,4 @@
-"""Durable recovery outside Gunicorn; each source read runs on a fetch worker."""
+"""Durable parcel verification and bounded restoration outside Gunicorn."""
 import logging
 
 from celery_app import celery_app
@@ -7,10 +7,11 @@ from shipment_reconciliation import due_operations, reconcile_operation
 LOG = logging.getLogger(__name__)
 
 
-def enqueue_orders(order_ids=None):
-    ids = due_operations(order_ids)
+def enqueue_orders(order_ids=None, *, manual=False):
+    ids = due_operations(order_ids, manual=manual)
     for operation_id in ids:
-        reconcile_shipment.apply_async(args=[operation_id], expires=300)
+        options = {'kwargs': {'manual': True}} if manual else {}
+        reconcile_shipment.apply_async(args=[operation_id], expires=300, **options)
     return len(ids)
 
 
@@ -22,8 +23,8 @@ def scan_shipments():
 
 @celery_app.task(name='woo_sync.reconcile_shipment', acks_late=True,
                  reject_on_worker_lost=True)
-def reconcile_shipment(operation_id):
-    return reconcile_operation(operation_id)
+def reconcile_shipment(operation_id, manual=False):
+    return reconcile_operation(operation_id, manual=manual)
 
 
 def enqueue_after_uncertain(operation_id):
