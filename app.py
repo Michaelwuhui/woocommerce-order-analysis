@@ -25869,6 +25869,9 @@ except Exception as _e:
     import logging as _logging
     _logging.getLogger(__name__).warning('库存模块未加载: %s', _e)
 
+from reconciliation_api import bp as reconciliation_v2_bp
+app.register_blueprint(reconciliation_v2_bp)
+
 try:
     from fulfillment_api import fulfillment_bp
     app.register_blueprint(fulfillment_bp)

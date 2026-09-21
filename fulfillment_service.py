@@ -20,6 +20,8 @@ from typing import Any
 
 from fulfillment_common import json_dump, json_load, utcnow
 from inv_common import record_movement
+import reconciliation_inventory as rec_inventory
+from reconciliation_core import order_config as rec_order_config
 from managed_transfer_catalog import (
     JYJG_TRANSIT_ROUTING_POLICY,
     JYJG_TRANSIT_ROUTING_SETTING,
@@ -517,6 +519,8 @@ def _release_managed_transfer_reservations(
     actor: dict | None,
     reason: str | None,
 ) -> None:
+    if rec_inventory.release(conn, fulfillment):
+        return
     if _warehouse_routing_policy(conn, fulfillment["warehouse_id"]) != MANAGED_TRANSFER_ROUTING:
         return
     items = conn.execute(
@@ -555,6 +559,8 @@ def _consume_managed_transfer_stock(
     *,
     actor: dict | None,
 ) -> None:
+    if rec_inventory.ship(conn, fulfillment, item, shipment_id, quantity):
+        return
     if _warehouse_routing_policy(conn, fulfillment["warehouse_id"]) != MANAGED_TRANSFER_ROUTING:
         return
     reserve_ref = f"{item['id']}:reserve"
@@ -1395,6 +1401,9 @@ def plan_order(
     if order["status"] not in ACTIVE_ORDER_STATUSES:
         raise DomainError(f"订单状态 {order['status']} 不允许创建履约单", "order_not_plannable")
 
+    from reconciliation_core import apply_site_profile
+    apply_site_profile(conn, order_id)
+
     old_state = conn.execute(
         "SELECT * FROM oms_order_fulfillment_state WHERE order_id=?", (order_id,)
     ).fetchone()
@@ -1443,11 +1452,12 @@ def plan_order(
             (order_id, old_revision),
         ).fetchall()
         for reserved in reserved_rows:
-            if _warehouse_routing_policy(conn, reserved["warehouse_id"]) == MANAGED_TRANSFER_ROUTING:
+            if not rec_order_config(conn, order_id) and _warehouse_routing_policy(conn, reserved["warehouse_id"]) == MANAGED_TRANSFER_ROUTING:
                 reusable_reservations[(reserved["warehouse_id"], reserved["sku_id"])] += int(
                     reserved["qty"] or 0
                 )
 
+    owned_warehouse_order = rec_inventory.fewest_warehouse_order(conn, order_id, items, market)
     availability = {}
     assignments: dict[int, list[dict]] = defaultdict(list)
     shortages = []
@@ -1470,6 +1480,9 @@ def plan_order(
             item["sku_id"],
             managed_family=bool(reserved_family),
         )
+        candidates = rec_inventory.candidates(conn, order_id, item["sku_id"], candidates, qty)
+        if owned_warehouse_order:
+            candidates.sort(key=lambda c: owned_warehouse_order.index(c["warehouse_id"]) if c["warehouse_id"] in owned_warehouse_order else len(owned_warehouse_order))
         if not candidates:
             shortages.append({
                 "order_item_id": item["id"], "sku_id": item["sku_id"], "name": item["name"],
@@ -1534,6 +1547,14 @@ def plan_order(
             for warehouse_id in sorted(financial_terms)
         ],
     }
+    rec_config = rec_order_config(conn, order_id)
+    if rec_config:
+        canonical_plan["source_configuration"] = rec_config
+        canonical_plan["source_batches"] = [
+            {"warehouse_id": wid, "order_item_id": line["order_item_id"],
+             "batches": line["candidate"].get("rec_batches", [])}
+            for wid, lines in sorted(assignments.items()) for line in lines
+        ]
     plan_hash = _hash(canonical_plan)
     if old_state and old_state["plan_hash"] == plan_hash:
         if commit:
@@ -1677,7 +1698,8 @@ def plan_order(
                 ),
             )
             fulfillment_item_id = int(cur.lastrowid)
-            if sw.get("routing_policy") == MANAGED_TRANSFER_ROUTING:
+            owned = rec_inventory.reserve(conn, order_id, fulfillment_item_id, warehouse_id, line["sku_id"], line["qty"])
+            if not owned and sw.get("routing_policy") == MANAGED_TRANSFER_ROUTING:
                 _apply_managed_transfer_stock_once(
                     conn,
                     warehouse_id=warehouse_id,
@@ -2120,6 +2142,9 @@ def create_shipment(
     fulfillment = conn.execute("SELECT * FROM oms_fulfillments WHERE id=?", (fulfillment_id,)).fetchone()
     if not fulfillment:
         raise DomainError("履约单不存在", "fulfillment_not_found")
+    if rec_order_config(conn, fulfillment["order_id"]):
+        conn.execute("SELECT id FROM orders WHERE id=?" + (" FOR UPDATE" if hasattr(conn,"_raw") else ""), (fulfillment["order_id"],)).fetchone()
+        fulfillment = conn.execute("SELECT * FROM oms_fulfillments WHERE id=?",(fulfillment_id,)).fetchone()
     existing = conn.execute(
         "SELECT * FROM oms_shipments WHERE carrier_slug=? AND tracking_number=?",
         (carrier_slug, tracking_number),
@@ -2129,6 +2154,8 @@ def create_shipment(
             raise DomainError("该运单号已属于其他履约单", "tracking_conflict")
         return dict(existing)
 
+    if rec_order_config(conn, fulfillment["order_id"]) and fulfillment["status"] not in {"ready_to_pick","picking","packed","accepted","shipped"}:
+        raise DomainError("货权履约当前状态不能出库", "owned_fulfillment_not_shippable")
     members = joint_dispatch_fulfillments(conn, fulfillment_id, pristine_only=True)
     owner = members[0]
 

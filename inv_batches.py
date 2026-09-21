@@ -71,6 +71,9 @@ def plan_fefo(conn, warehouse_id, sku_id, qty, include_expired=False):
     for r in rows:
         if need <= 0:
             break
+        from reconciliation_core import ready
+        if ready(conn) and conn.execute('SELECT batch_id FROM rec_batches WHERE batch_id=?', (r['id'],)).fetchone():
+            continue  # Owned batches are consumed exclusively through OMS source records.
         if not include_expired and r['expiry_date'] and str(r['expiry_date'])[:10] < today:
             continue  # 跳过过期批次
         take = min(need, r['qty_remaining'])
@@ -89,6 +92,9 @@ def consume_batches(conn, allocations):
 
 def restock_batch(conn, batch_id, qty):
     """退货回补:把 qty 加回指定批次的 qty_remaining。"""
+    from reconciliation_core import ready, ReconciliationError
+    if ready(conn) and conn.execute('SELECT batch_id FROM rec_batches WHERE batch_id=?',(batch_id,)).fetchone():
+        raise ReconciliationError('货权批次退货必须关联原出库来源，不能用旧库存回补处理')
     conn.execute('UPDATE inv_batches SET qty_remaining = qty_remaining + ?, updated_at=CURRENT_TIMESTAMP '
                  'WHERE id=?', (qty, batch_id))
 

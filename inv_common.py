@@ -230,6 +230,14 @@ def record_movement(conn, *, warehouse_id, sku_id, movement_type,
         'SELECT on_hand, reserved FROM inv_stock WHERE warehouse_id=? AND sku_id=?' + lock_sql,
         (warehouse_id, sku_id)
     ).fetchone()
+    # Once a SKU has owned batches, outbound/reservation changes need a source trail.
+    # Inbound inventory workflows remain available; classify the receipt before routing it.
+    if apply_stock and (qty_delta < 0 or reserved_delta != 0 or movement_type == 'return_in') and not str(ref_type or '').startswith('rec_'):
+        if _table_exists(conn, 'rec_batches') and conn.execute(
+                'SELECT r.batch_id FROM rec_batches r JOIN inv_batches b ON b.id=r.batch_id WHERE b.warehouse_id=? AND b.sku_id=? LIMIT 1',
+                (warehouse_id, sku_id)).fetchone():
+            from reconciliation_core import ReconciliationError
+            raise ReconciliationError('该 SKU 已启用批次货权，请使用货权订单履约或货权批次调拨')
     on_hand_before = row['on_hand'] if row else 0
     reserved_before = row['reserved'] if row else 0
     on_hand_after = on_hand_before + (qty_delta or 0)
