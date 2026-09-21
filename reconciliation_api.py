@@ -9,8 +9,26 @@ from inv_common import get_conn, can_manage_inventory
 from reconciliation_core import *
 import reconciliation_inventory as inventory
 import reconciliation_ledger as ledger
+import reconciliation_history as history
 
 bp = Blueprint('reconciliation_v2', __name__)
+
+
+@bp.get('/partner-reconciliation/history')
+@login_required
+def history_page():
+    conn = get_conn()
+    try:
+        editor(conn)
+    finally:
+        conn.close()
+    session.setdefault('rec_csrf', secrets.token_urlsafe(32))
+    return render_template('reconciliation_history.html', rec_csrf=session['rec_csrf'])
+
+
+def _history_listing(conn):
+    return [{k: r[k] for k in ('id', 'name', 'created_at')} for r in rows(conn,
+        "SELECT id,name,created_at FROM rec_objects WHERE kind='history_draft' ORDER BY created_at DESC,id DESC LIMIT 100")]
 
 
 def scope(conn):
@@ -255,3 +273,54 @@ def export(conn, ident):
         cells = [e.get(k) or '' for k in ('order_id','site','category','amount','currency','occurred_at')]
         writer.writerow(["'" + str(v) if index != 3 and str(v).startswith(('=', '+', '-', '@', '\t', '\r')) else v for index,v in enumerate(cells)])
     return Response('\ufeff' + out.getvalue(), content_type='text/csv; charset=utf-8', headers={'Content-Disposition': 'attachment; filename="reconciliation.csv"'})
+
+
+@bp.get('/api/reconciliation-v2/history/state')
+@api()
+def history_state(conn):
+    editor(conn)
+    return jsonify(rules=objects(conn, 'history_rule'), drafts=_history_listing(conn),
+                   parties=objects(conn,'party'), pools=objects(conn,'pool'), contracts=objects(conn,'contract'),
+                   warehouses=rows(conn,'SELECT id,name FROM warehouses ORDER BY id'))
+
+
+@bp.post('/api/reconciliation-v2/history/rule')
+@api(write=True)
+def history_rule(conn):
+    data = request.get_json()
+    return jsonify(id=history.save_rule(conn, data['name'], data['data'], current_user.id))
+
+
+@bp.post('/api/reconciliation-v2/history/preview')
+@api(write=True)
+def history_preview(conn):
+    data = request.get_json()
+    return jsonify(history.preview(conn, data['rule_id'], data['month'], data['currency'], data.get('reship_decisions')))
+
+
+@bp.post('/api/reconciliation-v2/history/draft')
+@api(write=True)
+def history_draft(conn):
+    return jsonify(id=history.create_draft(conn, request.get_json(), current_user.id))
+
+
+@bp.get('/api/reconciliation-v2/history/draft/<ident>')
+@api()
+def history_detail(conn, ident):
+    editor(conn)
+    return jsonify(object_(conn, ident, 'history_draft'))
+
+
+@bp.get('/api/reconciliation-v2/history/export/<ident>')
+@api()
+def history_export(conn, ident):
+    editor(conn)
+    snap = object_(conn, ident, 'history_draft')['data']['snapshot']
+    out=io.StringIO(); writer=csv.writer(out)
+    writer.writerow(['订单ID','订单号','站点','出库日期','状态','原币','商品净收入','客户运费','收入合计','收入人民币','应付物流费','物流费人民币','管理费人民币','运费净收益','货值','商品利润','汇率月份','对人民币汇率','待核实'])
+    for r in snap['rows']:
+        values=[r.get(k) for k in ('order_id','number','site','shipped_at','state','currency','goods_income','shipping_income','revenue','revenue_cny','freight','freight_cny','management_cny','shipping_net')]
+        values+=['待成本','待成本',(r['rate'] or {}).get('month'),(r['rate'] or {}).get('rate'),'；'.join(r['pending'])]
+        # Prefix textual formula triggers; numeric negative amounts remain numeric.
+        writer.writerow(["'"+str(v) if i in (0,1,2,3,4,5,14,15,16,18) and str(v or '').startswith(('=','+','-','@','\t','\r')) else ('待核实' if v is None else v) for i,v in enumerate(values)])
+    return Response('\ufeff'+out.getvalue(),content_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="historical-reconciliation.csv"'})
