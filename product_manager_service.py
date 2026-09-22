@@ -201,16 +201,24 @@ def find_child_product(req, site, master_item):
     else:
         return None, "商品没有 SKU 或名称，无法定位子站对应商品"
 
-    try:
-        resp = req.get(
-            f"{child_url}/wp-json/wc/v3/products",
-            auth=auth,
-            params=params,
-            timeout=30,
-            headers=headers,
-        )
-    except req.RequestException as exc:
-        return None, f"查询子站失败: {exc}"
+    # A master write has already completed. A transient read failure must not
+    # replay it; retry only this read once with a smaller timeout budget. A
+    # repeated failure remains pending and never triggers a blind child write.
+    for timeout in (30, 15):
+        try:
+            resp = req.get(
+                f"{child_url}/wp-json/wc/v3/products",
+                auth=auth,
+                params=params,
+                timeout=timeout,
+                headers=headers,
+            )
+            if timeout == 30 and resp.status_code in (502, 503, 504, 520, 521, 522, 523, 524, 525, 526):
+                continue
+            break
+        except req.RequestException as exc:
+            if timeout == 15:
+                return None, f"查询子站失败（已重试只读核验）: {exc}"
     candidates, error = parse_wc_response(resp)
     if error:
         return None, f"查询子站失败: {error}"

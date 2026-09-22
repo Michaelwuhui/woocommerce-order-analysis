@@ -35,3 +35,17 @@ def test_product_manager_inline_script_has_valid_javascript_syntax():
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is required")
+@pytest.mark.parametrize("operation,scenario", [
+    ("soldout", "selected"), ("stock", "selected"), ("restore", "selected"),
+    ("price", "selected"), ("soldout", "parent"), ("soldout", "failure"),
+])
+def test_batch_operations_respect_endpoint_lease_and_keep_item_results(operation, scenario):
+    completed = subprocess.run(
+        [shutil.which("node"), str(ROOT / "tests" / "product_manager_batch_harness.js"),
+         str(PRODUCT_MANAGER_TEMPLATE), operation, scenario],
+        cwd=ROOT, capture_output=True, text=True, encoding="utf-8", check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

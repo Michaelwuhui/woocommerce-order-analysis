@@ -1642,9 +1642,11 @@
         // A single server request used to update every row serially. On sites
         // with slow WooMultistore hooks, 13 rows could exceed Gunicorn's 120s
         // limit and the proxy would return an HTML error page. Keep each remote
-        // write in its own request and use a small concurrency so one slow item
-        // cannot kill the entire batch. Variations go first so the variable
-        // parent's final stock status is applied last.
+        // write in its own request so one slow item cannot kill the entire
+        // batch. Stock writes also hold a physical endpoint lease (including
+        // master-routed sites): overlapping requests from this batch would
+        // reject each other with RESOURCE_BUSY. Queue stock writes; prices can
+        // still run concurrently. Apply variable parents after variations.
         const variationItems = items.filter(item => item.parent_id);
         const productItems = items.filter(item => !item.parent_id);
         const results = {success: [], failed: []};
@@ -1652,7 +1654,7 @@
 
         async function runPhase(phaseItems) {
             let phaseCursor = 0;
-            const workerCount = Math.min(2, phaseItems.length);
+            const workerCount = Math.min(type === 'price' ? 2 : 1, phaseItems.length);
             async function worker() {
                 while (phaseCursor < phaseItems.length) {
                     const item = phaseItems[phaseCursor++];
