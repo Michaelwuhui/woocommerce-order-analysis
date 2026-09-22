@@ -55,6 +55,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 from product_manager_service import (
     PRODUCT_EDIT_FIELDS as PRODUCT_EDIT_WHITELIST,
+    new_product_operation_deadline as _product_operation_deadline,
     parse_wc_response as _parse_wc_response,
     product_operation_action as _product_operation_action,
     product_state_snapshot as _product_state_snapshot,
@@ -8034,8 +8035,9 @@ def product_manager_update_variation(site_id, parent_id, variation_id):
     resource_url = (
         f'{api_url}/wp-json/wc/v3/products/{parent_id}/variations/{variation_id}'
     )
+    deadline = _product_operation_deadline()
     v, err, trace = _wc_product_update_verified(
-        req, resource_url, (ck, cs), payload
+        req, resource_url, (ck, cs), payload, deadline=deadline
     )
     if err:
         app.logger.warning(
@@ -8050,7 +8052,7 @@ def product_manager_update_variation(site_id, parent_id, variation_id):
         return jsonify({'success': False, 'error': err}), 409
 
     v = v or {}
-    child_verification = _verify_product_child_sync(req, site, v, payload)
+    child_verification = _verify_product_child_sync(req, site, v, payload, deadline=deadline)
     if child_verification['status'] not in ('not_applicable', 'verified'):
         sync_error = (
             f'商品主站写入成功，但 {site["url"]} 同步未验证：'
@@ -8120,8 +8122,9 @@ def product_manager_update(site_id, product_id):
     conn.close()
 
     resource_url = f'{api_url}/wp-json/wc/v3/products/{product_id}'
+    deadline = _product_operation_deadline()
     p, err, trace = _wc_product_update_verified(
-        req, resource_url, (ck, cs), payload
+        req, resource_url, (ck, cs), payload, deadline=deadline
     )
     if err:
         app.logger.warning(
@@ -8136,7 +8139,7 @@ def product_manager_update(site_id, product_id):
         return jsonify({'success': False, 'error': err}), 409
 
     p = p or {}
-    child_verification = _verify_product_child_sync(req, site, p, payload)
+    child_verification = _verify_product_child_sync(req, site, p, payload, deadline=deadline)
     if child_verification['status'] not in ('not_applicable', 'verified'):
         sync_error = (
             f'商品主站写入成功，但 {site["url"]} 同步未验证：'
@@ -8218,6 +8221,7 @@ def product_manager_bulk():
     conn.close()
 
     results = {'success': [], 'failed': []}
+    deadline = _product_operation_deadline()
     for item in items:
         pid = item.get('product_id')
         parent_id = item.get('parent_id')  # if present → this is a variation
@@ -8237,7 +8241,7 @@ def product_manager_bulk():
             url = f'{api_url}/wp-json/wc/v3/products/{pid}'
 
         p, err, trace = _wc_product_update_verified(
-            req, url, (ck, cs), payload
+            req, url, (ck, cs), payload, deadline=deadline
         )
         if err:
             _write_product_operation_audit(
@@ -8252,7 +8256,7 @@ def product_manager_bulk():
             })
             continue
         p = p or {}
-        child_verification = _verify_product_child_sync(req, site, p, payload)
+        child_verification = _verify_product_child_sync(req, site, p, payload, deadline=deadline)
         if child_verification['status'] not in ('not_applicable', 'verified'):
             sync_error = (
                 f'商品主站写入成功，但 {site["url"]} 同步未验证：'

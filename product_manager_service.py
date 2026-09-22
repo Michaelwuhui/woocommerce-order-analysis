@@ -6,6 +6,7 @@ updates, authoritative read-back verification, and master-to-child checks.
 """
 
 import html
+import time
 from decimal import Decimal, InvalidOperation
 
 
@@ -31,6 +32,45 @@ PRODUCT_STATE_FIELDS = (
     "sale_price",
     "price",
 )
+
+
+class ProductOperationExpired(Exception):
+    pass
+
+
+def new_product_operation_deadline():
+    # Includes master writes, child lookup, child repair and all read-backs.
+    # Leave headroom below the production Gunicorn worker's 120-second limit.
+    return time.monotonic() + 90
+
+
+def _request_timeout(deadline, read_limit=20):
+    remaining = deadline - time.monotonic()
+    if remaining < 1:
+        raise ProductOperationExpired("本次核验时间已用完，请稍后重试核验已有结果")
+    return min(5, remaining / 2), min(read_limit, remaining / 2)
+
+
+def _payload_matches(item, payload):
+    if product_payload_mismatches(item, payload):
+        return False
+    metadata = {m.get("key"): m.get("value") for m in (item.get("meta_data") or [])}
+    return all(str(metadata.get(m["key"])) == str(m.get("value"))
+               for m in payload.get("meta_data", []))
+
+
+def _read_product(req, resource_url, auth, headers, deadline):
+    try:
+        resp = req.get(resource_url, auth=auth, timeout=_request_timeout(deadline),
+                       headers={**headers, "Cache-Control": "no-cache"})
+    except (req.RequestException, ProductOperationExpired) as exc:
+        return None, str(exc)
+    item, error = parse_wc_response(resp)
+    if error:
+        return None, error
+    if not isinstance(item, dict) or not item.get("id"):
+        return None, "商品核验响应缺少有效商品 ID"
+    return item, None
 
 
 def parse_wc_response(resp):
@@ -104,17 +144,20 @@ def product_payload_mismatches(item, payload):
     return mismatches
 
 
-def wc_product_update_verified(req, resource_url, auth, payload):
+def wc_product_update_verified(req, resource_url, auth, payload, *, deadline=None):
     from stock_sync_guard import legacy_write
     from stock_sync_common import SyncError
     try:
         with legacy_write(resource_url, payload):
-            return _wc_product_update_verified(req, resource_url, auth, payload)
+            return _wc_product_update_verified(
+                req, resource_url, auth, payload,
+                deadline=deadline if deadline is not None else new_product_operation_deadline(),
+            )
     except SyncError as exc:
         return None, f'{exc.code}: {exc}', {"phases": [], "final_state": None}
 
 
-def _wc_product_update_verified(req, resource_url, auth, payload):
+def _wc_product_update_verified(req, resource_url, auth, payload, *, deadline):
     """Write a product/variation and GET it back before reporting success."""
     headers = {
         "User-Agent": "WooCommerce API Client-Python/3.0.0",
@@ -136,43 +179,60 @@ def _wc_product_update_verified(req, resource_url, auth, payload):
         phases.append(dict(payload))
 
     trace = {"phases": [], "final_state": None}
+    current, error = _read_product(req, resource_url, auth, headers, deadline)
+    if error:
+        return None, "写入前核验失败，未提交修改：" + error, trace
+    trace["preflight_state"] = product_state_snapshot(current)
+    if _payload_matches(current, payload):
+        trace.update(already_satisfied=True, final_state=product_state_snapshot(current))
+        return current, None, trace
+
+    fresh_read = True
     for phase in phases:
+        if _payload_matches(current, phase):
+            continue
+        try:
+            timeout = _request_timeout(deadline)
+        except ProductOperationExpired as exc:
+            trace["final_state"] = product_state_snapshot(current) if fresh_read else None
+            trace["unconfirmed_write"] = not fresh_read
+            return current, str(exc), trace
+        phase_trace = {"payload": phase, "http_status": None}
+        trace["phases"].append(phase_trace)
         try:
             resp = req.put(
                 resource_url,
                 auth=auth,
                 json=phase,
-                timeout=90,
+                timeout=timeout,
                 headers=headers,
             )
+            changed, error = parse_wc_response(resp)
+            if changed is not None and not isinstance(changed, dict):
+                changed, error = None, "WC API 写入响应不是商品对象"
+            phase_trace.update(http_status=resp.status_code, response=product_state_snapshot(changed))
         except req.RequestException as exc:
-            return None, f"连接失败: {exc}", trace
-        changed, error = parse_wc_response(resp)
-        trace["phases"].append(
-            {
-                "payload": phase,
-                "http_status": resp.status_code,
-                "response": product_state_snapshot(changed),
-            }
-        )
+            error = f"连接失败: {exc}"
         if error:
-            return None, error, trace
+            # The remote save may have committed before its hooks timed out.
+            # Read back; never replay this phase on an ambiguous response.
+            phase_trace["error"] = error
+            current, read_error = _read_product(req, resource_url, auth, headers, deadline)
+            trace["final_state"] = product_state_snapshot(current) if current else None
+            if read_error or not _payload_matches(current, phase):
+                trace["unconfirmed_write"] = True
+                return current, "写入结果未确认：" + error + (
+                    "；回读失败：" + read_error if read_error else "；回读未达到目标状态"
+                ), trace
+            phase_trace["verified_after_error"] = True
+            fresh_read = True
+        else:
+            current = changed or {}
+            fresh_read = False
 
-    try:
-        verify_resp = req.get(
-            resource_url,
-            auth=auth,
-            timeout=60,
-            headers={
-                "User-Agent": headers["User-Agent"],
-                "Accept": "application/json",
-                "Cache-Control": "no-cache",
-            },
-        )
-    except req.RequestException as exc:
-        return None, f"写入后校验失败: {exc}", trace
-    final, error = parse_wc_response(verify_resp)
+    final, error = (current, None) if fresh_read else _read_product(req, resource_url, auth, headers, deadline)
     if error:
+        trace["unconfirmed_write"] = True
         return None, f"写入后校验失败: {error}", trace
     final = final or {}
     trace["final_state"] = product_state_snapshot(final)
@@ -182,7 +242,7 @@ def _wc_product_update_verified(req, resource_url, auth, payload):
     return final, None, trace
 
 
-def find_child_product(req, site, master_item):
+def find_child_product(req, site, master_item, *, deadline=None):
     """Resolve a master product or variation on its actual child site."""
     child_url = (site["url"] or "").rstrip("/")
     auth = (site["consumer_key"], site["consumer_secret"])
@@ -204,20 +264,23 @@ def find_child_product(req, site, master_item):
     # A master write has already completed. A transient read failure must not
     # replay it; retry only this read once with a smaller timeout budget. A
     # repeated failure remains pending and never triggers a blind child write.
-    for timeout in (30, 15):
+    deadline = deadline if deadline is not None else new_product_operation_deadline()
+    for attempt, read_limit in enumerate((20, 15)):
         try:
             resp = req.get(
                 f"{child_url}/wp-json/wc/v3/products",
                 auth=auth,
                 params=params,
-                timeout=timeout,
+                timeout=_request_timeout(deadline, read_limit),
                 headers=headers,
             )
-            if timeout == 30 and resp.status_code in (502, 503, 504, 520, 521, 522, 523, 524, 525, 526):
+            if attempt == 0 and resp.status_code in (502, 503, 504, 520, 521, 522, 523, 524, 525, 526):
                 continue
             break
+        except ProductOperationExpired as exc:
+            return None, str(exc)
         except req.RequestException as exc:
-            if timeout == 15:
+            if attempt == 1:
                 return None, f"查询子站失败（已重试只读核验）: {exc}"
     candidates, error = parse_wc_response(resp)
     if error:
@@ -287,7 +350,7 @@ def wcms_stock_meta_update(child_item, master_item, payload):
     ]
 
 
-def verify_product_child_sync(req, site, master_item, payload):
+def verify_product_child_sync(req, site, master_item, payload, *, deadline=None):
     """Ensure that a master-routed write reaches the selected child site.
 
     WooCommerce Multistore does not reliably propagate stock and price changes
@@ -309,7 +372,8 @@ def verify_product_child_sync(req, site, master_item, payload):
             "detail": "子站 WC API 凭据不完整，无法验证同步结果",
             "state": None,
         }
-    child_item, error = find_child_product(req, site, master_item)
+    deadline = deadline if deadline is not None else new_product_operation_deadline()
+    child_item, error = find_child_product(req, site, master_item, deadline=deadline)
     if error:
         return {"status": "pending", "detail": error, "state": None}
     child_state = product_state_snapshot(child_item)
@@ -348,6 +412,7 @@ def verify_product_child_sync(req, site, master_item, payload):
             resource_url,
             (site["consumer_key"], site["consumer_secret"]),
             direct_payload,
+            deadline=deadline,
         )
         if write_error:
             return {

@@ -101,6 +101,7 @@ class ProductManagerVerifiedUpdateTests(unittest.TestCase):
         self.assertEqual(
             req.calls,
             [
+                ("GET", {}),
                 ("PUT", {"manage_stock": False}),
                 ("PUT", {"stock_status": "outofstock"}),
                 ("GET", {}),
@@ -158,7 +159,7 @@ class ProductManagerVerifiedUpdateTests(unittest.TestCase):
                 {"manage_stock": False, "stock_status": "outofstock"},
             )
         self.assertEqual(result["status"], "verified")
-        self.assertEqual([c.kwargs["timeout"] for c in get.call_args_list], [30, 15])
+        self.assertEqual([c.kwargs["timeout"] for c in get.call_args_list], [(5, 20), (5, 15)])
         self.assertEqual(get.call_args_list[0].args, get.call_args_list[1].args)
         self.assertEqual(get.call_args_list[0].kwargs["params"], get.call_args_list[1].kwargs["params"])
         self.assertEqual(req.put_urls, [])
@@ -303,6 +304,86 @@ class ProductManagerVerifiedUpdateTests(unittest.TestCase):
         self.assertEqual(bridge_meta["wcms_stock_manage"], "no")
         self.assertEqual(bridge_meta["wcms_stock_qty"], 0)
         self.assertEqual(bridge_meta["wcms_stock_status"], "outofstock")
+
+    def test_already_soldout_is_verified_without_any_put(self):
+        req = FakeWooRequests()
+        req.state.update(manage_stock=False, stock_status="outofstock")
+        final, error, trace = service.wc_product_update_verified(
+            req, "https://shop.test/wp-json/wc/v3/products/101", ("ck", "cs"),
+            {"manage_stock": False, "stock_status": "outofstock"},
+        )
+        self.assertIsNone(error)
+        self.assertEqual(req.calls, [("GET", {})])
+        self.assertTrue(trace["already_satisfied"])
+        self.assertEqual(final["stock_status"], "outofstock")
+
+    def test_applied_write_timeout_is_read_back_without_replaying_phase(self):
+        req = FakeWooRequests()
+        put = req.put
+        def timeout_after_save(*args, **kwargs):
+            put(*args, **kwargs)
+            raise req.RequestException("remote hook still running after save")
+        with patch.object(req, "put", side_effect=timeout_after_save) as writes:
+            final, error, trace = service.wc_product_update_verified(
+                req, "https://shop.test/wp-json/wc/v3/products/101", ("ck", "cs"),
+                {"manage_stock": False, "stock_status": "outofstock"},
+            )
+        self.assertIsNone(error)
+        self.assertEqual(writes.call_count, 2)
+        self.assertEqual([p[1] for p in req.calls if p[0] == "PUT"],
+                         [{"manage_stock": False}, {"stock_status": "outofstock"}])
+        self.assertTrue(all(p["verified_after_error"] for p in trace["phases"]))
+        self.assertEqual(final["stock_status"], "outofstock")
+
+    def test_unconfirmed_first_phase_stops_without_replay_or_second_phase(self):
+        req = FakeWooRequests()
+        with patch.object(req, "put", side_effect=req.RequestException("connection lost")) as writes:
+            final, error, trace = service.wc_product_update_verified(
+                req, "https://shop.test/wp-json/wc/v3/products/101", ("ck", "cs"),
+                {"manage_stock": False, "stock_status": "outofstock"},
+            )
+        self.assertIn("写入结果未确认", error)
+        self.assertEqual(writes.call_count, 1)
+        self.assertTrue(trace["unconfirmed_write"])
+        self.assertTrue(final["manage_stock"])
+
+    def test_failed_preflight_never_sends_a_write(self):
+        req = FakeWooRequests()
+        with patch.object(req, "get", side_effect=req.RequestException("read timed out")):
+            final, error, trace = service.wc_product_update_verified(
+                req, "https://shop.test/wp-json/wc/v3/products/101", ("ck", "cs"),
+                {"manage_stock": False, "stock_status": "outofstock"},
+            )
+        self.assertIsNone(final)
+        self.assertIn("未提交修改", error)
+        self.assertEqual(req.put_urls, [])
+
+    def test_master_and_child_share_one_deadline(self):
+        now = [0]
+        master, child = FakeWooRequests(), FakeWooRequests()
+        child.state["parent_id"] = 77
+        def timed(method):
+            def call(*args, **kwargs):
+                now[0] += sum(kwargs["timeout"])
+                return method(*args, **kwargs)
+            return call
+        for req in (master, child):
+            req.get, req.put = timed(req.get), timed(req.put)
+        payload = {"manage_stock": False, "stock_status": "outofstock"}
+        site = {"url": "https://child.test", "consumer_key": "ck",
+                "consumer_secret": "cs", "product_master_id": 2}
+        with patch.object(service.time, "monotonic", side_effect=lambda: now[0]):
+            deadline = service.new_product_operation_deadline()
+            final, error, _ = service.wc_product_update_verified(
+                master, "https://shop.test/wp-json/wc/v3/products/101", ("ck", "cs"),
+                payload, deadline=deadline,
+            )
+            self.assertIsNone(error)
+            result = service.verify_product_child_sync(child, site, final, payload, deadline=deadline)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("时间已用完", result["detail"])
+        self.assertLessEqual(now[0], 90)
+        self.assertEqual(child.put_urls, [])
 
 if __name__ == "__main__":
     unittest.main()
