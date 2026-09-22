@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+from unittest.mock import patch
 
 import product_manager_service as service
 
@@ -143,6 +144,67 @@ class ProductManagerVerifiedUpdateTests(unittest.TestCase):
         self.assertEqual(result["status"], "verified")
         self.assertEqual(req.calls[-1][1]["sku"], "SKU-101")
         self.assertFalse(result.get("direct_update", False))
+
+    def test_child_read_timeout_is_retried_without_replaying_completed_write(self):
+        req = FakeWooRequests()
+        req.state.update(manage_stock=False, stock_status="outofstock")
+        site = {"url": "https://child.test", "consumer_key": "ck",
+                "consumer_secret": "cs", "product_master_id": 2}
+        with patch.object(req, "get", side_effect=[
+            req.RequestException("read timed out"), FakeResponse([dict(req.state)])
+        ]) as get:
+            result = service.verify_product_child_sync(
+                req, site, dict(req.state),
+                {"manage_stock": False, "stock_status": "outofstock"},
+            )
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual([c.kwargs["timeout"] for c in get.call_args_list], [30, 15])
+        self.assertEqual(get.call_args_list[0].args, get.call_args_list[1].args)
+        self.assertEqual(get.call_args_list[0].kwargs["params"], get.call_args_list[1].kwargs["params"])
+        self.assertEqual(req.put_urls, [])
+
+    def test_repeated_child_read_failure_stays_pending_without_writes(self):
+        req = FakeWooRequests()
+        site = {"url": "https://child.test", "consumer_key": "ck",
+                "consumer_secret": "cs", "product_master_id": 2}
+        with patch.object(req, "get", side_effect=req.RequestException("read timed out")) as get:
+            result = service.verify_product_child_sync(
+                req, site, dict(req.state),
+                {"manage_stock": False, "stock_status": "outofstock"},
+            )
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(req.put_urls, [])
+
+    def test_child_auth_failure_is_not_retried_or_written(self):
+        req = FakeWooRequests()
+        site = {"url": "https://child.test", "consumer_key": "ck",
+                "consumer_secret": "cs", "product_master_id": 2}
+        with patch.object(req, "get", return_value=FakeResponse({"message": "Unauthorized"}, 401)) as get:
+            result = service.verify_product_child_sync(
+                req, site, dict(req.state),
+                {"manage_stock": False, "stock_status": "outofstock"},
+            )
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(req.put_urls, [])
+
+    def test_child_gateway_failure_retries_read_only(self):
+        req = FakeWooRequests()
+        req.state.update(manage_stock=False, stock_status="outofstock")
+        site = {"url": "https://child.test", "consumer_key": "ck",
+                "consumer_secret": "cs", "product_master_id": 2}
+        with patch.object(req, "get", side_effect=[
+            FakeResponse({"message": "SSL handshake failed"}, 525),
+            FakeResponse([dict(req.state)]),
+        ]) as get:
+            result = service.verify_product_child_sync(
+                req, site, dict(req.state),
+                {"manage_stock": False, "stock_status": "outofstock"},
+            )
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(req.put_urls, [])
 
     def test_child_sync_mismatch_is_directly_repaired_and_verified(self):
         req = FakeWooRequests()
