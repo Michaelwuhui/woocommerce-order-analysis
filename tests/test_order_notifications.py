@@ -2531,6 +2531,104 @@ def test_select_admin_new_order_email_supports_live_czech_and_hungarian_subjects
     assert selected_hungarian["id"] == 44
 
 
+@pytest.mark.parametrize("status", ["failed", "error", "0", 0, False])
+def test_failed_admin_email_is_usable_without_accepting_customer_or_other_order(status):
+    logs = [
+        {"id": 7266, "status": "sent", "subject": "Twoje zamówienie #2072 jest w trakcie realizacji"},
+        {"id": 7267, "status": "sent", "subject": "[Shop]: Masz nowe zamówienie: #20720"},
+        {"id": 7265, "status": status, "subject": "[Shop]: Masz nowe zamówienie: #2072"},
+        {"id": 7268, "status": "pending", "subject": "[Shop]: Masz nowe zamówienie: #2072"},
+    ]
+    assert order_notification_email.select_admin_new_order_log(logs, "2072")["id"] == 7265
+    successful = {"id": 7200, "status": "sent", "subject": logs[2]["subject"]}
+    assert order_notification_email.select_admin_new_order_log(logs + [successful], "2072")["id"] == 7200
+
+
+class _FailedEmailSession:
+    """Read-only mail-log endpoint; any POST or mail resend fails the test."""
+
+    def __init__(self, **detail_overrides):
+        self.calls = []
+        self.log = {"id": 7265, "status": "failed", "subject": "[Shop]: Masz nowe zamówienie: #2072"}
+        self.detail = {
+            **self.log, "success": True, "plugin": "FluentSMTP",
+            "body": "<html><body><h1>Nowe zamówienie: #2072</h1><p>Test item × 2</p></body></html>",
+            **detail_overrides,
+        }
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _Response(200, self.detail if url.endswith("/7265") else {
+            "success": True, "plugin": "FluentSMTP", "logs": [self.log],
+        })
+
+
+def test_failed_email_fetch_uses_woo_id_and_validates_display_number_without_sending(db):
+    db.execute("UPDATE orders SET number='2072'")
+    session = _FailedEmailSession()
+    email = order_notification_email.fetch_admin_new_order_email(db, "1-1465", session=session)
+    assert email["delivery_status"] == "failed"
+    assert email["log_id"] == 7265 and email["order_number"] == "2072"
+    assert len(session.calls) == 2
+    assert all("/orders/1465/email-logs" in url for url, _ in session.calls)
+    # API success=true must not be recorded as SMTP success when an older
+    # detail endpoint omits its mail status.
+    del session.detail["status"]
+    assert order_notification_email.fetch_admin_new_order_email(
+        db, "1-1465", session=session
+    )["delivery_status"] == "failed"
+
+
+@pytest.mark.parametrize("overrides,code", [
+    ({"body": ""}, "email_body_missing"),
+    ({"body": "<html>Order #20720</html>"}, "email_log_order_mismatch"),
+    ({"id": 9999}, "email_log_order_mismatch"),
+    ({"subject": "[Shop]: New order #20720"}, "email_log_order_mismatch"),
+    ({"subject": "Your order #2072 has been received"}, "email_log_type_mismatch"),
+    ({"status": "pending"}, "email_log_status_unavailable"),
+    ({"body": "2072" + "x" * order_notification_email.MAX_EMAIL_HTML_BYTES}, "email_body_too_large"),
+])
+def test_failed_email_still_requires_a_valid_matching_admin_original(db, overrides, code):
+    db.execute("UPDATE orders SET number='2072'")
+    with pytest.raises(order_notification_email.EmailRenderError) as error:
+        order_notification_email.fetch_admin_new_order_email(
+            db, "1-1465", session=_FailedEmailSession(**overrides)
+        )
+    assert error.value.code == code
+
+
+def test_failed_smtp_source_reaches_group_once_and_keeps_delivery_audit(db, tmp_path, monkeypatch):
+    db.execute("UPDATE orders SET number='2072'")
+    db.execute("UPDATE settings SET value='email' WHERE key='order_notification_render_source'")
+    db.commit()
+    _target(db)
+    mail_session = _FailedEmailSession()
+    actual_renderer = order_notification_email.render_logged_admin_email
+
+    def render_html(html, output_dir, job_id, **kwargs):
+        assert "#2072" in html and "Content-Security-Policy" in html
+        path = Path(output_dir) / (job_id + '.png')
+        Image.new("RGB", (40, 40), "white").save(path)
+        return [{"path": str(path), "width": 40, "height": 40,
+                 "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}]
+
+    monkeypatch.setattr(order_notification_email, "render_email_html", render_html)
+    monkeypatch.setattr(order_notification_service, "render_logged_admin_email",
+                        lambda *args: actual_renderer(*args, session=mail_session))
+    created = _create(db)
+    queue_job = {"aggregate_id": created["job"]["id"]}
+    result = process_notification_job(db, queue_job, {}, output_dir=str(tmp_path))
+    assert result["accepted"] is True
+    assert process_notification_job(db, queue_job, {}, output_dir=str(tmp_path)) == {"noop": "SENT"}
+    assert len(mail_session.calls) == 2
+    assert db.execute("SELECT COUNT(*) FROM order_notification_attempts WHERE result='SUCCESS'").fetchone()[0] == 1
+    audit = json.loads(db.execute(
+        "SELECT after_summary FROM notification_audit_logs WHERE action='email_source_rendered'"
+    ).fetchone()[0])
+    assert audit["email_delivery_status"] == "failed" and audit["email_log_id"] == 7265
+    assert "body" not in audit
+
+
 def test_fetch_logged_admin_email_uses_get_only_and_keeps_credentials_in_headers(db):
     class Response:
         status_code = 200
@@ -2640,6 +2738,7 @@ def test_email_preview_is_superadmin_only_zero_send_and_audits_no_body(
             "source": "FluentSMTP",
             "subject": "[Shop] New order #1465",
             "sent_at": "2026-08-13T10:00:00",
+            "delivery_status": "failed",
             "images_inlined": 2,
             "images_removed": 1,
             "html_sha256": "a" * 64,
@@ -2654,6 +2753,7 @@ def test_email_preview_is_superadmin_only_zero_send_and_audits_no_body(
     assert response.status_code == 200
     data = response.get_json()
     assert data["source"] == "email" and data["email"]["log_id"] == 885
+    assert data["email"]["delivery_status"] == "failed"
     assert data["queued"] is False and data["sent"] is False
     verify = get_test_conn()
     assert verify.execute("SELECT COUNT(*) FROM order_notification_jobs").fetchone()[0] == 0
@@ -2663,6 +2763,7 @@ def test_email_preview_is_superadmin_only_zero_send_and_audits_no_body(
     ).fetchone()[0]
     assert "New order" not in audit and "<html" not in audit and "jan@example.test" not in audit
     assert json.loads(audit)["email_log_id"] == 885
+    assert json.loads(audit)["email_delivery_status"] == "failed"
     verify.close()
     assert list(preview_root.iterdir()) == []
 

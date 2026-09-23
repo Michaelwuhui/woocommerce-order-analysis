@@ -80,6 +80,7 @@ ALERT_REASON_LABELS = {
     "email_log_unavailable": "暂时无法读取邮件日志",
     "email_log_list_failed": "邮件日志列表读取失败",
     "email_log_detail_failed": "邮件正文读取失败",
+    "email_log_status_unavailable": "邮件发送状态尚未确定",
     "rate_limited": "通知发送达到限速",
     "connect_timeout": "连接企业微信超时",
     "connection_error": "连接企业微信失败",
@@ -1282,6 +1283,7 @@ def process_notification_job(conn, job: dict, payload: dict, *, session=None, ou
                     _json(
                         {
                             "email_log_id": email_metadata.get("log_id"),
+                            "email_delivery_status": email_metadata.get("delivery_status", "unknown"),
                             "html_sha256": email_metadata.get("html_sha256"),
                             "images_inlined": email_metadata.get("images_inlined", 0),
                             "images_removed": email_metadata.get("images_removed", 0),

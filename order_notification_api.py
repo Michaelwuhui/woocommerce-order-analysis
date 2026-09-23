@@ -713,6 +713,7 @@ def notification_preview():
                         "preview_source": source,
                         "pages": len(images),
                         "email_log_id": source_metadata.get("log_id") if source_metadata else None,
+                        "email_delivery_status": source_metadata.get("delivery_status", "unknown") if source_metadata else None,
                         "html_sha256": source_metadata.get("html_sha256") if source_metadata else None,
                     }
                 ),
@@ -743,6 +744,7 @@ def notification_preview():
                         "source": source_metadata.get("source"),
                         "subject": source_metadata.get("subject"),
                         "sent_at": source_metadata.get("sent_at"),
+                        "delivery_status": source_metadata.get("delivery_status", "unknown"),
                         "images_inlined": source_metadata.get("images_inlined", 0),
                         "images_removed": source_metadata.get("images_removed", 0),
                     }
