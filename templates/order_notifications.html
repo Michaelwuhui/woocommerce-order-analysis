@@ -138,7 +138,7 @@
                 <option value="email" selected>真实邮件原稿（FluentSMTP，推荐）</option>
                 <option value="system_card">系统脱敏卡片（备用）</option>
               </select>
-              <div class="notify-help mt-1" id="previewSourceHelp">显示实际发给管理员的新订单邮件，含客户资料；仅超级管理员可见。</div>
+              <div class="notify-help mt-1" id="previewSourceHelp">显示管理员新订单邮件原稿，含客户资料；邮件发送失败但原稿完整时也可生成图片。仅超级管理员可见。</div>
             </div>
             <div class="col-md-7">
               <label class="form-label" for="previewOrderId">已选内部订单 ID（也可直接输入）</label>
@@ -421,12 +421,13 @@
     status_groups_overlap: '同一个订单状态不能同时出现在多个规则组。',
     preview_too_many_pages: '该订单图片超过 5 页，请缩小订单后再预览。',
     order_not_found: '没有找到该订单。',
-    admin_new_order_email_not_found: '没有找到该订单已成功发送的管理员新订单邮件。',
+    admin_new_order_email_not_found: '没有找到该订单可用的管理员新订单邮件记录。',
     email_body_missing: '邮件日志存在，但没有保存邮件正文。',
     email_log_credentials_missing: '该站点没有可用的邮件日志只读凭据。',
     email_log_unavailable: '暂时无法连接站点邮件日志，请稍后重试。',
     email_log_list_failed: '站点邮件日志列表读取失败。',
     email_log_detail_failed: '站点邮件正文读取失败。',
+    email_log_status_unavailable: '邮件发送状态尚未确定，请稍后重试。',
     email_log_order_mismatch: '邮件正文与所选订单不匹配，已拒绝渲染。',
     email_log_type_mismatch: '找到的邮件不是管理员新订单通知，已拒绝渲染。',
     customer_email_rejected: '找到的是客户收件邮件，已拒绝用于群通知。',
@@ -729,7 +730,7 @@
     byId('previewEvent').disabled = isEmail;
     if (isEmail) byId('previewEvent').value = 'ORDER_READY';
     byId('previewSourceHelp').textContent = isEmail
-      ? '显示实际发给管理员的新订单邮件，含客户资料；仅超级管理员可见。'
+      ? '显示管理员新订单邮件原稿，含客户资料；邮件发送失败但原稿完整时也可生成图片。仅超级管理员可见。'
       : '使用订单系统最新快照生成备用卡片，姓名和电话会脱敏。';
     byId('previewPrivacyNote').textContent = isEmail
       ? '只读取并渲染现有邮件日志，不触发 WooCommerce 重发邮件。'
@@ -765,7 +766,8 @@
     try {
       const result = await api('/api/order-notifications/preview', { method: 'POST', body: JSON.stringify({ order_id: byId('previewOrderId').value.trim(), event_type: byId('previewEvent').value, source: byId('previewSource').value }) });
       currentPreview = result;
-      const sourceLabel = result.source === 'email' ? `FluentSMTP 真实邮件原稿 · 日志 #${result.email.log_id}` : '系统脱敏卡片';
+      const emailStatus = result.email && result.email.delivery_status === 'failed' ? ' · 邮件发送失败，使用已保存原稿' : '';
+      const sourceLabel = result.source === 'email' ? `FluentSMTP 真实邮件原稿 · 日志 #${result.email.log_id}${emailStatus}` : '系统脱敏卡片';
       const meta = byId('previewMeta'); meta.textContent = `订单 #${result.order.number} · ${result.order.store} · ${sourceLabel} · 共 ${result.images.length} 页 · 未入队 · 未发送`; meta.classList.remove('d-none');
       result.images.forEach(item => { const wrap = document.createElement('div'); wrap.className = 'text-center'; const label = document.createElement('div'); label.className = 'small text-muted mb-2'; label.textContent = `第 ${item.page} 页 · ${Math.round(item.bytes / 1024)} KB`; const image = document.createElement('img'); image.className = 'notify-preview-image'; image.src = item.data_url; image.alt = `订单通知预览第 ${item.page} 页`; wrap.append(label, image); byId('previewImages').appendChild(wrap); });
       refreshTestSendPanel();

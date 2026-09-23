@@ -57,6 +57,7 @@ _ADMIN_NEW_ORDER_PHRASES = (
     "nuevo pedido",
 )
 _SUCCESS_VALUES = {"1", "true", "sent", "success", "successful", "delivered", "completed"}
+_FAILURE_VALUES = {"0", "false", "failed", "fail", "error"}
 _DANGEROUS_TAGS = {
     "script", "iframe", "frame", "frameset", "object", "embed", "applet",
     "form", "input", "button", "textarea", "select", "option", "video",
@@ -112,26 +113,35 @@ def _has_exact_order_reference(value: Any, number: str) -> bool:
     return bool(re.search(rf"(?<!\d){re.escape(number)}(?!\d)", str(value or "")))
 
 
-def _is_success(log: dict) -> bool:
+def _delivery_status(log: dict) -> str:
     value = log.get("status")
     if value is None:
         value = log.get("success")
-    if isinstance(value, bool):
-        return value
-    return str(value or "").strip().lower() in _SUCCESS_VALUES
+    normalized = str(value).strip().lower() if value is not None else ""
+    if normalized in _SUCCESS_VALUES:
+        return "sent"
+    if normalized in _FAILURE_VALUES:
+        return "failed"
+    return "unknown"
 
 
 def select_admin_new_order_log(logs: list[dict], order_number: str, billing_email: str = "") -> dict:
-    """Select one successful admin-new-order template, never a customer receipt.
+    """Select a logged admin-new-order template, never a customer receipt.
 
     The recipient address is not an email-type discriminator. WooCommerce can
     legitimately send its administrator template to an address that also
     appears as the order billing address (common for internal/test orders).
     Positive template/subject classification therefore takes precedence.
+
+    SMTP delivery and group-image delivery are independent. A failed send can
+    still have the complete original HTML saved by the mail plugin. Prefer a
+    successful copy, but allow a known failed copy after the same identity and
+    body validation in fetch_admin_new_order_email. Unknown/pending logs are
+    not evidence of a finished email and remain ineligible.
     """
     candidates = []
     for log in logs or []:
-        if not isinstance(log, dict) or not _is_success(log):
+        if not isinstance(log, dict) or _delivery_status(log) == "unknown":
             continue
         subject = str(log.get("subject") or "")
         folded = subject.casefold()
@@ -144,7 +154,7 @@ def select_admin_new_order_log(logs: list[dict], order_number: str, billing_emai
         candidates.append(log)
     if not candidates:
         raise EmailRenderError(
-            "未找到该订单已成功发送的管理员新订单邮件",
+            "未找到该订单可用的管理员新订单邮件记录",
             code="admin_new_order_email_not_found",
             retryable=True,
         )
@@ -153,7 +163,11 @@ def select_admin_new_order_log(logs: list[dict], order_number: str, billing_emai
             log_id = int(item.get("id") or 0)
         except (TypeError, ValueError):
             log_id = 0
-        return str(item.get("sent_at") or item.get("created_at") or ""), log_id
+        return (
+            _delivery_status(item) == "sent",
+            str(item.get("sent_at") or item.get("created_at") or ""),
+            log_id,
+        )
 
     candidates.sort(key=sort_key, reverse=True)
     return candidates[0]
@@ -219,8 +233,12 @@ def fetch_admin_new_order_email(conn, order_id: str, *, session=None) -> dict:
     detail = _get_json(detail_response, code="email_log_detail_failed")
     subject = str(detail.get("subject") or selected.get("subject") or "")
     number = str(order.get("number") or remote_order_id)
-    detail_has_status = "status" in detail or "success" in detail
-    if not (_is_success(detail) if detail_has_status else _is_success(selected)) or not _has_exact_order_reference(subject, number):
+    # The detail endpoint's top-level `success` describes the API request, not
+    # SMTP delivery. Older endpoints without `status` use the selected log.
+    delivery_status = _delivery_status(detail if "status" in detail else selected)
+    if delivery_status == "unknown":
+        raise EmailRenderError("邮件发送状态尚未确定", code="email_log_status_unavailable", retryable=True)
+    if str(detail.get("id", selected["id"])) != str(selected["id"]) or not _has_exact_order_reference(subject, number):
         raise EmailRenderError("邮件正文与订单不匹配", code="email_log_order_mismatch")
     if not any(phrase in subject.casefold() for phrase in _ADMIN_NEW_ORDER_PHRASES):
         raise EmailRenderError("该邮件不是管理员新订单通知", code="email_log_type_mismatch")
@@ -229,6 +247,8 @@ def fetch_admin_new_order_email(conn, order_id: str, *, session=None) -> dict:
         raise EmailRenderError("邮件日志没有保存正文", code="email_body_missing")
     if len(body.encode("utf-8")) > MAX_EMAIL_HTML_BYTES:
         raise EmailRenderError("邮件正文超过安全上限", code="email_body_too_large")
+    if not _has_exact_order_reference(body, number):
+        raise EmailRenderError("邮件正文缺少该订单编号", code="email_log_order_mismatch")
     return {
         "order_id": order["id"],
         "order_number": number,
@@ -238,6 +258,7 @@ def fetch_admin_new_order_email(conn, order_id: str, *, session=None) -> dict:
         "source": detail.get("source") or selected.get("source") or "FluentSMTP",
         "subject": subject,
         "sent_at": detail.get("sent_at") or selected.get("sent_at"),
+        "delivery_status": delivery_status,
         "body": body,
     }
 
