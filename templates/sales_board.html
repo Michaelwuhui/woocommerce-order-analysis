@@ -808,8 +808,8 @@ function openRateSettings() {
             return;
         }
         var html = '';
-        function formatRate(value) {
-            return Number(value).toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+        function formatRate(value, digits) {
+            return Number(value).toFixed(digits || 6).replace(/0+$/, '').replace(/\.$/, '');
         }
         rates.forEach(function(r) {
             var sysRate = r.system_rate != null ? formatRate(r.system_rate) : '<span class="text-warning">无</span>';
@@ -818,7 +818,9 @@ function openRateSettings() {
                 : '<span class="text-white-50">无回款</span>';
             var override = r.override_rate != null ? Number(r.override_rate) : '';
             var settlement = r.settlement_rate != null ? Number(r.settlement_rate) : '';
-            var inUse = r.in_use ? formatRate(r.in_use) : '-';
+            var inUse = r.in_use
+                ? formatRate(r.in_use, r.source === 'settlement' || r.source === 'override' ? 8 : 6)
+                : '-';
             var srcBadge = r.source === 'settlement'
                 ? '<span class="badge bg-primary">实际结算</span>'
                 : (r.source === 'receipt'

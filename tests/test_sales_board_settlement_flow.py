@@ -104,7 +104,7 @@ def board(tmp_path, monkeypatch):
     partner_id = conn.execute("SELECT id FROM partners WHERE name='测试合伙人'").fetchone()[0]
     conn.execute(
         "INSERT INTO partner_receipts (partner_id, receipt_date, amount_pln, amount_cny) "
-        "VALUES (?, '2026-08-15', 100, 177.2)", (partner_id,)
+        "VALUES (?, '2026-08-15', 100000.3, 177200.53)", (partner_id,)
     )
     conn.execute(
         "INSERT INTO exchange_rates (year_month, currency, rate_to_cny) "
@@ -198,4 +198,11 @@ def test_august_actual_settlement_changes_commission_and_export(board):
     assert restored[0]["source"] == "receipt"
     assert restored[0]["override_rate"] == pytest.approx(1.74)
     with app_module.app.test_request_context("/sales-board"):
-        assert app_module._compute_sales_board_data("2026-08")["board_data"][0]["commission"] == 8.86
+        restored_data = app_module._compute_sales_board_data("2026-08")
+    assert restored_data["board_data"][0]["commission"] == 8.86
+    restored_workbook = load_workbook(io.BytesIO(
+        app_module._generate_sales_board_excel(restored_data).getvalue()
+    ))
+    restored_rules = [cell.value for row in restored_workbook["规则说明"]
+                      for cell in row if cell.value]
+    assert any("PLN → 1 PLN = ¥1.772 （回款加权）" in line for line in restored_rules)
