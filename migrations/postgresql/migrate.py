@@ -1020,6 +1020,8 @@ def main(argv=None) -> int:
         reset_sequences(pg, source, catalog)
         run_sql_file(pg, MIGRATION_DIR / "002_sync_pipeline.sql")
         run_sql_file(pg, MIGRATION_DIR / "003_sync_post_commit.sql")
+        run_sql_file(pg, MIGRATION_DIR / "004_sales_board_settlement_rates.sql")
+        run_sql_file(pg, MIGRATION_DIR / "005_clean_sync.sql")
         grant_runtime(pg)
         report = verify(pg, source, catalog)
         report["database"] = args.database

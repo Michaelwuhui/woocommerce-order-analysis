@@ -77,6 +77,7 @@ def test_connected_sites_page_contains_only_the_managers_sites(permission_app):
     assert "添加站点" not in html
     assert "数据备份与灾备" not in html
     assert "site_sync_settings.js" in html
+    assert html.count('id="syncProgressModal"') == 1
 
 
 def test_user_without_either_settings_permission_is_denied(permission_app):
@@ -99,6 +100,7 @@ def test_full_settings_and_permission_ui_remain_available_to_super_admin(permiss
     assert "Consumer Key" in settings_html
     assert "添加站点" in settings_html
     assert "site_sync_settings.js" not in settings_html
+    assert settings_html.count('id="syncProgressModal"') == 1
     assert users_page.status_code == 200
     assert "本人站点同步权限" in users_page.get_data(as_text=True)
     assert users_api.status_code == 200
@@ -128,14 +130,57 @@ def test_deep_sync_creates_site_bound_status(permission_app):
     assert [site["site_id"] for site in status.get_json()["sites"]] == [11]
 
 
-def test_destructive_clean_sync_stays_disabled_on_postgres(permission_app):
-    client = _client_for(permission_app, 2)
-    response = client.post("/api/sync/clean/11")
-    assert response.status_code == 409
-    assert "停用" in response.get_json()["error"]
+def test_clean_sync_requires_full_admin_and_queues_durable_job(permission_app):
+    own_site_manager = _client_for(permission_app, 2)
+    assert own_site_manager.post("/api/sync/clean/11").status_code == 403
+    assert own_site_manager.post("/api/sync/clean/all").status_code == 403
+    assert "clean-sync-btn" not in own_site_manager.get("/settings").get_data(as_text=True)
+
     conn = db.connect()
     assert conn.execute("SELECT COUNT(*) FROM sync_runs").fetchone()[0] == 0
     conn.close()
+
+    admin = _client_for(permission_app, 1)
+    response = admin.post("/api/sync/clean/11")
+    assert response.status_code == 202
+    run_id = response.get_json()["sync_id"]
+    status = admin.get(f"/api/sync/status/{run_id}")
+    assert status.status_code == 200
+    assert status.get_json()["mode"] == "clean"
+    assert [site["site_id"] for site in status.get_json()["sites"]] == [11]
+    conn = db.connect()
+    try:
+        assert conn.execute(
+            "SELECT task_name FROM sync_task_outbox WHERE dedupe_key=?",
+            (f"clean:{run_id}:11",),
+        ).fetchone()[0] == "woo_sync.clean_site"
+    finally:
+        conn.close()
+
+
+def test_admin_can_queue_global_clean_and_manage_weekly_schedule(permission_app):
+    admin = _client_for(permission_app, 1)
+    initial = admin.get("/api/cron/clean/status")
+    assert initial.status_code == 200
+    assert initial.get_json()["enabled"] is False
+
+    configured = admin.post(
+        "/api/cron/clean/setup", json={"day": 0, "hour": 4, "minute": 30}
+    )
+    assert configured.status_code == 200
+    schedule = admin.get("/api/cron/clean/status").get_json()
+    assert (schedule["enabled"], schedule["day"], schedule["hour"], schedule["minute"]) == (
+        True, 0, 4, 30
+    )
+    assert admin.delete("/api/cron/clean/remove").status_code == 200
+    assert admin.get("/api/cron/clean/status").get_json()["enabled"] is False
+
+    response = admin.post("/api/sync/clean/all")
+    assert response.status_code == 202
+    status = admin.get(f"/api/sync/status/{response.get_json()['sync_id']}")
+    assert status.status_code == 200
+    assert status.get_json()["mode"] == "clean"
+    assert {site["site_id"] for site in status.get_json()["sites"]} == {11, 22}
 
 
 def test_sync_status_cannot_be_read_through_another_owned_site(permission_app):

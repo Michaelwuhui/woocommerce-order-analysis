@@ -358,8 +358,9 @@ def test_global_sync_has_one_frontend_binding_and_one_post_site():
     settings = (ROOT / "templates/settings.html").read_text()
     runtime = (ROOT / "static/js/sync_runs.js").read_text()
     combined = base + settings + runtime
-    assert combined.count("fetch('/api/sync/all'") == 1
-    assert combined.count("button.addEventListener('click', startGlobalSync)") == 1
+    assert runtime.count("fetch(endpoint,") == 1
+    assert runtime.count("startSync('/api/sync/all', button)") == 1
+    assert runtime.count("button.addEventListener('click', function ()") == 1
     assert "syncAllBtn.addEventListener" not in base
     assert "syncAllBtn.addEventListener" not in settings
     assert "任务已中断/正在恢复" in runtime

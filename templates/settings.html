@@ -27,10 +27,12 @@
 {% endblock %}
 
 {% block content %}
+<script>window.wooPostgresSync = {{ postgres_sync|tojson }};</script>
 {% if current_user.can_edit_reconciliation() and not site_sync_only %}
 <div class="container-fluid mt-3"><a class="btn btn-outline-info" href="{{ url_for('reconciliation_v2.page') }}">合伙人对账规则：货权、合同与管理费配置</a></div>
 {% endif %}
 <!-- Sync Progress Modal -->
+{% if not postgres_sync %}
 <div class="modal fade" id="syncProgressModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1">
     <div class="modal-dialog modal-lg">
         <div class="modal-content bg-dark border border-secondary border-opacity-25">
@@ -67,6 +69,7 @@
         </div>
     </div>
 </div>
+{% endif %}
 
 <div class="container-fluid py-4">
     <div class="mb-4">
@@ -325,9 +328,11 @@
                                     <button class="btn btn-sm btn-outline-info deep-sync-btn"
                                         data-site-id="{{ site.id }}" title="深度同步 - 重新获取所有订单"><i
                                             class="bi bi-cloud-download"></i></button>
+                                    {% if not site_sync_only %}
                                     <button class="btn btn-sm btn-outline-warning clean-sync-btn"
-                                        data-site-id="{{ site.id }}" title="清理同步 - 删除已在远程删除的订单"><i
+                                        data-site-id="{{ site.id }}" title="清理同步 - 核实远端后先归档再移出"><i
                                             class="bi bi-trash2"></i></button>
+                                    {% endif %}
                                 </div>
                                 {% if not site_sync_only %}
                                 <button class="btn btn-sm btn-outline-secondary me-2 edit-btn"
@@ -621,7 +626,7 @@
     <div class="card-body">
         <div class="row align-items-center">
             <div class="col-md-6">
-                <p class="text-white-50 mb-2">设置每周自动执行清理同步的时间，删除已在WooCommerce中被删除的订单。</p>
+                <p class="text-white-50 mb-2">设置每周自动核对远端订单；仅对确认已删除且无业务关联的订单先归档再移出。默认关闭。</p>
                 <div class="d-flex align-items-center gap-2" id="cleanCronStatusDisplay">
                     <span class="badge bg-secondary">加载中...</span>
                 </div>
@@ -1642,7 +1647,7 @@
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
-                <p class="text-white">清理同步将删除本地数据库中已在WooCommerce远程删除的订单。</p>
+                <p class="text-white">清理同步会逐站核实远端订单；确认已删除且无业务关联的订单会先归档再从当前订单表移出，异常站点会停止清理。</p>
                 <p class="text-white-50 small mb-0">确定要执行清理同步吗？</p>
                 <input type="hidden" id="cleanSyncSiteId">
             </div>
@@ -1684,7 +1689,7 @@
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
-                <p class="text-white">清理同步将检查所有站点，删除已在WooCommerce中删除的订单。</p>
+                <p class="text-white">将逐站核实所有站点；确认已删除且无业务关联的订单会先归档再移出，异常站点不会删单。</p>
                 <p class="text-white-50 small mb-0">确定要执行全站点清理同步吗？</p>
             </div>
             <div class="modal-footer border-top border-secondary border-opacity-25">
@@ -2042,7 +2047,15 @@
 
         // Deep Sync All Confirmation Handler
         document.getElementById('confirmDeepSyncAllBtn').addEventListener('click', function () {
-            bootstrap.Modal.getInstance(document.getElementById('deepSyncAllConfirmModal')).hide();
+            const confirmEl = document.getElementById('deepSyncAllConfirmModal');
+            if (window.wooPostgresSync) {
+                confirmEl.addEventListener('hidden.bs.modal', function () {
+                    window.WooSyncRuns.start('/api/sync/deep');
+                }, { once: true });
+                bootstrap.Modal.getInstance(confirmEl).hide();
+                return;
+            }
+            bootstrap.Modal.getInstance(confirmEl).hide();
 
             const modalEl = document.getElementById('syncProgressModal');
             const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
@@ -2127,7 +2140,15 @@
 
         // Clean Sync All Confirmation Handler
         document.getElementById('confirmCleanSyncAllBtn').addEventListener('click', function () {
-            bootstrap.Modal.getInstance(document.getElementById('cleanSyncAllConfirmModal')).hide();
+            const confirmEl = document.getElementById('cleanSyncAllConfirmModal');
+            if (window.wooPostgresSync) {
+                confirmEl.addEventListener('hidden.bs.modal', function () {
+                    window.WooSyncRuns.start('/api/sync/clean/all');
+                }, { once: true });
+                bootstrap.Modal.getInstance(confirmEl).hide();
+                return;
+            }
+            bootstrap.Modal.getInstance(confirmEl).hide();
 
             const modalEl = document.getElementById('syncProgressModal');
             const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
@@ -2600,6 +2621,10 @@
             const syncBtn = e.target.closest('.sync-btn');
             if (syncBtn) {
                 const siteId = syncBtn.dataset.siteId;
+                if (window.wooPostgresSync) {
+                    window.WooSyncRuns.start('/api/sync', { site_id: Number(siteId) });
+                    return;
+                }
                 const modal = getModal('syncProgressModal');
                 const progressBar = document.getElementById('syncProgressBar');
                 const statusText = document.getElementById('syncStatusText');
@@ -2769,7 +2794,15 @@
         // Deep Sync Confirmation Handler
         document.getElementById('confirmDeepSyncBtn').addEventListener('click', function () {
             const siteId = document.getElementById('deepSyncSiteId').value;
-            bootstrap.Modal.getInstance(document.getElementById('deepSyncConfirmModal')).hide();
+            const confirmEl = document.getElementById('deepSyncConfirmModal');
+            if (window.wooPostgresSync) {
+                confirmEl.addEventListener('hidden.bs.modal', function () {
+                    window.WooSyncRuns.start('/api/sync/deep/' + encodeURIComponent(siteId));
+                }, { once: true });
+                bootstrap.Modal.getInstance(confirmEl).hide();
+                return;
+            }
+            bootstrap.Modal.getInstance(confirmEl).hide();
 
             const modal = getModal('syncProgressModal');
             const progressBar = document.getElementById('syncProgressBar');
@@ -2856,7 +2889,15 @@
         // Clean Sync Confirmation Handler
         document.getElementById('confirmCleanSyncBtn').addEventListener('click', function () {
             const siteId = document.getElementById('cleanSyncSiteId').value;
-            bootstrap.Modal.getInstance(document.getElementById('cleanSyncConfirmModal')).hide();
+            const confirmEl = document.getElementById('cleanSyncConfirmModal');
+            if (window.wooPostgresSync) {
+                confirmEl.addEventListener('hidden.bs.modal', function () {
+                    window.WooSyncRuns.start('/api/sync/clean/' + encodeURIComponent(siteId));
+                }, { once: true });
+                bootstrap.Modal.getInstance(confirmEl).hide();
+                return;
+            }
+            bootstrap.Modal.getInstance(confirmEl).hide();
 
             const modal = getModal('syncProgressModal');
             const progressBar = document.getElementById('syncProgressBar');

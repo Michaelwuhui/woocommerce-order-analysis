@@ -17,7 +17,7 @@ BROKER_URL = (
 celery_app = Celery(
     "woo_analysis",
     broker=BROKER_URL,
-    include=["sync_tasks", "shipment_reconciliation_tasks"],
+    include=["sync_tasks", "clean_sync", "shipment_reconciliation_tasks"],
 )
 
 celery_app.conf.update(
@@ -72,6 +72,8 @@ celery_app.conf.update(
         "woo_sync.confirm_delivered_order": {"queue": "sync_fetch", "routing_key": "sync_fetch"},
         "woo_sync.schedule_auto": {"queue": "sync_write", "routing_key": "sync_write"},
         "woo_sync.schedule_deep": {"queue": "sync_write", "routing_key": "sync_write"},
+        "woo_sync.schedule_clean": {"queue": "sync_write", "routing_key": "sync_write"},
+        "woo_sync.clean_site": {"queue": "sync_write", "routing_key": "sync_write"},
     },
     beat_schedule={
         "shipment-result-reconciliation": {
@@ -96,6 +98,10 @@ celery_app.conf.update(
         },
         "deep-sync-due-check": {
             "task": "woo_sync.schedule_deep",
+            "schedule": 60.0,
+        },
+        "clean-sync-due-check": {
+            "task": "woo_sync.schedule_clean",
             "schedule": 60.0,
         },
     },
