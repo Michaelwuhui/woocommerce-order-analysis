@@ -24843,7 +24843,8 @@ def _generate_sales_board_excel(data, hide_leader=False):
                 'override': '（自定义备用）',
                 'system': '（系统）',
             }.get(info.get('source'), '（系统）')
-            rate_text = f"{info['rate']:.8f}".rstrip('0').rstrip('.')
+            digits = 8 if info.get('source') in ('settlement', 'override') else 6
+            rate_text = f"{info['rate']:.{digits}f}".rstrip('0').rstrip('.')
             rate_lines.append(f"    - {cur} → 1 {cur} = ¥{rate_text} {tag}")
 
     lines = [
