@@ -7366,6 +7366,7 @@ def settings():
             product_masters=[],
             masters_lookup={},
             site_sync_only=True,
+            postgres_sync=sqlite3.is_postgres_backend(),
             # The global edit-scope context may include grants unrelated to
             # the stricter manager-owned sync scope.  Never embed those other
             # site URLs in this reduced settings page.
@@ -7423,7 +7424,8 @@ def settings():
                           currencies=currency_list,
                           product_masters=product_masters_list,
                           masters_lookup=masters_lookup,
-                          site_sync_only=False)
+                          site_sync_only=False,
+                          postgres_sync=sqlite3.is_postgres_backend())
 
 
 @app.route('/api/exchange-rates', methods=['GET', 'POST'])
@@ -9112,9 +9114,9 @@ def _start_durable_sync(mode, site_ids=None):
             created_by=_sync_actor(),
             site_ids=site_ids,
             params={
-                'per_page': 50,
+                'per_page': 100 if mode == 'clean' else 50,
                 'incremental_overlap_minutes': 10,
-                'notes_per_page': 10 if mode != 'deep' else 0,
+                'notes_per_page': 0 if mode in ('deep', 'clean') else 10,
             },
         )
     except ValueError as exc:
@@ -9122,6 +9124,15 @@ def _start_durable_sync(mode, site_ids=None):
     except Exception:
         app.logger.exception('创建持久化同步批次失败')
         return jsonify({'success': False, 'error': '同步任务暂时无法入队'}), 503
+    if not created and (
+        status['mode'] != mode
+        or status['requested_params'].get('site_ids') != site_ids
+    ):
+        return jsonify({
+            'success': False,
+            'error': '已有其他范围或类型的同步任务运行，请等待其完成后重试',
+            'active_run_id': status['run_id'],
+        }), 409
     payload = {
         'success': True,
         'created': created,
@@ -9744,9 +9755,9 @@ def clean_sync_site(site_id):
     if not _can_manage_site_sync(current_user, site_id):
         return jsonify({'error': '无权同步该站点'}), 403
     if sqlite3.is_postgres_backend():
-        return jsonify({
-            'error': '清理同步是删除性维护操作，已从 Web 后台线程停用；请使用受控维护流程。'
-        }), 409
+        if not _can_manage_all_settings(current_user):
+            return jsonify({'error': '清理同步仅允许系统管理员执行'}), 403
+        return _start_durable_sync('clean', [site_id])
 
     # Every run gets its own ID. Reusing a site-derived ID can expose a
     # terminal status from an earlier run to another Gunicorn worker.
@@ -10536,6 +10547,12 @@ def get_sync_dashboard():
     deep_enabled_row = conn.execute("SELECT value FROM settings WHERE key = 'deep_sync_enabled'").fetchone()
     deep_hour_row = conn.execute("SELECT value FROM settings WHERE key = 'deep_sync_hour'").fetchone()
     deep_minute_row = conn.execute("SELECT value FROM settings WHERE key = 'deep_sync_minute'").fetchone()
+    clean_settings = {
+        row['key']: row['value'] for row in conn.execute(
+            "SELECT key,value FROM settings WHERE key IN "
+            "('clean_sync_enabled','clean_sync_day','clean_sync_hour','clean_sync_minute')"
+        ).fetchall()
+    }
     
     autosync_enabled = autosync_enabled_row['value'] == 'true' if autosync_enabled_row else False
     autosync_interval = int(autosync_interval_row['value']) if autosync_interval_row else 900
@@ -10553,6 +10570,14 @@ def get_sync_dashboard():
             cron_info['auto_sync'] = f'Celery Beat · every {autosync_interval}s'
         if deep_enabled:
             cron_info['deep_sync'] = f'Celery Beat · {deep_hour:02d}:{deep_minute:02d}'
+        if str(clean_settings.get('clean_sync_enabled', 'false')).lower() == 'true':
+            clean_days = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+            clean_day = max(0, min(6, int(clean_settings.get('clean_sync_day', '0'))))
+            clean_hour = max(0, min(23, int(clean_settings.get('clean_sync_hour', '4'))))
+            clean_minute = max(0, min(59, int(clean_settings.get('clean_sync_minute', '0'))))
+            cron_info['clean_sync'] = (
+                f'Celery Beat · {clean_days[clean_day]} {clean_hour:02d}:{clean_minute:02d}'
+            )
     else:
         try:
             result = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
@@ -10747,9 +10772,7 @@ def trigger_deep_sync():
 def clean_all_sites():
     """Clean deleted orders from all sites"""
     if sqlite3.is_postgres_backend():
-        return jsonify({
-            'error': '清理同步是删除性维护操作，已从 Web 后台线程停用；请使用受控维护流程。'
-        }), 409
+        return _start_durable_sync('clean')
     import threading
 
     # A clean run must not reuse another quick-sync ID, otherwise
@@ -11051,10 +11074,25 @@ def remove_cron():
 def get_clean_cron_status():
     """Get status of clean sync cron job"""
     if sqlite3.is_postgres_backend():
+        conn = get_db_connection()
+        try:
+            rows = conn.execute(
+                "SELECT key,value FROM settings WHERE key IN "
+                "('clean_sync_enabled','clean_sync_day','clean_sync_hour','clean_sync_minute')"
+            ).fetchall()
+        finally:
+            conn.close()
+        values = {row['key']: row['value'] for row in rows}
+        enabled = str(values.get('clean_sync_enabled', 'false')).lower() == 'true'
+        day = max(0, min(6, int(values.get('clean_sync_day', 0))))
+        hour = max(0, min(23, int(values.get('clean_sync_hour', 4))))
+        minute = max(0, min(59, int(values.get('clean_sync_minute', 0))))
+        days = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
         return jsonify({
-            'enabled': False,
-            'scheduler': 'disabled-on-postgresql',
-            'message': '删除性清理调度已停用，必须走受控维护流程。',
+            'enabled': enabled,
+            'scheduler': 'celery-beat',
+            'day': day, 'hour': hour, 'minute': minute,
+            'schedule': f'{days[day]} {hour:02d}:{minute:02d}' if enabled else None,
         })
     import subprocess
     
@@ -11092,19 +11130,44 @@ def get_clean_cron_status():
 @all_site_sync_required
 def setup_clean_cron():
     """Setup cron job for clean sync"""
-    if sqlite3.is_postgres_backend():
-        return jsonify({
-            'error': 'PostgreSQL 模式禁止创建删除性清理 cron；请走受控维护流程。'
-        }), 409
     import subprocess
     
-    data = request.json
-    hour = int(data.get('hour', 4))  # Default 4 AM
-    day = int(data.get('day', 0))    # Default Sunday
-    minute = int(data.get('minute', 0))
+    data = request.get_json(silent=True) or {}
+    try:
+        hour = int(data.get('hour', 4))  # Default 4 AM
+        day = int(data.get('day', 0))    # Default Sunday
+        minute = int(data.get('minute', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid time or day'}), 400
     
     if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= day <= 6):
         return jsonify({'error': 'Invalid time or day'}), 400
+
+    if sqlite3.is_postgres_backend():
+        conn = get_db_connection()
+        try:
+            for key, value in (
+                ('clean_sync_enabled', 'true'),
+                ('clean_sync_day', str(day)),
+                ('clean_sync_hour', str(hour)),
+                ('clean_sync_minute', str(minute)),
+            ):
+                conn.execute(
+                    "INSERT INTO settings(key,value) VALUES (?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return jsonify({
+            'success': True,
+            'message': f'Celery Beat 每周清理同步已设置为周{day} {hour:02d}:{minute:02d}',
+            'scheduler': 'celery-beat',
+        })
     
     try:
         # Get existing crontab
@@ -11140,9 +11203,19 @@ def setup_clean_cron():
 def remove_clean_cron():
     """Remove cron job for clean sync"""
     if sqlite3.is_postgres_backend():
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                "INSERT INTO settings(key,value) VALUES ('clean_sync_enabled','false') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+            conn.commit()
+        finally:
+            conn.close()
         return jsonify({
             'success': True,
-            'message': 'PostgreSQL 模式下清理调度已保持禁用',
+            'message': 'Celery Beat 每周清理同步已禁用',
+            'scheduler': 'celery-beat',
         })
     import subprocess
     

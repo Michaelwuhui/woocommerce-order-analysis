@@ -239,10 +239,11 @@ def start_sync(
     """Create one globally-exclusive run or return the already-active run."""
 
     _require_postgres()
-    if mode not in {"quick", "auto", "deep"}:
+    if mode not in {"quick", "auto", "deep", "clean"}:
         raise ValueError("invalid synchronization mode")
     normalized_ids = _normalize_site_ids(site_ids)
     clean_params = dict(params or {})
+    clean_params["site_ids"] = normalized_ids
     clean_params["per_page"] = _bounded_per_page(clean_params.get("per_page"))
     clean_params["incremental_overlap_minutes"] = max(
         0, min(1440, int(clean_params.get("incremental_overlap_minutes", 10)))
@@ -286,7 +287,16 @@ def start_sync(
                 """,
                 (run_id, site_id),
             )
-            enqueue_fetch_page(connection, run_id, site_id, 1)
+            if mode == "clean":
+                enqueue_outbox(
+                    connection,
+                    dedupe_key=f"clean:{run_id}:{site_id}",
+                    queue_name="sync_write",
+                    task_name="woo_sync.clean_site",
+                    payload={"run_id": run_id, "site_id": site_id},
+                )
+            else:
+                enqueue_fetch_page(connection, run_id, site_id, 1)
         _event(
             connection,
             run_id,
@@ -619,7 +629,7 @@ def get_run_status(run_id: str, *, connection=None) -> dict[str, Any]:
 
 
 def _status_message(run: dict[str, Any], current: dict[str, Any] | None) -> str:
-    labels = {"quick": "快速同步", "auto": "自动同步", "deep": "深度同步"}
+    labels = {"quick": "快速同步", "auto": "自动同步", "deep": "深度同步", "clean": "清理同步"}
     prefix = labels.get(str(run.get("mode")), str(run.get("mode")))
     status = str(run.get("status"))
     if status == "success":
@@ -738,8 +748,60 @@ def recover_stale_work() -> dict[str, int]:
     """Requeue stale broker hand-offs and interrupted fetch/write tasks."""
 
     connection = get_connection()
-    counts = {"outbox": 0, "dispatches": 0, "post_commit": 0, "runs": 0}
+    counts = {"outbox": 0, "dispatches": 0, "post_commit": 0, "clean_sites": 0, "runs": 0}
     try:
+        stale_clean_sites = connection.execute(
+            """
+            SELECT p.run_id,p.site_id,p.status,r.cancellation_requested
+            FROM sync_site_progress p
+            JOIN sync_runs r ON r.run_id=p.run_id
+            WHERE r.mode='clean'
+              AND r.status IN ('queued','running','recovering','cancelling')
+              AND p.status IN ('queued','fetching','writing','recovering')
+              AND ((p.status='queued' AND p.heartbeat_at<CURRENT_TIMESTAMP - interval '1 hour')
+                OR (p.status<>'queued' AND p.heartbeat_at<CURRENT_TIMESTAMP - (? * interval '1 second')))
+            FOR UPDATE OF p SKIP LOCKED
+            """,
+            (RECOVERY_STALE_SECONDS,),
+        ).fetchall()
+        for row in stale_clean_sites:
+            run_id, site_id = str(row["run_id"]), int(row["site_id"])
+            if bool(row["cancellation_requested"]):
+                connection.execute(
+                    """UPDATE sync_site_progress SET status='cancelled',
+                       finished_at=CURRENT_TIMESTAMP,heartbeat_at=CURRENT_TIMESTAMP,
+                       version=version+1 WHERE run_id=? AND site_id=?""",
+                    (run_id, site_id),
+                )
+                _refresh_run_completion(connection, run_id)
+                continue
+            enqueue_outbox(
+                connection,
+                dedupe_key=f"clean:{run_id}:{site_id}",
+                queue_name="sync_write",
+                task_name="woo_sync.clean_site",
+                payload={"run_id": run_id, "site_id": site_id},
+            )
+            connection.execute(
+                """UPDATE sync_task_outbox SET status='pending',
+                   available_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                   WHERE dedupe_key=? AND status IN ('published','publishing','error')""",
+                (f"clean:{run_id}:{site_id}",),
+            )
+            connection.execute(
+                """UPDATE sync_site_progress SET status='recovering',
+                   retry_count=retry_count+1,heartbeat_at=CURRENT_TIMESTAMP,
+                   version=version+1 WHERE run_id=? AND site_id=?""",
+                (run_id, site_id),
+            )
+            connection.execute(
+                """UPDATE sync_runs SET status='recovering',
+                   heartbeat_at=CURRENT_TIMESTAMP,recovery_count=recovery_count+1,
+                   version=version+1 WHERE run_id=? AND status<>'cancelling'""",
+                (run_id,),
+            )
+            counts["clean_sites"] += 1
+
         cursor = connection.execute(
             """
             UPDATE sync_task_outbox

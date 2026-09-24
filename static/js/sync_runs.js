@@ -85,7 +85,7 @@
 
     function render(status) {
         const current = status.current_site || {};
-        const labels = { quick: '快速同步', auto: '自动同步', deep: '深度同步' };
+        const labels = { quick: '快速同步', auto: '自动同步', deep: '深度同步', clean: '清理同步' };
         setText('syncModeValue', labels[status.mode] || status.mode);
         setText(
             'syncSiteValue',
@@ -182,17 +182,16 @@
         pollTimer = null;
     }
 
-    async function startGlobalSync() {
-        const button = byId('syncAllBtn');
+    async function startSync(endpoint, button, payload) {
         if (button) button.disabled = true;
         resetUi();
         const instance = modal();
         if (instance) instance.show();
         try {
-            const response = await fetch('/api/sync/all', {
+            const response = await fetch(endpoint, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-                body: '{}'
+                body: JSON.stringify(payload || {})
             });
             const body = await response.json();
             if (!response.ok || !body.success) {
@@ -212,6 +211,10 @@
             if (button) button.disabled = false;
         }
     }
+
+    window.WooSyncRuns = Object.freeze({
+        start: function (endpoint, payload) { return startSync(endpoint, null, payload); }
+    });
 
     async function cancelCurrent() {
         if (!runId) return;
@@ -254,7 +257,9 @@
         const button = byId('syncAllBtn');
         if (button && !button.dataset.syncRunBound) {
             button.dataset.syncRunBound = '1';
-            button.addEventListener('click', startGlobalSync);
+            button.addEventListener('click', function () {
+                startSync('/api/sync/all', button);
+            });
         }
         const cancel = byId('cancelSyncBtn');
         if (cancel && !cancel.dataset.syncRunBound) {
