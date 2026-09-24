@@ -4,6 +4,7 @@ Rules and immutable drafts use versioned rec_objects. They cannot enter cash
 allocation or the final ledger while supplier cost/collection evidence is absent.
 """
 import hashlib
+import html
 import json
 import re
 from collections import defaultdict
@@ -12,6 +13,7 @@ from decimal import Decimal
 
 from reconciliation_core import (ReconciliationError, audit, currency, dec, dump,
                                  money, now, object_, objects, rows, uid)
+from product_recognition import parse_product_name
 
 
 def month_bounds(month):
@@ -98,7 +100,59 @@ def _json(value):
     return json.loads(value or '[]', parse_float=Decimal)
 
 
-def _calculate(order, rule, rate, start, end, decisions):
+def _cost_context(conn, warehouse_id):
+    """Only costs assigned to this physical warehouse can value its shipments."""
+    brands = []
+    for row in rows(conn, 'SELECT id,name,aliases FROM brands'):
+        try:
+            aliases = json.loads(row['aliases'] or '[]')
+        except (ValueError, TypeError):
+            aliases = []
+        brands.append({'id': row['id'], 'name': row['name'],
+                       'patterns': [row['name'].upper()] + [str(a).upper() for a in aliases]})
+    mappings = {}
+    for row in rows(conn, 'SELECT raw_name,source,brand_id,series_id,puff_count,flavor FROM product_mappings'):
+        mappings[(html.unescape(row['raw_name'] or ''), row['source'])] = row
+    return {'brands': brands, 'series': rows(conn, 'SELECT id,brand_id,name FROM series'),
+            'mappings': mappings, 'costs': rows(conn, '''SELECT id,brand_id,series_id,puff_count,flavor,
+                CAST(cost_price AS TEXT) AS price,cost_currency,effective_date FROM product_costs
+                WHERE warehouse_id=? ORDER BY effective_date DESC,id DESC''', (warehouse_id,))}
+
+
+def _line_cost(item, source, shipped_date, context, rates):
+    name = html.unescape(str(item.get('name') or ''))
+    mapping = next((context['mappings'].get((name, scope)) for scope in (source, '', None)
+                    if context['mappings'].get((name, scope))), None)
+    if mapping:
+        brand, series, puffs, flavor = (mapping[k] for k in ('brand_id','series_id','puff_count','flavor'))
+    else:
+        parsed = parse_product_name(name, context['brands'], context['series'])
+        brand, series, puffs, flavor = (parsed.get(k) for k in ('brand_id','series_id','puffs','flavor'))
+        if not puffs:
+            shorthand = re.search(r'\b(\d{1,3})\s*[kK]\b', name)
+            puffs = int(shorthand.group(1)) * 1000 if shorthand else None
+    if not brand or not puffs:
+        return None, '商品品牌或口数未识别：' + name
+    matches = [r for r in context['costs'] if r['brand_id'] == brand and r['puff_count'] == puffs
+               and (r['series_id'] is None or r['series_id'] == series)
+               and (not r['flavor'] or str(r['flavor']).casefold() == str(flavor or '').casefold())
+               and r['effective_date'] <= shipped_date]
+    if not matches:
+        return None, '本仓库出库日无对应成本：' + name
+    matches.sort(key=lambda r: (r['series_id'] is not None, bool(r['flavor']), r['effective_date'], r['id']), reverse=True)
+    chosen = matches[0]
+    unit = currency(chosen['cost_currency'])
+    fx = rates.get(unit)
+    if not fx:
+        return None, '成本币种缺少当月及历史汇率：' + unit
+    qty = dec(item['quantity'])
+    return {'name': name, 'quantity': str(qty), 'cost_id': chosen['id'],
+            'cost_effective_date': chosen['effective_date'], 'unit_cost': chosen['price'],
+            'cost_currency': unit, 'cost_fx_month': fx['month'],
+            'value_cny': str(money(dec(chosen['price']) * qty * dec(fx['rate'])))}, None
+
+
+def _calculate(order, rule, rate, start, end, decisions, costs=None, cost_rates=None):
     """Single original order; unsupported partial/mixed cases stay visibly pending."""
     pending = []
     all_parcels = [p for p in order['parcels'] if p.get('shipped_at') and p.get('status') not in ('cancelled', 'label_pending')]
@@ -180,6 +234,21 @@ def _calculate(order, rule, rate, start, end, decisions):
     # Any ambiguous source must not silently feed an apparently complete total.
     complete = not pending
     convert = lambda value: str(money(value * dec(rate['rate']))) if rate and complete else None
+    cost_lines, cost_missing = [], []
+    if base and not returned and complete:
+        for item in lines:
+            matched, reason = _line_cost(item, order['source'], first, costs or {'brands': [], 'series': [], 'mappings': {}, 'costs': []}, cost_rates or {})
+            if reason:
+                cost_missing.append(reason)
+            else:
+                cost_lines.append(matched)
+    known_cny = money(sum((dec(line['value_cny']) for line in cost_lines), Decimal(0)))
+    known_native = money(known_cny / dec(rate['rate'])) if rate and complete else None
+    cost_ready = complete and (returned or not base or not cost_missing) and bool(rate)
+    goods_value = known_native if cost_ready else None
+    goods_value_cny = known_cny if cost_ready else None
+    product_profit = money(goods - goods_value) if goods_value is not None else None
+    contribution = money(revenue - goods_value - freight - fee / dec(rate['rate'])) if goods_value is not None else None
     return {'order_id': order['id'], 'number': order['number'], 'site': order['source'], 'currency': order['currency'],
             'shipped_at': min(p['shipped_at'] for p in month_parcels), 'quantity': str(sum(quantities.values(), Decimal(0))),
             'state': '拒收退回' if returned else ('已签收' if all(p['status'] == 'delivered' for p in original) else '已出库，未确认签收'),
@@ -190,7 +259,16 @@ def _calculate(order, rule, rate, start, end, decisions):
             'freight': str(money(freight)) if complete else None, 'freight_cny': convert(freight),
             'management_cny': str(money(fee)) if complete else None,
             'shipping_net': str(money(shipping - freight)) if complete else None,
-            'supplier_goods_value': None, 'product_profit': None, 'cost_status': '黄总供货成本待提供',
+            'supplier_goods_value': str(goods_value) if goods_value is not None else None,
+            'supplier_goods_value_cny': str(goods_value_cny) if goods_value_cny is not None else None,
+            'known_goods_value': str(known_native) if known_native is not None else None,
+            'known_goods_value_cny': str(known_cny) if complete else None,
+            'product_profit': str(product_profit) if product_profit is not None else None,
+            'contribution_profit': str(contribution) if contribution is not None else None,
+            'cost_matched_quantity': str(sum((dec(line['quantity']) for line in cost_lines), Decimal(0))),
+            'cost_missing_quantity': str(sum((dec(item['quantity']) for item in lines), Decimal(0)) - sum((dec(line['quantity']) for line in cost_lines), Decimal(0))) if base and not returned and complete else '0',
+            'cost_lines': cost_lines, 'cost_missing': cost_missing,
+            'cost_status': ('出库待核实' if not complete else '退回不结商品货值' if returned else '补发不重复计货值' if not base else '部分成本待补' if cost_missing else '本仓成本已匹配'),
             'collection_status': '回款待凭证核对', 'pending': list(dict.fromkeys(pending)), 'reships': reship_details}
 
 
@@ -215,6 +293,9 @@ def preview(conn, rule_id, month, unit, decisions=None):
         (cfg['warehouse_id'], start, end, unit))
     if len(orders) > 2000:
         raise ReconciliationError('本次超过2000单，请缩小仓库范围')
+    cost_context = _cost_context(conn, cfg['warehouse_id'])
+    cost_rates = {unit: rate_at(conn, unit, month) for unit in
+                  {currency(row['cost_currency']) for row in cost_context['costs']}}
     details, known_ids = [], set()
     for order in orders:
         order['parcels'] = rows(conn, '''SELECT s.id,s.tracking_number,s.shipped_at,s.status,f.warehouse_id
@@ -226,7 +307,7 @@ def preview(conn, rule_id, month, unit, decisions=None):
             JOIN oms_fulfillment_items fi ON fi.id=si.fulfillment_item_id
             JOIN oms_order_items oi ON oi.id=fi.order_item_id
             JOIN oms_fulfillments f ON f.id=fi.fulfillment_id WHERE f.order_id=? AND f.warehouse_id=?''', (order['id'], cfg['warehouse_id']))
-        detail = _calculate(order, cfg, rate, start, end, decisions)
+        detail = _calculate(order, cfg, rate, start, end, decisions, cost_context, cost_rates)
         details.append(detail)
         known_ids.update(r['shipment_id'] for r in detail['reships'])
     if set(decisions) - known_ids:
@@ -234,18 +315,30 @@ def preview(conn, rule_id, month, unit, decisions=None):
     details.sort(key=lambda r: (r['shipped_at'], r['order_id']))
     fields = ('goods_income','shipping_income','tax','other_income','revenue','revenue_cny','freight','freight_cny','management_cny','shipping_net')
     totals = {k: str(money(sum((dec(r[k]) for r in details if r[k] is not None), Decimal(0)))) for k in fields}
+    for key in ('known_goods_value', 'known_goods_value_cny'):
+        totals[key] = str(money(sum((dec(r[key]) for r in details if r[key] is not None), Decimal(0))))
+    all_costs_known = all(r['supplier_goods_value'] is not None for r in details)
+    for key in ('supplier_goods_value', 'supplier_goods_value_cny', 'product_profit', 'contribution_profit'):
+        totals[key] = str(money(sum((dec(r[key]) for r in details), Decimal(0)))) if all_costs_known else None
     incomplete = sum(bool(r['pending']) for r in details)
-    result = {'version': 1, 'rule_id': rule_id, 'rule_snapshot': rule, 'month': month, 'currency': unit,
+    cost_pending = sum(r['supplier_goods_value'] is None for r in details if r['base_order'] and not r['returned'])
+    result = {'version': 2, 'rule_id': rule_id, 'rule_snapshot': rule, 'month': month, 'currency': unit,
             'generated_at': now(), 'status': 'draft', 'date_basis': '保存的出库日期字段，不变更历史时区口径',
             'state_basis': '读取时最新退回状态，非月末快照', 'rows': details, 'rate': rate,
             'counts': {'orders': len(details), 'returns': sum(r['returned'] for r in details),
                        'income_orders': sum(r['base_order'] and not r['returned'] for r in details),
-                       'pending_orders': incomplete, 'cost_pending_orders': len(details)},
+                       'pending_orders': incomplete, 'cost_pending_orders': cost_pending,
+                       'cost_matched_quantity': str(sum((dec(r['cost_matched_quantity']) for r in details), Decimal(0))),
+                       'cost_missing_quantity': str(sum((dec(r['cost_missing_quantity']) for r in details), Decimal(0)))},
             'totals': totals, 'totals_label': '已核实行合计（待核实行不计入）' if incomplete else '本期合计',
-            'supplier_statement': {'party_id': cfg['supplier_id'], 'goods_value': None, 'status': '成本待提供，不能确认货值'},
+            'supplier_statement': {'party_id': cfg['supplier_id'], 'goods_value': totals['supplier_goods_value'],
+                                   'goods_value_cny': totals['supplier_goods_value_cny'],
+                                   'known_subtotal_cny': totals['known_goods_value_cny'],
+                                   'status': '部分成本待补，已匹配小计不可当应付总额' if cost_pending else '系统成本参考值，待供货方凭证确认'},
             'provider_statement': {'party_id': cfg['provider_id'], 'freight': totals['freight'], 'currency': unit,
                                    'management_cny': totals['management_cny'], 'status': '待核对草稿'},
-            'can_lock': False, 'blocking': ['黄总商品成本未提供', '回款未核销', '历史草稿不向正式权益账重复记账']}
+            'can_lock': False, 'blocking': (['商品成本未完全匹配'] if cost_pending else []) +
+                                    ['供货方价格与货值待凭证确认', '回款未核销', '历史草稿不向正式权益账重复记账']}
     stable = {k: v for k, v in result.items() if k != 'generated_at'}
     result['digest'] = hashlib.sha256(dump(stable).encode()).hexdigest()
     return result

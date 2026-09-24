@@ -17,6 +17,12 @@ def db():
     INSERT INTO warehouses VALUES(10,'中转仓');
     CREATE TABLE exchange_rates(year_month TEXT,currency TEXT,rate_to_cny TEXT);
     INSERT INTO exchange_rates VALUES('2026-08','PLN','1.81988');
+    CREATE TABLE brands(id INTEGER PRIMARY KEY,name TEXT,aliases TEXT);
+    INSERT INTO brands VALUES(9,'FUMOT','[]');
+    CREATE TABLE series(id INTEGER,brand_id INTEGER,name TEXT);
+    CREATE TABLE product_mappings(raw_name TEXT,source TEXT,brand_id INTEGER,series_id INTEGER,puff_count INTEGER,flavor TEXT);
+    CREATE TABLE product_costs(id INTEGER PRIMARY KEY,warehouse_id INTEGER,brand_id INTEGER,series_id INTEGER,
+      puff_count INTEGER,flavor TEXT,cost_price TEXT,cost_currency TEXT,effective_date TEXT);
     CREATE TABLE orders(id TEXT PRIMARY KEY,number TEXT,source TEXT,status TEXT,currency TEXT,
       is_undelivered INTEGER,is_problem_return INTEGER,line_items TEXT,fee_lines TEXT,refunds TEXT,
       total TEXT,shipping_total TEXT,total_tax TEXT);
@@ -58,8 +64,69 @@ def test_shipped_unpaid_revenue_return_zero_and_separate_cost(db):
     assert p['totals']['management_cny']=='40.00'
     assert p['totals']['shipping_net']=='-25.00'
     assert p['supplier_statement']['goods_value'] is None
-    assert all(r['product_profit'] is None for r in p['rows'])
+    assert p['rows'][0]['product_profit'] is None
+    assert p['rows'][1]['product_profit']=='0.00'  # Returned goods are not billed to the team.
     assert p['can_lock'] is False and p['counts']['pending_orders']==0
+
+
+def test_dated_warehouse_costs_show_real_partial_coverage_without_inventing_profit(db):
+    c,rule,add=db;add()
+    c.execute("UPDATE orders SET line_items=?", (json.dumps([
+        {'id':1,'name':'Fumot Tornado 9000 Puffs - Grape','quantity':1,'total':'50'},
+        {'id':2,'name':'Fumot Leopard 40000 Puffs - Mint','quantity':1,'total':'50'}]),))
+    c.execute("INSERT INTO oms_order_items VALUES(2,'2')")
+    c.execute("INSERT INTO oms_fulfillment_items VALUES(2,2,'1-1')")
+    c.execute("UPDATE oms_shipment_items SET quantity=1")
+    c.execute("INSERT INTO oms_shipment_items VALUES('1-1',2,1)")
+    c.execute("INSERT INTO product_costs VALUES(1,10,9,NULL,9000,NULL,'39','CNY','2026-07-01')")
+    c.execute("INSERT INTO product_costs VALUES(2,1,9,NULL,40000,NULL,'10','CNY','2026-07-01')")
+    p=preview(c,rule,'2026-08','PLN');r=p['rows'][0]
+    assert p['counts']['cost_matched_quantity']=='1' and p['counts']['cost_missing_quantity']=='1'
+    assert p['counts']['cost_pending_orders']==1
+    assert r['known_goods_value_cny']=='39.00' and r['supplier_goods_value'] is None
+    assert r['product_profit'] is None and p['totals']['supplier_goods_value'] is None
+    assert r['cost_lines'][0]['cost_id']==1 and r['cost_lines'][0]['cost_effective_date']=='2026-07-01'
+    assert '40000' in r['cost_missing'][0]
+    c.execute("INSERT INTO product_costs VALUES(3,10,9,NULL,40000,NULL,'50','CNY','2026-08-11')")
+    assert preview(c,rule,'2026-08','PLN')['counts']['cost_missing_quantity']=='1'  # No future price.
+    c.execute("UPDATE product_costs SET effective_date='2026-07-01' WHERE id=3")
+    complete=preview(c,rule,'2026-08','PLN');r=complete['rows'][0]
+    assert complete['counts']['cost_pending_orders']==0
+    assert r['supplier_goods_value_cny']=='89.00'
+    assert r['supplier_goods_value']=='48.90'
+    assert r['product_profit']=='51.10'
+    assert r['contribution_profit']=='40.11'
+
+
+def test_return_does_not_bill_goods_and_saved_missing_cost_stays_immutable(db):
+    c,rule,add=db;add();add('1-2',True)
+    c.execute("UPDATE orders SET line_items=?",(json.dumps([{'id':1,'name':'Fumot 9000 Puffs','quantity':2,'total':'100'}]),))
+    before=preview(c,rule,'2026-08','PLN')
+    draft=create_draft(c,{'rule_id':rule,'month':'2026-08','currency':'PLN',
+                          'request_key':'missing-cost-snapshot-001','expected_digest':before['digest']},1)
+    c.execute("INSERT INTO product_costs VALUES(1,10,9,NULL,9000,NULL,'39','CNY','2026-07-01')")
+    after=preview(c,rule,'2026-08','PLN')
+    assert before['counts']['cost_pending_orders']==1 and after['counts']['cost_pending_orders']==0
+    assert after['totals']['supplier_goods_value_cny']=='78.00'
+    assert after['rows'][1]['supplier_goods_value_cny']=='0.00'
+    assert object_(c,draft,'history_draft')['data']['snapshot']['totals']['supplier_goods_value'] is None
+    with pytest.raises(ReconciliationError,match='变化'):
+        create_draft(c,{'rule_id':rule,'month':'2026-08','currency':'PLN',
+                        'request_key':'fresh-after-cost-0001','expected_digest':before['digest']},1)
+
+
+def test_market_currency_cost_keeps_pln_and_cny_values_separate(db):
+    c,rule,add=db;add()
+    c.execute("UPDATE orders SET line_items=?",(json.dumps([
+        {'id':1,'name':'Fumot 15000 Puffs','quantity':2,'total':'100'}]),))
+    c.execute("INSERT INTO product_costs VALUES(1,10,9,NULL,15000,NULL,'19','PLN','2026-07-01')")
+    snap=preview(c,rule,'2026-08','PLN')
+    row=snap['rows'][0]
+    assert row['supplier_goods_value']=='38.00'
+    assert row['supplier_goods_value_cny']=='69.16'
+    assert row['cost_lines'][0]['cost_currency']=='PLN'
+    assert row['cost_lines'][0]['cost_fx_month']=='2026-08'
+    assert row['product_profit']=='62.00'
 
 
 def test_fx_backward_only_and_exact_decimal(db):
@@ -178,6 +245,26 @@ def test_permission_and_csrf(db):
         assert 'attachment;' in response.headers['Content-Disposition']
         assert '227.49' in response.data.decode('utf-8-sig')
         assert '待成本' in response.data.decode('utf-8-sig')
+        old=object_(c,ident,'history_draft')['data']
+        old['snapshot']['version']=1
+        for row in old['snapshot']['rows']:
+            for field in ('supplier_goods_value_cny','known_goods_value_cny','contribution_profit',
+                          'cost_status','cost_missing','cost_lines'):
+                row.pop(field,None)
+        c.execute('UPDATE rec_objects SET data=? WHERE id=?',(json.dumps(old,ensure_ascii=False),ident))
+        legacy=client.get('/api/reconciliation-v2/history/export/'+ident)
+        assert legacy.status_code==200
+        assert '旧快照未计算成本' in legacy.data.decode('utf-8-sig')
+        c.execute("UPDATE orders SET line_items=?",(json.dumps([
+            {'id':1,'name':'Fumot 9000 Puffs','quantity':2,'total':'100'}]),))
+        c.execute("INSERT INTO product_costs VALUES(1,10,9,NULL,9000,NULL,'39','CNY','2026-07-01')")
+        fresh=preview(c,rule,'2026-08','PLN')
+        fresh_id=create_draft(c,{'rule_id':rule,'month':'2026-08','currency':'PLN',
+                                 'request_key':'admin-export-cost-001','expected_digest':fresh['digest']},1)
+        updated=client.get('/api/reconciliation-v2/history/export/'+fresh_id)
+        assert updated.status_code==200
+        assert '78.00' in updated.data.decode('utf-8-sig')
+        assert '本仓成本已匹配' in updated.data.decode('utf-8-sig')
     finally:api_module.get_conn=old
 
 
