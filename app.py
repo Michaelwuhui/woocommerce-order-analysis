@@ -27,7 +27,11 @@ from inpost_export import (
     format_collection_amount,
     normalize_polish_phone,
 )
-from sales_board_rates import load_monthly_receipt_rates, resolve_sales_board_rate
+from sales_board_rates import (
+    load_monthly_receipt_rates,
+    parse_sales_board_rate_updates,
+    resolve_sales_board_rate,
+)
 from sales_target_inheritance import load_sales_targets_for_month
 from customer_spending import customer_spending_cny_by_email
 from shipment_split import (
@@ -6843,6 +6847,18 @@ def init_sales_groups_tables():
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_by TEXT DEFAULT '',
             UNIQUE(year_month, currency)
+        )
+    ''')
+
+    # Explicit actual-settlement rates are separate from historical fallback rates.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sales_board_settlement_rates (
+            year_month TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            rate_to_cny REAL NOT NULL CHECK (rate_to_cny > 0),
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_by TEXT DEFAULT '',
+            PRIMARY KEY (year_month, currency)
         )
     ''')
 
@@ -23132,6 +23148,19 @@ def _get_sales_board_rate_overrides(year_month):
         conn.close()
 
 
+def _get_sales_board_settlement_rates(year_month):
+    """Return explicit actual-settlement CNY rates for one month."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            'SELECT currency, rate_to_cny FROM sales_board_settlement_rates WHERE year_month = ?',
+            (year_month,)
+        ).fetchall()
+        return {(r['currency'] or '').upper(): float(r['rate_to_cny']) for r in rows}
+    finally:
+        conn.close()
+
+
 def _get_sales_board_receipt_rates(year_month):
     """Return receipt-weighted rates for one month, keyed by currency."""
     conn = get_db_connection()
@@ -23146,11 +23175,12 @@ def _get_board_cny_rate(
     year_month,
     overrides=None,
     receipt_rates=None,
+    settlement_rates=None,
 ):
     """CNY rate for sales-board calculations only.
 
     overrides: optional pre-fetched dict for the month, to avoid repeated DB hits.
-    Priority: receipt-weighted rate, custom override, then global system rate.
+    Priority: actual settlement, receipt-weighted, fallback, system.
     """
     if not currency or currency.upper() == 'CNY':
         return 1.0, 'system'
@@ -23159,12 +23189,15 @@ def _get_board_cny_rate(
         overrides = _get_sales_board_rate_overrides(year_month)
     if receipt_rates is None:
         receipt_rates = _get_sales_board_receipt_rates(year_month)
+    if settlement_rates is None:
+        settlement_rates = _get_sales_board_settlement_rates(year_month)
     rate, _ = get_cny_rate(currency, year_month)
     return resolve_sales_board_rate(
         cur_u,
         receipt_rates=receipt_rates,
         custom_overrides=overrides,
         system_rate=rate,
+        settlement_rates=settlement_rates,
     )
 
 
@@ -23195,6 +23228,8 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
     _board_overrides_prev = _get_sales_board_rate_overrides(prev_month)
     _board_receipt_rates_cur = _get_sales_board_receipt_rates(selected_month)
     _board_receipt_rates_prev = _get_sales_board_receipt_rates(prev_month)
+    _board_settlement_rates_cur = _get_sales_board_settlement_rates(selected_month)
+    _board_settlement_rates_prev = _get_sales_board_settlement_rates(prev_month)
 
     # Get all managers and their sites
     sites = conn.execute('SELECT url, manager FROM sites WHERE manager IS NOT NULL AND manager != ""').fetchall()
@@ -23384,9 +23419,9 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
         })
         order_count = len(month_orders)
 
-        # Per-currency exchange rate cache (rate for the selected month, with sales-board overrides)
+        # Per-currency exchange rate cache for this month's board and export.
         _month_rates = {}
-        _month_rate_sources = {}  # 'override' or 'system'
+        _month_rate_sources = {}
         def _rate_for(cur):
             if cur not in _month_rates:
                 r, src = _get_board_cny_rate(
@@ -23394,6 +23429,7 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
                     selected_month,
                     _board_overrides_cur,
                     _board_receipt_rates_cur,
+                    _board_settlement_rates_cur,
                 )
                 _month_rates[cur] = r or 0
                 _month_rate_sources[cur] = src
@@ -23488,7 +23524,7 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
                 month_shipping_cny += shipping * rate
                 country_profit[order_country]['net_cny'] += net * rate
 
-        # Previous month CNY (uses prev-month board overrides if set).
+        # Previous month CNY uses that month's actual settlement or fallback rate.
         # Net definition mirrors current month: gross product revenue minus
         # collected shipping minus shipping_loss from undelivered orders.
         prev_net_cny = 0
@@ -23500,6 +23536,7 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
                     prev_month,
                     _board_overrides_prev,
                     _board_receipt_rates_prev,
+                    _board_settlement_rates_prev,
                 )
                 _prev_rate_cache[cur] = r or 0
             return _prev_rate_cache[cur]
@@ -23832,6 +23869,7 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
         'rates_in_use': rates_in_use,
         'rate_overrides': _board_overrides_cur,
         'receipt_rates': _board_receipt_rates_cur,
+        'settlement_rates': _board_settlement_rates_cur,
         'profit_mode': profit_mode,
         'profit_percentage': profit_percentage,
         'country_percentages': country_percentages,
@@ -24084,9 +24122,9 @@ def delete_sales_group(group_id):
 @login_required
 @admin_required
 def get_sales_board_exchange_rates():
-    """List receipt, custom and system rates for a given month.
+    """List actual settlement, receipt, fallback and system rates for a month.
 
-    Receipt-weighted rates take precedence over custom and system rates.
+    Explicit actual-settlement rates take precedence for the sales board.
     """
     month = (request.args.get('month') or '').strip()
     if not month:
@@ -24095,6 +24133,7 @@ def get_sales_board_exchange_rates():
 
     overrides = _get_sales_board_rate_overrides(month)
     receipt_rates = _get_sales_board_receipt_rates(month)
+    settlement_rates = _get_sales_board_settlement_rates(month)
 
     # Determine which currencies are in use this month
     conn = get_db_connection()
@@ -24115,6 +24154,9 @@ def get_sales_board_exchange_rates():
         for c in receipt_rates.keys():
             if c not in currencies:
                 currencies.append(c)
+        for c in settlement_rates.keys():
+            if c not in currencies:
+                currencies.append(c)
         currencies = sorted(set(currencies))
 
         result = []
@@ -24124,16 +24166,19 @@ def get_sales_board_exchange_rates():
             sys_rate, _ = get_cny_rate(cur, month)
             override = overrides.get(cur)
             receipt = receipt_rates.get(cur)
+            settlement = settlement_rates.get(cur)
             in_use, source = resolve_sales_board_rate(
                 cur,
                 receipt_rates=receipt_rates,
                 custom_overrides=overrides,
                 system_rate=sys_rate,
+                settlement_rates=settlement_rates,
             )
             result.append({
                 'currency': cur,
                 'system_rate': round(sys_rate, 6) if sys_rate else None,
                 'override_rate': override,
+                'settlement_rate': settlement,
                 'receipt_rate': (
                     round(receipt['rate'], 6) if receipt else None
                 ),
@@ -24161,46 +24206,45 @@ def get_sales_board_exchange_rates():
 @login_required
 @admin_required
 def save_sales_board_exchange_rates():
-    """Save custom fallback exchange-rate overrides for a month.
+    """Save fallback and actual-settlement rates for one sales-board month.
 
-    Payload: { "month": "YYYY-MM", "rates": [{"currency": "PLN", "rate": 1.95}, ...] }
-    A rate of null/empty/0 removes the override. Receipt rates still take
-    precedence whenever the selected month has valid partner receipts.
+    Payload entries may contain ``rate`` (legacy fallback) and/or
+    ``settlement_rate`` (highest priority). Null/empty/0 clears that field.
     """
-    data = request.get_json(silent=True) or {}
-    month = (data.get('month') or '').strip()
-    rates = data.get('rates') or []
-    if not month:
-        return jsonify({'error': '缺少月份参数'}), 400
+    try:
+        month, rates = parse_sales_board_rate_updates(request.get_json(silent=True))
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
 
     conn = get_db_connection()
     try:
         for entry in rates:
-            cur = (entry.get('currency') or '').strip().upper()
-            if not cur or cur == 'CNY':
-                continue
-            raw = entry.get('rate', None)
-            try:
-                rate = float(raw) if raw not in (None, '', 0, '0') else None
-            except (TypeError, ValueError):
-                rate = None
-            if rate is None or rate <= 0:
-                conn.execute(
-                    'DELETE FROM sales_board_exchange_rates WHERE year_month = ? AND currency = ?',
-                    (month, cur)
-                )
-            else:
-                conn.execute('''
-                    INSERT INTO sales_board_exchange_rates (year_month, currency, rate_to_cny, updated_by)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(year_month, currency) DO UPDATE SET
-                        rate_to_cny = excluded.rate_to_cny,
-                        updated_at = CURRENT_TIMESTAMP,
-                        updated_by = excluded.updated_by
-                ''', (month, cur, rate, getattr(current_user, 'username', '') or ''))
+            cur = entry['currency']
+            for field, table in (
+                ('rate', 'sales_board_exchange_rates'),
+                ('settlement_rate', 'sales_board_settlement_rates'),
+            ):
+                if field not in entry:
+                    continue
+                rate = entry[field]
+                if rate is None:
+                    conn.execute(
+                        f'DELETE FROM {table} WHERE year_month = ? AND currency = ?',
+                        (month, cur)
+                    )
+                else:
+                    conn.execute(f'''
+                        INSERT INTO {table} (year_month, currency, rate_to_cny, updated_by)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(year_month, currency) DO UPDATE SET
+                            rate_to_cny = excluded.rate_to_cny,
+                            updated_at = CURRENT_TIMESTAMP,
+                            updated_by = excluded.updated_by
+                    ''', (month, cur, rate, getattr(current_user, 'username', '') or ''))
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
+        conn.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         conn.close()
@@ -24793,8 +24837,14 @@ def _generate_sales_board_excel(data, hide_leader=False):
     if rates_in_use:
         for cur in sorted(rates_in_use.keys()):
             info = rates_in_use[cur]
-            tag = "（自定义）" if info.get('source') == 'override' else "（系统）"
-            rate_lines.append(f"    - {cur} → 1 {cur} = ¥{info['rate']:.4f} {tag}")
+            tag = {
+                'settlement': '（实际结算）',
+                'receipt': '（回款加权）',
+                'override': '（自定义备用）',
+                'system': '（系统）',
+            }.get(info.get('source'), '（系统）')
+            rate_text = f"{info['rate']:.8f}".rstrip('0').rstrip('.')
+            rate_lines.append(f"    - {cur} → 1 {cur} = ¥{rate_text} {tag}")
 
     lines = [
         (f"销售看板 — {selected_month}", True, 14),
@@ -24805,7 +24855,7 @@ def _generate_sales_board_excel(data, hide_leader=False):
         ("", False, 10),
         ("【本月使用汇率】", True, 12),
         *([(line, False, 10) for line in rate_lines] if rate_lines else [("• （无）", False, 10)]),
-        ("• 汇率优先级：当月回款加权汇率 → 自定义汇率 → 系统汇率；仅作用于销售看板和本导出文件。", False, 10),
+        ("• 汇率优先级：实际结算汇率 → 当月回款加权汇率 → 自定义备用汇率 → 系统汇率；用于销售看板计算与本导出，不更改全局汇率或回款记录。", False, 10),
         ("", False, 10),
         ("【底薪保护（满足其一即可）】", True, 12),
         ("• 环比增长 ≥ 20%", False, 10),
@@ -25693,6 +25743,14 @@ def get_sales_board_unmapped():
         for ov in override_rows:
             _board_overrides[ov['currency']] = ov['rate_to_cny']
         _board_receipt_rates = load_monthly_receipt_rates(conn, year_month)
+        settlement_rows = conn.execute(
+            'SELECT currency, rate_to_cny FROM sales_board_settlement_rates WHERE year_month = ?',
+            (year_month,)
+        ).fetchall()
+        _board_settlement_rates = {
+            (row['currency'] or '').upper(): float(row['rate_to_cny'])
+            for row in settlement_rows
+        }
 
         rate_cache = {}
         def _rate_for(cur):
@@ -25702,6 +25760,7 @@ def get_sales_board_unmapped():
                     year_month,
                     _board_overrides,
                     _board_receipt_rates,
+                    _board_settlement_rates,
                 )
                 rate_cache[cur] = r or 0
             return rate_cache[cur]

@@ -10,6 +10,7 @@ if ROOT not in sys.path:
 
 from sales_board_rates import (  # noqa: E402
     load_monthly_receipt_rates,
+    parse_sales_board_rate_updates,
     resolve_sales_board_rate,
 )
 
@@ -73,6 +74,42 @@ class SalesBoardReceiptRateTests(unittest.TestCase):
             "USD", receipts, {}, 7.2
         )
         self.assertEqual((rate, source), (7.2, "system"))
+
+    def test_actual_settlement_rate_wins_without_changing_old_fallback(self):
+        receipts = load_monthly_receipt_rates(self.conn, "2026-06")
+        args = ("PLN", receipts, {"PLN": 1.75}, 1.82288)
+
+        self.assertEqual(
+            resolve_sales_board_rate(*args, settlement_rates={"PLN": 1.69}),
+            (1.69, "settlement"),
+        )
+        self.assertEqual(resolve_sales_board_rate(*args)[1], "receipt")
+        self.assertEqual(
+            resolve_sales_board_rate("PLN", {}, {"PLN": 1.75}, 1.82)[1],
+            "override",
+        )
+        self.assertEqual(
+            resolve_sales_board_rate("CNY", receipts, {}, 9, {"CNY": 2}),
+            (1.0, "system"),
+        )
+
+    def test_rate_save_validation_is_atomic_and_preserves_omitted_fields(self):
+        month, changes = parse_sales_board_rate_updates({
+            "month": "2026-08",
+            "rates": [{"currency": "pln", "settlement_rate": "1.69"}],
+        })
+        self.assertEqual(month, "2026-08")
+        self.assertEqual(changes, [{"currency": "PLN", "settlement_rate": 1.69}])
+
+        for invalid in ("nan", "inf", -1, "wrong"):
+            with self.assertRaises(ValueError):
+                parse_sales_board_rate_updates({
+                    "month": "2026-08",
+                    "rates": [
+                        {"currency": "AUD", "rate": 4.6},
+                        {"currency": "PLN", "settlement_rate": invalid},
+                    ],
+                })
 
 
 if __name__ == "__main__":
