@@ -129,6 +129,25 @@ def test_market_currency_cost_keeps_pln_and_cny_values_separate(db):
     assert row['product_profit']=='62.00'
 
 
+def test_multiple_pln_cost_lines_do_not_gain_a_cent_from_round_trip_fx(db):
+    c,rule,add=db;add()
+    c.execute("UPDATE orders SET line_items=?",(json.dumps([
+        {'id':1,'name':'Fumot 15000 Puffs','quantity':2,'total':'30'},
+        {'id':2,'name':'Fumot 40000 Puffs','quantity':2,'total':'30'},
+        {'id':3,'name':'Fumot 80000 Puffs','quantity':2,'total':'40'}]),))
+    for ident in (2,3):
+        c.execute('INSERT INTO oms_order_items VALUES(?,?)',(ident,str(ident)))
+        c.execute("INSERT INTO oms_fulfillment_items VALUES(?,?,'1-1')",(ident,ident))
+        c.execute("INSERT INTO oms_shipment_items VALUES('1-1',?,2)",(ident,))
+    for ident,puffs,price in ((1,15000,'19'),(2,40000,'46'),(3,80000,'57')):
+        c.execute('INSERT INTO product_costs VALUES(?,10,9,NULL,?,NULL,?,\'PLN\',\'2026-08-01\')',
+                  (ident,puffs,price))
+    row=preview(c,rule,'2026-08','PLN')['rows'][0]
+    assert row['supplier_goods_value']=='244.00'
+    assert row['supplier_goods_value_cny']=='444.05'
+    assert row['product_profit']=='-144.00'
+
+
 def test_fx_backward_only_and_exact_decimal(db):
     c,_,_=db
     assert rate_at(c,'PLN','2026-09')['rate']=='1.81988'
