@@ -146,10 +146,12 @@ def _line_cost(item, source, shipped_date, context, rates):
     if not fx:
         return None, '成本币种缺少当月及历史汇率：' + unit
     qty = dec(item['quantity'])
+    raw_cost = dec(chosen['price']) * qty
     return {'name': name, 'quantity': str(qty), 'cost_id': chosen['id'],
             'cost_effective_date': chosen['effective_date'], 'unit_cost': chosen['price'],
             'cost_currency': unit, 'cost_fx_month': fx['month'],
-            'value_cny': str(money(dec(chosen['price']) * qty * dec(fx['rate'])))}, None
+            'value_cost_currency': str(raw_cost),
+            'value_cny': str(raw_cost * dec(fx['rate']))}, None
 
 
 def _calculate(order, rule, rate, start, end, decisions, costs=None, cost_rates=None):
@@ -243,7 +245,11 @@ def _calculate(order, rule, rate, start, end, decisions, costs=None, cost_rates=
             else:
                 cost_lines.append(matched)
     known_cny = money(sum((dec(line['value_cny']) for line in cost_lines), Decimal(0)))
-    known_native = money(known_cny / dec(rate['rate'])) if rate and complete else None
+    # Keep market-currency cost exact before rounding. Converting PLN to CNY
+    # and back per line can otherwise invent or lose a cent in the PLN total.
+    known_native = money(sum((dec(line['value_cost_currency']) if line['cost_currency'] == order['currency']
+                              else dec(line['value_cny']) / dec(rate['rate'])
+                              for line in cost_lines), Decimal(0))) if rate and complete else None
     cost_ready = complete and (returned or not base or not cost_missing) and bool(rate)
     goods_value = known_native if cost_ready else None
     goods_value_cny = known_cny if cost_ready else None
