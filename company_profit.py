@@ -162,23 +162,10 @@ def init_company_profit_tables(get_db_connection):
     finally:
         conn.close()
 def _rate_to_cny(conn, currency, year_month):
+    """Use system settings for reports outside the sales board."""
     currency = (currency or "CNY").upper()
     if currency == "CNY":
         return 1.0
-    try:
-        row = conn.execute(
-            """
-            SELECT rate_to_cny
-            FROM sales_board_exchange_rates
-            WHERE currency = ? AND year_month = ?
-            """,
-            (currency, year_month),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        row = None
-    if row:
-        return float(row["rate_to_cny"])
-
     row = conn.execute(
         """
         SELECT rate_to_cny

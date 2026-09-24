@@ -10,6 +10,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from company_profit import (  # noqa: E402
+    _month_gmv,
     _revenue_ladder,
     build_company_profit_summary,
     init_company_profit_tables,
@@ -252,6 +253,33 @@ class CompanyProfitTests(unittest.TestCase):
         self.assertNotIn("can_edit_company_profit", second_columns)
         self.assertIn("company_profit_month_settings", finance_tables)
         self.assertIn("company_profit_expenses", finance_tables)
+
+    def test_offline_gmv_ignores_sales_board_custom_rates(self):
+        conn = self.get_conn()
+        conn.executescript("""
+            CREATE TABLE sales_board_settlement_rates (
+                year_month TEXT, currency TEXT, rate_to_cny REAL
+            );
+            INSERT INTO orders (
+                id, date_created, source, currency, total, shipping_total,
+                status, payment_method
+            ) VALUES (
+                'pl-august', '2026-08-10T10:00:00', 'https://pl.example',
+                'PLN', 100, 0, 'completed', 'cod'
+            );
+            INSERT INTO exchange_rates (year_month, currency, rate_to_cny)
+            VALUES ('2026-08', 'PLN', 1.82);
+            INSERT INTO sales_board_exchange_rates (year_month, currency, rate_to_cny)
+            VALUES ('2026-08', 'PLN', 1.75);
+            INSERT INTO sales_board_settlement_rates (year_month, currency, rate_to_cny)
+            VALUES ('2026-08', 'PLN', 1.69);
+        """)
+        total, by_country, missing_rates = _month_gmv(conn, "2026-08")
+        conn.close()
+
+        self.assertEqual(total, 182)
+        self.assertEqual(by_country, {"PL": 182})
+        self.assertEqual(missing_rates, [])
 
     def test_unknown_market_is_not_guessed_and_actual_can_be_confirmed(self):
         summary = build_company_profit_summary(
