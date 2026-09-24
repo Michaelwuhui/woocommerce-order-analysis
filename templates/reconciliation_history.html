@@ -7,7 +7,7 @@
 </style>
 <div id="rec-app" data-csrf="{{ rec_csrf }}">
  <header class="rec-header"><div><div class="rec-kicker">历史出库 · 费用核对 · 原币与人民币</div><h1>历史对账草稿</h1><p>按既有出库记录核算，生成固定快照；不重放库存、不生成付款。</p></div><a class="rec-button secondary" href="/partner-reconciliation/modular">返回模块化对账</a></header>
- <div class="rec-warning">供货成本未提供时，货值和商品利润显示待定。此处草稿不能锁单或核销，不能与旧账重复结算；收入不代表已回款。</div>
+ <div class="rec-warning">商品按实际出库仓库和出库日期匹配成本。缺成本时仅显示已匹配小计，不生成完整货值或利润；旧草稿保留原快照。此处草稿不能锁单或核销，收入不代表已回款。</div>
  <div id="rec-message" role="status"></div>
  <div class="rec-actions"><button id="history-new-rule">新增历史核算规则</button></div>
  <details><summary>已保存的历史核算规则</summary><div id="history-rules"></div></details>

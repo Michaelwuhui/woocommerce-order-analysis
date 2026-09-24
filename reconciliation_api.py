@@ -317,10 +317,14 @@ def history_export(conn, ident):
     editor(conn)
     snap = object_(conn, ident, 'history_draft')['data']['snapshot']
     out=io.StringIO(); writer=csv.writer(out)
-    writer.writerow(['订单ID','订单号','站点','出库日期','状态','原币','商品净收入','客户运费','收入合计','收入人民币','应付物流费','物流费人民币','管理费人民币','运费净收益','货值','商品利润','汇率月份','对人民币汇率','待核实'])
+    writer.writerow(['订单ID','订单号','站点','出库日期','状态','原币','商品净收入','客户运费','收入合计','收入人民币','应付物流费','物流费人民币','管理费人民币','运费净收益','供货货值原币','供货货值人民币','已匹配货值人民币小计','商品毛利原币','团队贡献利润原币','成本状态','缺失成本商品','成本记录ID','汇率月份','对人民币汇率','其他待核实'])
     for r in snap['rows']:
         values=[r.get(k) for k in ('order_id','number','site','shipped_at','state','currency','goods_income','shipping_income','revenue','revenue_cny','freight','freight_cny','management_cny','shipping_net')]
-        values+=['待成本','待成本',(r['rate'] or {}).get('month'),(r['rate'] or {}).get('rate'),'；'.join(r['pending'])]
+        values += [r.get('supplier_goods_value'),r.get('supplier_goods_value_cny'),r.get('known_goods_value_cny'),
+                   r.get('product_profit'),r.get('contribution_profit'),r.get('cost_status','旧快照未计算成本'),
+                   '；'.join(r.get('cost_missing') or []),
+                   ','.join(str(line['cost_id']) for line in r.get('cost_lines') or []),
+                   (r['rate'] or {}).get('month'),(r['rate'] or {}).get('rate'),'；'.join(r['pending'])]
         # Prefix textual formula triggers; numeric negative amounts remain numeric.
-        writer.writerow(["'"+str(v) if i in (0,1,2,3,4,5,14,15,16,18) and str(v or '').startswith(('=','+','-','@','\t','\r')) else ('待核实' if v is None else v) for i,v in enumerate(values)])
+        writer.writerow(["'"+str(v) if i in (0,1,2,3,4,5,19,20,21,22,24) and str(v or '').startswith(('=','+','-','@','\t','\r')) else ('待成本' if v is None and i in (14,15,17,18) else '待核实' if v is None else v) for i,v in enumerate(values)])
     return Response('\ufeff'+out.getvalue(),content_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="historical-reconciliation.csv"'})
