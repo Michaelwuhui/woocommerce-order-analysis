@@ -171,6 +171,11 @@ def test_august_actual_settlement_changes_commission_and_export(board):
     assert employee["commission"] == 8.45
     assert data["rates_in_use"]["PLN"] == {"rate": 1.69, "source": "settlement"}
 
+    with app_module.app.test_request_context("/monthly?month=2026-08"):
+        assert app_module.convert_to_cny(100, "PLN", "2026-08") == (
+            182, 1.82, "2026-08"
+        )
+
     workbook = load_workbook(io.BytesIO(app_module._generate_sales_board_excel(data).getvalue()))
     rule_lines = [cell.value for row in workbook["规则说明"] for cell in row if cell.value]
     assert any("PLN" in line and "实际结算" in line for line in rule_lines)
