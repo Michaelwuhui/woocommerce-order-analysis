@@ -32,7 +32,7 @@
             <button class="btn btn-sm btn-outline-success" onclick="openGroupSettings()">
                 <i class="bi bi-people me-1"></i>小组管理
             </button>
-            <button class="btn btn-sm btn-outline-warning" onclick="openRateSettings()" title="查看当月回款汇率，并设置无回款时的备用汇率">
+            <button class="btn btn-sm btn-outline-warning" onclick="openRateSettings()" title="查看汇率来源，设置实际结算汇率或备用汇率">
                 <i class="bi bi-currency-exchange me-1"></i>汇率来源
             </button>
             {% if current_user.username == 'admin' %}
@@ -544,7 +544,7 @@
 </div>
 <!-- Custom Exchange Rate Modal -->
 <div class="modal fade" id="rateModal" tabindex="-1">
-    <div class="modal-dialog modal-lg">
+    <div class="modal-dialog modal-xl">
         <div class="modal-content bg-dark border border-secondary border-opacity-25">
             <div class="modal-header border-bottom border-secondary border-opacity-25">
                 <h5 class="modal-title text-white"><i class="bi bi-currency-exchange me-2"></i>销售看板汇率来源 - <span id="rateModalMonth">{{ selected_month }}</span></h5>
@@ -553,8 +553,8 @@
             <div class="modal-body">
                 <div class="alert alert-info bg-info bg-opacity-10 border-info border-opacity-25 text-info small">
                     <i class="bi bi-info-circle me-1"></i>
-                    销售看板按<strong>当月回款加权汇率 → 自定义备用汇率 → 系统汇率</strong>的顺序取值。<br>
-                    有多笔回款时按回款本币金额加权；有有效回款时，自定义值会保留但不生效。
+                    销售看板按<strong>实际结算汇率 → 当月回款加权汇率 → 自定义备用汇率 → 系统汇率</strong>的顺序取值。<br>
+                    实际结算汇率请按实际人民币到账金额 ÷ 外币回款金额填写；它会优先用于本月销售额、提成及新导出的文件。清空后恢复原取值顺序。
                 </div>
                 <div class="table-responsive">
                     <table class="table table-dark table-sm align-middle mb-0">
@@ -563,13 +563,14 @@
                                 <th style="min-width:70px;">币种</th>
                                 <th style="min-width:145px;" class="text-end">当月回款加权(¥)</th>
                                 <th style="min-width:120px;" class="text-end">系统汇率(¥)</th>
+                                <th style="min-width:180px;">实际结算汇率(¥)</th>
                                 <th style="min-width:180px;">自定义备用汇率(¥)</th>
                                 <th style="min-width:120px;">当前生效</th>
                                 <th style="min-width:100px;">来源</th>
                             </tr>
                         </thead>
                         <tbody id="rateModalBody">
-                            <tr><td colspan="6" class="text-center text-white-50 py-4">加载中...</td></tr>
+                            <tr><td colspan="7" class="text-center text-white-50 py-4">加载中...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -795,7 +796,7 @@ function openRateSettings() {
     var monthLabel = document.getElementById('rateModalMonth');
     if (monthLabel) monthLabel.textContent = '{{ selected_month }}';
     var body = document.getElementById('rateModalBody');
-    body.innerHTML = '<tr><td colspan="6" class="text-center text-white-50 py-4">加载中...</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="text-center text-white-50 py-4">加载中...</td></tr>';
     bootstrap.Modal.getOrCreateInstance(document.getElementById('rateModal')).show();
 
     fetch('/api/sales-board/exchange-rates?month={{ selected_month }}')
@@ -803,29 +804,43 @@ function openRateSettings() {
     .then(function(data) {
         var rates = data.rates || [];
         if (rates.length === 0) {
-            body.innerHTML = '<tr><td colspan="6" class="text-center text-white-50 py-4">本月暂无订单或回款使用的币种</td></tr>';
+            body.innerHTML = '<tr><td colspan="7" class="text-center text-white-50 py-4">本月暂无订单或回款使用的币种</td></tr>';
             return;
         }
         var html = '';
+        function formatRate(value) {
+            return Number(value).toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+        }
         rates.forEach(function(r) {
-            var sysRate = r.system_rate != null ? Number(r.system_rate).toFixed(4) : '<span class="text-warning">无</span>';
+            var sysRate = r.system_rate != null ? formatRate(r.system_rate) : '<span class="text-warning">无</span>';
             var receiptRate = r.receipt_rate != null
-                ? Number(r.receipt_rate).toFixed(4) + '<div class="small text-white-50">' + r.receipt_count + ' 笔 · ' + Number(r.receipt_native_amount).toLocaleString('zh-CN') + ' ' + r.currency + '</div>'
+                ? formatRate(r.receipt_rate) + '<div class="small text-white-50">' + r.receipt_count + ' 笔 · ' + Number(r.receipt_native_amount).toLocaleString('zh-CN') + ' ' + r.currency + '</div>'
                 : '<span class="text-white-50">无回款</span>';
             var override = r.override_rate != null ? Number(r.override_rate) : '';
-            var inUse = r.in_use ? Number(r.in_use).toFixed(4) : '-';
-            var srcBadge = r.source === 'receipt'
-                ? '<span class="badge bg-success">回款加权</span>'
-                : (r.source === 'override'
-                    ? '<span class="badge bg-warning text-dark">自定义备用</span>'
-                    : '<span class="badge bg-secondary">系统</span>');
+            var settlement = r.settlement_rate != null ? Number(r.settlement_rate) : '';
+            var inUse = r.in_use ? formatRate(r.in_use) : '-';
+            var srcBadge = r.source === 'settlement'
+                ? '<span class="badge bg-primary">实际结算</span>'
+                : (r.source === 'receipt'
+                    ? '<span class="badge bg-success">回款加权</span>'
+                    : (r.source === 'override'
+                        ? '<span class="badge bg-warning text-dark">自定义备用</span>'
+                        : '<span class="badge bg-secondary">系统</span>'));
             html += '<tr data-currency="' + r.currency + '">' +
                 '<td class="text-white fw-bold">' + r.currency + '</td>' +
                 '<td class="text-end text-success">' + receiptRate + '</td>' +
                 '<td class="text-end text-white-50">' + sysRate + '</td>' +
                 '<td>' +
                     '<div class="input-group input-group-sm">' +
-                        '<input type="number" step="0.0001" min="0" class="form-control bg-dark text-white border-secondary rate-input" ' +
+                        '<input type="number" step="any" min="0" class="form-control bg-dark text-white border-secondary settlement-rate-input" ' +
+                            'value="' + settlement + '" placeholder="按实际到账填写">' +
+                        '<button class="btn btn-outline-secondary" type="button" onclick="resetRate(this)" title="清空实际结算汇率">' +
+                            '<i class="bi bi-arrow-counterclockwise"></i></button>' +
+                    '</div>' +
+                '</td>' +
+                '<td>' +
+                    '<div class="input-group input-group-sm">' +
+                        '<input type="number" step="any" min="0" class="form-control bg-dark text-white border-secondary rate-input" ' +
                             'value="' + override + '" placeholder="无回款时使用">' +
                         '<button class="btn btn-outline-secondary" type="button" onclick="resetRate(this)" title="清空备用汇率">' +
                             '<i class="bi bi-arrow-counterclockwise"></i></button>' +
@@ -838,12 +853,12 @@ function openRateSettings() {
         body.innerHTML = html;
     })
     .catch(function(err) {
-        body.innerHTML = '<tr><td colspan="6" class="text-center text-danger py-4">加载失败：' + err.message + '</td></tr>';
+        body.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">加载失败：' + err.message + '</td></tr>';
     });
 }
 
 function resetRate(btn) {
-    var input = btn.parentElement.querySelector('.rate-input');
+    var input = btn.parentElement.querySelector('input');
     if (input) input.value = '';
 }
 
@@ -853,11 +868,21 @@ function saveRates() {
     rows.forEach(function(row) {
         var cur = row.dataset.currency;
         var input = row.querySelector('.rate-input');
+        var settlementInput = row.querySelector('.settlement-rate-input');
+        if ((input.value !== '' && (!input.checkValidity() || Number(input.value) <= 0)) ||
+            (settlementInput.value !== '' && (!settlementInput.checkValidity() || Number(settlementInput.value) <= 0))) {
+            showToast(cur + ' 的汇率必须是正数', 'error');
+            payload = null;
+            return;
+        }
+        if (payload === null) return;
         payload.push({
             currency: cur,
-            rate: input && input.value !== '' ? parseFloat(input.value) : null
+            rate: input.value !== '' ? Number(input.value) : null,
+            settlement_rate: settlementInput.value !== '' ? Number(settlementInput.value) : null
         });
     });
+    if (payload === null) return;
     fetch('/api/sales-board/exchange-rates', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -871,7 +896,8 @@ function saveRates() {
         } else {
             showToast('保存失败: ' + (data.error || '未知错误'), 'error');
         }
-    });
+    })
+    .catch(function(err) { showToast('保存失败: ' + err.message, 'error'); });
 }
 
 {% if current_user.username == 'admin' %}
