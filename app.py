@@ -23881,8 +23881,13 @@ def _compute_sales_board_data(selected_month, restrict_manager=None):
 
     is_current_month = (selected_month == datetime.date.today().strftime('%Y-%m'))
 
-    # Build leader bonus map: {leader_manager: leader_bonus}
-    leader_bonus_map = {g['leader_manager']: g['leader_bonus'] for g in group_summaries}
+    # A manager can lead more than one group; all of their bonuses are payable.
+    leader_bonus_map = {}
+    for g in group_summaries:
+        leader = g['leader_manager']
+        leader_bonus_map[leader] = round(
+            leader_bonus_map.get(leader, 0) + g['leader_bonus'], 2
+        )
 
     # Aggregate the unique exchange rates used (for display in UI)
     rates_in_use = {}
@@ -24462,7 +24467,7 @@ def _generate_sales_board_excel(data, hide_leader=False):
     ws.title = "销售汇总"
     set_default_row_height(ws)
 
-    ws.merge_cells('A1:P1')
+    ws.merge_cells('A1:T1')
     ws['A1'] = f"销售看板 — {selected_month}" + ("（演示模式：已隐藏组长）" if hide_leader else "")
     ws['A1'].font = Font(bold=True, size=14)
     ws['A1'].alignment = center
@@ -24500,9 +24505,9 @@ def _generate_sales_board_excel(data, hide_leader=False):
         "达成率",
         "订单数", "产品数", "运费(不计¥)", "免提成(不计¥)",
         "提成基数¥", "提成率", "提成¥",
-        "底薪¥", "扣除¥", "达标情况", "预计薪资¥",
+        "底薪¥", "扣除¥", "达标情况", "预计薪资¥", "应发提成",
     ]
-    col_widths = [10, 36, 12, 14, 12, 12, 12, 10, 10, 10, 14, 16, 16, 10, 12, 12, 12, 22, 16]
+    col_widths = [10, 36, 12, 14, 12, 12, 12, 10, 10, 10, 14, 16, 16, 10, 12, 12, 12, 22, 16, 16]
     header_row = 4
     write_header_row(ws, header_row, headers, col_widths)
 
@@ -24510,6 +24515,7 @@ def _generate_sales_board_excel(data, hide_leader=False):
     for d in board_data:
         is_leader = d['manager'] in leader_names
         group_bonus = leader_bonus_map.get(d['manager'], 0)
+        payable_commission = round(d['commission'] + (0 if hide_leader else group_bonus), 2)
 
         # Decide displayed salary/income
         if hide_leader and is_leader:
@@ -24551,12 +24557,13 @@ def _generate_sales_board_excel(data, hide_leader=False):
             -d['salary_deduction'] if d['salary_deduction'] > 0 else 0,
             met_text,
             total_income_disp,
+            payable_commission,
         ]
         # column index map (1-based):
         # 1姓名 2网站 3月目标 4本月实际 5波兰 6澳洲 7其他 8达成率
         # 9订单数 10产品数 11运费 12免提成 13提成基数 14提成率 15提成
-        # 16底薪 17扣除 18达标情况 19预计薪资
-        money_cols = {3, 4, 5, 6, 7, 11, 12, 13, 15, 16, 17, 19}
+        # 16底薪 17扣除 18达标情况 19预计薪资 20应发提成
+        money_cols = {3, 4, 5, 6, 7, 11, 12, 13, 15, 16, 17, 19, 20}
         pct_cols = {8, 14}
         center_cols = {9, 10}
         for c_idx, val in enumerate(row_vals, 1):
@@ -24585,12 +24592,40 @@ def _generate_sales_board_excel(data, hide_leader=False):
             ws.cell(row=r, column=6).fill = PatternFill("solid", fgColor="E8F4FC")  # AU 浅蓝
         r += 1
 
+    # Keep the team total directly below the people, regardless of team size.
+    # Additive fields sum the displayed employee cells; achievement is weighted
+    # by the team target. Rates and status text have no meaningful sum.
+    first_employee_row = header_row + 1
+    last_employee_row = r - 1
+    sum_cols = {3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 15, 16, 17, 19, 20}
+    money_cols_t = {3, 4, 5, 6, 7, 11, 12, 13, 15, 16, 17, 19, 20}
+    for c_idx in range(1, len(headers) + 1):
+        if c_idx == 1:
+            val = "团队合计"
+        elif c_idx == 8:
+            val = f"=IF(C{r}>0,D{r}/C{r},0)" if board_data else 0
+        elif c_idx in sum_cols:
+            col_letter = get_column_letter(c_idx)
+            val = (f"=SUM({col_letter}{first_employee_row}:"
+                   f"{col_letter}{last_employee_row})") if board_data else 0
+        else:
+            val = None
+        cell = ws.cell(row=r, column=c_idx, value=val)
+        cell.border = border; cell.fill = total_fill; cell.font = Font(bold=True)
+        if c_idx in money_cols_t:
+            cell.alignment = right; cell.number_format = money_fmt
+        elif c_idx == 8:
+            cell.alignment = center; cell.number_format = pct_fmt
+        else:
+            cell.alignment = center
+    r += 1
+
     # Group summaries (only if not hide_leader)
     if not hide_leader and group_summaries:
         # Blank separator
         r += 1
         ws.cell(row=r, column=1, value="— 小组汇总 —").font = Font(bold=True, italic=True, color="305496")
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=19)
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=20)
         r += 1
         board_by_mgr = {d['manager']: d for d in board_data}
         for g in group_summaries:
@@ -24608,7 +24643,7 @@ def _generate_sales_board_excel(data, hide_leader=False):
                 g['month_achievement'] / 100 if g['month_achievement'] else 0,
                 "", g['month_total_products'], "", "",
                 g['bonus_base_cny'], g['bonus_rate'], g['leader_bonus'],
-                "", "", f"带团奖金 = 成员基数 × {g['bonus_rate']*100:.1f}%", "",
+                "", "", f"带团奖金 = 成员基数 × {g['bonus_rate']*100:.1f}%", "", "",
             ]
             money_cols_g = {3, 4, 5, 6, 7, 13, 15}
             pct_cols_g = {8, 14}
@@ -24626,34 +24661,6 @@ def _generate_sales_board_excel(data, hide_leader=False):
                 else:
                     cell.alignment = center
             r += 1
-
-    # Team total
-    r += 1
-    total_income = team_totals['total_income_no_bonus'] if hide_leader else team_totals['total_income']
-    total_row = [
-        "团队合计", "",
-        team_totals['monthly_target'], team_totals['month_net_cny'],
-        team_pl, team_au, team_other,
-        team_totals['month_achievement'] / 100 if team_totals['month_achievement'] else 0,
-        sum(d['order_count'] for d in board_data),
-        team_totals['month_total_products'],
-        round(sum(d['month_shipping_cny'] for d in board_data), 2),
-        round(sum(d['month_excluded_cny'] for d in board_data), 2),
-        round(sum(d['commission_base_cny'] for d in board_data), 2),
-        "", team_totals['total_commission'],
-        "", "", "", total_income,
-    ]
-    money_cols_t = {3, 4, 5, 6, 7, 11, 12, 13, 15, 19}
-    pct_cols_t = {8}
-    for c_idx, val in enumerate(total_row, 1):
-        cell = ws.cell(row=r, column=c_idx, value=val)
-        cell.border = border; cell.fill = total_fill; cell.font = Font(bold=True)
-        if c_idx in money_cols_t:
-            cell.alignment = right; cell.number_format = money_fmt
-        elif c_idx in pct_cols_t:
-            cell.alignment = center; cell.number_format = pct_fmt
-        else:
-            cell.alignment = center
 
     ws.freeze_panes = 'C5'
 
@@ -24946,11 +24953,11 @@ def _generate_sales_board_excel(data, hide_leader=False):
         ("【小组带团奖金】", True, 12),
         ("• 组长带团奖金 = 组内非组长成员的提成基数(¥) 之和 × 带团奖金比例", False, 10),
         ("• 组长个人仍按其自己的提成基数和提成率计算个人提成，与带团奖金独立。", False, 10),
+        ("• 销售汇总 T 列「应发提成」= 个人提成 + 组长带团奖金；团队合计位于员工行下方，金额与数量列自动求和。", False, 10),
         ("", False, 10),
         ("【演示/完整版说明】", True, 12),
         ("• 完整版：包含小组汇总和组长带团奖金。", False, 10),
-        ("• 演示版：不包含「小组奖金」Sheet；汇总页中组长的底薪按标准 7000 展示，预计薪资也按此重新计算；团队合计的预计薪资会相应扣减，避免从合计倒推出带团奖金。", False, 10),
-        ("• 两份数字的差额 = 带团奖金之和。", False, 10),
+        ("• 演示版：不包含「小组奖金」Sheet；T 列只显示个人提成；组长的底薪按标准 7000 展示，预计薪资也按此重新计算。", False, 10),
     ]
     for i, (text, bold, size) in enumerate(lines, 1):
         c = ws5.cell(row=i, column=1, value=text)
