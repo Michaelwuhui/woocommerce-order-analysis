@@ -211,3 +211,104 @@ def test_august_actual_settlement_changes_commission_and_export(board):
     restored_rules = [cell.value for row in restored_workbook["规则说明"]
                       for cell in row if cell.value]
     assert any("PLN → 1 PLN = ¥1.772 （回款加权）" in line for line in restored_rules)
+
+
+def test_export_payable_commission_and_moving_team_total(board):
+    app_module, _, database = board
+    added_managers = ["吴辉", "员工乙", "员工丙", "员工丁", "员工戊", "员工己", "员工庚"]
+    conn = sqlite3.connect(database)
+    for i, manager in enumerate(added_managers, 1):
+        conn.execute(
+            "INSERT INTO sites (url, manager, country, consumer_key, consumer_secret) "
+            "VALUES (?, ?, 'PL', 'test-key', 'test-secret')",
+            (f"https://person-{i}.invalid", manager),
+        )
+        conn.execute(
+            "INSERT INTO sales_targets (year_month, manager, monthly_target, weekly_targets, "
+            "base_salary, commission_rate, notes) "
+            "VALUES ('2026-08', ?, 100, '{}', 7000, 0.05, '')",
+            (manager,),
+        )
+    for i in (1, 2):
+        conn.execute(
+            "INSERT INTO orders (id, source, date_created, status, payment_method, "
+            "currency, total, shipping_total, line_items) "
+            "VALUES (?, ?, '2026-08-12', 'completed', 'cod', 'PLN', 100, 0, ?)",
+            (f"person-{i}-order", f"https://person-{i}.invalid",
+             json.dumps([{"name": "普通商品", "quantity": 2, "total": "100"}])),
+        )
+    conn.executemany(
+        "INSERT INTO sales_groups (id, name, leader_manager, bonus_rate) VALUES (?, ?, '吴辉', ?)",
+        [(1, "甲组", 0.02), (2, "乙组", 0.03)],
+    )
+    conn.executemany(
+        "INSERT INTO sales_group_members (group_id, manager) VALUES (?, ?)",
+        [(1, "吴辉"), (1, "员工甲"), (2, "吴辉"), (2, "员工乙")],
+    )
+    conn.commit()
+    conn.close()
+
+    with app_module.app.test_request_context("/sales-board"):
+        data = app_module._compute_sales_board_data("2026-08")
+    assert len(data["board_data"]) == 8
+    assert data["leader_bonus_map"]["吴辉"] == pytest.approx(
+        sum(group["leader_bonus"] for group in data["group_summaries"])
+    )
+
+    workbook = load_workbook(io.BytesIO(app_module._generate_sales_board_excel(data).getvalue()))
+    sheet = workbook["销售汇总"]
+    assert sheet["T4"].value == "应发提成"
+    rows = {sheet[f"A{row}"].value: row for row in range(5, 13)}
+    leader = next(person for person in data["board_data"] if person["manager"] == "吴辉")
+    leader_row = rows["吴辉"]
+    assert sheet[f"O{leader_row}"].value == leader["commission"]
+    assert sheet[f"T{leader_row}"].value == pytest.approx(
+        leader["commission"] + data["leader_bonus_map"]["吴辉"]
+    )
+    assert sheet[f"T{rows['员工甲']}"].value == sheet[f"O{rows['员工甲']}"].value
+    assert sum(sheet[f"T{row}"].value for row in rows.values()) == pytest.approx(
+        data["team_totals"]["total_commission"]
+        + sum(group["leader_bonus"] for group in data["group_summaries"])
+    )
+    for row in rows.values():
+        assert sheet[f"S{row}"].value == pytest.approx(
+            sheet[f"P{row}"].value + sheet[f"Q{row}"].value + sheet[f"T{row}"].value
+        )
+
+    assert sheet["A13"].value == "团队合计"
+    for col in ("C", "D", "E", "F", "G", "I", "J", "K", "L", "M", "O", "P", "Q", "S", "T"):
+        assert sheet[f"{col}13"].value == f"=SUM({col}5:{col}12)"
+    assert sheet["H13"].value == "=IF(C13>0,D13/C13,0)"
+    assert sheet["N13"].value is None
+    assert sheet["R13"].value is None
+    assert sheet["A15"].value == "— 小组汇总 —"
+
+    demo = load_workbook(io.BytesIO(
+        app_module._generate_sales_board_excel(data, hide_leader=True).getvalue()
+    ))
+    demo_sheet = demo["销售汇总"]
+    assert demo_sheet[f"T{leader_row}"].value == leader["commission"]
+    assert demo_sheet[f"S{leader_row}"].value == pytest.approx(
+        demo_sheet[f"P{leader_row}"].value + demo_sheet[f"Q{leader_row}"].value
+        + demo_sheet[f"T{leader_row}"].value
+    )
+    assert demo_sheet["A13"].value == "团队合计"
+    assert demo_sheet["T13"].value == "=SUM(T5:T12)"
+    assert "小组奖金" not in demo.sheetnames
+
+    conn = sqlite3.connect(database)
+    conn.execute(
+        "INSERT INTO sites (url, manager, country, consumer_key, consumer_secret) "
+        "VALUES ('https://person-8.invalid', '员工辛', 'PL', 'test-key', 'test-secret')"
+    )
+    conn.commit()
+    conn.close()
+    with app_module.app.test_request_context("/sales-board"):
+        expanded_data = app_module._compute_sales_board_data("2026-08")
+    assert len(expanded_data["board_data"]) == 9
+    expanded = load_workbook(io.BytesIO(
+        app_module._generate_sales_board_excel(expanded_data).getvalue()
+    ))["销售汇总"]
+    assert expanded["A14"].value == "团队合计"
+    assert expanded["T14"].value == "=SUM(T5:T13)"
+    assert expanded["H14"].value == "=IF(C14>0,D14/C14,0)"
