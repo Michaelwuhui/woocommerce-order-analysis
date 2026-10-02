@@ -121,7 +121,7 @@
         const statusNode = byId('syncStatusText');
         const close = byId('closeSyncModalBtn');
         const cancel = byId('cancelSyncBtn');
-        const partial = status.outcome === 'partial';
+        const partial = ['partial', 'unavailable'].includes(status.outcome);
         if (bar) bar.style.width = progressPercent(status) + '%';
 
         if (status.interruption_state === 'recovering') {
