@@ -269,6 +269,12 @@
                                 {% else %}
                                 <span class="text-muted fst-italic">从未同步</span>
                                 {% endif %}
+                                {% set outage = sync_site_health.get(site.id) %}
+                                {% if outage %}
+                                <div class="small text-warning mt-1" data-sync-site-unavailable="{{ site.id }}">
+                                    <i class="bi bi-exclamation-triangle me-1"></i>{{ outage.availability_message }}
+                                </div>
+                                {% endif %}
                             </td>
                             {% if not site_sync_only %}
                             <td>
@@ -1706,7 +1712,7 @@
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/site_api_checks.js') }}?v=20260914"></script>
 {% if site_sync_only %}
-<script src="{{ url_for('static', filename='js/site_sync_settings.js') }}"></script>
+<script src="{{ url_for('static', filename='js/site_sync_settings.js', v='20261002') }}"></script>
 {% else %}
 <script>
     document.addEventListener('DOMContentLoaded', function () {

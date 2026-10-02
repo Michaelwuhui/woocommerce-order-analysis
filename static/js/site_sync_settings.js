@@ -59,13 +59,13 @@ document.addEventListener('DOMContentLoaded', () => {
         clockTimer = null;
     }
 
-    function finish(status, message, logs) {
+    function finish(status, message, logs, outcome) {
         stopTimers();
         statusText.textContent = message || (status === 'success' ? '同步完成' : '同步失败');
         setLogs(logs);
         progressBar.style.width = '100%';
-        progressBar.classList.remove('progress-bar-animated', 'bg-primary');
-        progressBar.classList.add(status === 'success' ? 'bg-success' : 'bg-danger');
+        progressBar.classList.remove('progress-bar-animated', 'bg-primary', 'bg-warning', 'bg-danger', 'bg-success');
+        progressBar.classList.add(status === 'success' ? 'bg-success' : (outcome === 'partial' ? 'bg-warning' : 'bg-danger'));
         closeButton.disabled = false;
         if (activeButton) activeButton.disabled = false;
         activeButton = null;
@@ -79,8 +79,18 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await parseJsonResponse(response, '同步状态');
             statusText.textContent = data.message || '同步进行中...';
             setLogs(data.logs);
+            const warnings = document.getElementById('syncAvailabilityWarnings');
+            if (warnings) {
+                warnings.replaceChildren();
+                (data.sites || []).filter(site => site.temporarily_unavailable).forEach(site => {
+                    const item = document.createElement('div');
+                    item.textContent = site.url + '：' + site.availability_message;
+                    warnings.appendChild(item);
+                });
+                warnings.hidden = !warnings.childElementCount;
+            }
             if (['success', 'error', 'cancelled', 'interrupted'].includes(data.status)) {
-                finish(data.status, data.message, data.logs);
+                finish(data.status, data.message, data.logs, data.outcome);
                 return;
             }
             if (data.status === 'unknown') {
@@ -104,7 +114,7 @@ document.addEventListener('DOMContentLoaded', () => {
         setLogs([]);
         closeButton.disabled = true;
         progressBar.style.width = '15%';
-        progressBar.classList.remove('bg-success', 'bg-danger');
+        progressBar.classList.remove('bg-success', 'bg-danger', 'bg-warning');
         progressBar.classList.add('progress-bar-animated', 'bg-primary');
         startedAt = Date.now();
         clockTimer = window.setInterval(() => {

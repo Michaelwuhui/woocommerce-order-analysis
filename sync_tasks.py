@@ -16,6 +16,7 @@ import requests
 from urllib3.util import connection as urllib3_connection
 
 from celery_app import celery_app
+from sync_site_health import clear_site_failure, due_site_rechecks
 from oid_utils import make_oid
 from sync_service import (
     _event,
@@ -58,9 +59,10 @@ IPV4_PREFERENCE_ACTIVE = configure_ipv4_preference()
 
 
 class TransientFetchError(RuntimeError):
-    def __init__(self, message: str, retry_after: int | None = None):
+    def __init__(self, message: str, retry_after: int | None = None, *, failure_kind="connection"):
         super().__init__(message)
         self.retry_after = retry_after
+        self.failure_kind = failure_kind
 
 
 class AuthenticationFetchError(RuntimeError):
@@ -68,7 +70,30 @@ class AuthenticationFetchError(RuntimeError):
 
 
 class PermanentFetchError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, failure_kind=None):
+        super().__init__(message)
+        self.failure_kind = failure_kind
+
+
+def _network_failure_kind(error) -> str:
+    if isinstance(error, requests.exceptions.SSLError):
+        return "tls"
+    if isinstance(error, requests.Timeout):
+        return "timeout"
+    pending, seen = [error], set()
+    while pending and len(seen) < 30:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, socket.gaierror) or type(current).__name__ == "NameResolutionError":
+            return "dns"
+        pending.extend(value for value in (
+            getattr(current, "__cause__", None), getattr(current, "__context__", None),
+            getattr(current, "reason", None), getattr(current, "_reason", None),
+            *getattr(current, "args", ()),
+        ) if isinstance(value, BaseException))
+    return "connection"
 
 
 def _defer_busy_site(run_id: str, site_id: int, page: int) -> None:
@@ -152,8 +177,16 @@ def _http_json_list(session, url: str, *, auth, params=None):
                     headers={'Accept': 'application/json', 'User-Agent': 'WooCommerce API Client-Python/3.0.0'},
                     allow_redirects=False,
                 )
-    except (requests.Timeout, requests.ConnectionError) as exc:
-        raise TransientFetchError(type(exc).__name__) from exc
+    except requests.TooManyRedirects as exc:
+        # A store/domain routing loop cannot recover by repeating this page.
+        # Persist a terminal site error so stale-task recovery cannot block
+        # every subsequent run by replaying the same failed fetch forever.
+        raise PermanentFetchError(
+            "WooCommerce redirect loop; check the site URL and domain routing",
+            failure_kind="redirect",
+        ) from exc
+    except requests.RequestException as exc:
+        raise TransientFetchError(type(exc).__name__, failure_kind=_network_failure_kind(exc)) from exc
     status = int(response.status_code)
     if status in {401, 403}:
         raise AuthenticationFetchError(f"WooCommerce authentication failed (HTTP {status})")
@@ -161,13 +194,16 @@ def _http_json_list(session, url: str, *, auth, params=None):
         raise TransientFetchError(
             f"WooCommerce temporary failure (HTTP {status})",
             retry_after=_retry_after(response),
+            failure_kind="tls" if status in {525, 526} else "http",
         )
     if status < 200 or status >= 300:
         raise PermanentFetchError(f"WooCommerce request failed (HTTP {status})")
+    if "text/html" in response.headers.get("Content-Type", "").lower():
+        raise PermanentFetchError("WooCommerce returned HTML instead of order JSON", failure_kind="html")
     try:
         data = response.json()
     except ValueError as exc:
-        raise TransientFetchError("WooCommerce returned invalid JSON") from exc
+        raise TransientFetchError("WooCommerce returned invalid JSON", failure_kind="json") from exc
     if not isinstance(data, list):
         raise PermanentFetchError("WooCommerce returned a non-list response")
     return response, data
@@ -250,7 +286,7 @@ def _claim_fetch(payload: dict[str, Any], task_id: str):
         if not row:
             connection.rollback()
             return None
-        if row["status"] in {"fetched", "writing", "completed", "cancelled"}:
+        if row["status"] in {"fetched", "writing", "completed", "cancelled", "error", "auth_error"}:
             connection.rollback()
             return None
         if row["run_status"] in {"cancelled", "success", "error", "interrupted"}:
@@ -515,11 +551,11 @@ def fetch_page(self, payload: dict[str, Any]):
         mark_site_error(run_id, site_id, page, str(exc), auth_error=True)
         return {"auth_error": True}
     except PermanentFetchError as exc:
-        mark_site_error(run_id, site_id, page, str(exc))
+        mark_site_error(run_id, site_id, page, str(exc), failure_kind=exc.failure_kind)
         return {"error": str(exc)}
     except TransientFetchError as exc:
         if int(self.request.retries or 0) >= MAX_FETCH_RETRIES:
-            mark_site_error(run_id, site_id, page, str(exc))
+            mark_site_error(run_id, site_id, page, str(exc), failure_kind=exc.failure_kind)
             raise
         note_retry(run_id, site_id, page, str(exc))
         raise self.retry(
@@ -744,6 +780,8 @@ def _write_page_transaction(payload: dict[str, Any]):
                 (run_id, site_id),
             )
         elif is_last:
+            if clear_site_failure(connection, site_id):
+                _event(connection, run_id, "site_recovered", "站点订单接口已恢复，补同步完成", site_id=site_id)
             connection.execute(
                 """
                 UPDATE sync_site_progress
@@ -1189,11 +1227,23 @@ def _deep_due() -> tuple[bool, dict[str, Any]]:
 )
 def schedule_auto():
     due, schedule = _auto_due()
+    site_ids = None
+    actor = "celery-beat:auto"
     if not due:
-        return {"created": False, "schedule": schedule}
+        if schedule.get("reason") == "disabled":
+            return {"created": False, "schedule": schedule}
+        connection = get_connection()
+        try:
+            site_ids = due_site_rechecks(connection)
+        finally:
+            connection.close()
+        if not site_ids:
+            return {"created": False, "schedule": schedule}
+        actor = "celery-beat:site-recovery"
     status, created = start_sync(
         mode="auto",
-        created_by="celery-beat:auto",
+        created_by=actor,
+        site_ids=site_ids,
         params={
             "per_page": 50,
             "incremental_overlap_minutes": 10,

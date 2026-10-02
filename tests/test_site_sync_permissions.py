@@ -80,6 +80,30 @@ def test_connected_sites_page_contains_only_the_managers_sites(permission_app):
     assert html.count('id="syncProgressModal"') == 1
 
 
+def test_outage_hints_only_include_the_managers_owned_sites(permission_app):
+    import uuid
+    connection = db.connect()
+    try:
+        for site_id in (11, 22):
+            connection.execute(
+                """INSERT INTO sync_site_health
+                   (site_id,failure_kind,failure_count,next_check_at,last_error,last_failure_run_id)
+                   VALUES (?,'dns',1,CURRENT_TIMESTAMP+interval '5 minutes','DNS failure',?)""",
+                (site_id, str(uuid.uuid4())),
+            )
+        connection.commit()
+        html = _client_for(permission_app, 2).get("/settings").get_data(as_text=True)
+        assert 'data-sync-site-unavailable="11"' in html
+        assert 'data-sync-site-unavailable="22"' not in html
+        assert "DNS 解析失败" in html
+        assert "恢复后自动补同步" in html
+        assert "bob.example" not in html
+    finally:
+        connection.execute("DELETE FROM sync_site_health WHERE site_id IN (11,22)")
+        connection.commit()
+        connection.close()
+
+
 def test_user_without_either_settings_permission_is_denied(permission_app):
     response = _client_for(permission_app, 4).get("/settings")
 

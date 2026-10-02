@@ -74,6 +74,50 @@ def test_network_timeouts_and_disconnects_are_retryable(error):
         )
 
 
+def test_redirect_loop_is_permanent_without_exposing_request_secrets():
+    error = requests.TooManyRedirects("https://unit.invalid/?consumer_secret=private")
+    with pytest.raises(sync_tasks.PermanentFetchError, match="redirect loop") as raised:
+        sync_tasks._http_json_list(
+            _Session(error=error), "https://unit.invalid", auth=("x", "y")
+        )
+    assert "private" not in str(raised.value)
+    assert raised.value.__cause__ is error
+    assert raised.value.failure_kind == "redirect"
+
+
+def test_html_stop_or_block_page_is_an_unavailable_store():
+    with pytest.raises(sync_tasks.PermanentFetchError) as raised:
+        sync_tasks._http_json_list(
+            _Session(_Response(200, headers={"Content-Type": "text/html; charset=UTF-8"})),
+            "https://unit.invalid", auth=("x", "y"),
+        )
+    assert raised.value.failure_kind == "html"
+
+
+@pytest.mark.parametrize("status", [525, 526])
+def test_origin_tls_errors_are_identified_for_automatic_recheck(status):
+    with pytest.raises(sync_tasks.TransientFetchError) as raised:
+        sync_tasks._http_json_list(_Session(_Response(status)), "https://unit.invalid", auth=("x", "y"))
+    assert raised.value.failure_kind == "tls"
+
+
+def test_dns_failure_is_found_inside_wrapped_connection_error():
+    import socket
+    from urllib3.exceptions import MaxRetryError, NameResolutionError
+
+    dns = NameResolutionError("unit.invalid", None, socket.gaierror(-2, "Name or service not known"))
+    error = requests.ConnectionError(MaxRetryError(None, "/orders", reason=dns))
+    with pytest.raises(sync_tasks.TransientFetchError) as raised:
+        sync_tasks._http_json_list(_Session(error=error), "https://unit.invalid", auth=("x", "y"))
+    assert raised.value.failure_kind == "dns"
+
+
+def test_outage_backoff_is_bounded():
+    from sync_site_health import backoff_seconds
+    assert [backoff_seconds(n) for n in range(1, 7)] == [300, 600, 1200, 2400, 3600, 3600]
+    assert backoff_seconds(10000) == 3600
+
+
 def test_ipv4_preference_is_explicit_and_fetch_worker_scoped(monkeypatch):
     import socket
     from urllib3.util import connection as urllib3_connection
@@ -233,7 +277,8 @@ def test_beat_checks_database_backed_auto_and_deep_schedules():
     deep_source = inspect.getsource(sync_tasks.schedule_deep)
     assert "_auto_due()" in auto_source
     assert "_deep_due()" in deep_source
-    assert 'created_by="celery-beat:auto"' in auto_source
+    assert 'actor = "celery-beat:auto"' in auto_source
+    assert 'actor = "celery-beat:site-recovery"' in auto_source
     assert 'created_by="celery-beat:deep"' in deep_source
     migration = (ROOT / "migrations/postgresql/002_sync_pipeline.sql").read_text()
     assert "INSERT INTO settings" not in migration
