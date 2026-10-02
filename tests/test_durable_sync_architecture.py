@@ -118,6 +118,16 @@ def test_outage_backoff_is_bounded():
     assert backoff_seconds(10000) == 3600
 
 
+def test_recovery_batch_names_the_recheck_and_count_of_restored_sites():
+    message = sync_service._status_message({
+        "mode": "auto", "status": "error", "created_by": "celery-beat:site-recovery",
+        "succeeded_sites": 0, "failed_sites": 2, "unavailable_sites": 2,
+    }, None)
+    assert "站点自动复查已结束" in message
+    assert "0 个站点恢复" in message
+    assert "2 个站点暂不可用，将自动复查" in message
+
+
 def test_ipv4_preference_is_explicit_and_fetch_worker_scoped(monkeypatch):
     import socket
     from urllib3.util import connection as urllib3_connection

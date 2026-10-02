@@ -147,6 +147,7 @@ def test_scheduled_sync_defers_outage_without_incrementing_failure_count(isolate
     assert created
     assert status["status"] == "error"
     assert sync_service.active_run() is None
+    assert status["outcome"] == "unavailable"
     # A manual quick sync can check a store immediately; no switch is needed.
     status, created = sync_service.start_sync(
         mode="quick", created_by="pytest:manual-check", site_ids=[SITE_IDS[0]], publish=False

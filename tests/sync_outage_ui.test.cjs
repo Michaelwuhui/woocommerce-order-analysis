@@ -56,3 +56,14 @@ test('healthy completion uses a success display without outage warnings', async 
     assert.equal(nodes.get('syncProgressBar').classList.contains('bg-success'), true);
     assert.equal(nodes.get('syncAvailabilityWarnings').hidden, true);
 });
+
+test('a recheck with every store still unavailable uses a warning and finishes', async () => {
+    const {nodes, window} = runtime({status: 'error', outcome: 'unavailable', sites: [], logs: [],
+        message: '站点自动复查已结束：0 个站点恢复，9 个站点暂不可用，将自动复查'});
+    await window.WooSyncRuns.start('/api/sync/all');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(nodes.get('syncProgressBar').classList.contains('bg-warning'), true);
+    assert.equal(nodes.get('syncProgressBar').classList.contains('bg-danger'), false);
+    assert.equal(nodes.get('closeSyncModalBtn').disabled, false);
+    assert.match(nodes.get('syncStatusText').textContent, /站点自动复查已结束/);
+});

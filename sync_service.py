@@ -653,6 +653,8 @@ def get_run_status(run_id: str, *, connection=None) -> dict[str, Any]:
         item["unavailable_sites"] = sum(bool(row.get("temporarily_unavailable")) for row in site_items)
         item["failed_sites"] = sum(row["status"] in {"error", "auth_error"} for row in site_items)
         item["outcome"] = "partial" if item["status"] == "error" and item["succeeded_sites"] else item["status"]
+        if item["status"] == "error" and item["unavailable_sites"] == len(site_items) and site_items:
+            item["outcome"] = "unavailable"
         item["current_site"] = current
         item["current_page"] = int(current["current_page"]) if current else 0
         item["retry_count"] = sum(int(row["retry_count"] or 0) for row in site_items)
@@ -669,6 +671,9 @@ def get_run_status(run_id: str, *, connection=None) -> dict[str, Any]:
 def _status_message(run: dict[str, Any], current: dict[str, Any] | None) -> str:
     labels = {"quick": "快速同步", "auto": "自动同步", "deep": "深度同步", "clean": "清理同步"}
     prefix = labels.get(str(run.get("mode")), str(run.get("mode")))
+    recheck = run.get("created_by") == "celery-beat:site-recovery"
+    if recheck:
+        prefix = "站点自动复查"
     status = str(run.get("status"))
     if status == "success":
         return f"{prefix}已完成"
@@ -676,7 +681,7 @@ def _status_message(run: dict[str, Any], current: dict[str, Any] | None) -> str:
         return f"{prefix}已取消"
     if status == "error":
         if run.get("failed_sites"):
-            message = f"{prefix}已结束：{run.get('succeeded_sites', 0)} 个站点完成"
+            message = f"{prefix}已结束：{run.get('succeeded_sites', 0)} 个站点{'恢复' if recheck else '完成'}"
             if run.get("unavailable_sites"):
                 message += f"，{run['unavailable_sites']} 个站点暂不可用，将自动复查"
             other = int(run["failed_sites"]) - int(run.get("unavailable_sites", 0))

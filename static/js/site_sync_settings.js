@@ -65,7 +65,7 @@ document.addEventListener('DOMContentLoaded', () => {
         setLogs(logs);
         progressBar.style.width = '100%';
         progressBar.classList.remove('progress-bar-animated', 'bg-primary', 'bg-warning', 'bg-danger', 'bg-success');
-        progressBar.classList.add(status === 'success' ? 'bg-success' : (outcome === 'partial' ? 'bg-warning' : 'bg-danger'));
+        progressBar.classList.add(status === 'success' ? 'bg-success' : (['partial', 'unavailable'].includes(outcome) ? 'bg-warning' : 'bg-danger'));
         closeButton.disabled = false;
         if (activeButton) activeButton.disabled = false;
         activeButton = null;
