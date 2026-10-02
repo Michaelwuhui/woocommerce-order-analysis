@@ -7337,6 +7337,8 @@ else:
 @settings_access_required
 def settings():
     """Full settings, or the connected-sites card scoped to the user's sites."""
+    from sync_site_health import load_site_health
+
     conn = get_db_connection()
     site_sync_only = not _can_manage_all_settings(current_user)
     if site_sync_only:
@@ -7356,10 +7358,12 @@ def settings():
             for site in sites
             if (site['manager'] or '').strip()
         }, key=str.casefold)
+        site_health = load_site_health(conn, [site['id'] for site in sites]) if sqlite3.is_postgres_backend() else {}
         conn.close()
         return render_template(
             'settings.html',
             sites=sites,
+            sync_site_health=site_health,
             site_managers=site_managers,
             exchange_rates=[],
             currencies=[],
@@ -7376,6 +7380,7 @@ def settings():
         )
 
     sites = conn.execute('SELECT * FROM sites').fetchall()
+    site_health = load_site_health(conn, [site['id'] for site in sites]) if sqlite3.is_postgres_backend() else {}
     site_managers = sorted({
         (site['manager'] or '').strip()
         for site in sites
@@ -7419,6 +7424,7 @@ def settings():
     conn.close()
     return render_template('settings.html',
                           sites=sites,
+                          sync_site_health=site_health,
                           site_managers=site_managers,
                           exchange_rates=exchange_rates,
                           currencies=currency_list,

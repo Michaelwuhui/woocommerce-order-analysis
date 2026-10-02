@@ -34,6 +34,8 @@
             status.classList.remove('text-danger', 'text-warning', 'text-success');
         }
         if (byId('syncLogConsole')) byId('syncLogConsole').textContent = '';
+        const warnings = byId('syncAvailabilityWarnings');
+        if (warnings) { warnings.replaceChildren(); warnings.hidden = true; }
         if (close) {
             close.disabled = true;
             close.textContent = '完成';
@@ -84,6 +86,16 @@
     }
 
     function render(status) {
+        const warnings = byId('syncAvailabilityWarnings');
+        if (warnings) {
+            warnings.replaceChildren();
+            (status.sites || []).filter(site => site.temporarily_unavailable).forEach(site => {
+                const item = document.createElement('div');
+                item.textContent = site.url + '：' + site.availability_message;
+                warnings.appendChild(item);
+            });
+            warnings.hidden = !warnings.childElementCount;
+        }
         const current = status.current_site || {};
         const labels = { quick: '快速同步', auto: '自动同步', deep: '深度同步', clean: '清理同步' };
         setText('syncModeValue', labels[status.mode] || status.mode);
@@ -109,6 +121,7 @@
         const statusNode = byId('syncStatusText');
         const close = byId('closeSyncModalBtn');
         const cancel = byId('cancelSyncBtn');
+        const partial = status.outcome === 'partial';
         if (bar) bar.style.width = progressPercent(status) + '%';
 
         if (status.interruption_state === 'recovering') {
@@ -133,11 +146,12 @@
         if (bar) {
             bar.style.width = '100%';
             bar.classList.remove('progress-bar-animated', 'bg-primary', 'bg-warning');
-            bar.classList.add(status.status === 'success' ? 'bg-success' : 'bg-danger');
+            bar.classList.add(status.status === 'success' ? 'bg-success' : (partial ? 'bg-warning' : 'bg-danger'));
         }
         if (statusNode) {
+            statusNode.classList.remove('text-success', 'text-warning', 'text-danger');
             statusNode.classList.add(
-                status.status === 'success' ? 'text-success' : 'text-danger'
+                status.status === 'success' ? 'text-success' : (partial ? 'text-warning' : 'text-danger')
             );
         }
         if (cancel) cancel.disabled = true;

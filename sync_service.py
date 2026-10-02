@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Iterable
 
 import db_backend as db
+from sync_site_health import clear_site_failure, load_site_health, record_site_failure
 
 
 DB_FILE = os.getenv("WOO_SQLITE_PATH", "woocommerce_orders.db")
@@ -277,6 +278,9 @@ def start_sync(
                 len(sites),
             ),
         )
+        automatic = mode == "auto" or str(created_by or "") == "celery-beat:deep"
+        health = load_site_health(connection, [site["id"] for site in sites]) if automatic else {}
+        deferred = 0
         for site in sites:
             site_id = int(site["id"])
             connection.execute(
@@ -287,6 +291,21 @@ def start_sync(
                 """,
                 (run_id, site_id),
             )
+            outage = health.get(site_id)
+            if outage and outage["cooling_down"] and mode != "clean":
+                deferred += 1
+                connection.execute(
+                    """UPDATE sync_site_progress SET status='error',finished_at=CURRENT_TIMESTAMP,
+                           error_message=? WHERE run_id=? AND site_id=?""",
+                    (outage["availability_message"], run_id, site_id),
+                )
+                _event(
+                    connection, run_id, "site_deferred",
+                    f"{site['url']}：{outage['availability_message']}",
+                    site_id=site_id, level="warning",
+                    details={"failure_kind": outage["failure_kind"], "next_check_at": outage["next_check_at"]},
+                )
+                continue
             if mode == "clean":
                 enqueue_outbox(
                     connection,
@@ -304,6 +323,8 @@ def start_sync(
             f"{mode} synchronization queued for {len(sites)} site(s)",
             details={"total_sites": len(sites), "mode": mode},
         )
+        if deferred:
+            _refresh_run_completion(connection, run_id)
         connection.commit()
         created = True
     except db.IntegrityError:
@@ -386,11 +407,17 @@ def mark_site_error(
     message: str,
     *,
     auth_error: bool = False,
+    failure_kind: str | None = None,
 ) -> None:
     connection = get_connection()
     try:
         status = "auth_error" if auth_error else "error"
         safe_message = str(message)[:2000]
+        outage = record_site_failure(connection, site_id, run_id, failure_kind, safe_message) if failure_kind else None
+        if outage:
+            safe_message = outage["availability_message"]
+        else:
+            clear_site_failure(connection, site_id)
         connection.execute(
             """
             UPDATE sync_page_dispatches
@@ -415,8 +442,8 @@ def mark_site_error(
             "site_error",
             safe_message,
             site_id=site_id,
-            level="error",
-            details={"page": page, "auth_error": auth_error},
+            level="warning" if outage else "error",
+            details={"page": page, "auth_error": auth_error, "failure_kind": failure_kind},
         )
         _refresh_run_completion(connection, run_id)
         connection.commit()
@@ -588,12 +615,19 @@ def get_run_status(run_id: str, *, connection=None) -> dict[str, Any]:
         for key in ("created_at", "started_at", "heartbeat_at", "finished_at"):
             item[key] = _iso(item.get(key))
         site_items = []
+        health = load_site_health(connection, [row["site_id"] for row in sites])
         current = None
         for row in sites:
             value = dict(row)
             for key in ("heartbeat_at", "started_at", "finished_at"):
                 value[key] = _iso(value.get(key))
             value["site_id"] = int(value["site_id"])
+            outage = health.get(value["site_id"])
+            if outage and value["status"] == "error":
+                value.update({key: outage[key] for key in (
+                    "failure_kind", "failure_count", "next_check_at", "availability_message"
+                )})
+                value["temporarily_unavailable"] = True
             site_items.append(value)
             if current is None and value["status"] in {
                 "fetching", "writing", "recovering"
@@ -615,6 +649,10 @@ def get_run_status(run_id: str, *, connection=None) -> dict[str, Any]:
             else None
         )
         item["sites"] = site_items
+        item["succeeded_sites"] = sum(row["status"] == "success" for row in site_items)
+        item["unavailable_sites"] = sum(bool(row.get("temporarily_unavailable")) for row in site_items)
+        item["failed_sites"] = sum(row["status"] in {"error", "auth_error"} for row in site_items)
+        item["outcome"] = "partial" if item["status"] == "error" and item["succeeded_sites"] else item["status"]
         item["current_site"] = current
         item["current_page"] = int(current["current_page"]) if current else 0
         item["retry_count"] = sum(int(row["retry_count"] or 0) for row in site_items)
@@ -637,6 +675,14 @@ def _status_message(run: dict[str, Any], current: dict[str, Any] | None) -> str:
     if status == "cancelled":
         return f"{prefix}已取消"
     if status == "error":
+        if run.get("failed_sites"):
+            message = f"{prefix}已结束：{run.get('succeeded_sites', 0)} 个站点完成"
+            if run.get("unavailable_sites"):
+                message += f"，{run['unavailable_sites']} 个站点暂不可用，将自动复查"
+            other = int(run["failed_sites"]) - int(run.get("unavailable_sites", 0))
+            if other:
+                message += f"，{other} 个站点需处理"
+            return message
         return run.get("error_message") or f"{prefix}完成，但有站点失败"
     if run.get("interruption_state") == "recovering":
         return "任务已中断/正在恢复"
