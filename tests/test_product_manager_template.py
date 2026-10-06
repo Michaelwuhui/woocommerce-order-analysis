@@ -12,7 +12,7 @@ PRODUCT_MANAGER_TEMPLATE = ROOT / "templates" / "product_manager.html"
 
 def product_manager_script():
     template = PRODUCT_MANAGER_TEMPLATE.read_text(encoding="utf-8")
-    scripts = re.findall(r"<script(?:\s[^>]*)?>([\s\S]*?)</script>", template)
+    scripts = re.findall(r"<script>([\s\S]*?)</script>", template)
     assert len(scripts) == 1
     return scripts[0]
 
@@ -46,6 +46,15 @@ def test_batch_operations_respect_endpoint_lease_and_keep_item_results(operation
     completed = subprocess.run(
         [shutil.which("node"), str(ROOT / "tests" / "product_manager_batch_harness.js"),
          str(PRODUCT_MANAGER_TEMPLATE), operation, scenario],
+        cwd=ROOT, capture_output=True, text=True, encoding="utf-8", check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is required")
+def test_cross_site_catalog_loading_and_filters():
+    completed = subprocess.run(
+        [shutil.which("node"), str(ROOT / "tests" / "product_manager_catalog_harness.cjs")],
         cwd=ROOT, capture_output=True, text=True, encoding="utf-8", check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr

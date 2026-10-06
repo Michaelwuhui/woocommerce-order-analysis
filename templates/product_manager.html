@@ -164,10 +164,86 @@
         <div>
             <h5 class="text-light mb-0"><i class="bi bi-pencil-square me-2"></i>产品管理</h5>
             <a href="{{ url_for('stock_sync.page') }}" class="btn btn-outline-primary">跨站库存同步</a>
-            <small class="text-muted">跨站点的库存与价格批量编辑（Layer 1：单站点视图）</small>
+            <small class="text-muted">按品牌、口味或全部产品加载各站点，再按负责人、站点、产品和口味筛选</small>
         </div>
     </div>
 
+    <ul class="nav nav-pills gap-2 mb-3" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="pmCatalogTab" data-bs-toggle="pill" data-bs-target="#pmCatalogPane"
+                type="button" role="tab" aria-controls="pmCatalogPane" aria-selected="true">跨站产品查询</button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="pmSingleSiteTab" data-bs-toggle="pill" data-bs-target="#pmSingleSitePane"
+                type="button" role="tab" aria-controls="pmSingleSitePane" aria-selected="false">单站编辑 / 克隆</button>
+        </li>
+    </ul>
+    <div class="tab-content">
+    <div class="tab-pane fade show active" id="pmCatalogPane" role="tabpanel" aria-labelledby="pmCatalogTab">
+        <div class="card data-card mb-3">
+            <div class="card-body">
+                <div class="row g-3 mb-3">
+                    <div class="col-lg-3 col-md-4">
+                        <label for="pmCatalogQueryMode" class="form-label">加载方式</label>
+                        <select id="pmCatalogQueryMode" class="form-select bg-dark text-white border-secondary">
+                            <option value="brand" selected>按品牌加载</option>
+                            <option value="flavor">按口味 / 关键词加载</option>
+                            <option value="all">加载全部产品</option>
+                        </select>
+                    </div>
+                    <div id="pmCatalogBrandInputWrap" class="col-lg-9 col-md-8">
+                        <label for="pmCatalogBrandInput" class="form-label">品牌</label>
+                        <input id="pmCatalogBrandInput" type="text" list="pmCatalogBrandChoices" autocomplete="off"
+                            class="form-control bg-dark text-white border-secondary" placeholder="下拉选择或输入品牌，例如 IGET、Merrymi" maxlength="200">
+                        <datalist id="pmCatalogBrandChoices">
+                            {% for brand in catalog_brands %}<option value="{{ brand }}"></option>{% endfor %}
+                        </datalist>
+                    </div>
+                    <div id="pmCatalogFlavorInputWrap" class="col-lg-9 col-md-8 d-none">
+                        <label for="pmCatalogSearch" class="form-label">口味 / 产品关键词</label>
+                        <input id="pmCatalogSearch" class="form-control bg-dark text-white border-secondary"
+                            placeholder="例如 Blueberry Ice" maxlength="200">
+                    </div>
+                </div>
+                <div class="d-flex flex-wrap gap-2">
+                    <button id="pmCatalogLoad" class="btn btn-primary"><i class="bi bi-search me-1"></i>加载全部站点</button>
+                    <button id="pmCatalogRefresh" class="btn btn-outline-light">重新加载</button>
+                    <button id="pmCatalogStop" class="btn btn-outline-warning" disabled>停止加载</button>
+                    <button id="pmCatalogRetry" class="btn btn-outline-info" disabled>重试未完成站点</button>
+                </div>
+                <div class="text-muted small mt-2">按品牌加载会列出该品牌在你有权限的各站点的所有产品与口味；加载后可直接按站点负责人筛选。结果筛选无需再次读取网站。</div>
+                <div id="pmCatalogStatus" class="small mt-3" role="status" aria-live="polite">选择或输入一个品牌，然后点击「加载全部站点」。</div>
+                <div id="pmCatalogCounts" class="small text-muted mt-2"></div>
+                <details class="mt-2">
+                    <summary class="small text-muted">查看各站点加载进度与异常</summary>
+                    <div id="pmCatalogProgress" class="small mt-2"></div>
+                </details>
+            </div>
+        </div>
+        <div class="card data-card mb-3">
+            <div class="card-body py-3">
+                <div class="row g-2">
+                    {% for field, label in [('Manager', '站点负责人'), ('Site', '站点'), ('Brand', '品牌'), ('Product', '产品'), ('Flavor', '口味'), ('Stock', '库存状态'), ('Publish', '发布状态')] %}
+                    <div class="col-lg-3 col-md-4 col-6">
+                        <label for="pmCatalog{{ field }}Filter" class="form-label small mb-1">{{ label }}</label>
+                        <select id="pmCatalog{{ field }}Filter" class="form-select form-select-sm bg-dark text-white border-secondary">
+                            <option value="">全部{{ label }}</option>
+                        </select>
+                    </div>
+                    {% endfor %}
+                    <div class="col-lg-3 col-md-4 col-sm-6">
+                        <label for="pmCatalogTextFilter" class="form-label small mb-1">结果内搜索</label>
+                        <input id="pmCatalogTextFilter" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="产品名称 / SKU / 口味">
+                    </div>
+                </div>
+                <button id="pmCatalogResetFilters" class="btn btn-sm btn-outline-secondary mt-2">清空筛选</button>
+            </div>
+        </div>
+        <div class="card data-card"><div id="pmCatalogResults" class="card-body p-0">
+            <div class="pm-empty-state">加载后将在这里列出各站点的匹配产品和口味。</div>
+        </div></div>
+    </div>
+    <div class="tab-pane fade" id="pmSingleSitePane" role="tabpanel" aria-labelledby="pmSingleSiteTab">
     <!-- Filter bar (sticky to top below navbar) -->
     <div class="card data-card mb-3 pm-filter-sticky">
         <div class="card-body py-3">
@@ -284,6 +360,8 @@
     <nav class="mt-3" id="pmPagination" style="display:none;">
         <ul class="pagination pagination-sm justify-content-center" id="pmPaginationList"></ul>
     </nav>
+    </div>
+    </div>
 </div>
 
 <!-- Batch operation modal (generic) -->
@@ -396,6 +474,7 @@
     </div>
 </div>
 
+<script src="{{ url_for('static', filename='js/product_manager_catalog.js') }}?v=20261006"></script>
 <script>
 (function() {
     // State
@@ -460,7 +539,7 @@
         });
 
         fetch(`/api/product-manager/products?${params}`)
-            .then(r => r.json())
+            .then(r => parseProductManagerJson(r))
             .then(data => {
                 if (data.error) {
                     $('pmTableArea').innerHTML = `
@@ -2013,6 +2092,18 @@
         $('pmCloneApplyBtn').innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>后台克隆中...';
         pollCloneJob(activeCloneJob);
     }
+
+    // Cross-site rows retain child IDs; open the existing editor by site/name,
+    // allowing its existing Master routing to resolve its own product IDs.
+    $('pmCatalogPane').addEventListener('pm:open-single-site', event => {
+        const site = String(event.detail.site_id);
+        if (![...$('pmSiteSelect').options].some(option => option.value === site)) return;
+        if (modifiedRows.size && !confirm('单站管理中有未保存的修改。打开此结果将放弃这些输入，是否继续？')) return;
+        bootstrap.Tab.getOrCreateInstance($('pmSingleSiteTab')).show();
+        $('pmSiteSelect').value = site;
+        $('pmSearchInput').value = event.detail.search || '';
+        loadProducts(1);
+    });
 
 })();
 </script>
