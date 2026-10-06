@@ -233,10 +233,14 @@
             <span class="badge bg-info ms-2">{{ current_month }}（本页 {{ orders|length }} 条）</span>
             {% endif %}
         </h5>
-        {% if current_user.is_authenticated and current_user.is_admin() %}
-        <button class="btn btn-primary btn-sm me-2" id="syncAllBtn">
-            <i class="bi bi-arrow-repeat me-1"></i>快速同步
+        {% if can_sync_all_sites or can_sync_own_sites %}
+        <button class="btn btn-primary btn-sm me-2" id="syncAllBtn"
+            data-sync-endpoint="{{ url_for('sync_all_data') if can_sync_all_sites else url_for('sync_own_sites') }}"
+            title="{{ '同步全部站点' if can_sync_all_sites else '同步本人负责的全部站点' }}">
+            <i class="bi bi-arrow-repeat me-1"></i>{{ '快速同步' if can_sync_all_sites else '快速同步（本人站点）' }}
         </button>
+        {% endif %}
+        {% if current_user.is_authenticated and current_user.is_admin() %}
         <a href="{{ url_for('export_orders') }}" class="btn btn-success btn-sm">
             <i class="bi bi-file-earmark-excel me-1"></i>导出所有订单
         </a>

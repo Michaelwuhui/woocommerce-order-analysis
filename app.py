@@ -2931,6 +2931,8 @@ def orders():
     
     return render_template('orders.html',
                          orders=processed_orders,
+                         can_sync_all_sites=_can_manage_all_settings(current_user),
+                         can_sync_own_sites=current_user.can_manage_own_site_sync(),
                          sources=sources,
                          statuses=statuses,
                          summary_stats=summary_stats,
@@ -9254,6 +9256,30 @@ def cancel_sync_run(run_id):
         app.logger.exception('安全取消同步失败: run_id=%s', run_id)
         return jsonify({'error': '取消请求暂时无法保存'}), 503
     return jsonify({'success': True, 'run_id': run_id, 'status': status})
+
+
+@app.route('/api/sync/own', methods=['POST'])
+@login_required
+def sync_own_sites():
+    """Quick-sync the caller's current manager assignments, never client IDs."""
+    if not current_user.can_manage_own_site_sync():
+        return jsonify({'error': '没有本人站点同步权限'}), 403
+    conn = get_db_connection()
+    try:
+        site_ids = [row['id'] for row in conn.execute(
+            '''SELECT s.id FROM sites s JOIN users u ON u.id = ?
+               WHERE TRIM(COALESCE(u.name, '')) != ''
+                 AND TRIM(COALESCE(s.manager, '')) = TRIM(u.name)
+               ORDER BY s.id''',
+            (current_user.id,),
+        ).fetchall()]
+    finally:
+        conn.close()
+    if not site_ids:
+        return jsonify({'error': '当前账号名下没有可同步的站点'}), 400
+    if not sqlite3.is_postgres_backend():
+        return jsonify({'error': '批量同步本人站点需要 PostgreSQL 同步服务'}), 409
+    return _start_durable_sync('quick', site_ids)
 
 
 @app.route('/api/sync', methods=['POST'])
