@@ -34,6 +34,7 @@ from sales_board_rates import (
 )
 from sales_target_inheritance import load_sales_targets_for_month
 from customer_spending import customer_spending_cny_by_email
+from customer_table_data import customer_table_context
 from shipment_split import (
     ShipmentItemError,
     normalize_batch_items,
@@ -5078,10 +5079,11 @@ def customers():
         'date_to': date_to,
     }
     period_active = bool(date_from or date_to)
-    return render_template('customers.html', customers=customers_list, stats=stats, sources=all_sources,
+    return render_template('customers.html', customers=[], stats=stats, sources=all_sources,
                            source_filter=source_filter, manager_filter=manager_filter, all_managers=all_managers,
                            site_managers=site_managers, all_countries=all_countries,
-                           current_filters=current_filters, period_active=period_active)
+                           current_filters=current_filters, period_active=period_active,
+                           **customer_table_context(customers_list))
 
 
 @app.route('/api/customers/loss-list')
