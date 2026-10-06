@@ -286,119 +286,7 @@
                             <th>操作</th>
                         </tr>
                     </thead>
-                    <tbody>
-                        {% for c in customers %}
-                        {% set _ident_emails = (c.identity_emails or [c.email])|join(' ') %}
-                        <tr>
-                            <td data-identity-count="{{ c.identity_email_count or 1 }}"
-                                data-search="{{ ((c.name or '') ~ ' ' ~ _ident_emails ~ ' ' ~ (c.phone or ''))|lower }}">
-                                <div class="d-flex align-items-center">
-                                    <div
-                                        class="avatar-circle me-2 bg-gradient-{{ 'warning' if c.tier == 'VIP' else ('success' if c.tier == '优质' else ('primary' if c.tier == '普通' else 'secondary')) }}">
-                                        {{ c.name[0]|upper if c.name else '?' }}
-                                    </div>
-                                    <div>
-                                        <div class="fw-bold text-white">{{ c.name or 'Unknown' }}</div>
-                                        <small class="text-white-50">{{ c.email }}</small>
-                                        {% if (c.identity_email_count or 1) > 1 %}
-                                        {% set matched_map = {'phone':'同手机','address':'同地址'} %}
-                                        <div class="mt-1">
-                                            <span class="badge" style="background:rgba(167,139,250,0.18);color:#a78bfa;border:1px solid rgba(167,139,250,0.5);cursor:help;"
-                                                title="同一身份合并了 {{ c.identity_email_count }} 个邮箱（依据：{% for m in c.identity_matched_by %}{{ matched_map.get(m, m) }}{% if not loop.last %}+{% endif %}{% endfor %}）：&#10;{% for e in c.identity_emails %}· {{ e }}&#10;{% endfor %}">
-                                                <i class="bi bi-people-fill me-1"></i>合并 {{ c.identity_email_count }} 邮箱
-                                            </span>
-                                        </div>
-                                        {% endif %}
-                                    </div>
-                                </div>
-                            </td>
-                            <td>{% set mgr = site_managers.get(c.source, '') %}{% if mgr %}<span class="badge me-1"
-                                    style="background:rgba(23,162,184,0.3);color:#17a2b8;">{{ mgr }}</span>{% endif
-                                %}{% if source_display_mode != 'manager_only' %}<span
-                                    class="badge bg-dark border border-secondary">{{
-                                    c.source.replace('https://www.', '').replace('https://', '') }}</span>{% endif %}
-                            </td>
-                            <td class="text-center" data-order="{{ c.site_count or 1 }}">
-                                {% if (c.site_count or 1) >= 2 %}
-                                <span class="badge" style="background:rgba(93,208,230,0.18);color:#5dd0e6;border:1px solid rgba(93,208,230,0.5);cursor:help;"
-                                    title="该客户在 {{ c.site_count }} 个站点下过单：&#10;{% for s in c.site_list %}· {{ s.short }}{% if s.manager %} ({{ s.manager }}){% endif %}&#10;{% endfor %}">
-                                    <i class="bi bi-diagram-3 me-1"></i>{{ c.site_count }} 站
-                                </span>
-                                {% else %}
-                                <span class="text-secondary">—</span>
-                                {% endif %}
-                            </td>
-                            <td>
-                                <div class="btn-group">
-                                    <a href="mailto:{{ c.email }}" class="btn btn-sm btn-outline-secondary"
-                                        title="发送邮件"><i class="bi bi-envelope"></i></a>
-                                    {% if c.phone %}
-                                    <a href="tel:{{ c.phone }}" class="btn btn-sm btn-outline-secondary" title="拨打电话"><i
-                                            class="bi bi-telephone"></i></a>
-                                    {% endif %}
-                                </div>
-                            </td>
-                            <td>
-                                {% if c.tier == 'VIP' %}
-                                <span class="badge bg-warning text-dark"><i class="bi bi-star-fill me-1"></i>VIP</span>
-                                {% elif c.tier == '优质' %}
-                                <span class="badge bg-success"><i class="bi bi-gem me-1"></i>优质</span>
-                                {% elif c.tier == '普通' %}
-                                <span class="badge bg-primary"><i class="bi bi-person-check me-1"></i>普通</span>
-                                {% else %}
-                                <span class="badge bg-secondary"><i class="bi bi-person me-1"></i>新客</span>
-                                {% endif %}
-                            </td>
-                            <td class="text-center">{{ c.successful_orders }}</td>
-                            <td class="text-end fw-bold text-success" data-order="{{ c.total_spent_cny or 0 }}">
-                                ¥{{ "{:,.2f}".format(c.total_spent_cny or 0) }}
-                                {% if c.missing_exchange_rates %}
-                                <i class="bi bi-exclamation-triangle-fill text-warning ms-1"
-                                   title="以下汇率缺失，人民币金额未完全折算：{{ c.missing_exchange_rates|join(', ') }}"></i>
-                                {% endif %}
-                            </td>
-                            <td class="text-center" data-order="{{ c.total_loss or 0 }}" data-loss="{{ c.total_loss or 0 }}">
-                                {% if (c.undelivered_orders and c.undelivered_orders > 0) or (c.problem_return_orders and c.problem_return_orders > 0) %}
-                                {% if c.undelivered_orders and c.undelivered_orders > 0 %}
-                                <span class="badge" style="background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.4);" title="拒收 {{ c.undelivered_orders }} 单 / 共 {{ c.total_orders }} 单 = {{ c.refusal_rate }}%">
-                                    未送达 {{ c.undelivered_orders }}
-                                    {% if c.refusal_rate >= 30 %}
-                                    <i class="bi bi-exclamation-triangle-fill ms-1" style="color:#fbbf24;" title="高拒收率"></i>
-                                    {% endif %}
-                                </span>
-                                {% endif %}
-                                {% if c.problem_return_orders and c.problem_return_orders > 0 %}
-                                <span class="badge ms-1" style="background:rgba(220,53,69,0.2); color:#f87171; border:1px solid rgba(220,53,69,0.4);" title="问题退货（调包/少件/损坏）{{ c.problem_return_orders }} 单">
-                                    问题退货 {{ c.problem_return_orders }}
-                                </span>
-                                {% endif %}
-                                {% if c.shipping_loss_total > 0 %}
-                                <div><small class="text-warning">运费损失 {{ "%.2f"|format(c.shipping_loss_total) }} {{ c.currency }}</small></div>
-                                {% endif %}
-                                {% if c.product_loss_total and c.product_loss_total > 0 %}
-                                <div><small class="text-warning">货值损失 {{ "%.2f"|format(c.product_loss_total) }} {{ c.currency }}</small></div>
-                                {% endif %}
-                                {% else %}
-                                <span class="text-secondary">—</span>
-                                {% endif %}
-                            </td>
-                            <td>{{ c.last_order_date|replace('T', ' ')|truncate(11, True, '') }}</td>
-                            <td>
-                                {% for action in c.actions %}
-                                <span
-                                    class="badge rounded-pill bg-{{ action.type }} bg-opacity-25 text-{{ action.type }} border border-{{ action.type }} me-1 mb-1"
-                                    title="{{ action.text }}">
-                                    <i class="bi bi-{{ action.icon }} me-1"></i>{{ action.text }}
-                                </span>
-                                {% endfor %}
-                            </td>
-                            <td>
-                                <button class="btn btn-sm btn-outline-info"
-                                    onclick="showCustomerDetail('{{ c.email }}')">详情</button>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
+                    <tbody></tbody>
                 </table>
             </div>
         </div>
@@ -424,10 +312,13 @@
 
 {% block scripts %}
 <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.4/css/dataTables.bootstrap5.min.css">
 <script src="https://cdn.datatables.net/1.13.4/js/jquery.dataTables.min.js"></script>
 <script src="https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js"></script>
+
+<script type="application/json" id="customersTableData">{{ customers_payload | tojson }}</script>
+<script type="application/json" id="customersTableConfig">{{ {'siteManagers': site_managers, 'sourceDisplayMode': source_display_mode} | tojson }}</script>
+<script src="{{ url_for('static', filename='js/customer_table.js') }}?v=20261006"></script>
 
 <style>
     /* DataTables Dark Mode Overrides */
@@ -551,148 +442,6 @@
         })();
     });
 
-    $(document).ready(function () {
-        // Column layout (after inserting 多站下单 at index 2):
-        // 0姓名 1来源 2多站 3触达 4等级 5订单数 6总消费 7损失 8最近购买 9行动 10操作
-        // "只看有损失" filter: keep only rows whose loss cell (index 7) has data-loss > 0.
-        // "只看多站客户" filter: keep only rows whose 多站 cell (index 2) data-order >= 2.
-        // "只看聚合客户" filter: keep only rows whose 姓名 cell (index 0)
-        //                       data-identity-count >= 2 (merged from ≥2 emails).
-        var lossOnly = false;
-        var multiSiteOnly = false;
-        var mergedOnly = false;
-        // Name/email/phone search. Matches against the 姓名 cell's data-search
-        // attribute, which includes the customer name + ALL merged-identity
-        // emails + phone — so searching a secondary (merged-in) email still hits.
-        var customerQuery = '';
-        $.fn.dataTable.ext.search.push(function (settings, data, dataIndex) {
-            if (settings.nTable.id !== 'customersTable') return true;
-            var cells = settings.aoData[dataIndex].anCells;
-            if (lossOnly) {
-                var loss = parseFloat(cells[7].getAttribute('data-loss') || '0');
-                if (!(loss > 0)) return false;
-            }
-            if (multiSiteOnly) {
-                var sc = parseInt(cells[2].getAttribute('data-order') || '1', 10);
-                if (!(sc >= 2)) return false;
-            }
-            if (mergedOnly) {
-                var ic = parseInt(cells[0].getAttribute('data-identity-count') || '1', 10);
-                if (!(ic >= 2)) return false;
-            }
-            if (customerQuery) {
-                var hay = (cells[0].getAttribute('data-search') || '');
-                if (hay.indexOf(customerQuery) === -1) return false;
-            }
-            return true;
-        });
-
-        var dt = $('#customersTable').DataTable({
-            language: {
-                "sProcessing": "处理中...",
-                "sLengthMenu": "显示 _MENU_ 项结果",
-                "sZeroRecords": "没有匹配结果",
-                "sInfo": "显示第 _START_ 至 _END_ 项结果，共 _TOTAL_ 项",
-                "sInfoEmpty": "显示第 0 至 0 项结果，共 0 项",
-                "sInfoFiltered": "(由 _MAX_ 项结果过滤)",
-                "sInfoPostFix": "",
-                "sSearch": "搜索:",
-                "sUrl": "",
-                "sEmptyTable": "表中数据为空",
-                "sLoadingRecords": "载入中...",
-                "sInfoThousands": ",",
-                "oPaginate": {
-                    "sFirst": "首页",
-                    "sPrevious": "上页",
-                    "sNext": "下页",
-                    "sLast": "末页"
-                },
-                "oAria": {
-                    "sSortAscending": ": 以升序排列此列",
-                    "sSortDescending": ": 以降序排列此列"
-                }
-            },
-            order: [[6, 'desc']], // Default sort by Total Spent (now index 6)
-            columnDefs: [
-                { orderable: false, targets: [3, 9, 10] }, // Disable sort for Contact, Smart Actions, Actions
-                { type: 'num', targets: [2, 7] }           // 多站(2) + 损失(7) sort numerically via data-order
-            ],
-            // Hide the built-in search box ('f') — we provide our own labelled
-            // 姓名/邮箱/电话 box in the card header that also matches merged emails.
-            dom: 'lrtip',
-            pageLength: 25
-        });
-
-        // Wire the custom 姓名/邮箱/电话 search box → custom ext.search filter.
-        var searchBox = document.getElementById('customerSearchBox');
-        if (searchBox) {
-            searchBox.addEventListener('input', function () {
-                customerQuery = this.value.trim().toLowerCase();
-                dt.draw();
-            });
-        }
-
-        // Wire the "只看有损失" toggle button (only present when losses exist).
-        var lossBtn = document.getElementById('toggleLossOnlyBtn');
-        if (lossBtn) {
-            lossBtn.addEventListener('click', function () {
-                lossOnly = !lossOnly;
-                if (lossOnly) {
-                    lossBtn.classList.add('active', 'btn-danger');
-                    lossBtn.classList.remove('btn-outline-danger');
-                    lossBtn.innerHTML = '<i class="bi bi-funnel-fill me-1"></i>显示全部客户';
-                    dt.order([7, 'desc']);   // sort by loss desc so worst offenders top the list
-                } else {
-                    lossBtn.classList.remove('active', 'btn-danger');
-                    lossBtn.classList.add('btn-outline-danger');
-                    lossBtn.innerHTML = '<i class="bi bi-funnel me-1"></i>只看有损失的客户';
-                    dt.order([6, 'desc']);   // restore default sort by total spent
-                }
-                dt.draw();
-            });
-        }
-
-        // Wire the "只看多站客户" toggle button.
-        var multiBtn = document.getElementById('toggleMultiSiteBtn');
-        if (multiBtn) {
-            multiBtn.addEventListener('click', function () {
-                multiSiteOnly = !multiSiteOnly;
-                if (multiSiteOnly) {
-                    multiBtn.classList.add('active', 'btn-info');
-                    multiBtn.classList.remove('btn-outline-info');
-                    multiBtn.innerHTML = '<i class="bi bi-funnel-fill me-1"></i>显示全部客户';
-                    dt.order([2, 'desc']);   // most-spread customers first
-                } else {
-                    multiBtn.classList.remove('active', 'btn-info');
-                    multiBtn.classList.add('btn-outline-info');
-                    multiBtn.innerHTML = '<i class="bi bi-diagram-3 me-1"></i>只看多站客户';
-                    dt.order([6, 'desc']);
-                }
-                dt.draw();
-            });
-        }
-
-        // Wire the "只看聚合客户" toggle button (identity merged ≥2 emails).
-        var mergedBtn = document.getElementById('toggleMergedBtn');
-        if (mergedBtn) {
-            mergedBtn.addEventListener('click', function () {
-                mergedOnly = !mergedOnly;
-                if (mergedOnly) {
-                    mergedBtn.classList.add('active');
-                    mergedBtn.style.background = '#a78bfa';
-                    mergedBtn.style.color = '#fff';
-                    mergedBtn.innerHTML = '<i class="bi bi-funnel-fill me-1"></i>显示全部客户';
-                } else {
-                    mergedBtn.classList.remove('active');
-                    mergedBtn.style.background = '';
-                    mergedBtn.style.color = '#a78bfa';
-                    mergedBtn.innerHTML = '<i class="bi bi-people-fill me-1"></i>只看聚合客户';
-                }
-                dt.draw();
-            });
-        }
-    });
-
     // Tier Chart
     var ctxTier = document.getElementById('customerTierChart').getContext('2d');
     new Chart(ctxTier, {
@@ -719,7 +468,7 @@
 
     // Top Customers Chart
     var ctxTop = document.getElementById('topCustomersChart').getContext('2d');
-    var topCustomers = {{ customers[:10] | tojson }};
+    var topCustomers = {{ top_customers | tojson }};
     new Chart(ctxTop, {
         type: 'bar',
         data: {
