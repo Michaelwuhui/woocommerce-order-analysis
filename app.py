@@ -8953,8 +8953,12 @@ def product_manager():
             'label': r['label'],
             'host': r['url'].replace('https://www.', '').replace('https://', '').replace('http://', ''),
         }
+    catalog_brands = sorted([r['name'] for r in conn.execute(
+        "SELECT DISTINCT name FROM brands WHERE trim(COALESCE(name, '')) != ''"
+    ).fetchall()], key=str.casefold)
     conn.close()
-    return render_template('product_manager.html', sites=sites, masters_lookup=masters_lookup)
+    return render_template('product_manager.html', sites=sites, masters_lookup=masters_lookup,
+                           catalog_brands=catalog_brands)
 
 
 @app.route('/api/sites', methods=['POST'])

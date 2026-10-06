@@ -5,6 +5,7 @@ published catalog and each variation's own attributes are the search evidence.
 The browser coordinates bounded page reads and owns cross-page completeness.
 """
 import html
+import json
 import math
 import re
 import unicodedata
@@ -71,6 +72,89 @@ def _unique(values):
             seen.add(normalized)
             output.append(value)
     return output
+
+
+def _brand_index(brands_cache):
+    """Resolve exact configured names and aliases to a canonical display name."""
+    index = {}
+    ambiguous = set()
+    for brand in brands_cache:
+        name = _text(brand.get("name"))
+        if not name:
+            continue
+        aliases = brand.get("aliases", [])
+        if isinstance(aliases, str):
+            try:
+                aliases = json.loads(aliases)
+            except (ValueError, TypeError):
+                aliases = []
+        labels = [name] + (aliases if isinstance(aliases, list) else [])
+        labels += brand.get("patterns", []) if isinstance(brand.get("patterns", []), list) else []
+        for label in labels:
+            if not isinstance(label, str):
+                continue
+            key = normalize_catalog_text(label)
+            if not key:
+                continue
+            if key in index and normalize_catalog_text(index[key]) != normalize_catalog_text(name):
+                ambiguous.add(key)
+            else:
+                index[key] = name
+    for key in ambiguous:
+        index.pop(key, None)
+    # A configured canonical name takes precedence over another brand's alias.
+    for brand in brands_cache:
+        name = _text(brand.get("name"))
+        if name:
+            index[normalize_catalog_text(name)] = name
+    return index
+
+
+def _brand_identity_name(name, parsed, structured_flavors):
+    """Do not infer a brand from a title's flavor/marketing suffix."""
+    name = _text(name)
+    for separator in (" - ", " – ", " | ", " / "):
+        if separator in name:
+            return name.split(separator, 1)[0].strip()
+    flavor = _text(parsed.get("flavor"))
+    if flavor and flavor.casefold() in name.casefold():
+        return name[:name.casefold().rfind(flavor.casefold())].strip()
+    for flavor in sorted(_unique(structured_flavors), key=len, reverse=True):
+        if name.casefold().endswith(flavor.casefold()):
+            return name[:-len(flavor)].strip()
+    return name
+
+
+def _infer_identity_brand(name, index):
+    # The shared parser accepts arbitrary substrings. Brand filtering needs
+    # whole configured names/aliases inside the product identity region.
+    padded = f" {normalize_catalog_text(name)} "
+    matches = []
+    for alias, canonical in index.items():
+        position = padded.find(f" {alias} ")
+        if position >= 0:
+            matches.append((position, -len(alias), canonical))
+    if not matches:
+        return None
+    matches.sort()
+    best = matches[0][:2]
+    names = {canonical for position, length, canonical in matches if (position, length) == best}
+    return next(iter(names)) if len(names) == 1 else None
+
+
+def _matches_brand(row, brand_key, index):
+    if not brand_key:
+        return True
+    canonical = index.get(brand_key)
+    if canonical:
+        canonical_key = normalize_catalog_text(canonical)
+        return any(
+            normalize_catalog_text(index.get(normalize_catalog_text(label), label)) == canonical_key
+            for label in row["brands"]
+        )
+    # Free text searches only actual recognized brand labels, never the
+    # product title, SKU, or flavor. Exact configured names use identity above.
+    return any(brand_key in normalize_catalog_text(label) for label in row["brands"])
 
 
 class CatalogReadError(Exception):
@@ -247,7 +331,7 @@ def _attributes(item, parent=None):
     return result
 
 
-def _build_row(site_id, item, parent, recognition):
+def _build_row(site_id, item, parent, recognition, brand_index=None):
     attributes = _attributes(item, parent)
     brand_sources = list(item.get("brands", [])) + list((parent or {}).get("brands", []))
     brands = [brand.get("name") for brand in brand_sources]
@@ -263,10 +347,19 @@ def _build_row(site_id, item, parent, recognition):
     brands_cache, series_cache = recognition
     parsed = parse_product_name(leaf_name or product_name, brands_cache, series_cache)
     parent_parsed = parse_product_name(product_name, brands_cache, series_cache) if parent else {}
-    if parsed.get("brand"):
-        brands.append(parsed["brand"])
-    elif parent_parsed.get("brand"):
-        brands.append(parent_parsed["brand"])
+    brand_index = brand_index if brand_index is not None else _brand_index(brands_cache)
+    if not _unique(brands):
+        parent_flavors = [
+            option for attribute in (parent or {}).get("attributes", [])
+            if _is_flavor_attribute(attribute) for option in attribute.get("options", [])
+        ]
+        identity_name = _brand_identity_name(
+            product_name, parent_parsed if parent else parsed, parent_flavors if parent else flavors,
+        )
+        inferred_brand = _infer_identity_brand(identity_name, brand_index)
+        if inferred_brand:
+            brands.append(inferred_brand)
+    brands = _unique(brand_index.get(normalize_catalog_text(label), label) for label in brands)
     # A variable parent's inferred flavor can describe a sibling or the entire
     # range. Only the leaf's own name can supply inferred variation flavor.
     if not flavors and parsed.get("flavor") and (not parent or (leaf_name and leaf_name != product_name)):
@@ -421,8 +514,26 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
         except (ValueError, TypeError):
             return jsonify({"error": "site_id、page 必须为正整数，parent_id 必须为非负整数。", "code": "invalid_arguments"}), 400
         search = request.args.get("search", "")
-        if len(search) > 200:
-            return jsonify({"error": "查询词不能超过 200 个字符。", "code": "invalid_arguments"}), 400
+        brand = request.args.get("brand", "")
+        query_mode = request.args.get("query_mode")
+        if query_mode is not None and query_mode not in {"flavor", "brand", "all"}:
+            return jsonify({"error": "无效的加载模式。", "code": "invalid_arguments"}), 400
+        if len(search) > 200 or len(brand) > 200:
+            return jsonify({"error": "查询词和品牌不能超过 200 个字符。", "code": "invalid_arguments"}), 400
+        # Explicit UI modes cannot accidentally retain an earlier mode's
+        # filter. Requests without a mode retain the compatible AND contract.
+        if query_mode == "brand":
+            search = ""
+        elif query_mode == "flavor":
+            brand = ""
+        elif query_mode == "all":
+            brand = ""
+            search = ""
+        brand_key = normalize_catalog_text(brand)
+        if query_mode == "brand" and not brand_key:
+            return jsonify({"error": "按品牌加载时，请先选择或输入品牌。", "code": "invalid_arguments"}), 400
+        if brand.strip() and not brand_key:
+            return jsonify({"error": "请输入有效的品牌名称。", "code": "invalid_arguments"}), 400
         conn = get_db_connection()
         try:
             row = conn.execute(f"SELECT {_SITE_COLUMNS} FROM sites WHERE id = ?", (site_id,)).fetchone()
@@ -460,6 +571,7 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
                 ids.add(item["id"])
             pagination = _pagination(headers, page, len(items))
             recognition = load_recognition()
+            brand_index = _brand_index(recognition[0])
             rows = []
             variables = []
             keyword = normalize_catalog_text(search)
@@ -471,8 +583,8 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
                         "variation_ids": item.get("variations", []),
                     })
                 else:
-                    leaf = _build_row(site_id, item, parent, recognition)
-                    if _matches(leaf, keyword, parent, item):
+                    leaf = _build_row(site_id, item, parent, recognition, brand_index)
+                    if _matches(leaf, keyword, parent, item) and _matches_brand(leaf, brand_key, brand_index):
                         rows.append(leaf)
             return jsonify({
                 **response_base, **pagination, "rows": rows, "variable_products": variables,

@@ -308,6 +308,149 @@ def test_rules_are_loaded_once_per_page_and_shared_parser_extracts_brand_flavor(
     assert len(system["recognition_calls"]) == 1
 
 
+def configure_fumot_rules(system):
+    system["recognition"]["brands"] = [{
+        "id": 1, "name": "Fumot", "patterns": ["FUMOT", "RANDM", "R&M"],
+        "aliases": ["R and M"],
+    }]
+
+
+def test_brand_only_returns_every_flavor_of_brand_without_name_search(system):
+    configure_fumot_rules(system)
+    system["responses"].append(Response([
+        product(1, name="Generic Lemon", brands=[{"name": "Fumot"}], attributes=[{"name": "Flavor", "options": ["Lemon"]}]),
+        product(2, name="Generic Cherry", brands=[{"name": "Fumot"}], attributes=[{"name": "Flavor", "options": ["Cherry"]}]),
+        product(3, name="Other Lemon", brands=[{"name": "Other"}], attributes=[{"name": "Flavor", "options": ["Lemon"]}]),
+    ], total=3, pages=1))
+    data = page(system, brand="Fumot").get_json()
+    assert [row["product_id"] for row in data["rows"]] == [1, 2]
+    assert {flavor for row in data["rows"] for flavor in row["flavors"]} == {"Lemon", "Cherry"}
+    assert data["source_ids"] == [1, 2, 3] and data["scanned"] == data["total"] == 3
+    assert "brand" not in system["calls"][0][1]["params"]
+    assert "search" not in system["calls"][0][1]["params"]
+
+
+@pytest.mark.parametrize("brand", ["R&M", "randm", "R and M", "FÚMOT"])
+def test_known_alias_and_canonical_brand_inputs_resolve_to_same_brand(system, brand):
+    configure_fumot_rules(system)
+    system["responses"].append(Response([product(1, name="Generic Device", brands=[{"name": "FUMOT"}])], total=1, pages=1))
+    rows = page(system, brand=brand).get_json()["rows"]
+    assert len(rows) == 1 and rows[0]["brands"] == ["Fumot"]
+
+
+def test_recognized_alias_in_actual_brand_label_is_canonicalized(system):
+    configure_fumot_rules(system)
+    system["responses"].append(Response([
+        product(1, name="Generic Device", attributes=[{"name": "pa_brand", "options": ["R&M"]}]),
+    ], total=1, pages=1))
+    row = page(system, brand="Fumot").get_json()["rows"][0]
+    assert row["brands"] == ["Fumot"]
+
+
+def test_brand_and_search_are_anded(system):
+    configure_fumot_rules(system)
+    system["responses"].append(Response([
+        product(1, name="Generic Lemon", brands=[{"name": "Fumot"}]),
+        product(2, name="Generic Cherry", brands=[{"name": "Fumot"}]),
+        product(3, name="Other Lemon", brands=[{"name": "Other"}]),
+    ], total=3, pages=1))
+    rows = page(system, brand="R&M", search="lemon").get_json()["rows"]
+    assert [row["product_id"] for row in rows] == [1]
+
+
+def test_brand_word_in_flavor_or_marketing_suffix_is_not_brand_identity(system):
+    system["recognition"]["brands"] = [{"id": 1, "name": "IGET", "patterns": ["IGET"]}]
+    system["responses"].append(Response([
+        product(1, name="Generic Device - IGET Lemon", brands=[{"name": "Other"}], attributes=[{"name": "Flavor", "options": ["IGET Lemon"]}]),
+        product(2, name="Generic Device - IGET Lemon", attributes=[{"name": "Flavor", "options": ["IGET Lemon"]}]),
+        product(3, name="IGETastic Device", attributes=[{"name": "Flavor", "options": ["Lemon"]}]),
+        product(4, name="Generic Device IGET Lemon", attributes=[{"name": "Flavor", "options": ["IGET Lemon"]}]),
+    ], total=4, pages=1))
+    data = page(system, brand="IGET").get_json()
+    assert data["complete_page"] is True and data["rows"] == []
+    assert data["scanned"] == 4
+
+
+def test_variation_flavor_only_name_cannot_supply_parent_brand(system):
+    system["recognition"]["brands"] = [{"id": 1, "name": "IGET", "patterns": ["IGET"]}]
+    parent = product(10, name="Generic Device", type="variable", variations=[101])
+    system["responses"].extend([Response(parent), Response([product(101, name="IGET Lemon")], total=1, pages=1)])
+    data = page(system, parent_id=10, brand="IGET").get_json()
+    assert data["complete_page"] is True and data["rows"] == []
+
+
+def test_unknown_parent_brand_still_returns_descriptor_and_leaf_brand_can_match(system):
+    configure_fumot_rules(system)
+    parent = product(10, name="Generic Device", type="variable", variations=[101, 102])
+    system["responses"].append(Response([parent], total=1, pages=1))
+    root_page = page(system, brand="Fumot").get_json()
+    assert [descriptor["id"] for descriptor in root_page["variable_products"]] == [10]
+    system["responses"].extend([Response(parent), Response([
+        product(101, name="Lemon", brands=[{"name": "Fumot"}], attributes=[{"name": "Flavor", "option": "Lemon"}]),
+        product(102, name="Cherry", brands=[{"name": "Fumot"}], attributes=[{"name": "Flavor", "option": "Cherry"}]),
+    ], total=2, pages=1)])
+    leaves = page(system, parent_id=10, brand="Fumot").get_json()["rows"]
+    assert [row["variation_id"] for row in leaves] == [101, 102]
+
+
+def test_free_brand_input_matches_only_actual_unknown_brand_label(system):
+    system["responses"].append(Response([
+        product(1, name="Generic Device", brands=[{"name": "Éxample Brands"}]),
+        product(2, name="Example Device - Example Flavor", brands=[{"name": "Other"}]),
+    ], total=2, pages=1))
+    rows = page(system, brand="example").get_json()["rows"]
+    assert [row["product_id"] for row in rows] == [1]
+
+
+def test_exact_known_brand_does_not_match_other_brand_with_longer_name(system):
+    configure_fumot_rules(system)
+    system["responses"].append(Response([product(1, brands=[{"name": "Fumotastic"}])], total=1, pages=1))
+    assert page(system, brand="Fumot").get_json()["rows"] == []
+
+
+def test_shared_alias_is_not_assigned_to_one_arbitrary_canonical_brand(system):
+    system["recognition"]["brands"] = [
+        {"id": 1, "name": "First", "patterns": ["FIRST", "R&M"]},
+        {"id": 2, "name": "Second", "patterns": ["SECOND", "R&M"]},
+    ]
+    system["responses"].append(Response([product(1, name="R&M Device")], total=1, pages=1))
+    data = page(system, brand="First").get_json()
+    assert data["complete_page"] is True and data["rows"] == []
+
+
+def test_empty_brand_and_search_preserve_full_loading_behavior(system):
+    items = [product(1, brands=[{"name": "First"}]), product(2, brands=[{"name": "Second"}])]
+    system["responses"].append(Response(items, total=2, pages=1))
+    data = page(system, brand="", search="").get_json()
+    assert [row["product_id"] for row in data["rows"]] == [1, 2]
+
+
+@pytest.mark.parametrize("params,expected", [
+    ({"query_mode": "brand", "brand": "Fumot", "search": "Lemon"}, [1, 2]),
+    ({"query_mode": "flavor", "brand": "Fumot", "search": "Lemon"}, [1, 3]),
+    ({"query_mode": "all", "brand": "Fumot", "search": "Lemon"}, [1, 2, 3]),
+])
+def test_explicit_query_mode_ignores_stale_fields_from_other_modes(system, params, expected):
+    configure_fumot_rules(system)
+    system["responses"].append(Response([
+        product(1, name="Lemon Device", brands=[{"name": "Fumot"}]),
+        product(2, name="Cherry Device", brands=[{"name": "Fumot"}]),
+        product(3, name="Lemon Device", brands=[{"name": "Other"}]),
+    ], total=3, pages=1))
+    rows = page(system, **params).get_json()["rows"]
+    assert [row["product_id"] for row in rows] == expected
+
+
+@pytest.mark.parametrize("params", [
+    {"brand": "x" * 201}, {"brand": "!!!"}, {"query_mode": "invalid"},
+    {"query_mode": "brand", "brand": ""}, {"query_mode": "brand", "brand": "  "},
+])
+def test_invalid_brand_request_is_rejected_before_any_network_read(system, params):
+    response = page(system, **params)
+    assert response.status_code == 400 and response.get_json()["code"] == "invalid_arguments"
+    assert system["calls"] == []
+
+
 @pytest.mark.parametrize("value,query", [("SMÁK", "smak"), ("Żółty", "zolty"), ("A&amp;B", "a&b"), ("Strawberry  Ice", "strawberry ice"), ("Blueberry-Ice", "blueberry ice"), ("Blueberry_Ice", "blueberry ice")])
 def test_name_and_sku_normalization(system, value, query):
     system["responses"].append(Response([product(1, sku=value)], total=1, pages=1))

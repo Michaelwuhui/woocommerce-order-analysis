@@ -1,6 +1,6 @@
 // Exercise the production cross-site controller with synthetic Woo pages only.
 const assert = require('node:assert/strict');
-const {createController, resultHtml, safeUrl} = require('../static/js/product_manager_catalog.js');
+const {createController, mount, resultHtml, safeUrl} = require('../static/js/product_manager_catalog.js');
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const sites = [1, 2, 3, 4].map(id => ({id, url: `https://site${id}.example`, manager: id < 3 ? 'Michael' : 'Anna'}));
 const response = (data, status = 200, type = 'application/json') => ({status, ok: status < 400, headers: {get: () => type}, json: async () => data});
@@ -149,6 +149,171 @@ async function childStatusAndWildcardSemantics() {
     assert.match(resultHtml(wildcardController.getSnapshot()), /任意口味（共用此变体）/);
 }
 
+async function brandQueriesAndModes() {
+    let healed = false;
+    const fixture = abortableFetch(url => {
+        if (url.endsWith('catalog-sites')) return response({sites});
+        const params = new URL(url, 'https://app.example').searchParams;
+        assert.equal(params.get('search'), '', 'brand queries do not require or reuse a flavor keyword');
+        assert.equal(params.get('brand'), 'ELFBAR');
+        assert.equal(params.get('query_mode'), 'brand');
+        const site = Number(params.get('site_id')), parent = Number(params.get('parent_id'));
+        if (site === 3 && !healed) return response({error: '站点暂不可用'}, 200);
+        if (site === 1 && !parent) return response(page(1, 0, 1, [10], [], {variable_products: [{id: 10, name: 'ELFBAR 600', variation_ids: [101, 102]}]}));
+        if (site === 1 && parent) return response(page(1, 10, 1, [101, 102], [row(1, 10, 101), row(1, 10, 102, {flavors: ['Apple'], name: 'Apple'})]));
+        return response(page(site, 0, 1, [10], [row(site, 10, 0, {flavors: [site === 2 ? 'Grape' : 'Mango']})]));
+    });
+    const controller = createController({fetch: fixture.fetch});
+    await controller.load('stale flavor text must be ignored', {queryMode: 'brand', brand: '  ELFBAR  '});
+    let state = controller.getSnapshot();
+    assert.equal(state.phase, 'incomplete');
+    assert.equal(state.mode, 'brand');
+    assert.equal(state.queryMode, 'brand');
+    assert.equal(state.keyword, '');
+    assert.equal(state.brand, 'ELFBAR');
+    assert.deepEqual([...new Set(state.rows.flatMap(row => row.flavors))].sort(), ['Apple', 'Blueberry Ice', 'Grape', 'Mango']);
+    const beforeFilter = fixture.calls.length;
+    controller.setFilters({manager: 'value:michael'});
+    assert.equal(controller.getSnapshot().filtered.length, 3);
+    assert.equal(fixture.calls.length, beforeFilter, 'owner filtering after brand load is local');
+    healed = true;
+    const retryStart = fixture.calls.length;
+    await controller.retryIncomplete();
+    assert(fixture.calls.slice(retryStart).every(url => /site_id=3/.test(url)), 'brand retry only reads incomplete sites');
+    assert.equal(controller.getSnapshot().phase, 'complete');
+    await controller.refresh();
+    state = controller.getSnapshot();
+    assert.equal(state.mode, 'brand');
+    assert.equal(state.brand, 'ELFBAR');
+    assert.equal(state.keyword, '');
+    assert.equal(state.filters.manager, 'value:michael', 'refresh preserves loaded result filters');
+    assert.equal(state.filtered.length, 3);
+
+    const modeCalls = [];
+    const modes = createController({fetch: async url => {
+        modeCalls.push(url);
+        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        return response(page(1, 0, 1, [10], [row(1, 10)]));
+    }});
+    await modes.load('unused', {queryMode: 'brand', brand: ''});
+    assert.equal(modes.getSnapshot().phase, 'error');
+    assert.match(modes.getSnapshot().error, /输入或选择一个品牌/);
+    assert.equal(modeCalls.length, 0, 'empty brand never scans all sites');
+    await modes.loadQuery({mode: 'brand', brand: 'R&M'});
+    let params = new URL(modeCalls.at(-1), 'https://app.example').searchParams;
+    assert.equal(params.get('brand'), 'R&M', 'free input and aliases are passed to backend without a forced dropdown selection');
+    assert.equal(params.get('search'), '');
+    assert.equal(params.get('query_mode'), 'brand');
+    await modes.loadQuery({mode: 'all', keyword: 'ignored', brand: 'ignored'});
+    params = new URL(modeCalls.at(-1), 'https://app.example').searchParams;
+    assert.equal(params.get('brand'), '');
+    assert.equal(params.get('search'), '');
+    assert.equal(params.get('query_mode'), 'all');
+    assert.equal(modes.getSnapshot().mode, 'all');
+    await modes.load('Blueberry Ice'); // Existing public interface still means flavor search.
+    params = new URL(modeCalls.at(-1), 'https://app.example').searchParams;
+    assert.equal(params.get('brand'), '');
+    assert.equal(params.get('search'), 'Blueberry Ice');
+    assert.equal(params.get('query_mode'), 'flavor');
+    assert.equal(modes.getSnapshot().mode, 'flavor');
+
+    const stoppedFixture = abortableFetch(url => {
+        if (url.endsWith('catalog-sites')) return response({sites});
+        const params = new URL(url, 'https://app.example').searchParams;
+        assert.equal(params.get('brand'), 'ELFBAR');
+        assert.equal(params.get('search'), '');
+        return response(page(Number(params.get('site_id')), 0, 1, [], []));
+    }, 15);
+    const stoppedBrand = createController({fetch: stoppedFixture.fetch});
+    const running = stoppedBrand.load('', {queryMode: 'brand', brand: 'ELFBAR'});
+    await sleep(20);
+    stoppedBrand.stop();
+    await running;
+    assert.equal(stoppedBrand.getSnapshot().mode, 'brand');
+    assert.equal(stoppedBrand.getSnapshot().brand, 'ELFBAR');
+    await stoppedBrand.retryIncomplete();
+    assert.equal(stoppedBrand.getSnapshot().phase, 'complete');
+
+    for (const newMode of ['flavor', 'all']) {
+        let releaseOld, oldStarted;
+        const ready = new Promise(resolve => { oldStarted = resolve; });
+        const gate = new Promise(resolve => { releaseOld = resolve; });
+        const races = createController({fetch: async url => {
+            if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+            const params = new URL(url, 'https://app.example').searchParams;
+            const old = params.get('brand') === 'ELFBAR';
+            if (old) { oldStarted(); await gate; }
+            return response(page(1, 0, 1, [10], [row(1, 10, 0, {product_name: old ? 'old brand' : 'new ' + newMode})]));
+        }});
+        const oldRun = races.load('', {queryMode: 'brand', brand: 'ELFBAR'});
+        await ready;
+        await races.load('Apple', {queryMode: newMode});
+        releaseOld();
+        await oldRun;
+        assert.equal(races.getSnapshot().mode, newMode);
+        assert.equal(races.getSnapshot().brand, '');
+        assert.equal(races.getSnapshot().rows[0].product_name, 'new ' + newMode, 'late old brand pages cannot overwrite a switched mode');
+    }
+}
+
+async function mountedQueryControls() {
+    const ids = ['pmCatalogPane', 'pmCatalogSearch', 'pmCatalogLoad', 'pmCatalogStop', 'pmCatalogRetry', 'pmCatalogRefresh', 'pmCatalogStatus', 'pmCatalogCounts',
+        'pmCatalogProgress', 'pmCatalogResults', 'pmCatalogManagerFilter', 'pmCatalogSiteFilter', 'pmCatalogBrandFilter', 'pmCatalogProductFilter',
+        'pmCatalogFlavorFilter', 'pmCatalogStockFilter', 'pmCatalogPublishFilter', 'pmCatalogTextFilter', 'pmCatalogResetFilters',
+        'pmCatalogQueryMode', 'pmCatalogBrandInput', 'pmCatalogFlavorInputWrap', 'pmCatalogBrandInputWrap'];
+    const elements = Object.fromEntries(ids.map(id => {
+        const classes = new Set(), handlers = new Map();
+        return [id, {value: '', innerHTML: '', textContent: '', options: [], disabled: false,
+            classList: {toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); }, contains: name => classes.has(name)},
+            addEventListener(name, handler) { handlers.set(name, handler); },
+            trigger(name, event = {}) { return handlers.get(name)(event); }}];
+    }));
+    elements.pmCatalogQueryMode.value = 'brand';
+    elements.pmCatalogBrandInput.value = 'ELFBAR';
+    elements.pmCatalogSearch.value = 'stale flavor';
+    const calls = [];
+    const controller = mount({getElementById: id => elements[id]}, {fetch: async url => {
+        calls.push(url);
+        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        return response(page(1, 0, 1, [10], [row(1, 10)]));
+    }});
+    assert.equal(elements.pmCatalogQueryMode.value, 'brand', 'mount preserves brand default from template');
+    assert(elements.pmCatalogFlavorInputWrap.classList.contains('d-none'));
+    assert(!elements.pmCatalogBrandInputWrap.classList.contains('d-none'));
+    let prevented = false;
+    elements.pmCatalogBrandInput.trigger('keydown', {key: 'Enter', preventDefault() { prevented = true; }});
+    await sleep(2);
+    assert(prevented);
+    assert.equal(controller.getSnapshot().mode, 'brand');
+    assert.equal(controller.getSnapshot().brand, 'ELFBAR');
+    assert.equal(new URL(calls.at(-1), 'https://app.example').searchParams.get('search'), '');
+    elements.pmCatalogQueryMode.value = 'all';
+    elements.pmCatalogQueryMode.trigger('change');
+    assert(elements.pmCatalogFlavorInputWrap.classList.contains('d-none'));
+    assert(elements.pmCatalogBrandInputWrap.classList.contains('d-none'));
+    await elements.pmCatalogLoad.trigger('click');
+    assert.equal(controller.getSnapshot().mode, 'all');
+    elements.pmCatalogQueryMode.value = 'flavor';
+    elements.pmCatalogSearch.value = 'Apple';
+    elements.pmCatalogQueryMode.trigger('change');
+    assert(!elements.pmCatalogFlavorInputWrap.classList.contains('d-none'));
+    assert(elements.pmCatalogBrandInputWrap.classList.contains('d-none'));
+    await elements.pmCatalogLoad.trigger('click');
+    elements.pmCatalogQueryMode.value = 'brand';
+    elements.pmCatalogBrandInput.value = 'unloaded brand';
+    elements.pmCatalogRefresh.trigger('click');
+    await sleep(2);
+    assert.equal(elements.pmCatalogQueryMode.value, 'flavor', 'refresh restores the loaded mode instead of using unsent form edits');
+    assert.equal(controller.getSnapshot().keyword, 'Apple');
+    elements.pmCatalogQueryMode.value = 'brand';
+    elements.pmCatalogBrandInput.value = '';
+    const beforeEmptyBrand = calls.length;
+    await elements.pmCatalogLoad.trigger('click');
+    await sleep(2);
+    assert.equal(calls.length, beforeEmptyBrand);
+    assert.match(elements.pmCatalogStatus.textContent, /请输入或选择一个品牌/);
+}
+
 async function cancelAndRace() {
     const fixture = abortableFetch(url => url.endsWith('catalog-sites') ? response({sites}) : response(page(Number(new URL(url, 'https://app.example').searchParams.get('site_id')), 0, 1, [], [])), 15);
     const controller = createController({fetch: fixture.fetch});
@@ -263,6 +428,8 @@ async function errorsAndRendering() {
     await crossSiteAndRetry();
     await completenessFailures();
     await childStatusAndWildcardSemantics();
+    await brandQueriesAndModes();
+    await mountedQueryControls();
     await cancelAndRace();
     await errorsAndRendering();
     console.log('Cross-site catalog: streaming, pagination, variation integrity, local filters, retry, cancellation, race and rendering checks passed.');

@@ -164,14 +164,14 @@
         <div>
             <h5 class="text-light mb-0"><i class="bi bi-pencil-square me-2"></i>产品管理</h5>
             <a href="{{ url_for('stock_sync.page') }}" class="btn btn-outline-primary">跨站库存同步</a>
-            <small class="text-muted">输入口味，查看各站点匹配产品，再按负责人、品牌、产品和口味筛选</small>
+            <small class="text-muted">按品牌、口味或全部产品加载各站点，再按负责人、站点、产品和口味筛选</small>
         </div>
     </div>
 
     <ul class="nav nav-pills gap-2 mb-3" role="tablist">
         <li class="nav-item" role="presentation">
             <button class="nav-link active" id="pmCatalogTab" data-bs-toggle="pill" data-bs-target="#pmCatalogPane"
-                type="button" role="tab" aria-controls="pmCatalogPane" aria-selected="true">跨站口味查询</button>
+                type="button" role="tab" aria-controls="pmCatalogPane" aria-selected="true">跨站产品查询</button>
         </li>
         <li class="nav-item" role="presentation">
             <button class="nav-link" id="pmSingleSiteTab" data-bs-toggle="pill" data-bs-target="#pmSingleSitePane"
@@ -182,17 +182,37 @@
     <div class="tab-pane fade show active" id="pmCatalogPane" role="tabpanel" aria-labelledby="pmCatalogTab">
         <div class="card data-card mb-3">
             <div class="card-body">
-                <label for="pmCatalogSearch" class="form-label">口味 / 产品关键词</label>
+                <div class="row g-3 mb-3">
+                    <div class="col-lg-3 col-md-4">
+                        <label for="pmCatalogQueryMode" class="form-label">加载方式</label>
+                        <select id="pmCatalogQueryMode" class="form-select bg-dark text-white border-secondary">
+                            <option value="brand" selected>按品牌加载</option>
+                            <option value="flavor">按口味 / 关键词加载</option>
+                            <option value="all">加载全部产品</option>
+                        </select>
+                    </div>
+                    <div id="pmCatalogBrandInputWrap" class="col-lg-9 col-md-8">
+                        <label for="pmCatalogBrandInput" class="form-label">品牌</label>
+                        <input id="pmCatalogBrandInput" type="text" list="pmCatalogBrandChoices" autocomplete="off"
+                            class="form-control bg-dark text-white border-secondary" placeholder="下拉选择或输入品牌，例如 IGET、Merrymi" maxlength="200">
+                        <datalist id="pmCatalogBrandChoices">
+                            {% for brand in catalog_brands %}<option value="{{ brand }}"></option>{% endfor %}
+                        </datalist>
+                    </div>
+                    <div id="pmCatalogFlavorInputWrap" class="col-lg-9 col-md-8 d-none">
+                        <label for="pmCatalogSearch" class="form-label">口味 / 产品关键词</label>
+                        <input id="pmCatalogSearch" class="form-control bg-dark text-white border-secondary"
+                            placeholder="例如 Blueberry Ice" maxlength="200">
+                    </div>
+                </div>
                 <div class="d-flex flex-wrap gap-2">
-                    <input id="pmCatalogSearch" class="form-control bg-dark text-white border-secondary flex-grow-1"
-                        style="flex-basis:320px" placeholder="例如 Aperol、Blueberry Ice；留空加载全部产品" maxlength="200">
                     <button id="pmCatalogLoad" class="btn btn-primary"><i class="bi bi-search me-1"></i>加载全部站点</button>
                     <button id="pmCatalogRefresh" class="btn btn-outline-light">重新加载</button>
                     <button id="pmCatalogStop" class="btn btn-outline-warning" disabled>停止加载</button>
                     <button id="pmCatalogRetry" class="btn btn-outline-info" disabled>重试未完成站点</button>
                 </div>
-                <div class="text-muted small mt-2">查询范围为你有产品管理权限的全部站点，同时读取商品名称、SKU 和具体变体属性。筛选已加载的结果无需再次读取网站。</div>
-                <div id="pmCatalogStatus" class="small mt-3" role="status" aria-live="polite">输入一个口味，然后点击「加载全部站点」。</div>
+                <div class="text-muted small mt-2">按品牌加载会列出该品牌在你有权限的各站点的所有产品与口味；加载后可直接按站点负责人筛选。结果筛选无需再次读取网站。</div>
+                <div id="pmCatalogStatus" class="small mt-3" role="status" aria-live="polite">选择或输入一个品牌，然后点击「加载全部站点」。</div>
                 <div id="pmCatalogCounts" class="small text-muted mt-2"></div>
                 <details class="mt-2">
                     <summary class="small text-muted">查看各站点加载进度与异常</summary>

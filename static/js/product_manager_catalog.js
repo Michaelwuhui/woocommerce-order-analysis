@@ -118,7 +118,7 @@
         const fetcher = options.fetch;
         const concurrency = Math.max(1, Math.min(3, Number(options.concurrency) || 3));
         let epoch = 0, aborter = null;
-        const state = {phase: 'idle', keyword: '', sites: [], siteStates: new Map(), rows: new Map(), filters: emptyFilters(), page: 1, error: ''};
+        const state = {phase: 'idle', queryMode: 'flavor', brand: '', keyword: '', sites: [], siteStates: new Map(), rows: new Map(), filters: emptyFilters(), page: 1, error: ''};
         function snapshot() {
             const rows = [...state.rows.values()];
             const filtered = rows.filter(row => matchesFilters(row, state.filters));
@@ -128,7 +128,7 @@
             const incomplete = siteStates.filter(site => ['failed', 'incomplete', 'stopped'].includes(site.status)).length;
             const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
             state.page = Math.max(1, Math.min(state.page, pages));
-            return {phase: state.phase, keyword: state.keyword, sites: state.sites.slice(), siteStates,
+            return {phase: state.phase, queryMode: state.queryMode, mode: state.queryMode, brand: state.brand, keyword: state.keyword, sites: state.sites.slice(), siteStates,
                 rows, filtered, filters: Object.assign({}, state.filters), options: facetOptions(rows, state.sites),
                 page: state.page, pages, pageRows: filtered.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE),
                 counts: {matched: rows.length, filtered: filtered.length, totalSites: state.sites.length, completeSites: complete, failedSites: failed, incompleteSites: incomplete}, error: state.error,
@@ -162,7 +162,7 @@
             while (current(run)) {
                 if (requestedPages.has(page)) throw new Error('分页重复，当前站点结果不完整。');
                 requestedPages.add(page);
-                const params = new URLSearchParams({site_id: siteState.site.id, parent_id: parentId, page, search: state.keyword});
+                const params = new URLSearchParams({site_id: siteState.site.id, parent_id: parentId, page, search: state.keyword, brand: state.brand, query_mode: state.queryMode});
                 const data = await readJson(fetcher, '/api/product-manager/catalog-page?' + params.toString(), aborter.signal, options.requestTimeout);
                 if (!current(run)) return;
                 if (data.complete_page !== true || !Array.isArray(data.rows) || !Array.isArray(data.source_ids) || typeof data.has_more !== 'boolean') {
@@ -297,7 +297,9 @@
         }
         async function load(keyword, loadOptions) {
             const run = begin();
-            state.keyword = str(keyword).trim();
+            state.queryMode = loadOptions && loadOptions.queryMode || 'flavor';
+            state.brand = state.queryMode === 'brand' ? str(loadOptions && loadOptions.brand).trim() : '';
+            state.keyword = state.queryMode === 'flavor' ? str(keyword).trim() : '';
             state.phase = 'discovering';
             state.error = '';
             state.rows.clear();
@@ -306,6 +308,18 @@
             state.page = 1;
             if (!loadOptions || !loadOptions.preserveFilters) state.filters = emptyFilters();
             emit();
+            if (!['flavor', 'brand', 'all'].includes(state.queryMode) || (state.queryMode === 'brand' && !state.brand)) {
+                state.phase = 'error';
+                state.error = state.queryMode === 'brand' ? '请输入或选择一个品牌，再加载全部站点。' : '请选择有效的查询方式。';
+                emit();
+                return;
+            }
+            if (state.brand.length > 200 || state.keyword.length > 200) {
+                state.phase = 'error';
+                state.error = '品牌或口味关键词不能超过 200 个字符。';
+                emit();
+                return;
+            }
             try {
                 const data = await readJson(fetcher, '/api/product-manager/catalog-sites', aborter.signal, options.requestTimeout);
                 if (!current(run)) return;
@@ -338,6 +352,8 @@
             await runSites(targets, run);
         }
         return {load, stop, retryIncomplete, getSnapshot: snapshot,
+            loadQuery(query) { return load(query.keyword || query.search || '', {queryMode: query.queryMode || query.mode || 'flavor', brand: query.brand, preserveFilters: !!query.preserveFilters}); },
+            refresh() { return load(state.keyword, {queryMode: state.queryMode, brand: state.brand, preserveFilters: true}); },
             setFilters(filters) { state.filters = Object.assign({}, state.filters, filters); state.page = 1; emit(); },
             resetFilters() { state.filters = emptyFilters(); state.page = 1; emit(); },
             setPage(page) { state.page = Number(page) || 1; emit(); }};
@@ -346,12 +362,12 @@
     function resultHtml(snapshot) {
         if (!snapshot.pageRows.length) {
             let message;
-            if (snapshot.phase === 'idle') message = '输入口味或关键词，点击「加载全部站点」开始查询。';
+            if (snapshot.phase === 'idle') message = '选择按品牌、按口味或全部产品，点击「加载全部站点」开始查询。';
             else if (snapshot.counts.matched) message = '已加载的匹配结果中没有符合当前筛选条件的产品。可清空筛选后查看。';
             else if (snapshot.busy) message = '正在逐站读取，暂未收到匹配结果，请查看读取进度。';
-            else if (snapshot.phase === 'complete' && snapshot.counts.totalSites) message = '已完整读取全部有权限站点，此次关键词未匹配到产品或口味。';
+            else if (snapshot.phase === 'complete' && snapshot.counts.totalSites) message = '已完整读取全部有权限站点，此次查询未匹配到产品或口味。';
             else if (snapshot.phase === 'complete') message = '当前账号没有可查询的站点，请联系管理员核对产品管理权限。';
-            else message = '当前结果尚不完整，暂未匹配到产品。不能据此判断全部站点没有该口味，请重试异常站点或重新加载。';
+            else message = '当前结果尚不完整，暂未匹配到产品。不能据此判断全部站点没有符合查询条件的产品，请重试异常站点或重新加载。';
             return '<div class="pm-empty-state">' + escapeHtml(message) + '</div>';
         }
         const rows = snapshot.pageRows.map(row => {
@@ -386,9 +402,13 @@
             $('pmCatalogStop').disabled = !snapshot.busy;
             $('pmCatalogRetry').disabled = snapshot.busy || !snapshot.counts.incompleteSites;
             $('pmCatalogRefresh').disabled = snapshot.phase === 'idle';
-            let status = {idle: '一次查询全部有权限站点，加载后可继续组合筛选。', discovering: '正在确认当前账号有权限的全部站点…', loading: '正在读取各站产品与全部变体，匹配结果会陆续显示。', complete: '查询完成，全部站点读取完整。', incomplete: '查询结束，存在不完整站点；已保留成功读取的匹配结果。', stopped: '已停止；已读取的匹配结果保留，未完成站点可单独重试。', error: snapshot.error}[snapshot.phase];
+            let status = {idle: '选择查询方式，一次查询全部有权限站点；加载后可继续组合筛选。', discovering: '正在确认当前账号有权限的全部站点…', loading: '正在读取各站产品与全部变体，匹配结果会陆续显示。', complete: '查询完成，全部站点读取完整。', incomplete: '查询结束，存在不完整站点；已保留成功读取的匹配结果。', stopped: '已停止；已读取的匹配结果保留，未完成站点可单独重试。', error: snapshot.error}[snapshot.phase];
             if (snapshot.phase === 'complete' && !snapshot.counts.totalSites) status = '当前账号没有可查询的站点，请核对产品管理权限。';
             if (snapshot.phase === 'stopped' && !snapshot.counts.totalSites) status = '已停止确认站点范围，请重新加载以继续查询。';
+            if (snapshot.phase !== 'idle') {
+                const scope = snapshot.queryMode === 'brand' ? (snapshot.brand ? `品牌「${snapshot.brand}」` : '品牌查询') : snapshot.queryMode === 'all' || !snapshot.keyword ? '全部产品' : `口味 / 关键词「${snapshot.keyword}」`;
+                status = scope + '：' + status;
+            }
             $('pmCatalogStatus').textContent = status;
             $('pmCatalogStatus').classList.toggle('text-warning', ['incomplete', 'stopped', 'error'].includes(snapshot.phase));
             const counts = snapshot.counts;
@@ -412,11 +432,30 @@
             });
             $('pmCatalogResults').innerHTML = resultHtml(snapshot);
         }
-        $('pmCatalogLoad').addEventListener('click', () => controller.load($('pmCatalogSearch').value));
-        $('pmCatalogSearch').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); controller.load($('pmCatalogSearch').value); } });
-        $('pmCatalogRefresh').addEventListener('click', () => { $('pmCatalogSearch').value = controller.getSnapshot().keyword; controller.load(controller.getSnapshot().keyword, {preserveFilters: true}); });
+        function syncQueryForm() {
+            const mode = $('pmCatalogQueryMode') ? $('pmCatalogQueryMode').value : 'flavor';
+            if ($('pmCatalogFlavorInputWrap')) $('pmCatalogFlavorInputWrap').classList.toggle('d-none', mode !== 'flavor');
+            if ($('pmCatalogBrandInputWrap')) $('pmCatalogBrandInputWrap').classList.toggle('d-none', mode !== 'brand');
+        }
+        function loadFormQuery() {
+            const queryMode = $('pmCatalogQueryMode') ? $('pmCatalogQueryMode').value : 'flavor';
+            return controller.load($('pmCatalogSearch').value, {queryMode, brand: $('pmCatalogBrandInput') ? $('pmCatalogBrandInput').value : ''});
+        }
+        function restoreLoadedQueryForm() {
+            const snapshot = controller.getSnapshot();
+            if ($('pmCatalogQueryMode')) $('pmCatalogQueryMode').value = snapshot.queryMode;
+            if ($('pmCatalogBrandInput')) $('pmCatalogBrandInput').value = snapshot.brand;
+            $('pmCatalogSearch').value = snapshot.keyword;
+            syncQueryForm();
+        }
+        $('pmCatalogLoad').addEventListener('click', loadFormQuery);
+        [$('pmCatalogSearch'), $('pmCatalogBrandInput')].filter(Boolean).forEach(input => input.addEventListener('keydown', event => {
+            if (event.key === 'Enter') { event.preventDefault(); loadFormQuery(); }
+        }));
+        if ($('pmCatalogQueryMode')) $('pmCatalogQueryMode').addEventListener('change', syncQueryForm);
+        $('pmCatalogRefresh').addEventListener('click', () => { restoreLoadedQueryForm(); controller.refresh(); });
         $('pmCatalogStop').addEventListener('click', controller.stop);
-        $('pmCatalogRetry').addEventListener('click', controller.retryIncomplete);
+        $('pmCatalogRetry').addEventListener('click', () => { restoreLoadedQueryForm(); controller.retryIncomplete(); });
         $('pmCatalogResetFilters').addEventListener('click', controller.resetFilters);
         Object.entries(FILTER_IDS).forEach(([key, id]) => { if ($(id)) $(id).addEventListener(key === 'text' ? 'input' : 'change', event => controller.setFilters({[key]: event.target.value})); });
         root.addEventListener('click', event => {
@@ -428,6 +467,7 @@
             if (row) root.dispatchEvent(new CustomEvent('pm:open-single-site', {bubbles: true, detail: {site_id: row.site_id, search: row.product_name}}));
         });
         render(controller.getSnapshot());
+        syncQueryForm(); // Preserve the template's initial mode, including its brand default.
         root.productManagerCatalog = controller;
         return controller;
     }
