@@ -272,7 +272,7 @@
         if (button && !button.dataset.syncRunBound) {
             button.dataset.syncRunBound = '1';
             button.addEventListener('click', function () {
-                startSync('/api/sync/all', button);
+                startSync(button.dataset.syncEndpoint || '/api/sync/all', button);
             });
         }
         const cancel = byId('cancelSyncBtn');

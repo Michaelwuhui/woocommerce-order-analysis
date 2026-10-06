@@ -95,6 +95,8 @@ PostgreSQL 保存业务状态、任务进度、操作记录及待投递消息；
 
 新域名与旧站点的关联须核实，系统不会根据名称相似自动替换来源。上线此功能先应用 `migrations/postgresql/006_sync_site_health.sql`，再重载 Web 并更新 Celery fetch / writer；Beat 的定时配置未增加新实例或新任务。
 
+订单列表的“快速同步”按同步权限显示：全站设置管理员同步全部站点；已有“本人站点同步权限”的人员使用“快速同步（本人站点）”，按请求时的站点负责人同步本人全部站点。进度与取消沿用同一站点权限校验；没有同步权限的账号不显示该按钮。
+
 核心履约关系为 `Order → OrderItem → FulfillmentItem → Fulfillment → Shipment → TrackingEvent`。订单是商业记录，履约单表示仓库责任，包裹表示物理发货；多仓或分批发货不会凭空生成新的客户订单。
 
 ### 服务与运行环境

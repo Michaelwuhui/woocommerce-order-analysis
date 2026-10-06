@@ -33,6 +33,8 @@ def permission_app(monkeypatch):
         (3, "bob", "Bob Test", "user", False, True),
         (4, "plain", "No Permission", "user", False, False),
         (5, "operator-admin", "Operator Test", "admin", True, False),
+        (6, "owner-admin", "Alice Test", "admin", False, True),
+        (7, "restricted-admin", "Restricted Test", "admin", False, False),
     ]
     for row in users:
         conn.execute("""
@@ -46,6 +48,7 @@ def permission_app(monkeypatch):
     for row in [
         (11, "https://alice.example.invalid", "ck_alice_secret", "cs_alice_secret", "Alice Test"),
         (22, "https://bob.example.invalid", "ck_bob_secret", "cs_bob_secret", "Bob Test"),
+        (33, "https://alice-second.example.invalid", "ck_second", "cs_second", "Alice Test"),
     ]:
         conn.execute("""
             INSERT INTO sites (id,url,consumer_key,consumer_secret,manager,country,last_sync)
@@ -204,7 +207,7 @@ def test_admin_can_queue_global_clean_and_manage_weekly_schedule(permission_app)
     status = admin.get(f"/api/sync/status/{response.get_json()['sync_id']}")
     assert status.status_code == 200
     assert status.get_json()["mode"] == "clean"
-    assert {site["site_id"] for site in status.get_json()["sites"]} == {11, 22}
+    assert {site["site_id"] for site in status.get_json()["sites"]} == {11, 22, 33}
 
 
 def test_sync_status_cannot_be_read_through_another_owned_site(permission_app):
@@ -258,3 +261,92 @@ def test_permission_cannot_be_granted_without_an_owned_site(permission_app):
 
     assert response.status_code == 400
     assert "名下没有站点" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize("user_id", [2, 6])
+def test_owned_quick_sync_uses_server_assignments_and_reuses_its_run(permission_app, user_id):
+    client = _client_for(permission_app, user_id)
+    response = client.post("/api/sync/own", json={"site_ids": [22], "mode": "clean"})
+
+    assert response.status_code == 202
+    body = response.get_json()
+    assert body["status"]["mode"] == "quick"
+    assert {site["site_id"] for site in body["status"]["sites"]} == {11, 33}
+    assert "bob.example" not in response.get_data(as_text=True)
+    assert client.get(f"/api/sync/status/{body['run_id']}").status_code == 200
+    repeated = client.post("/api/sync/own")
+    assert repeated.status_code == 200
+    assert repeated.get_json()["run_id"] == body["run_id"]
+    assert repeated.get_json()["existing"] is True
+    assert client.post("/api/sync/all").status_code == 403
+    assert client.post(f"/api/sync/{body['run_id']}/cancel").status_code == 200
+
+
+@pytest.mark.parametrize("user_id", [4, 7])
+def test_owned_quick_sync_denies_accounts_without_permission(permission_app, user_id):
+    assert _client_for(permission_app, user_id).post("/api/sync/own").status_code == 403
+    conn = db.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM sync_runs").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_owned_quick_sync_rechecks_assignments_and_never_falls_back_to_all(permission_app):
+    client = _client_for(permission_app, 2)
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE sites SET manager='Bob Test' WHERE id IN (11,33)")
+        conn.commit()
+        response = client.post("/api/sync/own")
+        assert response.status_code == 400
+        assert "名下没有" in response.get_json()["error"]
+        assert conn.execute("SELECT COUNT(*) FROM sync_runs").fetchone()[0] == 0
+        conn.execute("UPDATE sites SET manager=' Alice Test ' WHERE id=33")
+        conn.commit()
+        response = client.post("/api/sync/own")
+        assert response.status_code == 202
+        assert [s["site_id"] for s in response.get_json()["status"]["sites"]] == [33]
+    finally:
+        conn.close()
+
+
+def test_owned_quick_sync_does_not_expose_or_cancel_another_scopes_active_run(permission_app):
+    status, _ = sync_service.start_sync(
+        mode="quick", created_by="pytest:other", site_ids=[22], publish=False
+    )
+    client = _client_for(permission_app, 2)
+    response = client.post("/api/sync/own")
+    assert response.status_code == 409
+    assert "bob.example" not in response.get_data(as_text=True)
+    assert client.get(f"/api/sync/status/{status['run_id']}").status_code == 403
+    assert client.post(f"/api/sync/{status['run_id']}/cancel").status_code == 403
+
+
+def test_owned_run_status_and_cancel_recheck_current_assignments(permission_app):
+    client = _client_for(permission_app, 2)
+    run_id = client.post("/api/sync/own").get_json()["run_id"]
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE sites SET manager='Bob Test' WHERE id=33")
+        conn.commit()
+    finally:
+        conn.close()
+    assert client.get(f"/api/sync/status/{run_id}").status_code == 403
+    assert client.post(f"/api/sync/{run_id}/cancel").status_code == 403
+
+
+@pytest.mark.parametrize("user_id,endpoint", [
+    (1, "/api/sync/all"), (5, "/api/sync/all"),
+    (2, "/api/sync/own"), (6, "/api/sync/own"), (4, None), (7, None),
+])
+def test_orders_quick_sync_button_matches_actual_permission(permission_app, user_id, endpoint):
+    response = _client_for(permission_app, user_id).get("/orders")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    if endpoint is None:
+        assert 'id="syncAllBtn"' not in html
+    else:
+        assert f'data-sync-endpoint="{endpoint}"' in html
+        if endpoint.endswith("/own"):
+            assert "快速同步（本人站点）" in html

@@ -414,7 +414,7 @@ def test_global_sync_has_one_frontend_binding_and_one_post_site():
     runtime = (ROOT / "static/js/sync_runs.js").read_text()
     combined = base + settings + runtime
     assert runtime.count("fetch(endpoint,") == 1
-    assert runtime.count("startSync('/api/sync/all', button)") == 1
+    assert runtime.count("startSync(button.dataset.syncEndpoint || '/api/sync/all', button)") == 1
     assert runtime.count("button.addEventListener('click', function ()") == 1
     assert "syncAllBtn.addEventListener" not in base
     assert "syncAllBtn.addEventListener" not in settings

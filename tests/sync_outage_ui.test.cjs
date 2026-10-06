@@ -7,6 +7,8 @@ function element() {
     const classes = new Set();
     return {
         textContent: '', style: {}, children: [], disabled: false, hidden: false,
+        dataset: {}, listeners: {},
+        addEventListener(name, callback) { this.listeners[name] = callback; },
         classList: {add: (...names) => names.forEach(n => classes.add(n)),
                     remove: (...names) => names.forEach(n => classes.delete(n)),
                     contains: name => classes.has(name)},
@@ -16,19 +18,44 @@ function element() {
     };
 }
 
-function runtime(finalStatus) {
+function runtime(finalStatus, buttonEndpoint) {
     const nodes = new Map(['syncProgressBar', 'syncStatusText', 'syncAvailabilityWarnings',
         'syncLogConsole', 'closeSyncModalBtn', 'cancelSyncBtn'].map(id => [id, element()]));
     const store = new Map();
+    const requests = [];
+    const ready = [];
+    if (buttonEndpoint !== undefined) {
+        const button = element();
+        if (buttonEndpoint) button.dataset.syncEndpoint = buttonEndpoint;
+        nodes.set('syncAllBtn', button);
+    }
     const window = {setInterval: () => 1, clearInterval() {}, location: {reload() {}}};
     const context = {
-        window, document: {getElementById: id => nodes.get(id), createElement: element, addEventListener() {}},
+        window, document: {getElementById: id => nodes.get(id), createElement: element,
+            addEventListener(event, callback) { if (event === 'DOMContentLoaded') ready.push(callback); }},
         localStorage: {setItem: (k,v) => store.set(k,v), getItem: k => store.get(k), removeItem: k => store.delete(k)},
-        fetch: async url => ({ok: true, json: async () => url.includes('/status/') ? finalStatus :
-            {success: true, run_id: 'test-run', status: {created_at: '2026-10-02T05:00:00Z'}}}),
+        fetch: async (url, options) => {
+            requests.push({url, options});
+            return {ok: true, json: async () => url.includes('/status/') ? finalStatus :
+                {success: true, run_id: 'test-run', status: {created_at: '2026-10-02T05:00:00Z'}}};
+        },
     };
     vm.runInNewContext(fs.readFileSync(require.resolve('../static/js/sync_runs.js'), 'utf8'), context);
-    return {nodes, window, store};
+    return {nodes, window, store, requests, ready};
+}
+
+for (const endpoint of ['/api/sync/own', '/api/sync/all', '']) {
+    test(`quick sync button uses its authorized endpoint: ${endpoint || 'settings default'}`, async () => {
+        const {nodes, requests, ready} = runtime(
+            {status: 'success', sites: [], logs: []}, endpoint);
+        ready.forEach(callback => callback());
+        nodes.get('syncAllBtn').listeners.click();
+        await new Promise(resolve => setImmediate(resolve));
+        const posts = requests.filter(request => request.options?.method === 'POST');
+        assert.deepEqual(posts.map(request => request.url), [endpoint || '/api/sync/all']);
+        assert.equal(nodes.get('syncAllBtn').disabled, false);
+        assert.equal(nodes.get('syncStatusText').classList.contains('text-danger'), false);
+    });
 }
 
 test('partial sync finishes with an outage warning and does not keep polling', async () => {
