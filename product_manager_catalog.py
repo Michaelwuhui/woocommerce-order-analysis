@@ -54,10 +54,10 @@ def _attribute_key(attribute):
 
 
 def _is_flavor_attribute(attribute):
-    # Labels such as Flavour Profiles and Hungarian Ízcsoport occur on real
+    # Labels such as Flavour Profiles and Hungarian Ízesítés occur on real
     # sites. Match taxonomy tokens rather than demanding one exact label.
     return any(
-        bool(re.search(r"smak|flavo[u]?r|口味|味道|风味|香味|taste|aroma|\b(?:iz|izcsoport|prichut\w*)\b", normalize_catalog_text(value)))
+        bool(re.search(r"smak|flavo[u]?r|口味|味道|风味|香味|taste|aroma|\b(?:iz|izesites|izcsoport|prichut\w*)\b", normalize_catalog_text(value)))
         for value in (attribute.get("name", ""), attribute.get("slug", ""))
     )
 
