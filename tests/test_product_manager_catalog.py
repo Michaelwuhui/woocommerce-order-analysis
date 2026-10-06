@@ -220,6 +220,69 @@ def test_empty_variation_name_does_not_inherit_parsed_parent_flavor(system):
     assert row["flavors"] == ["Lemon"]
 
 
+@pytest.mark.parametrize("parent_attribute,leaf_attribute", [
+    ({"id": 5, "name": "Flavour"}, {"id": 5, "option": ""}),
+    ({"id": 0, "name": "Flavour Profiles"}, {"id": 0, "name": "flavour_profiles", "option": ""}),
+    ({"id": 0, "name": "Flavour Profiles", "slug": "pa_flavour_profiles"}, {"id": 0, "slug": "flavour-profiles", "option": ""}),
+    ({"id": 0, "name": "Íz"}, {"id": 0, "name": "iz", "option": " "}),
+])
+def test_wildcard_flavor_matches_each_supported_option_without_expanding_specific_sibling(system, parent_attribute, leaf_attribute):
+    parent_attribute = {**parent_attribute, "variation": True, "options": ["Cherry", "Blue Razz"]}
+    parent = product(10, name="Generic Product", type="variable", variations=[101, 102], attributes=[parent_attribute])
+    specific_attribute = {**leaf_attribute, "option": "Blue Razz"}
+    leaves = [product(101, name="", attributes=[leaf_attribute]), product(102, name="", attributes=[specific_attribute])]
+    for query, expected in [("Cherry", [101]), ("Blue Razz", [101, 102])]:
+        system["responses"].extend([Response(parent), Response(leaves, total=2, pages=1)])
+        data = page(system, parent_id=10, search=query).get_json()
+        assert data["complete_page"] is True
+        assert [row["variation_id"] for row in data["rows"]] == expected
+        shared = data["rows"][0]
+        assert shared["flavor_scope"] == "any"
+        assert shared["attributes"][0]["wildcard"] is True
+        assert shared["flavors"] == ["Cherry", "Blue Razz"]
+        if len(data["rows"]) == 2:
+            specific = data["rows"][1]
+            assert specific["flavor_scope"] == "specific"
+            assert specific["attributes"][0]["wildcard"] is False
+            assert specific["flavors"] == ["Blue Razz"]
+
+
+@pytest.mark.parametrize("parent_attributes", [[], [{"name": "Flavor", "options": []}], [
+    {"name": "Flavor", "options": ["Cherry"]}, {"name": "Flavor", "options": ["Lemon"]},
+]])
+def test_unresolvable_wildcard_is_incomplete_instead_of_zero_matches(system, parent_attributes):
+    parent = product(10, type="variable", variations=[101], attributes=parent_attributes)
+    system["responses"].extend([Response(parent), Response([
+        product(101, attributes=[{"id": 0, "name": "Flavor", "option": ""}]),
+    ], total=1, pages=1)])
+    data = page(system, parent_id=10, search="Cherry").get_json()
+    assert data["complete_page"] is False
+    assert data["code"] == "unresolved_flavor_wildcard"
+
+
+def test_source_statuses_include_all_scanned_variations_even_unmatched_drafts(system):
+    # Woo parent.variations declares publish/private children; the all-status
+    # variations endpoint additionally contains draft/pending/future children.
+    parent = product(10, type="variable", variations=[101, 102])
+    states = ["publish", "private", "draft", "pending", "future"]
+    leaves = [product(101 + index, name="Generic leaf", status=state) for index, state in enumerate(states)]
+    system["responses"].extend([Response(parent), Response(leaves, total=5, pages=1)])
+    data = page(system, parent_id=10, search="Absent flavor").get_json()
+    assert data["complete_page"] is True
+    assert data["rows"] == []
+    assert data["source_ids"] == [101, 102, 103, 104, 105]
+    assert data["source_statuses"] == {str(101 + index): state for index, state in enumerate(states)}
+    assert data["scanned"] == data["total"] == 5
+
+
+def test_missing_source_status_is_not_treated_as_an_unpublished_extra(system):
+    leaf = product(101)
+    del leaf["status"]
+    system["responses"].extend([Response(product(10, type="variable", variations=[101])), Response([leaf], total=1, pages=1)])
+    data = page(system, parent_id=10).get_json()
+    assert data["complete_page"] is False and data["code"] == "invalid_schema"
+
+
 def test_explicit_leaf_flavor_takes_precedence_over_flavor_in_marketing_title(system):
     parent = product(10, name="Device - Promotional Cherry", type="variable", variations=[101])
     system["responses"].extend([

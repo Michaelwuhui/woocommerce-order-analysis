@@ -9,7 +9,7 @@
         publish: 'pmCatalogPublishFilter', text: 'pmCatalogTextFilter'
     };
     const STOCK_LABELS = {instock: '有货', outofstock: '售完', onbackorder: '可预订', unknown: '未知'};
-    const PUBLISH_LABELS = {publish: '已发布', draft: '草稿', private: '私密', pending: '待审核', trash: '回收站', unknown: '未知'};
+    const PUBLISH_LABELS = {publish: '已发布', draft: '草稿', private: '私密', pending: '待审核', future: '定时发布', trash: '回收站', 'auto-draft': '自动草稿', unknown: '未知'};
     const SITE_LABELS = {pending: '等待读取', loading: '读取中', complete: '完整', failed: '失败 / 不完整', incomplete: '不完整', stopped: '已停止 / 不完整'};
     const str = value => value === undefined || value === null ? '' : String(value);
     const normalized = value => str(value).normalize('NFKC').trim().toLocaleLowerCase();
@@ -153,7 +153,7 @@
         async function scanPages(siteState, parentId, run, parents) {
             let page = 1;
             let knownTotal = null, knownPages = null;
-            const sourceIds = new Set(), requestedPages = new Set();
+            const sourceIds = new Set(), sourceStatuses = new Map(), requestedPages = new Set();
             function knownNumber(value, label) {
                 if (value === null || value === undefined) return null;
                 if (!Number.isSafeInteger(Number(value)) || Number(value) < 0) throw new Error(label + '无效，当前站点结果不完整。');
@@ -187,6 +187,19 @@
                     sourceIds.add(key);
                     pageIds.add(key);
                 });
+                if (parentId) {
+                    const statuses = data.source_statuses;
+                    if (!statuses || typeof statuses !== 'object' || Array.isArray(statuses) || Object.keys(statuses).length !== pageIds.size) {
+                        throw new Error('变体分页缺少完整发布状态，当前站点结果不完整。');
+                    }
+                    pageIds.forEach(id => {
+                        const status = statuses[id];
+                        if (!Object.prototype.hasOwnProperty.call(statuses, id) || typeof status !== 'string' || !Object.prototype.hasOwnProperty.call(PUBLISH_LABELS, status) || status === 'unknown') {
+                            throw new Error('变体分页含缺失或未知发布状态，当前站点结果不完整。');
+                        }
+                        sourceStatuses.set(id, status);
+                    });
+                }
                 // Normalize the entire page first: malformed pages never partly masquerade as valid pages.
                 const incoming = data.rows.map(row => normalizeRow(row, siteState.site));
                 incoming.forEach(row => {
@@ -217,7 +230,7 @@
                         (knownPages !== null && requestedPages.size !== Math.max(1, knownPages))) {
                         throw new Error('已读取数量与站点声明的目录总数不一致，当前站点结果不完整，请刷新后重试。');
                     }
-                    return sourceIds;
+                    return {sourceIds, sourceStatuses};
                 }
                 const nextPage = Number(data.next_page);
                 if (!Number.isSafeInteger(nextPage) || nextPage !== page + 1 || data.source_ids.length === 0) {
@@ -237,11 +250,15 @@
                 for (const parentId of parents.keys()) {
                     if (!current(run)) return;
                     siteState.currentProduct = str(parents.get(parentId).name || ('产品 ' + parentId));
-                    const seen = await scanPages(siteState, parentId, run, parents);
+                    const scanned = await scanPages(siteState, parentId, run, parents);
                     if (!current(run)) return;
                     const expectedIds = parents.get(parentId).variation_ids;
                     if (!Array.isArray(expectedIds)) throw new Error('可变产品缺少完整变体编号，当前站点结果不完整。');
                     const expected = new Set(expectedIds.map(id => str(Number(id))));
+                    // Woo's parent get_children() lists publish/private children.
+                    // status=any also returns drafts and scheduled variations;
+                    // those remain valid rows without expanding the parent list.
+                    const seen = new Set([...scanned.sourceStatuses.entries()].filter(([, status]) => status === 'publish' || status === 'private').map(([id]) => id));
                     if (expected.size !== expectedIds.length || [...expected].some(id => !Number.isSafeInteger(Number(id)) || Number(id) <= 0) ||
                         seen.size !== expected.size || [...expected].some(id => !seen.has(id))) {
                         throw new Error('读取期间产品变体目录发生变化或缺失，当前站点结果不完整，请刷新后重试。');
@@ -345,7 +362,7 @@
             const stockClass = stock === 'outofstock' ? 'text-danger' : stock === 'onbackorder' ? 'text-warning' : '';
             return `<tr data-catalog-key="${escapeHtml(row.key)}"><td>${escapeHtml(siteLabel(row.site))}<div class="text-muted small">${escapeHtml(managerLabel(row.site))}</div></td>` +
                 `<td>${escapeHtml(row.brands.join(' / ') || '未识别')}</td><td class="pm-name">${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(row.product_name)}</a>` : escapeHtml(row.product_name)}<div class="text-muted small">${escapeHtml(PUBLISH_LABELS[row.status] || row.status || '未知')} · ${row.variation_id ? '变体 ' + row.variation_id : '产品 ' + row.product_id}</div></td>` +
-                `<td>${escapeHtml(row.flavors.join(' / ') || '未识别口味')}${row.variation_id && row.name !== row.product_name ? '<div class="text-muted small">' + escapeHtml(row.name) + '</div>' : ''}<div class="pm-sku">SKU：${escapeHtml(row.sku || '未提供')}</div></td>` +
+                `<td>${escapeHtml(row.flavors.join(' / ') || '未识别口味')}${row.flavor_scope === 'any' ? '<div class="small text-info">任意口味（共用此变体）</div>' : ''}${row.variation_id && row.name !== row.product_name ? '<div class="text-muted small">' + escapeHtml(row.name) + '</div>' : ''}<div class="pm-sku">SKU：${escapeHtml(row.sku || '未提供')}</div></td>` +
                 `<td class="${stockClass}">${escapeHtml(STOCK_LABELS[stock] || stock)}<div class="small">${escapeHtml(quantity)}</div></td><td>${escapeHtml(price)}</td>` +
                 `<td><button type="button" class="btn btn-sm btn-outline-light" data-catalog-open="${escapeHtml(row.key)}">单站管理</button></td></tr>`;
         }).join('');

@@ -2078,6 +2078,7 @@
     $('pmCatalogPane').addEventListener('pm:open-single-site', event => {
         const site = String(event.detail.site_id);
         if (![...$('pmSiteSelect').options].some(option => option.value === site)) return;
+        if (modifiedRows.size && !confirm('单站管理中有未保存的修改。打开此结果将放弃这些输入，是否继续？')) return;
         bootstrap.Tab.getOrCreateInstance($('pmSingleSiteTab')).show();
         $('pmSiteSelect').value = site;
         $('pmSearchInput').value = event.detail.search || '';

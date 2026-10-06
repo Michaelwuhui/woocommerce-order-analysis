@@ -89,6 +89,8 @@ def _validate_item(item, *, variation=False):
     for key in ("name", "sku", "status", "stock_status", "permalink"):
         if item.get(key) is not None and not isinstance(item[key], str):
             raise CatalogReadError("invalid_schema", "WC 返回了无效的商品字段，当前页尚未完整读取。")
+    if not _text(item.get("status")):
+        raise CatalogReadError("invalid_schema", "WC 商品状态缺失，无法核对目录完整性。")
     if not variation and not isinstance(item.get("type"), str):
         raise CatalogReadError("invalid_schema", "WC 商品类型缺失，当前页尚未完整读取。")
     if not variation and item["type"] == "variable" and "variations" not in item:
@@ -200,17 +202,48 @@ def _pagination(headers, page, count):
     }
 
 
+def _attribute_identities(attribute):
+    keys = set()
+    for field in ("name", "slug"):
+        value = normalize_catalog_text(attribute.get(field, ""))
+        if value.startswith("pa "):
+            value = value[3:]
+        if value:
+            keys.add(value)
+    return keys
+
+
 def _attributes(item, parent=None):
     parent_attributes = (parent or {}).get("attributes", [])
     parent_by_id = {a.get("id"): a for a in parent_attributes if a.get("id")}
     result = []
     for attribute in item.get("attributes", []):
         parent_attribute = parent_by_id.get(attribute.get("id"), {})
+        if parent and not parent_attribute:
+            identities = _attribute_identities(attribute)
+            candidates = [
+                candidate for candidate in parent_attributes
+                if identities & _attribute_identities(candidate)
+            ]
+            if len(candidates) == 1:
+                parent_attribute = candidates[0]
         # Woo variation attributes may omit the taxonomy name but retain its ID.
         name = _text(attribute.get("name") or parent_attribute.get("name"))
         slug = _text(attribute.get("slug") or parent_attribute.get("slug"))
+        if parent and not name and not slug:
+            raise CatalogReadError("invalid_schema", "WC 变体属性无法对应父商品属性，当前页尚未完整读取。")
         values = [attribute.get("option")] if "option" in attribute else attribute.get("options", [])
-        result.append({"id": attribute.get("id", 0), "name": name, "slug": slug, "values": _unique(values)})
+        resolved = {"id": attribute.get("id", 0), "name": name, "slug": slug, "values": _unique(values), "wildcard": False}
+        if parent and "option" in attribute and not _text(attribute["option"]) and _is_flavor_attribute(resolved):
+            # Woo's empty variation option means this same variation supports
+            # every parent option for that dimension. Unlike sibling options,
+            # these are genuine leaf capabilities and share one product ID.
+            supported = _unique(parent_attribute.get("options", []))
+            if not supported:
+                raise CatalogReadError("unresolved_flavor_wildcard", "任意口味变体缺少可核实的父商品口味选项，当前页尚未完整读取。")
+            resolved["values"] = supported
+            resolved["wildcard"] = True
+        result.append(resolved)
     return result
 
 
@@ -253,6 +286,7 @@ def _build_row(site_id, item, parent, recognition):
         "name": display_name,
         "sku": _text(item.get("sku")),
         "brands": _unique(brands), "flavors": _unique(flavors),
+        "flavor_scope": "any" if any(a["wildcard"] and _is_flavor_attribute(a) for a in attributes) else "specific",
         "attributes": attributes,
         "type": "variation" if parent else item["type"],
         "status": effective_status, "parent_status": parent_status,
@@ -443,6 +477,7 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
             return jsonify({
                 **response_base, **pagination, "rows": rows, "variable_products": variables,
                 "source_ids": [item["id"] for item in items], "scanned": len(items), "complete_page": True,
+                "source_statuses": {str(item["id"]): _text(item["status"]) for item in items},
             })
         except CatalogReadError as exc:
             # HTTP 200 preserves actionable JSON through proxy/CDN error pages.

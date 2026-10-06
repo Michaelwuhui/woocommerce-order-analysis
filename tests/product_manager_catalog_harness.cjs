@@ -9,7 +9,7 @@ const row = (site, product, variation = 0, overrides = {}) => Object.assign({sit
     flavors: ['Blueberry Ice'], brands: ['ELFBAR'], stock_status: 'instock', stock_quantity: 7, manage_stock: true,
     price: '12.00', status: 'publish', permalink: `https://site${site}.example/product/${product}`}, overrides);
 const page = (site, parent, number, ids, rows, overrides = {}) => Object.assign({site_id: site, parent_id: parent, page: number, per_page: 50,
-    source_ids: ids, scanned: ids.length, rows, variable_products: [], total: ids.length, total_pages: 1,
+    source_ids: ids, source_statuses: Object.fromEntries(ids.map(id => [String(id), 'publish'])), scanned: ids.length, rows, variable_products: [], total: ids.length, total_pages: 1,
     has_more: false, next_page: null, complete_page: true, warnings: []}, overrides);
 
 function abortableFetch(handler, delay = 2) {
@@ -111,6 +111,42 @@ async function completenessFailures() {
     await controller.load('blue');
     assert.equal(controller.getSnapshot().phase, 'incomplete');
     assert.match(controller.getSnapshot().siteStates[0].error, /变体目录/);
+}
+
+async function childStatusAndWildcardSemantics() {
+    const cases = [
+        {name: 'draft-pending-future-extra', ids: [101, 102, 103, 104], statuses: {'101': 'publish', '102': 'draft', '103': 'pending', '104': 'future'}, expected: [101], complete: true},
+        {name: 'private-listed', ids: [101, 102], statuses: {'101': 'publish', '102': 'private'}, expected: [101, 102], complete: true},
+        {name: 'published-missing', ids: [101, 102], statuses: {'101': 'publish', '102': 'draft'}, expected: [101, 103], complete: false},
+        {name: 'unexpected-published', ids: [101, 102], statuses: {'101': 'publish', '102': 'publish'}, expected: [101], complete: false},
+        {name: 'missing-status-map', ids: [101], statuses: undefined, expected: [101], complete: false},
+        {name: 'incomplete-status-map', ids: [101, 102], statuses: {'101': 'publish'}, expected: [101], complete: false},
+        {name: 'unknown-status', ids: [101, 102], statuses: {'101': 'publish', '102': 'mystery'}, expected: [101], complete: false},
+    ];
+    for (const scenario of cases) {
+        const fixture = abortableFetch(url => {
+            if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+            const parent = Number(new URL(url, 'https://app.example').searchParams.get('parent_id'));
+            if (!parent) return response(page(1, 0, 1, [10], [], {variable_products: [{id: 10, name: 'Parent', variation_ids: scenario.expected}]}));
+            return response(page(1, 10, 1, scenario.ids, scenario.ids.map(id => row(1, 10, id, {status: scenario.statuses && scenario.statuses[id] || 'publish'})), {source_statuses: scenario.statuses}));
+        });
+        const controller = createController({fetch: fixture.fetch});
+        await controller.load('blue');
+        const state = controller.getSnapshot();
+        assert.equal(state.phase, scenario.complete ? 'complete' : 'incomplete', scenario.name);
+        if (scenario.complete) assert.equal(state.counts.matched, scenario.ids.length, 'draft and scheduled rows remain visible');
+    }
+    const wildcardController = createController({fetch: async url => {
+        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        const parent = Number(new URL(url, 'https://app.example').searchParams.get('parent_id'));
+        return response(parent ? page(1, 10, 1, [101], [row(1, 10, 101, {flavors: ['Blueberry Ice', 'Apple'], flavor_scope: 'any'})]) : page(1, 0, 1, [10], [], {variable_products: [{id: 10, name: 'Parent', variation_ids: [101]}]}));
+    }});
+    await wildcardController.load('blue');
+    assert.equal(wildcardController.getSnapshot().phase, 'complete');
+    assert.equal(wildcardController.getSnapshot().rows.length, 1, 'wildcard is one shared variation, not synthetic duplicates');
+    wildcardController.setFilters({flavor: 'value:apple'});
+    assert.equal(wildcardController.getSnapshot().filtered.length, 1);
+    assert.match(resultHtml(wildcardController.getSnapshot()), /任意口味（共用此变体）/);
 }
 
 async function cancelAndRace() {
@@ -226,6 +262,7 @@ async function errorsAndRendering() {
 (async () => {
     await crossSiteAndRetry();
     await completenessFailures();
+    await childStatusAndWildcardSemantics();
     await cancelAndRace();
     await errorsAndRendering();
     console.log('Cross-site catalog: streaming, pagination, variation integrity, local filters, retry, cancellation, race and rendering checks passed.');
