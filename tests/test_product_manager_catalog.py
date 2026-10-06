@@ -165,7 +165,7 @@ def test_reads_actual_child_and_scans_parent_directory_without_woo_search(system
     assert "search" not in kwargs["params"]
 
 
-@pytest.mark.parametrize("attribute_name", ["口味", "Flavor", "Flavour", "Flavour Profiles", "Smak", "Příchuť", "pa_flavor", "pa_prichut", "Íz", "Ízcsoport", "pa_íz"])
+@pytest.mark.parametrize("attribute_name", ["口味", "Flavor", "Flavour", "Flavour Profiles", "Smak", "Příchuť", "pa_flavor", "pa_prichut", "Íz", "Ízcsoport", "pa_íz", "Ízesítés", "pa_izesites"])
 def test_simple_flavor_attributes_match_even_with_generic_product_name(system, attribute_name):
     system["responses"].append(Response([
         product(1, attributes=[{"name": attribute_name, "options": ["Míxed &amp; Berries"]}]),
@@ -199,6 +199,27 @@ def test_variation_uses_own_attribute_not_sibling_options(system):
     assert "Blue Razz" not in str(leaf)
     assert system["calls"][0][0] == "https://child.test/wp-json/wc/v3/products/10"
     assert system["calls"][1][0] == "https://child.test/wp-json/wc/v3/products/10/variations"
+
+
+@pytest.mark.parametrize("attribute_identity", [
+    {"id": 7, "name": "Ízesítés"},
+    {"id": 7, "slug": "pa_izesites"},
+])
+def test_hungarian_flavoring_preserves_specific_variant_flavor(system, attribute_identity):
+    parent = product(10, name="Merry Mi Blade 30000 Puffs", type="variable", variations=[101, 102], attributes=[
+        {**attribute_identity, "variation": True, "options": ["Aloe blackcurrant", "Black Dragon Ice"]},
+    ], brands=[{"name": "Merrymi"}])
+    leaves = [
+        product(101, name="", attributes=[{**attribute_identity, "option": "Aloe blackcurrant"}]),
+        product(102, name="", attributes=[{**attribute_identity, "option": "Black Dragon Ice"}]),
+    ]
+    system["responses"].extend([Response(parent), Response(leaves, total=2, pages=1)])
+    by_brand = page(system, parent_id=10, query_mode="brand", brand="Merrymi").get_json()
+    assert [row["flavors"] for row in by_brand["rows"]] == [["Aloe blackcurrant"], ["Black Dragon Ice"]]
+    system["responses"].extend([Response(parent), Response(leaves, total=2, pages=1)])
+    by_flavor = page(system, parent_id=10, query_mode="flavor", search="aloe blackcurrant").get_json()
+    assert [row["variation_id"] for row in by_flavor["rows"]] == [101]
+    assert by_flavor["rows"][0]["flavors"] == ["Aloe blackcurrant"]
 
 
 def test_parent_identity_is_read_from_site_not_client_claims(system):
