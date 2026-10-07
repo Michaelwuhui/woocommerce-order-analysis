@@ -8380,16 +8380,48 @@ def _clone_variations(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
     # Fetch all source variations (paginated)
     all_variations = []
     page = 1
+    direct_catalog = options.get('_catalog_direct_sites') is True
+    read_failure = None
+    seen_variations = set()
+    known_total = None
     while True:
         try:
             resp = req.get(
                 f'{src_url}/wp-json/wc/v3/products/{src_parent_id}/variations',
                 auth=(src_ck, src_cs),
-                params={'page': page, 'per_page': 100},
+                params={'page': page, 'per_page': 100, **({'status': 'any'} if direct_catalog else {})},
                 timeout=60,
                 headers={'User-Agent': _WC_HEADERS['User-Agent'], 'Accept': 'application/json'},
             )
             batch, err = _parse_wc_response(resp)
+            if direct_catalog:
+                if err or not isinstance(batch, list):
+                    read_failure = '源变体分页读取失败，未确认完整目录'
+                    break
+                if any(not isinstance(v, dict) or type(v.get('id')) is not int or v['id'] <= 0
+                       or v['id'] in seen_variations
+                       or ('parent_id' in v and v['parent_id'] != src_parent_id) for v in batch):
+                    read_failure = '源变体分页身份不一致，未确认完整目录'
+                    break
+                page_ids = [v['id'] for v in batch]
+                if len(page_ids) != len(set(page_ids)):
+                    read_failure = '源变体分页含重复商品，未确认完整目录'
+                    break
+                seen_variations.update(page_ids)
+                from product_manager_catalog_edit import catalog_item_identity
+                for variation in batch:
+                    catalog_item_identity(variation, src_parent_id)
+                total = getattr(resp, 'headers', {}).get('X-WP-Total')
+                if total is not None:
+                    try:
+                        declared_total = int(total)
+                        if (declared_total < 0 or (known_total is not None and known_total != declared_total)
+                                or (len(batch) < 100 and len(all_variations) + len(batch) != declared_total)):
+                            raise ValueError
+                        known_total = declared_total
+                    except (ValueError, TypeError):
+                        read_failure = '源变体条数与分页声明不一致，未确认完整目录'
+                        break
             if err or not batch:
                 break
             all_variations.extend(batch)
@@ -8397,9 +8429,17 @@ def _clone_variations(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
                 break
             page += 1
             if page > 10:
+                if direct_catalog:
+                    read_failure = '源变体超过当前读取上限，未确认完整目录'
                 break
         except Exception:
+            if direct_catalog:
+                read_failure = '源变体分页连接或响应异常，未确认完整目录'
             break
+
+    if direct_catalog and read_failure:
+        return {'success': [], 'failed': [{'src_id': None, 'error': read_failure}],
+                'total_source': len(all_variations), 'complete_source': False}
 
     success = []
     failed = []
@@ -8407,7 +8447,7 @@ def _clone_variations(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
         payload = {
             'regular_price': v.get('regular_price', ''),
             'sale_price': v.get('sale_price', ''),
-            'manage_stock': bool(v.get('manage_stock', False)),
+            'manage_stock': v.get('manage_stock') is True if direct_catalog else bool(v.get('manage_stock', False)),
             'stock_status': v.get('stock_status', 'instock'),
             # Map attributes by name (WC will match against parent's local attrs)
             'attributes': [
@@ -8415,7 +8455,7 @@ def _clone_variations(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
                 for a in (v.get('attributes') or []) if a.get('name')
             ],
         }
-        if v.get('manage_stock') and v.get('stock_quantity') is not None:
+        if (v.get('manage_stock') is True if direct_catalog else v.get('manage_stock')) and v.get('stock_quantity') is not None:
             payload['stock_quantity'] = v['stock_quantity']
         if v.get('weight'):
             payload['weight'] = v['weight']
@@ -8436,6 +8476,8 @@ def _clone_variations(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
             payload['image'] = {'src': v['image'].get('src')}
 
         try:
+            if options.get('_catalog_write_check'):
+                options['_catalog_write_check']()
             resp = req.post(
                 f'{tgt_url}/wp-json/wc/v3/products/{tgt_parent_id}/variations',
                 auth=(tgt_ck, tgt_cs), json=payload, timeout=60, headers=_WC_HEADERS,
@@ -8448,6 +8490,8 @@ def _clone_variations(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
                     retry_payload = dict(payload)
                     retry_payload.pop('sku', None)
                     try:
+                        if options.get('_catalog_write_check'):
+                            options['_catalog_write_check']()
                         resp2 = req.post(
                             f'{tgt_url}/wp-json/wc/v3/products/{tgt_parent_id}/variations',
                             auth=(tgt_ck, tgt_cs), json=retry_payload, timeout=60, headers=_WC_HEADERS,
@@ -8513,7 +8557,7 @@ def _extract_source_image_urls(html, src_host):
 
 
 def _migrate_inline_images_after_clone(src, new_data, src_url, tgt_url,
-                                       tgt_ck, tgt_cs, new_id, warnings):
+                                       tgt_ck, tgt_cs, new_id, warnings, write_check=None):
     """Re-host description/short_description images that point at the source
     site into the target's media library, then rewrite the product HTML.
 
@@ -8524,8 +8568,8 @@ def _migrate_inline_images_after_clone(src, new_data, src_url, tgt_url,
     new URLs, then PUT #2 to save the rewritten HTML and reset the gallery to
     the original images only (so inline images don't pollute the gallery).
 
-    Best-effort: any failure leaves the product intact (description still
-    points at the source) and records a warning. Never raises."""
+    Best-effort: any failure records a warning. Return False for an incomplete
+    migration, True for completion, or None when no inline images need work."""
     import re
     import requests as req
     from urllib.parse import urlparse
@@ -8553,15 +8597,17 @@ def _migrate_inline_images_after_clone(src, new_data, src_url, tgt_url,
     # PUT #1 — append content images so WC sideloads them into the media library.
     put1_images = [{'id': gid} for gid in gallery_ids] + [{'src': u} for u in content_urls]
     try:
+        if write_check:
+            write_check()
         resp = req.put(put_url, auth=(tgt_ck, tgt_cs), json={'images': put1_images},
                        timeout=120, headers=_WC_HEADERS)
     except Exception as e:
         warnings.append(f'文案内图片迁移失败（描述仍指向源站）：{e}')
-        return
+        return False
     data1, err = _parse_wc_response(resp)
     if err:
         warnings.append(f'文案内图片迁移失败（描述仍指向源站）：{err}')
-        return
+        return False
 
     resp_imgs = data1.get('images') or []
     new_for_content = resp_imgs[gcount:]
@@ -8589,7 +8635,7 @@ def _migrate_inline_images_after_clone(src, new_data, src_url, tgt_url,
 
     if not url_map:
         warnings.append('文案内图片迁移：未匹配到新图片地址，描述仍指向源站')
-        return
+        return False
 
     def _rewrite(html):
         for k, ns in url_map.items():
@@ -8606,20 +8652,23 @@ def _migrate_inline_images_after_clone(src, new_data, src_url, tgt_url,
         'images': [{'id': gid} for gid in gallery_ids],
     }
     try:
+        if write_check:
+            write_check()
         resp = req.put(put_url, auth=(tgt_ck, tgt_cs), json=put2,
                        timeout=120, headers=_WC_HEADERS)
     except Exception as e:
         warnings.append(f'文案内图片已上传但描述回写失败：{e}')
-        return
+        return False
     _, err = _parse_wc_response(resp)
     if err:
         warnings.append(f'文案内图片已上传但描述回写失败：{err}')
-        return
+        return False
 
     msg = f'文案内图片迁移：{len(url_map)}/{len(order)} 张已重新托管到目标站'
     if truncated:
         msg += f'（图片超过 {MAX_IMG} 张，仅处理前 {MAX_IMG} 张）'
     warnings.append(msg)
+    return not truncated and len(url_map) == len(order)
 
 
 def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
@@ -8645,6 +8694,13 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
 
     warnings = []
     options = dict(options or {})
+    if options.get('_catalog_direct_sites') is True:
+        from product_manager_catalog_edit import catalog_item_identity
+        expected = (options.get('_catalog_source_identities') or {}).get(str(source_product_id))
+        if (not isinstance(src, dict) or type(src.get('id')) is not int
+                or src['id'] != source_product_id or expected is None
+                or catalog_item_identity(src) != expected):
+            return {'error': '源商品身份已变化，请刷新跨站结果后重新确认克隆；未创建目标商品'}
     clone_as_new = options.get('collision_mode') == 'clone_as_new'
     if clone_as_new:
         suffix = normalize_clone_suffix(options.get('clone_sku_suffix', ''))
@@ -8706,6 +8762,7 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
                 None,
             )
             if existing and existing.get('id'):
+                partial_clone = False
                 if clone_as_new:
                     warnings.append(
                         f'本次全新克隆 SKU "{target_sku}" 已存在于目标站产品 '
@@ -8718,14 +8775,17 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
                     )
                 if options.get('include_images') and existing.get('status') == 'draft':
                     try:
-                        _migrate_inline_images_after_clone(
+                        migration = _migrate_inline_images_after_clone(
                             src, existing, src_url, tgt_url, tgt_ck, tgt_cs,
-                            existing['id'], warnings,
+                            existing['id'], warnings, options.get('_catalog_write_check'),
                         )
+                        partial_clone = options.get('_catalog_direct_sites') is True and migration is False
                     except Exception as e:
                         warnings.append(f'现有草稿文案内图片修复异常：{e}')
+                        partial_clone = options.get('_catalog_direct_sites') is True
                 return {
                     'new_id': existing['id'],
+                    'partial_clone': partial_clone,
                     'name': existing.get('name'),
                     'sku': existing.get('sku', ''),
                     'permalink': existing.get('permalink', ''),
@@ -8773,6 +8833,8 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
     # 3. POST to target. Default mode never renames a colliding source SKU.
     #    Explicit clone-as-new already supplied unique parent/variation SKUs.
     def _post_create(p):
+        if options.get('_catalog_write_check'):
+            options['_catalog_write_check']()
         return req.post(
             f'{tgt_url}/wp-json/wc/v3/products',
             auth=(tgt_ck, tgt_cs), json=p, timeout=90, headers=_WC_HEADERS,
@@ -8790,6 +8852,7 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
         return {'error': '创建目标产品成功但未返回新 ID'}
 
     new_id = new_data['id']
+    partial_clone = False
 
     # 4. Variations (if variable + option enabled)
     if options.get('include_variations') and src.get('type') == 'variable':
@@ -8798,7 +8861,10 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
             source_product_id, new_id, options,
         )
         if var_results['failed']:
+            partial_clone = options.get('_catalog_direct_sites') is True
             warnings.append(f'变体克隆：{len(var_results["success"])} 成功 / {len(var_results["failed"])} 失败')
+            if partial_clone:
+                warnings.extend(v.get('error', '变体未完成') for v in var_results['failed'][:3])
         else:
             warnings.append(f'变体克隆：{len(var_results["success"])} 个成功')
 
@@ -8807,13 +8873,18 @@ def _clone_one_product(src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
     #    too and rewrite the copy. Best-effort: never fails the clone.
     if options.get('include_images'):
         try:
-            _migrate_inline_images_after_clone(
-                src, new_data, src_url, tgt_url, tgt_ck, tgt_cs, new_id, warnings)
+            migration = _migrate_inline_images_after_clone(
+                src, new_data, src_url, tgt_url, tgt_ck, tgt_cs, new_id, warnings,
+                options.get('_catalog_write_check'))
+            if options.get('_catalog_direct_sites') is True and migration is False:
+                partial_clone = True
         except Exception as e:
             warnings.append(f'文案内图片迁移异常（描述仍指向源站）：{e}')
+            partial_clone = options.get('_catalog_direct_sites') is True
 
     return {
         'new_id': new_id,
+        'partial_clone': partial_clone,
         'name': new_data.get('name'),
         'sku': new_data.get('sku', ''),
         'permalink': new_data.get('permalink', ''),
@@ -26054,6 +26125,11 @@ def _load_product_catalog_rules():
 from product_manager_catalog import create_catalog_blueprint
 app.register_blueprint(create_catalog_blueprint(
     get_db_connection, product_manager_required, _load_product_catalog_rules))
+
+from product_manager_catalog_edit import create_catalog_edit_blueprint
+app.register_blueprint(create_catalog_edit_blueprint(
+    get_db_connection, product_manager_required, _write_product_operation_audit,
+    enqueue_clone_job, make_clone_suffix, recognition_loader=_load_product_catalog_rules))
 
 # ─────────────────────── 进销存(库存)模块 ───────────────────────
 # 库存功能拆到独立的 inv_*.py 模块(Blueprint),避免继续膨胀 app.py。

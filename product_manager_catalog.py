@@ -5,6 +5,7 @@ published catalog and each variation's own attributes are the search evidence.
 The browser coordinates bounded page reads and owns cross-page completeness.
 """
 import html
+import hashlib
 import json
 import math
 import re
@@ -13,13 +14,56 @@ from urllib.parse import urlsplit
 
 from flask import Blueprint, current_app, jsonify, request
 from flask_login import current_user, login_required
+from itsdangerous import BadSignature, URLSafeTimedSerializer
 import requests
 from werkzeug.exceptions import HTTPException
 
 from product_recognition import parse_product_name
 
 
-PER_PAGE = 50
+PER_PAGE = 100
+# Product descriptions, gallery images and large metadata are not used by the
+# table. Keep the actual identity, attributes and editable values on every read.
+CATALOG_FIELDS = (
+    "id", "parent_id", "name", "sku", "type", "status", "attributes", "brands",
+    "variations", "stock_status", "stock_quantity", "manage_stock", "price",
+    "regular_price", "sale_price", "permalink",
+)
+PARENT_TOKEN_MAX_LENGTH = 3000
+
+
+def _site_snapshot_key(site):
+    return hashlib.sha256("\0".join(str(site.get(key) or "") for key in (
+        "url", "consumer_key", "consumer_secret"
+    )).encode("utf-8")).hexdigest()
+
+
+def _parent_token(site, parent):
+    snapshot = {key: parent[key] for key in CATALOG_FIELDS if key in parent}
+    token = URLSafeTimedSerializer(current_app.secret_key, salt="catalog-parent-v1").dumps(
+        {"site_id": site["id"], "site_snapshot": _site_snapshot_key(site), "parent": snapshot}
+    )
+    # Keep GET URLs below common proxy limits. Large snapshots safely use the
+    # existing fresh-parent read instead; the token is never used for writes.
+    return token if len(token) <= PARENT_TOKEN_MAX_LENGTH else ""
+
+
+def _read_parent_token(token, site, parent_id):
+    if not token or len(token) > PARENT_TOKEN_MAX_LENGTH:
+        return None
+    try:
+        data = URLSafeTimedSerializer(current_app.secret_key, salt="catalog-parent-v1").loads(
+            token, max_age=900
+        )
+        parent = data.get("parent")
+        if (data.get("site_id") != site["id"] or not isinstance(parent, dict)
+                or data.get("site_snapshot") != _site_snapshot_key(site)):
+            return None
+        if parent.get("id") != parent_id or parent.get("type") != "variable":
+            return None
+        return parent
+    except (BadSignature, TypeError, ValueError, AttributeError):
+        return None
 _SITE_COLUMNS = (
     "id, url, manager, country, consumer_key, consumer_secret, product_master_id"
 )
@@ -211,7 +255,7 @@ def _read_wc(site, path, params=None):
         response = requests.get(
             f'{site["url"].rstrip("/")}/wp-json/wc/v3/{path}',
             auth=(site["consumer_key"], site["consumer_secret"]),
-            params=params,
+            params={**(params or {}), "_fields": ",".join(CATALOG_FIELDS)},
             timeout=(5, 25),
             headers={"Accept": "application/json", "User-Agent": "Woo-Analysis-Catalog/1.0"},
         )
@@ -244,7 +288,7 @@ def _pagination(headers, page, count):
             values[key] = int(str(raw).strip())
     total, pages = values["total"], values["total_pages"]
     if count > PER_PAGE:
-        raise CatalogReadError("invalid_pagination", "站点返回超过 50 条的单页，无法确认目录完整性。")
+        raise CatalogReadError("invalid_pagination", f"站点返回超过 {PER_PAGE} 条的单页，无法确认目录完整性。")
     if total is not None and pages is not None:
         expected_pages = math.ceil(total / PER_PAGE)
         # WordPress may report one page for an empty collection.
@@ -277,7 +321,7 @@ def _pagination(headers, page, count):
             mode = "pages-header"
         else:
             more = count == PER_PAGE
-            warnings.append("按每页 50 条继续读取，短页结束；目录完整性依据分页长度。")
+            warnings.append(f"按每页 {PER_PAGE} 条继续读取，短页结束；目录完整性依据分页长度。")
             mode = "length-fallback"
     return {
         "total": total, "total_pages": pages, "has_more": more,
@@ -371,7 +415,7 @@ def _build_row(site_id, item, parent, recognition, brand_index=None):
     parent_status = _text((parent or {}).get("status"))
     own_status = _text(item.get("status"))
     effective_status = parent_status if parent and parent_status != "publish" else own_status or parent_status
-    return {
+    row = {
         "site_id": site_id,
         "product_id": (parent or item)["id"],
         "variation_id": item["id"] if parent else 0,
@@ -395,6 +439,12 @@ def _build_row(site_id, item, parent, recognition, brand_index=None):
         "puffs": parsed.get("puffs") or parent_parsed.get("puffs"),
         "series": parsed.get("series") or parent_parsed.get("series"),
     }
+    # Preserve raw edit evidence independently of normalized display/facets.
+    # This also retains Woo's 'parent' stock-management value for variations.
+    from product_manager_catalog_edit import catalog_item_before, catalog_item_identity
+    row["edit_identity"] = catalog_item_identity(item, parent["id"] if parent else 0)
+    row["edit_before"] = catalog_item_before(item)
+    return row
 
 
 def _matches(row, keyword, parent=None, item=None):
@@ -553,7 +603,9 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
                 raise CatalogReadError("site_unconfigured", "该站点未配置完整的直接读取 URL 和 WC API 凭据。")
             parent = None
             if parent_id:
-                parent, _ = _read_wc(site, f"products/{parent_id}")
+                parent = _read_parent_token(request.args.get("parent_token", ""), site, parent_id)
+                if parent is None:
+                    parent, _ = _read_wc(site, f"products/{parent_id}")
                 _validate_item(parent)
                 if parent["id"] != parent_id or parent["type"] != "variable":
                     raise CatalogReadError("invalid_parent", "站点父商品身份或类型不一致，变体尚未完整读取。")
@@ -581,6 +633,7 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
                         "id": item["id"], "name": _text(item.get("name")), "sku": _text(item.get("sku")),
                         "variations_count": len(item.get("variations", [])),
                         "variation_ids": item.get("variations", []),
+                        "parent_token": _parent_token(site, item),
                     })
                 else:
                     leaf = _build_row(site_id, item, parent, recognition, brand_index)

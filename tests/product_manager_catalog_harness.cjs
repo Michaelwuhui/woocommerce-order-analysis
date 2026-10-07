@@ -424,6 +424,46 @@ async function errorsAndRendering() {
     assert.equal(largeController.getSnapshot().pageRows.length, 1);
 }
 
+async function boundedParentsTokensAndCaching() {
+    const progress = [], activeParents = new Map(), peakParents = new Map();
+    const fixture = abortableFetch(async url => {
+        if (url.endsWith('catalog-sites')) return response({sites: sites.slice(0, 3)});
+        const params = new URL(url, 'https://app.example').searchParams, site = Number(params.get('site_id')), parent = Number(params.get('parent_id'));
+        if (!parent) {
+            const descriptors = [10, 20, 30].map(id => ({id, name: 'Merrymi ' + id, variation_ids: [id * 10], parent_token: `synthetic-token-${site}-${id}`}));
+            return response(page(site, 0, 1, [10, 20, 30], [], {variable_products: descriptors}));
+        }
+        assert.equal(params.get('parent_token'), `synthetic-token-${site}-${parent}`, 'variation scan must reuse the matching signed parent snapshot');
+        const current = (activeParents.get(site) || 0) + 1; activeParents.set(site, current); peakParents.set(site, Math.max(peakParents.get(site) || 0, current));
+        try { await sleep(8); return response(page(site, parent, 1, [parent * 10], [row(site, parent, parent * 10)])); }
+        finally { activeParents.set(site, activeParents.get(site) - 1); }
+    }, 2);
+    const controller = createController({fetch: fixture.fetch, onChange: state => progress.push(state.phase)});
+    await controller.load('Blue Ice');
+    assert.equal(controller.getSnapshot().phase, 'complete'); assert.equal(progress.at(-1), 'complete', 'terminal callback is synchronous with completion');
+    assert.equal(controller.getSnapshot().rows.length, 9); assert(fixture.metrics.maxActive <= 6); assert(fixture.metrics.maxActive >= 4, 'multiple parents really run concurrently');
+    assert([...peakParents.values()].every(count => count === 2), 'each site caps variable parent workers at2');
+    const first = controller.getSnapshot(), count = fixture.calls.length;
+    controller.setPage(1); const pageSnapshot = controller.getSnapshot();
+    assert.strictEqual(first.rows, pageSnapshot.rows); assert.strictEqual(first.options, pageSnapshot.options, 'page changes reuse facets');
+    controller.setFilters({manager: 'value:michael'}); const filtered = controller.getSnapshot();
+    assert.strictEqual(first.rows, filtered.rows); assert.strictEqual(first.options, filtered.options, 'local filters reuse rows and facets'); assert.equal(fixture.calls.length, count);
+    controller.updateRows([Object.assign({}, first.rows[0], {regular_price: '31', stock_status: 'outofstock', stock_state: 'outofstock'})]);
+    const edited = controller.getSnapshot(); assert.notStrictEqual(first.rows, edited.rows); assert.notStrictEqual(first.options, edited.options);
+    assert.equal(edited.counts.matched, 9); assert.equal(edited.siteStates.find(state => state.site.id === first.rows[0].site_id).matched, 3, 'canonical updates do not double-count matches');
+}
+async function progressThrottling() {
+    let notices = 0;
+    const controller = createController({fetch: async url => {
+        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        const number = Number(new URL(url, 'https://app.example').searchParams.get('page'));
+        return response(page(1, 0, number, [number], [row(1, number)], {total: 40, total_pages: 40, has_more: number < 40, next_page: number < 40 ? number + 1 : null}));
+    }, onChange: () => { notices += 1; }});
+    await controller.load('Blue Ice'); assert.equal(controller.getSnapshot().rows.length, 40); assert.equal(controller.getSnapshot().phase, 'complete');
+    assert(notices <= 5, 'rapid pages coalesce progress instead of repeated full DOM renders');
+    const terminalNotices = notices; await sleep(120); assert.equal(notices, terminalNotices, 'terminal emission clears the pending progress timer');
+}
+
 (async () => {
     await crossSiteAndRetry();
     await completenessFailures();
@@ -432,5 +472,7 @@ async function errorsAndRendering() {
     await mountedQueryControls();
     await cancelAndRace();
     await errorsAndRendering();
+    await boundedParentsTokensAndCaching();
+    await progressThrottling();
     console.log('Cross-site catalog: streaming, pagination, variation integrity, local filters, retry, cancellation, race and rendering checks passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

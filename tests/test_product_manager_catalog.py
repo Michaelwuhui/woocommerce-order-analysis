@@ -161,8 +161,65 @@ def test_reads_actual_child_and_scans_parent_directory_without_woo_search(system
     assert url == "https://child.test/wp-json/wc/v3/products"
     assert kwargs["auth"] == ("private_ck_1", "private_cs_1")
     assert kwargs["timeout"] == (5, 25)
-    assert kwargs["params"] == {"page": 1, "per_page": 50, "status": "any", "orderby": "id", "order": "asc"}
+    assert kwargs["params"] == {"page": 1, "per_page": 100, "status": "any", "orderby": "id", "order": "asc",
+                                "_fields": ",".join(catalog.CATALOG_FIELDS)}
+    assert "description" not in kwargs["params"]["_fields"]
     assert "search" not in kwargs["params"]
+
+
+def test_signed_parent_snapshot_avoids_repeat_parent_read_and_keeps_wildcard_flavors(system):
+    parent = product(10, type="variable", variations=[101], attributes=[
+        {"id": 5, "name": "Flavor", "variation": True, "options": ["Cherry", "Lemon"]},
+    ])
+    system["responses"].append(Response([parent], total=1, pages=1))
+    token = page(system).get_json()["variable_products"][0]["parent_token"]
+    assert token
+    assert len(token) <= 3000
+    system["responses"].append(Response([
+        product(101, name="", attributes=[{"id": 5, "option": ""}]),
+    ], total=1, pages=1))
+    result = page(system, parent_id=10, parent_token=token).get_json()
+    assert result["complete_page"] is True
+    assert result["rows"][0]["flavors"] == ["Cherry", "Lemon"]
+    assert [call[0] for call in system["calls"]] == [
+        "https://child.test/wp-json/wc/v3/products",
+        "https://child.test/wp-json/wc/v3/products/10/variations",
+    ]
+
+
+@pytest.mark.parametrize("mode", ["tampered", "different_site", "different_parent", "configuration_changed", "expired", "oversized"])
+def test_invalid_parent_snapshot_cannot_replace_authoritative_parent_read(system, monkeypatch, mode):
+    from itsdangerous import URLSafeTimedSerializer
+    parent = product(10, type="variable", variations=[101])
+    system["responses"].append(Response([parent], total=1, pages=1))
+    token = page(system).get_json()["variable_products"][0]["parent_token"]
+    app = system["client"].application
+    signer = URLSafeTimedSerializer(app.secret_key, salt="catalog-parent-v1")
+    snapshot = signer.loads(token)
+    if mode == "tampered":
+        token = token + "x"
+    elif mode == "different_site":
+        token = signer.dumps({**snapshot, "site_id": 2})
+    elif mode == "different_parent":
+        token = signer.dumps({**snapshot, "parent": product(999, type="variable")})
+    elif mode == "configuration_changed":
+        connection = system["connect"]()
+        connection.execute("UPDATE sites SET consumer_secret='changed_secret' WHERE id=1")
+        connection.commit()
+        connection.close()
+    elif mode == "expired":
+        import itsdangerous.timed
+        now = itsdangerous.timed.time.time()
+        monkeypatch.setattr(itsdangerous.timed.time, "time", lambda: now + 901)
+    else:
+        token = "x" * 3001
+    system["responses"].extend([Response(parent), Response([product(101)], total=1, pages=1)])
+    result = page(system, parent_id=10, parent_token=token).get_json()
+    assert result["complete_page"] is True
+    assert [call[0] for call in system["calls"]][-2:] == [
+        "https://child.test/wp-json/wc/v3/products/10",
+        "https://child.test/wp-json/wc/v3/products/10/variations",
+    ]
 
 
 @pytest.mark.parametrize("attribute_name", ["口味", "Flavor", "Flavour", "Flavour Profiles", "Smak", "Příchuť", "pa_flavor", "pa_prichut", "Íz", "Ízcsoport", "pa_íz", "Ízesítés", "pa_izesites"])
@@ -479,39 +536,39 @@ def test_name_and_sku_normalization(system, value, query):
 
 
 def test_pagination_uses_counts_before_search_filtering(system):
-    system["responses"].append(Response([product(i) for i in range(1, 51)], total=51, pages=2))
+    system["responses"].append(Response([product(i) for i in range(1, 101)], total=101, pages=2))
     data = page(system, search="nonexistent").get_json()
     assert data["rows"] == []
-    assert data["total"] == 51 and data["total_pages"] == 2
+    assert data["total"] == 101 and data["total_pages"] == 2
     assert data["has_more"] is True and data["next_page"] == 2
-    assert data["scanned"] == 50
-    system["responses"].append(Response([product(51)], total=51, pages=2))
+    assert data["scanned"] == 100
+    system["responses"].append(Response([product(101)], total=101, pages=2))
     data = page(system, page=2).get_json()
     assert data["has_more"] is False and data["next_page"] is None
 
 
 def test_missing_headers_use_full_page_continue_and_short_page_end_with_warning(system):
-    system["responses"].append(Response([product(i) for i in range(1, 51)]))
+    system["responses"].append(Response([product(i) for i in range(1, 101)]))
     data = page(system).get_json()
     assert data["pagination_mode"] == "length-fallback"
     assert data["total"] is None and data["total_pages"] is None
     assert data["has_more"] is True and data["next_page"] == 2
     assert len(data["warnings"]) == 3
-    system["responses"].append(Response([product(51)]))
+    system["responses"].append(Response([product(101)]))
     data = page(system, page=2).get_json()
     assert data["complete_page"] is True and data["has_more"] is False
     assert data["warnings"]
 
 
 @pytest.mark.parametrize("headers,mode", [
-    ({"X-WP-Total": "100"}, "total-header"),
+    ({"X-WP-Total": "200"}, "total-header"),
     ({"X-WP-TotalPages": "2"}, "pages-header"),
 ])
 def test_single_pagination_header_knows_exact_full_page_terminal(system, headers, mode):
-    system["responses"].append(Response([product(i) for i in range(1, 51)], headers=headers))
+    system["responses"].append(Response([product(i) for i in range(1, 101)], headers=headers))
     first = page(system).get_json()
     assert first["has_more"] is True and first["next_page"] == 2
-    system["responses"].append(Response([product(i) for i in range(51, 101)], headers=headers))
+    system["responses"].append(Response([product(i) for i in range(101, 201)], headers=headers))
     last = page(system, page=2).get_json()
     assert last["complete_page"] is True
     assert last["has_more"] is False and last["next_page"] is None
@@ -565,9 +622,9 @@ def test_variable_catalog_missing_identity_list_is_an_error(system):
 @pytest.mark.parametrize("headers,items,code", [
     ({"X-WP-Total": "bad", "X-WP-TotalPages": "1"}, [product(1)], "invalid_pagination"),
     ({"X-WP-Total": "1", "X-WP-TotalPages": "2"}, [product(1)], "invalid_pagination"),
-    ({"X-WP-Total": "51", "X-WP-TotalPages": "2"}, [product(1)], "incomplete_page"),
+    ({"X-WP-Total": "101", "X-WP-TotalPages": "2"}, [product(1)], "incomplete_page"),
     ({"X-WP-Total": "1", "X-WP-TotalPages": "1"}, [], "incomplete_page"),
-    ({"X-WP-Total": "51"}, [product(1)], "incomplete_page"),
+    ({"X-WP-Total": "101"}, [product(1)], "incomplete_page"),
 ])
 def test_inconsistent_pagination_is_not_a_zero_result(system, headers, items, code):
     system["responses"].append(Response(items, headers=headers))

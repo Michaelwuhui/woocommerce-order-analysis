@@ -144,7 +144,7 @@ def product_payload_mismatches(item, payload):
     return mismatches
 
 
-def wc_product_update_verified(req, resource_url, auth, payload, *, deadline=None):
+def wc_product_update_verified(req, resource_url, auth, payload, *, deadline=None, preflight_validator=None, postflight_hook=None):
     from stock_sync_guard import legacy_write
     from stock_sync_common import SyncError
     try:
@@ -152,18 +152,31 @@ def wc_product_update_verified(req, resource_url, auth, payload, *, deadline=Non
             return _wc_product_update_verified(
                 req, resource_url, auth, payload,
                 deadline=deadline if deadline is not None else new_product_operation_deadline(),
+                preflight_validator=preflight_validator,
+                postflight_hook=postflight_hook,
             )
     except SyncError as exc:
         return None, f'{exc.code}: {exc}', {"phases": [], "final_state": None}
 
 
-def _wc_product_update_verified(req, resource_url, auth, payload, *, deadline):
+def _wc_product_update_verified(req, resource_url, auth, payload, *, deadline, preflight_validator=None, postflight_hook=None):
     """Write a product/variation and GET it back before reporting success."""
     headers = {
         "User-Agent": "WooCommerce API Client-Python/3.0.0",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    trace = {"phases": [], "final_state": None}
+    current, error = _read_product(req, resource_url, auth, headers, deadline)
+    if error:
+        return None, "写入前核验失败，未提交修改：" + error, trace
+    trace["preflight_state"] = product_state_snapshot(current)
+    if preflight_validator is not None:
+        # Runs after the fresh GET and within legacy_write's resource lease.
+        # A conflict must stop before the first PUT, including no-op writes.
+        preflight_validator(current)
+    # A guarded validator may derive bridge metadata from this fresh state.
+    # Build the phase copies only after that final preflight has completed.
     hard_sold_out = (
         payload.get("manage_stock") is False
         and payload.get("stock_status") == "outofstock"
@@ -177,14 +190,10 @@ def _wc_product_update_verified(req, resource_url, auth, payload, *, deadline):
         phases.append({"stock_status": "outofstock"})
     else:
         phases.append(dict(payload))
-
-    trace = {"phases": [], "final_state": None}
-    current, error = _read_product(req, resource_url, auth, headers, deadline)
-    if error:
-        return None, "写入前核验失败，未提交修改：" + error, trace
-    trace["preflight_state"] = product_state_snapshot(current)
     if _payload_matches(current, payload):
         trace.update(already_satisfied=True, final_state=product_state_snapshot(current))
+        if postflight_hook is not None:
+            return postflight_hook(current, trace, deadline)
         return current, None, trace
 
     fresh_read = True
@@ -239,6 +248,8 @@ def _wc_product_update_verified(req, resource_url, auth, payload, *, deadline):
     mismatches = product_payload_mismatches(final, payload)
     if mismatches:
         return final, "写入未达到目标状态：" + "；".join(mismatches), trace
+    if postflight_hook is not None:
+        return postflight_hook(final, trace, deadline)
     return final, None, trace
 
 
