@@ -15391,6 +15391,7 @@ def api_reconciliation_overview():
 def products():
     """Product analysis page"""
     from datetime import date, timedelta
+    from product_analysis_data import RequestProductParser, build_weekly_trends
     conn = get_db_connection()
     
     # Get user's allowed sources for permission filtering
@@ -15526,6 +15527,7 @@ def products():
     _series_rows = conn.execute('SELECT id, brand_id, name FROM series').fetchall()
     series_cache = [{'id': r['id'], 'brand_id': r['brand_id'], 'name': r['name']} for r in _series_rows]
     series_names_map = {r['id']: r['name'] for r in _series_rows}
+    parse_name = RequestProductParser(parse_product_name, brands_cache, series_cache)
 
     # Load manual product mappings
     mappings_rows = conn.execute('''
@@ -15590,13 +15592,10 @@ def products():
             
             gross_total = total + item_shipping
             
-            # Extract flavor from WooCommerce variation meta_data
-            meta_flavor = extract_flavor_from_meta(item)
-            
             # Check for manual mapping first (using full name with flavor).
             # Canonicalize the lookup key so saved HTML-entity / decoded variants
             # both hit the same mapping row.
-            full_name, _, meta_puffs = get_full_product_name(item)
+            full_name, meta_flavor, meta_puffs = get_full_product_name(item)
             full_name_key = normalize_raw_name(full_name)
             product_name_key = normalize_raw_name(product_name)
             series = ''
@@ -15613,7 +15612,7 @@ def products():
                 flavor = mapping.get('flavor') or meta_flavor or ''
                 series = mapping.get('series') or ''
             else:
-                parsed = parse_product_name(product_name, brands_cache, series_cache)
+                parsed = parse_name(product_name)
                 brand = parsed.get('brand') or 'Unknown'
                 puffs = meta_puffs or parsed.get('puffs')
                 flavor = meta_flavor or parsed.get('flavor') or ''
@@ -15732,9 +15731,7 @@ def products():
             source_conditions.append('1=0')
             
     if manager_filter:
-        # Get sites managed by this manager
-        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
-        manager_urls = [s['url'] for s in manager_sites]
+        # Reuse the same request's manager scope from the ranking query.
         if manager_urls:
             placeholders = ', '.join(['?' for _ in manager_urls])
             source_conditions.append(f'source IN ({placeholders})')
@@ -15800,14 +15797,16 @@ def products():
     total_gross_revenue_cny = 0
     from datetime import datetime
     current_month = datetime.now().strftime('%Y-%m')
+    currency_rates = {currency: get_cny_rate(currency, current_month)[0]
+                      for currency in set(total_revenue_by_currency) | set(total_gross_revenue_by_currency)}
 
     for currency, amount in total_revenue_by_currency.items():
-        rate, _ = get_cny_rate(currency, current_month)
+        rate = currency_rates[currency]
         if rate:
             total_revenue_cny += amount * rate
 
     for currency, amount in total_gross_revenue_by_currency.items():
-        rate, _ = get_cny_rate(currency, current_month)
+        rate = currency_rates[currency]
         if rate:
             total_gross_revenue_cny += amount * rate
 
@@ -15862,8 +15861,7 @@ def products():
     
     # Add manager filter if set
     if manager_filter:
-        manager_sites = conn.execute('SELECT url FROM sites WHERE manager = ?', (manager_filter,)).fetchall()
-        manager_urls_for_trend = [s['url'] for s in manager_sites]
+        manager_urls_for_trend = manager_urls
         if manager_urls_for_trend:
             placeholders = ', '.join(['?' for _ in manager_urls_for_trend])
             trend_conditions.append(f'source IN ({placeholders})')
@@ -15885,166 +15883,12 @@ def products():
     # Trend rendering can be CPU-heavy; release the DB transaction first.
     conn.commit()
     
-    weekly_flavor_data = {}  # {week_key: {flavor: quantity}}
-    
-    for order in trend_orders:
-        items = parse_json_field(order['line_items'])
-        if not isinstance(items, list):
-            continue
-        
-        # Get week number from order date
-        order_date_str = order['date_created']
-        if order_date_str:
-            try:
-                order_date = datetime.strptime(order_date_str[:10], '%Y-%m-%d')
-                # Use ISO week number with year
-                year, week_num, _ = order_date.isocalendar()
-                week_key = f"{year}-W{week_num:02d}"
-                week_start = order_date - timedelta(days=order_date.weekday())
-                week_label = week_start.strftime('%m/%d')
-                
-                if week_key not in weekly_flavor_data:
-                    weekly_flavor_data[week_key] = {'label': week_label, 'flavors': {}}
-                
-                # Sum quantities by flavor for this week (only for top_flavors from page filter)
-                for item in items:
-                    quantity = item.get('quantity', 0)
-                    # Get flavor from item (check manual mappings first)
-                    product_name = item.get('name', '')
-                    full_name, flavor_only, _ = get_full_product_name(item)
-                    
-                    # Check manual mappings (canonicalize for entity-safe lookup)
-                    full_name_key = normalize_raw_name(full_name)
-                    if full_name_key in manual_mappings and manual_mappings[full_name_key].get('flavor'):
-                        flavor = manual_mappings[full_name_key]['flavor']
-                    elif flavor_only:
-                        flavor = flavor_only
-                    else:
-                        flavor = '未知口味'
-                    
-                    # Only aggregate for top flavors (determined by page filter)
-                    # Use normalized matching to handle case differences
-                    normalized_flavor = flavor.upper().strip()
-                    if normalized_flavor in top_flavors_normalized:
-                        # Use the display name from top_flavors for consistency
-                        display_flavor = top_flavors_normalized[normalized_flavor]
-                        if display_flavor not in weekly_flavor_data[week_key]['flavors']:
-                            weekly_flavor_data[week_key]['flavors'][display_flavor] = 0
-                        weekly_flavor_data[week_key]['flavors'][display_flavor] += quantity
-            except:
-                pass
-    
-    # Sort weeks and take last 8 weeks
-    sorted_weeks = sorted(weekly_flavor_data.keys())[-8:]
-    
-    # Build structured data for chart
-    weekly_trend_data = {
-        'weeks': [weekly_flavor_data[w]['label'] for w in sorted_weeks],
-        'flavors': top_flavors,
-        'datasets': []
-    }
-    
-    # Create dataset for each flavor (preserving page filter ranking order)
-    # Include the page-filter-period total for correct frontend sorting
-    for flavor in top_flavors:
-        flavor_data = []
-        for week_key in sorted_weeks:
-            qty = weekly_flavor_data.get(week_key, {}).get('flavors', {}).get(flavor, 0)
-            flavor_data.append(qty)
-        weekly_trend_data['datasets'].append({
-            'flavor': flavor,
-            'data': flavor_data,
-            'pageTotal': top_flavor_qtys.get(flavor, 0)  # Total from page filter period
-        })
-    
-    # Calculate weekly trend data by PRODUCT (TOP 10 products)
-    # Get top 10 products for the trend
-    top_10_products = top_products[:10]
-    
-    # Build product keys for matching
-    top_product_keys = {}  # {normalized_key: {brand, puffs, flavor, label}}
-    for p in top_10_products:
-        brand = p.get('brand') or 'Unknown'
-        puffs = p.get('puffs') or 'N/A'
-        flavor = normalize_flavor(p.get('flavor') or '')
-        key = f"{brand}|{puffs}|{flavor}"
-        label = f"{brand} {puffs} {p.get('flavor', '')[:15]}"  # Short label for display
-        top_product_keys[key] = {'brand': brand, 'puffs': puffs, 'flavor': flavor, 'label': label, 'pageTotal': p['quantity']}
-    
-    # Aggregate weekly data for these products from trend_orders
-    weekly_product_data = {}  # {week_key: {product_key: quantity}}
-    for order in trend_orders:
-        items = parse_json_field(order['line_items'])
-        if not isinstance(items, list):
-            continue
-        
-        order_date_str = order['date_created']
-        if order_date_str:
-            try:
-                order_date = datetime.strptime(order_date_str[:10], '%Y-%m-%d')
-                year, week_num, _ = order_date.isocalendar()
-                week_key = f"{year}-W{week_num:02d}"
-                week_start = order_date - timedelta(days=order_date.weekday())
-                week_label = week_start.strftime('%m/%d')
-                
-                if week_key not in weekly_product_data:
-                    weekly_product_data[week_key] = {'label': week_label, 'products': {}}
-                
-                for item in items:
-                    quantity = item.get('quantity', 0)
-                    product_name = item.get('name', '')
-                    
-                    # Get brand/puffs/flavor using the same logic as main aggregation
-                    meta_flavor = extract_flavor_from_meta(item)
-                    full_name, _, meta_puffs = get_full_product_name(item)
-                    full_name_key = normalize_raw_name(full_name)
-                    product_name_key = normalize_raw_name(product_name)
-
-                    if full_name_key in manual_mappings:
-                        mapping = manual_mappings[full_name_key]
-                        brand = mapping.get('brand') or 'Unknown'
-                        puffs = mapping.get('puffs') or meta_puffs
-                        flavor = mapping.get('flavor') or meta_flavor or ''
-                    elif product_name_key in manual_mappings:
-                        mapping = manual_mappings[product_name_key]
-                        brand = mapping.get('brand') or 'Unknown'
-                        puffs = mapping.get('puffs') or meta_puffs
-                        flavor = mapping.get('flavor') or meta_flavor or ''
-                    else:
-                        parsed = parse_product_name(product_name, brands_cache)
-                        brand = parsed.get('brand') or 'Unknown'
-                        puffs = meta_puffs or parsed.get('puffs')
-                        flavor = meta_flavor or parsed.get('flavor') or ''
-                    
-                    # Normalize and create key
-                    flavor_norm = normalize_flavor(flavor)
-                    product_key = f"{brand}|{puffs or 'N/A'}|{flavor_norm}"
-                    
-                    # Only aggregate for top 10 products
-                    if product_key in top_product_keys:
-                        if product_key not in weekly_product_data[week_key]['products']:
-                            weekly_product_data[week_key]['products'][product_key] = 0
-                        weekly_product_data[week_key]['products'][product_key] += quantity
-            except:
-                pass
-    
-    # Build product trend chart data
-    product_trend_data = {
-        'weeks': [weekly_product_data.get(w, {}).get('label', '') for w in sorted_weeks],
-        'products': [top_product_keys[k]['label'] for k in top_product_keys],
-        'datasets': []
-    }
-    
-    for key, info in top_product_keys.items():
-        prod_data = []
-        for week_key in sorted_weeks:
-            qty = weekly_product_data.get(week_key, {}).get('products', {}).get(key, 0)
-            prod_data.append(qty)
-        product_trend_data['datasets'].append({
-            'label': info['label'],
-            'data': prod_data,
-            'pageTotal': info['pageTotal']
-        })
+    weekly_trend_data, product_trend_data = build_weekly_trends(
+        trend_orders, top_products, top_flavors, top_flavor_qtys, manual_mappings,
+        parse_items=parse_json_field, full_product_name=get_full_product_name,
+        normalize_raw_name=normalize_raw_name, normalize_flavor=normalize_flavor,
+        parse_product=parse_name,
+    )
     
     conn.close()
     
@@ -16212,6 +16056,7 @@ def add_series():
 def get_product_stats():
     """Get product statistics API"""
     from datetime import date, timedelta
+    from product_analysis_data import RequestProductParser
     
     conn = get_db_connection()
     allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
@@ -16265,6 +16110,8 @@ def get_product_stats():
         })
     conn.close()
     
+    # This response never uses series; avoid the wrapper's per-name DB lookup.
+    parse_name = RequestProductParser(parse_product_name, brands_cache, [])
     # Aggregate
     stats = {}
     for order in orders:
@@ -16279,7 +16126,7 @@ def get_product_stats():
             # Extract flavor from meta_data
             meta_flavor = extract_flavor_from_meta(item)
             
-            parsed = parse_product_name(name, brands_cache)
+            parsed = parse_name(name)
             # Use meta_flavor if available, otherwise use parsed flavor
             flavor = meta_flavor or parsed.get('flavor') or ''
             
@@ -16308,6 +16155,7 @@ def get_product_stats():
 def get_unknown_products():
     """Get products that could not be mapped to any brand"""
     from datetime import date, timedelta
+    from product_analysis_data import RequestProductParser
     
     conn = get_db_connection()
     
@@ -16317,11 +16165,22 @@ def get_unknown_products():
     
     # Get orders from last N days
     date_from = (date.today() - timedelta(days=days)).isoformat()
+    allowed_sources = get_user_allowed_sources(current_user.id, current_user.is_admin(), current_user.is_viewer())
+    conditions = ['date_created >= ?', _active_status_cond()]
+    params = [date_from]
+    if allowed_sources is not None:
+        if allowed_sources:
+            placeholders = ','.join('?' for _ in allowed_sources)
+            conditions.append(f'source IN ({placeholders})')
+            params.extend(allowed_sources)
+        else:
+            conditions.append('1=0')
+    where_clause = ' AND '.join(conditions)
     
     orders = conn.execute(f'''
         SELECT line_items, source FROM orders
-        WHERE date_created >= ? AND {_active_status_cond()}
-    ''', (date_from,)).fetchall()
+        WHERE {where_clause}
+    ''', params).fetchall()
     
     # Get brands cache
     brands_rows = conn.execute('SELECT id, name, aliases FROM brands').fetchall()
@@ -16356,6 +16215,7 @@ def get_unknown_products():
     
     conn.close()
     
+    parse_name = RequestProductParser(parse_product_name, brands_cache, [])
     # Find unknown products
     unknown_products = {}
     
@@ -16392,7 +16252,7 @@ def get_unknown_products():
                 brand = mapping['brand_name']
                 puffs = mapping['puff_count'] or meta_puffs
             else:
-                parsed = parse_product_name(name, brands_cache)
+                parsed = parse_name(name)
                 brand = parsed.get('brand')
                 puffs = meta_puffs or parsed.get('puffs')
             
