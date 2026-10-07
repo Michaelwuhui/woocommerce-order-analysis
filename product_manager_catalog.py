@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from flask import Blueprint, current_app, jsonify, request
 from flask_login import current_user, login_required
+from site_connection_service import filter_active_sites, is_site_archived
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 import requests
 from werkzeug.exceptions import HTTPException
@@ -540,6 +541,7 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
         conn = get_db_connection()
         try:
             sites = conn.execute(f"SELECT {_SITE_COLUMNS} FROM sites ORDER BY country, url").fetchall()
+            sites = filter_active_sites(conn, sites)
         finally:
             conn.close()
         return jsonify({"sites": [
@@ -588,10 +590,13 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
         try:
             row = conn.execute(f"SELECT {_SITE_COLUMNS} FROM sites WHERE id = ?", (site_id,)).fetchone()
             site = dict(row) if row else None
+            archived = is_site_archived(conn, site_id)
         finally:
             conn.close()
         if site is None:
             return jsonify({"error": "站点不存在。", "code": "site_not_found"}), 404
+        if archived:
+            return jsonify({"error": "站点连接已删除，历史记录仍保留，不能继续读取产品。", "code": "site_archived"}), 409
         if not visible(site):
             return jsonify({"error": "仅站点负责人可读取该站点产品。", "code": "site_forbidden"}), 403
         response_base = {

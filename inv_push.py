@@ -14,6 +14,9 @@ from flask import Blueprint, jsonify, render_template, request
 from flask_login import current_user, login_required
 
 import inv_allocator
+from site_connection_service import (
+    SiteConnectionError, filter_active_sites, is_site_archived, lock_active_sites,
+)
 from inv_common import (
     _deny,
     can_manage_inventory,
@@ -197,7 +200,7 @@ def _quota_participants(conn, sku_id, warehouse_ids, country_cache):
     ).fetchall()
     result = []
     target = tuple(sorted(warehouse_ids))
-    for row in rows:
+    for row in filter_active_sites(conn, rows):
         market = (row["country"] or "").upper()
         if market not in country_cache:
             country_cache[market] = tuple(
@@ -215,7 +218,7 @@ def compute_site_stock(conn, site_id, use_sync_strategy=False):
     pass use_sync_strategy=True and use the configured shared-stock quota.
     """
     site = conn.execute("SELECT id,url,country FROM sites WHERE id=?", (site_id,)).fetchone()
-    if not site:
+    if not site or is_site_archived(conn, site_id):
         return []
     market = (site["country"] or "").upper()
     warehouses = _serving_warehouses(conn, market)
@@ -293,6 +296,8 @@ def site_sync_readiness(conn, site_id, for_live=False):
     errors, warnings = [], []
     if not site:
         return {"ready": False, "errors": ["站点不存在"], "warnings": []}
+    if is_site_archived(conn, site_id):
+        return {"ready": False, "errors": ["站点连接已删除，不能继续同步库存"], "warnings": []}
     market = (site["country"] or "").upper()
     warehouses = _serving_warehouses(conn, market)
     maps = conn.execute(
@@ -457,12 +462,16 @@ def _get_stock_state(api_url, ck, cs, product_id, variation_id):
     return {"manage_stock": bool(payload.get("manage_stock")), "stock_quantity": quantity}, None
 
 
-def _put_stock(api_url, ck, cs, product_id, variation_id, qty):
+def _put_stock(api_url, ck, cs, product_id, variation_id, qty, write_check=None):
     from stock_sync_guard import legacy_write
     from stock_sync_common import SyncError
     try:
         with legacy_write(_resource_url(api_url, product_id, variation_id),
                           {"manage_stock": True, "stock_quantity": qty}):
+            if write_check:
+                error = write_check()
+                if error:
+                    return False, error
             return _put_unmanaged_stock(api_url, ck, cs, product_id, variation_id, qty)
     except SyncError as exc:
         return False, f'{exc.code}: {exc}'
@@ -495,7 +504,11 @@ def _put_unmanaged_stock(api_url, ck, cs, product_id, variation_id, qty):
     return error is None, error
 
 
-def _sync_one_stock(api_url, ck, cs, item, only_changed=True):
+def _sync_one_stock(api_url, ck, cs, item, only_changed=True, write_check=None):
+    if write_check:
+        error = write_check()
+        if error:
+            return "error", None, None, error
     before, error = _get_stock_state(
         api_url, ck, cs, item["wc_product_id"], item["wc_variation_id"]
     )
@@ -507,8 +520,13 @@ def _sync_one_stock(api_url, ck, cs, item, only_changed=True):
         return "unchanged", previous, previous, None
 
     write_ok, write_error = _put_stock(
-        api_url, ck, cs, item["wc_product_id"], item["wc_variation_id"], desired
+        api_url, ck, cs, item["wc_product_id"], item["wc_variation_id"], desired,
+        **({"write_check": write_check} if write_check else {}),
     )
+    if write_check:
+        error = write_check()
+        if error:
+            return "error", previous, None, error
     after, readback_error = _get_stock_state(
         api_url, ck, cs, item["wc_product_id"], item["wc_variation_id"]
     )
@@ -609,6 +627,9 @@ def push_site(
     if not site:
         result["fatal"] = "站点不存在"
         return result
+    if is_site_archived(conn, site_id):
+        result["fatal"] = "站点连接已删除，不能继续同步库存"
+        return result
 
     readiness = site_sync_readiness(conn, site_id, for_live=not dry_run)
     result["readiness"] = readiness
@@ -631,7 +652,14 @@ def push_site(
             result["error"] = len(items)
             return result
 
-    for item in items:
+    def connection_write_check():
+        return "站点连接已删除，未继续写入库存" if is_site_archived(conn, site_id) else None
+
+    for index, item in enumerate(items):
+        if connection_write_check():
+            result["fatal"] = "站点连接已删除，未继续同步剩余库存"
+            result["error"] += len(items) - index
+            break
         previous = remote = error = None
         if dry_run:
             status = "dry"
@@ -641,7 +669,8 @@ def push_site(
             # its separate resource lease, including on SQLite.
             conn.commit()
             status, previous, remote, error = _sync_one_stock(
-                api_url, consumer_key, consumer_secret, item, only_changed=only_changed
+                api_url, consumer_key, consumer_secret, item, only_changed=only_changed,
+                write_check=connection_write_check,
             )
             if status == "ok":
                 result["ok"] += 1
@@ -686,6 +715,9 @@ def _acquire_site_lock(conn, site_id):
         "DELETE FROM inv_push_locks WHERE acquired_at < datetime('now','-30 minutes')"
     )
     try:
+        # Keep the connection active until the committed inventory lock is
+        # visible to connection removal's busy check.
+        lock_active_sites(conn, [site_id])
         conn.execute(
             "INSERT INTO inv_push_locks (site_id,lock_token) VALUES (?,?)",
             (site_id, token),
@@ -723,6 +755,8 @@ def execute_site_sync(
     operator=None,
 ):
     """Run one configured site with locking, run audit and failure suspension."""
+    if is_site_archived(conn, site_id):
+        return {"site_id": site_id, "status": "skipped", "reason": "站点连接已删除", "fatal": "站点连接已删除，不能继续同步库存"}
     config = get_site_sync_config(conn, site_id)
     if trigger_type == "scheduler":
         if not global_sync_enabled(conn):
@@ -744,7 +778,11 @@ def execute_site_sync(
     if not operator_name and trigger_type == "scheduler":
         operator_name = "system:auto_inventory_push"
 
-    token = _acquire_site_lock(conn, site_id)
+    try:
+        token = _acquire_site_lock(conn, site_id)
+    except SiteConnectionError as exc:
+        conn.rollback()
+        return {"site_id": site_id, "status": "skipped", "reason": str(exc), "fatal": str(exc)}
     if not token:
         return {"site_id": site_id, "status": "skipped", "reason": "该站点已有同步任务运行中"}
     run_id = None
@@ -854,12 +892,12 @@ def scheduler_site_ids(conn):
         return []
     return [
         int(row["site_id"])
-        for row in conn.execute(
+        for row in filter_active_sites(conn, conn.execute(
             """SELECT site_id FROM inv_site_sync_config
                WHERE mode IN ('observe','live')
                  AND (next_run_at IS NULL OR datetime(next_run_at)<=datetime('now'))
                ORDER BY site_id"""
-        ).fetchall()
+        ).fetchall())
     ]
 
 
@@ -882,6 +920,8 @@ def update_site_sync_config(conn, site_id, changes, operator=None):
     site = conn.execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone()
     if not site:
         raise ValueError("站点不存在")
+    if is_site_archived(conn, site_id):
+        raise ValueError("站点连接已删除，不能重新启用库存同步配置")
     before = get_site_sync_config(conn, site_id)
     mode = str(changes.get("mode", before["mode"])).strip().lower()
     strategy = str(
@@ -994,7 +1034,7 @@ def _site_rows_for_current_user(conn):
         sql += f" WHERE id IN ({','.join('?' * len(scope))})"
         params.extend(scope)
     sql += " ORDER BY country,url"
-    return conn.execute(sql, params).fetchall()
+    return filter_active_sites(conn, conn.execute(sql, params).fetchall())
 
 
 def _json_error(message, status=400):
@@ -1033,6 +1073,8 @@ def api_site_stock(site_id):
     try:
         if not _site_allowed(conn, site_id):
             return _json_error("您没有该站点的库存查看权限", 403)
+        if is_site_archived(conn, site_id):
+            return _json_error("站点连接已删除，不能继续读取操作库存", 409)
         use_strategy = request.args.get("strategy") == "auto"
         return jsonify(compute_site_stock(conn, site_id, use_sync_strategy=use_strategy))
     finally:
@@ -1049,6 +1091,8 @@ def api_push_site(site_id):
     try:
         if not _site_allowed(conn, site_id):
             return _json_error("您没有该站点的库存同步权限", 403)
+        if is_site_archived(conn, site_id):
+            return _json_error("站点连接已删除，不能继续同步库存", 409)
         if not dry_run and not (_is_superadmin() or can_manage_inventory()):
             return _json_error("您只能执行不写入 WooCommerce 的同步演练", 403)
         result = execute_site_sync(

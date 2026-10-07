@@ -77,6 +77,14 @@ def lock_clause(c):
     return ' FOR UPDATE' if hasattr(c, '_raw') else ''
 
 
+def lock_site_connections(c, site_ids):
+    from site_connection_service import SiteConnectionError, lock_active_sites
+    try:
+        return lock_active_sites(c, site_ids)
+    except SiteConnectionError as exc:
+        raise SyncError(exc.code, str(exc), exc.status) from None
+
+
 def event(c, kind, actor_id, object_id, detail):
     c.execute('INSERT INTO stock_sync_events(id,kind,actor_id,object_id,detail_json,created_at) VALUES(?,?,?,?,?,?)',
               (uid(), kind, actor_id, object_id, dumps(detail), stamp()))

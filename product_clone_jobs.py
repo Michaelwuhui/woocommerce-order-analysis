@@ -12,6 +12,7 @@ import json
 import uuid
 
 import db_backend as db
+from site_connection_service import lock_active_sites
 
 
 TERMINAL_STATUSES = frozenset({"succeeded", "partial_failed", "failed", "interrupted"})
@@ -71,6 +72,9 @@ def enqueue_clone_job(
     created_by_id: str,
     created_by_name: str,
 ) -> dict:
+    # Hold both config rows until the queue INSERT commits. Connection removal
+    # takes FOR UPDATE, so it cannot race a newly-created clone job.
+    lock_active_sites(conn, [source_site_id, target_site_id])
     job_id = str(uuid.uuid4())
     conn.execute(
         """
