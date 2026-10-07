@@ -61,6 +61,8 @@ def test_unknown_products_respects_manual_mapping_and_meta_puffs():
 
     namespace = {
         "get_db_connection": lambda: FakeConnection(),
+        "current_user": SimpleNamespace(id=1, is_admin=lambda: True, is_viewer=lambda: False),
+        "get_user_allowed_sources": lambda *_args: None,
         "request": SimpleNamespace(args={"days": "90", "limit": "50"}),
         "_active_status_cond": lambda: "1 = 1",
         "parse_json_field": json.loads,
