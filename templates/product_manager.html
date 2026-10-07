@@ -171,7 +171,7 @@
     <ul class="nav nav-pills gap-2 mb-3" role="tablist">
         <li class="nav-item" role="presentation">
             <button class="nav-link active" id="pmCatalogTab" data-bs-toggle="pill" data-bs-target="#pmCatalogPane"
-                type="button" role="tab" aria-controls="pmCatalogPane" aria-selected="true">跨站产品查询</button>
+                type="button" role="tab" aria-controls="pmCatalogPane" aria-selected="true">跨站产品管理</button>
         </li>
         <li class="nav-item" role="presentation">
             <button class="nav-link" id="pmSingleSiteTab" data-bs-toggle="pill" data-bs-target="#pmSingleSitePane"
@@ -237,6 +237,35 @@
                     </div>
                 </div>
                 <button id="pmCatalogResetFilters" class="btn btn-sm btn-outline-secondary mt-2">清空筛选</button>
+            </div>
+        </div>
+        <div class="card data-card mb-3">
+            <div class="card-body py-3">
+                <div id="pmCatalogSelectedCount" class="small mb-2">已选择 0 条 · 未保存 0 条</div>
+                <div class="d-flex flex-wrap gap-2 mb-2">
+                    <button type="button" id="pmCatalogSelectPage" class="btn btn-sm btn-outline-light" disabled>选择当前页</button>
+                    <button type="button" id="pmCatalogSelectFiltered" class="btn btn-sm btn-outline-light" disabled>选择当前筛选全部结果</button>
+                    <button type="button" id="pmCatalogClearSelection" class="btn btn-sm btn-outline-secondary" disabled>清空选择</button>
+                    <button type="button" id="pmCatalogSaveAll" class="btn btn-sm btn-primary" disabled>保存全部行修改</button>
+                    <button type="button" id="pmCatalogStopWrites" class="btn btn-sm btn-outline-warning" disabled>停止后续修改</button>
+                </div>
+                <div class="d-flex flex-wrap gap-2">
+                    <button type="button" data-edit-bulk="price" class="btn btn-sm btn-outline-warning" disabled>批量价格</button>
+                    <button type="button" data-edit-bulk="stock" class="btn btn-sm btn-outline-info" disabled>批量库存数量</button>
+                    <button type="button" data-edit-bulk="stock_status" class="btn btn-sm btn-outline-info" disabled>库存状态（关闭数量管理）</button>
+                    <button type="button" data-edit-bulk="soldout" class="btn btn-sm btn-outline-danger" disabled>硬售完</button>
+                    <button type="button" data-edit-bulk="restore" class="btn btn-sm btn-outline-success" disabled>恢复数量库存</button>
+                    <button type="button" data-edit-bulk="clear_sale" class="btn btn-sm btn-outline-warning" disabled>清空优惠价</button>
+                    <button type="button" data-edit-bulk="clone" class="btn btn-sm btn-outline-light" disabled>跨站克隆</button>
+                    <button type="button" id="pmCatalogRetryAction" class="btn btn-sm btn-outline-warning" disabled>仅重试失败修改</button>
+                </div>
+                <div class="small text-muted mt-2">选择和未保存修改跨筛选、跨页保留；全选只包括当前已加载的筛选结果。批量操作会包含筛选外仍选中的行，确认弹框会说明范围。</div>
+                <div id="pmCatalogActionStatus" class="small mt-2" role="status" aria-live="polite"></div>
+                <div id="pmCatalogCloneJobs" class="mt-2"></div>
+                <div id="pmCatalogCloneLockNotice" class="alert alert-warning small mt-3 mb-0 d-none">
+                    克隆提交结果尚未完全确认，已阻止重复提交，刷新页面也会保留此提示。请核对上方已知任务；丢失任务编号的批次，请联系管理员核对后台任务和目标商品。
+                    <button type="button" id="pmCatalogUnlockClone" class="btn btn-sm btn-outline-dark mt-2">已人工核对，保证不重复已提交商品</button>
+                </div>
             </div>
         </div>
         <div class="card data-card"><div id="pmCatalogResults" class="card-body p-0">
@@ -474,7 +503,24 @@
     </div>
 </div>
 
-<script src="{{ url_for('static', filename='js/product_manager_catalog.js') }}?v=20261006"></script>
+<div class="modal fade" id="pmCatalogEditorModal" tabindex="-1" aria-labelledby="pmCatalogEditorTitle" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+        <div class="modal-content bg-dark text-light border-secondary">
+            <div class="modal-header border-secondary">
+                <h5 class="modal-title" id="pmCatalogEditorTitle">批量操作</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body"><div id="pmCatalogEditorBody"></div><div id="pmCatalogEditorProgress" class="small text-info mt-3" role="status" aria-live="polite"></div><div id="pmCatalogEditorError" class="small text-warning mt-3" role="alert"></div></div>
+            <div class="modal-footer border-secondary">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+                <button type="button" id="pmCatalogEditorStopWrites" class="btn btn-outline-warning" disabled>停止后续修改</button>
+                <button type="button" id="pmCatalogEditorApply" class="btn btn-primary">确认修改所选结果</button>
+            </div>
+        </div>
+    </div>
+</div>
+<script src="{{ url_for('static', filename='js/product_manager_catalog_editor.js') }}?v=20261007"></script>
+<script src="{{ url_for('static', filename='js/product_manager_catalog.js') }}?v=20261007"></script>
 <script>
 (function() {
     // State

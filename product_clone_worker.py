@@ -52,13 +52,45 @@ def resolve_site_for_worker(conn, site_id: int, *, get_api_endpoint):
     return site, api_url, ck, cs
 
 
+def resolve_catalog_clone_site(conn, site_id, actor_id):
+    """New catalog jobs use real site IDs and recheck live manager authority."""
+    from product_manager_catalog import _configured
+    actor = conn.execute(
+        "SELECT id,username,name,role,can_manage_products,can_manage_own_products FROM users WHERE id=?",
+        (actor_id,),
+    ).fetchone()
+    if not actor or (actor["username"] != "admin" and actor["can_manage_products"] != 1):
+        raise ValueError("克隆发起人的产品管理权限已撤销")
+    site = conn.execute(
+        "SELECT id,url,consumer_key,consumer_secret,product_master_id,manager FROM sites WHERE id=?",
+        (site_id,),
+    ).fetchone()
+    if not site:
+        raise ValueError("克隆站点不存在")
+    scoped = actor["username"] != "admin" and (actor["role"] != "admin" or actor["can_manage_own_products"] == 1)
+    name = str(actor["name"] or "").strip()
+    if scoped and (not name or name != str(site["manager"] or "").strip()):
+        raise ValueError("克隆站点负责人已变化，当前发起人没有操作权限")
+    if not _configured(site):
+        raise ValueError("实际站点直接 API 凭据不完整")
+    return site, site["url"].rstrip("/"), site["consumer_key"], site["consumer_secret"]
+
+
 def process_clone_job(conn, job: dict, *, clone_one, resolve_site) -> dict:
     """Process one claimed job and persist progress after every product."""
+    direct = (job.get("options") or {}).get("_catalog_direct_sites") is True
     try:
-        source = resolve_site(conn, int(job["source_site_id"]))
-        target = resolve_site(conn, int(job["target_site_id"]))
+        if direct:
+            source = resolve_catalog_clone_site(conn, int(job["source_site_id"]), job["created_by_id"])
+            target = resolve_catalog_clone_site(conn, int(job["target_site_id"]), job["created_by_id"])
+        else:
+            source = resolve_site(conn, int(job["source_site_id"]))
+            target = resolve_site(conn, int(job["target_site_id"]))
         _, src_url, src_ck, src_cs = source
         _, tgt_url, tgt_ck, tgt_cs = target
+        if direct and (src_url != job["options"].get("_catalog_source_url")
+                       or tgt_url != job["options"].get("_catalog_target_url")):
+            raise ValueError("克隆站点 URL 已变化，未执行本任务")
     except Exception as exc:
         fail_clone_job(conn, job["id"], f"站点配置读取失败: {exc}")
         return {"success": [], "failed": []}
@@ -76,13 +108,29 @@ def process_clone_job(conn, job: dict, *, clone_one, resolve_site) -> dict:
             continue
         set_current_product(conn, job["id"], product_id)
         try:
+            clone_options = dict(job.get("options") or {})
+            if direct:
+                # Reassigned or revoked operators cannot continue queued writes.
+                def check_direct_write():
+                    fresh_source = resolve_catalog_clone_site(conn, int(job["source_site_id"]), job["created_by_id"])
+                    fresh_target = resolve_catalog_clone_site(conn, int(job["target_site_id"]), job["created_by_id"])
+                    if fresh_source[1:] != source[1:] or fresh_target[1:] != target[1:]:
+                        raise ValueError("克隆执行期间站点 URL 或 API 凭据已变化，未继续写入")
+                check_direct_write()
+                # A process-local callable never enters the persisted job JSON.
+                # App helpers invoke it immediately before each external write.
+                clone_options["_catalog_write_check"] = check_direct_write
             result = clone_one(
                 src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
-                product_id, job.get("options") or {},
+                product_id, clone_options,
             )
         except Exception as exc:
             result = {"error": f"未知错误: {exc}"}
-        if result.get("error"):
+        if direct and result.get("partial_clone"):
+            results["failed"].append({"product_id": product_id, "target_id": result.get("new_id"),
+                "partial_clone": True, "warnings": result.get("warnings") or [],
+                "error": "目标商品已存在，但变体或图片迁移尚未完整；请核对现有目标商品，不要直接重复克隆。"})
+        elif result.get("error"):
             results["failed"].append({"product_id": product_id, "error": result["error"]})
         else:
             results["success"].append(
