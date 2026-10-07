@@ -1,5 +1,5 @@
 """Idempotent durable jobs and non-stealable physical-resource leases."""
-from stock_sync_common import SyncError, one, rows, loads, dumps, digest, uid, stamp, now, parse_time, begin, lock_clause, event
+from stock_sync_common import SyncError, one, rows, loads, dumps, digest, uid, stamp, now, parse_time, begin, lock_clause, event, lock_site_connections
 from stock_sync_permissions import actor, require_object, target_sites
 from stock_sync_catalog import enqueue
 
@@ -38,6 +38,7 @@ def confirm(c,u,data):
     chosen = [i for i in items if i['id'] in accepted]
     if len(chosen)!=len(accepted) or any(i['decision'] not in ('change','unchanged') for i in chosen):
         raise SyncError('INVALID_ACCEPTED_ITEMS','冲突和跳过项目不能执行',400)
+    lock_site_connections(c, req['target_site_ids'] + ([req['source_site_id']] if req.get('source_site_id') else []))
     id_ = uid()
     c.execute("INSERT INTO stock_sync_jobs(id,plan_id,actor_id,idempotency_key,request_hash,status,created_at) VALUES(?,?,?,?,?,'queued',?)",(id_,plan['id'],u['id'],key,request_hash,stamp()))
     for item in chosen:

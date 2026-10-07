@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Iterable
 
 import db_backend as db
+from site_connection_service import ARCHIVED_STATUS
 from sync_site_health import clear_site_failure, load_site_health, record_site_failure
 
 
@@ -194,16 +195,19 @@ def _normalize_site_ids(site_ids: Iterable[Any] | None) -> list[int] | None:
 
 
 def _load_sites(connection, site_ids: list[int] | None):
+    lock = " FOR KEY SHARE" if hasattr(connection, "_raw") else ""
     if site_ids is None:
         return connection.execute(
-            "SELECT id,url FROM sites ORDER BY id"
+            "SELECT id,url FROM sites WHERE COALESCE(api_status,'')<>? ORDER BY id" + lock,
+            (ARCHIVED_STATUS,),
         ).fetchall()
     if not site_ids:
         return []
     placeholders = ",".join("?" for _ in site_ids)
     return connection.execute(
-        f"SELECT id,url FROM sites WHERE id IN ({placeholders}) ORDER BY id",
-        tuple(site_ids),
+        f"SELECT id,url FROM sites WHERE id IN ({placeholders}) "
+        "AND COALESCE(api_status,'')<>? ORDER BY id" + lock,
+        (*site_ids, ARCHIVED_STATUS),
     ).fetchall()
 
 
@@ -260,7 +264,7 @@ def start_sync(
         if normalized_ids is not None and len(sites) != len(normalized_ids):
             found = {int(row["id"]) for row in sites}
             missing = sorted(set(normalized_ids) - found)
-            raise ValueError("unknown site ids: " + ",".join(map(str, missing)))
+            raise ValueError("unavailable or unknown site ids: " + ",".join(map(str, missing)))
         if not sites:
             raise ValueError("no sites configured for synchronization")
         connection.execute(

@@ -1,5 +1,6 @@
 """Current DB permissions at every boundary, independent of the broad admin role."""
 from stock_sync_common import SyncError, one, rows, positive_ids
+from site_connection_service import filter_active_sites, is_site_archived
 
 
 def actor(c, actor_id):
@@ -16,13 +17,15 @@ def can_write(u, site):
     return u['superadmin'] or bool(u.get('name') and str(u['name']).strip() == str(site.get('manager') or '').strip())
 
 
-def target_sites(c, u, scope):
+def target_sites(c, u, scope, allow_archived=False):
     sites = rows(c, 'SELECT * FROM sites ORDER BY id')
+    if not allow_archived:
+        sites = filter_active_sites(c, sites)
     if scope.get('mode') == 'explicit_sites':
         ids = positive_ids(scope.get('site_ids'), 'site_ids')
         chosen = [s for s in sites if s['id'] in ids]
         if len(chosen) != len(ids) or any(not can_write(u, s) for s in chosen):
-            raise SyncError('PERMISSION_REVOKED', '包含无权写入或不存在的目标站点', 403)
+            raise SyncError('PERMISSION_REVOKED', '包含无权写入、不存在或已删除连接的目标站点', 403)
     elif scope.get('mode') == 'all_authorized':
         chosen = [s for s in sites if can_write(u, s)]
     else:
@@ -35,11 +38,13 @@ def target_sites(c, u, scope):
     return chosen
 
 
-def reference_site(c, u, site_id):
+def reference_site(c, u, site_id, allow_archived=False):
     s = one(c, 'SELECT * FROM sites WHERE id=?', (site_id,))
     shared = one(c, 'SELECT * FROM stock_sync_reference_sites WHERE site_id=? AND enabled=1', (site_id,))
     if not s or not (can_write(u, s) or shared):
         raise SyncError('REFERENCE_PERMISSION_REVOKED', '参照读取权限不存在或已撤销', 403)
+    if not allow_archived and is_site_archived(s):
+        raise SyncError('SITE_ARCHIVED', '参照站点连接已删除，不能继续远程读取', 409)
     return s
 
 
@@ -51,9 +56,9 @@ def can_release(u, control):
     return u['superadmin'] or control['protection'] != 'superadmin'
 
 
-def require_object(c, u, obj, site_ids, source_id=None):
+def require_object(c, u, obj, site_ids, source_id=None, allow_archived=False):
     if not u['superadmin'] and obj['actor_id'] != u['id']:
         raise SyncError('FORBIDDEN', '无权查看该记录', 403)
-    target_sites(c, u, {'mode': 'explicit_sites', 'site_ids': list(site_ids)})
+    target_sites(c, u, {'mode': 'explicit_sites', 'site_ids': list(site_ids)}, allow_archived=allow_archived)
     if source_id:
-        reference_site(c, u, source_id)
+        reference_site(c, u, source_id, allow_archived=allow_archived)

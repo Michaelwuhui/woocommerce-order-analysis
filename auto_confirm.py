@@ -30,6 +30,7 @@ from datetime import datetime
 from return_shipping_loss import load_policy, quote_loss, required_loss
 
 from oid_utils import woo_post_id  # raw WC post id for REST write-back
+from site_connection_service import filter_active_sites, is_site_archived
 
 ENABLE_KEY = 'auto_confirm_delivered_enabled'
 RETURNED_ENABLE_KEY = 'auto_confirm_returned_enabled'
@@ -331,12 +332,14 @@ def _ready_sql():
 
 
 def _load_sites(conn):
-    return {r['url']: r for r in conn.execute("SELECT * FROM sites").fetchall()}
+    return {r['url']: r for r in filter_active_sites(conn, conn.execute("SELECT * FROM sites").fetchall())}
 
 
-def _complete_remote(site, oid):
+def _complete_remote(site, oid, conn=None):
     """PUT status=completed on WooCommerce. Returns (ok: bool, detail: str).
     Mirrors app.confirm_order_delivery's WC push (fires the completed email)."""
+    if is_site_archived(site) or (conn is not None and is_site_archived(conn, site['id'])):
+        return False, "站点连接已删除，未提交远程签收确认"
     wid = woo_post_id(oid)
     url = f"{site['url']}/wp-json/wc/v3/orders/{wid}"
     try:
@@ -431,7 +434,7 @@ def enforce(conn, progress=None, dry_run=False, actor='auto'):
                 _log(f"[auto-confirm] #{num} 无写权限，仅本地标记签收")
             continue
 
-        ok, detail = _complete_remote(site, oid)
+        ok, detail = _complete_remote(site, oid, conn=conn)
         if ok:
             conn.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
             _confirm_local(conn, oid, now)

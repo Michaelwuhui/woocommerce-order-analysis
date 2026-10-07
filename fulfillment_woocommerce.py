@@ -19,6 +19,7 @@ from fulfillment_service import (
     record_event,
 )
 from oid_utils import woo_post_id
+from site_connection_service import is_site_archived
 from shipment_customer_messages import (
     CUSTOMER_NOTE_TEXT,
     customer_carrier_name,
@@ -270,7 +271,13 @@ def _remote_has_tracking(payload: Any, tracking_number: str) -> bool:
     return str(payload or "").strip() == tracking_number
 
 
-def _request(method: str, url: str, site, *, payload=None, timeout=60):
+def _require_site_connection(site, conn=None):
+    if is_site_archived(site) or (conn is not None and is_site_archived(conn, site["id"])):
+        raise WooError("站点连接已删除，不能继续远程发货、签收或发送邮件", code="site_archived")
+
+
+def _request(method: str, url: str, site, *, payload=None, timeout=60, conn=None):
+    _require_site_connection(site, conn)
     try:
         response = requests.request(
             method,
@@ -410,10 +417,11 @@ def _customer_note_body(conn, order, shipment: dict, tracking_url: str = "", sit
 def _post_customer_note(conn, site, order, shipment, tracking_url: str = "") -> None:
     body = _customer_note_body(conn, order, shipment, tracking_url, site=site)
     url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}/notes"
-    _request("POST", url, site, payload={"note": body, "customer_note": True}, timeout=45)
+    _request("POST", url, site, payload={"note": body, "customer_note": True}, timeout=45, conn=conn)
 
 
 def _notify_shipment(conn, site, order, shipment: dict, fmt: str, final: bool) -> str:
+    _require_site_connection(site, conn)
     notification = conn.execute(
         '''SELECT * FROM oms_shipment_notifications
            WHERE shipment_id=? AND channel='email' AND template_version=? ''',
@@ -443,6 +451,7 @@ def _notify_shipment(conn, site, order, shipment: dict, fmt: str, final: bool) -
             result = "sent_split_cod_customer_note"
         else:
             trigger_url = f"{site['url']}/wp-json/woo-tracking/v1/orders/{woo_post_id(order['id'])}/trigger-shipment-email"
+            _require_site_connection(site, conn)
             response = requests.post(
                 trigger_url,
                 json={"tracking_number": shipment["tracking_number"], "carrier_slug": shipment["carrier_slug"]},
@@ -490,6 +499,8 @@ def sync_shipment(conn, shipment_id: str) -> dict:
     shipment = dict(shipment_row)
     order = conn.execute("SELECT * FROM orders WHERE id=?", (shipment["order_id"],)).fetchone()
     site = conn.execute("SELECT * FROM sites WHERE url=?", (order["source"],)).fetchone()
+    if site:
+        _require_site_connection(site, conn)
     if not site or not site["consumer_key"] or not site["consumer_secret"]:
         raise WooError("WooCommerce 站点写入凭据缺失", code="site_credentials_missing")
 
@@ -548,15 +559,15 @@ def sync_shipment(conn, shipment_id: str) -> dict:
         write_method = "PUT"
         write_payload = payload
     try:
-        remote = _request(write_method, write_url, site, payload=write_payload)
+        remote = _request(write_method, write_url, site, payload=write_payload, conn=conn)
     except WooError as exc:
         if not exc.unknown_outcome:
             raise
-        remote = _request("GET", url, site)
+        remote = _request("GET", url, site, conn=conn)
         if not _remote_has_tracking(remote, shipment["tracking_number"]):
             raise
     if not _remote_has_tracking(remote, shipment["tracking_number"]):
-        verify = _request("GET", url, site)
+        verify = _request("GET", url, site, conn=conn)
         if not _remote_has_tracking(verify, shipment["tracking_number"]):
             raise WooError("WooCommerce 回查未找到新运单号", code="tracking_not_persisted", retryable=True)
 
@@ -616,17 +627,19 @@ def complete_order(conn, order_id: str) -> dict:
     if not order:
         raise DomainError("订单不存在", "order_not_found")
     site = conn.execute("SELECT * FROM sites WHERE url=?", (order["source"],)).fetchone()
+    if site:
+        _require_site_connection(site, conn)
     if not site or not site["consumer_key"] or not site["consumer_secret"]:
         raise WooError("WooCommerce 站点写入凭据缺失", code="site_credentials_missing")
     url = f"{site['url']}/wp-json/wc/v3/orders/{woo_post_id(order['id'])}"
     try:
-        remote = _request("PUT", url, site, payload={"status": "completed"})
+        remote = _request("PUT", url, site, payload={"status": "completed"}, conn=conn)
     except WooError as exc:
         if not exc.unknown_outcome:
             raise
-        remote = _request("GET", url, site)
+        remote = _request("GET", url, site, conn=conn)
     if remote.get("status") != "completed":
-        remote = _request("GET", url, site)
+        remote = _request("GET", url, site, conn=conn)
         if remote.get("status") != "completed":
             raise WooError("WooCommerce 回查状态不是 completed", code="completion_not_persisted", retryable=True)
     conn.execute("UPDATE orders SET status='completed' WHERE id=?", (order_id,))

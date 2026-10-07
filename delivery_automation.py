@@ -8,6 +8,7 @@ import requests
 import auto_confirm
 from external_operations import begin_operation, transition_operation
 from oid_utils import woo_post_id
+from site_connection_service import is_site_archived
 
 
 PAYLOAD = {"target_status": "completed"}
@@ -157,6 +158,8 @@ def process_delivered_order(conn, order_id, session=None):
         if ofs and ofs[0] in {"pending", "running"}:
             return {"order_id": order_id, "result": "fulfillment_completion_pending"}
         site = conn.execute("SELECT id,url,consumer_key,consumer_secret FROM sites WHERE url=?", (order["source"],)).fetchone()
+        if site and is_site_archived(conn, site["id"]):
+            return {"order_id": order_id, "result": "site_archived"}
         if not site or not site["consumer_key"] or not site["consumer_secret"]:
             return {"order_id": order_id, "result": "missing_credentials"}
         op = begin_operation(conn, operation_type="confirm_delivery", order_id=order_id,
@@ -203,6 +206,10 @@ def process_delivered_order(conn, order_id, session=None):
         conn.commit()
         # Persist the boundary before calling WooCommerce. An interrupted
         # read-only preflight can be retried; a started write must reconcile.
+        if is_site_archived(conn, site["id"]):
+            _transition(conn, op, "failed", error="site_connection_archived_before_write",
+                        evidence={"automatic": True, "phase": "preflight", "retry_safe": True})
+            return {"order_id": order_id, "result": "site_archived"}
         _record_phase(conn, op, 'write_started')
         try:
             response = session.put(url, auth=auth, headers=auto_confirm._API_HEADERS,

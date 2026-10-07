@@ -10,8 +10,9 @@ import re
 import unicodedata
 
 from stock_sync_common import (SyncError, begin, digest, dumps, event, exists,
-    loads, lock_clause, now, one, parse_time, rows, stamp, uid)
+    loads, lock_clause, now, one, parse_time, rows, stamp, uid, lock_site_connections)
 from stock_sync_permissions import actor, can_write, reference_site, require_object, target_sites
+from site_connection_service import is_site_archived
 from stock_sync_catalog import enqueue
 from stock_sync_woo import Woo, site_identity
 from product_recognition import parse_product_name
@@ -178,6 +179,7 @@ def create(c, u, data):
     if not targets:
         raise SyncError('EMPTY_TARGET', '请先勾选目标站点', 400)
     scope = {'purpose': 'mapping_assist', 'mode': 'explicit_sites', 'site_ids': [s['id'] for s in targets]}
+    lock_site_connections(c, scope['site_ids'] + ([source] if source else []))
     id_ = uid()
     c.execute('''INSERT INTO stock_sync_catalog_snapshots(id,actor_id,site_id,scope_json,status,created_at,expires_at)
                  VALUES(?,?,?,?,'queued',?,?)''', (id_, u['id'], source, dumps(scope), stamp(), stamp(3600)))
@@ -187,25 +189,25 @@ def create(c, u, data):
     return id_
 
 
-def accessible(c, u, id_, purpose='mapping_assist'):
+def accessible(c, u, id_, purpose='mapping_assist', allow_archived=False):
     require_manager(u)
     snap = one(c, 'SELECT * FROM stock_sync_catalog_snapshots WHERE id=?', (id_,))
     if not snap or loads(snap['scope_json']).get('purpose') != purpose:
         raise SyncError('NOT_FOUND', status=404)
     scope = loads(snap['scope_json'])
-    require_object(c, u, snap, scope['site_ids'], snap['site_id'])
+    require_object(c, u, snap, scope['site_ids'], snap['site_id'], allow_archived=allow_archived)
     return snap, scope
 
 
 def status(c, u, id_, confirmation=False):
-    snap, scope = accessible(c, u, id_, 'mapping_confirmation' if confirmation else 'mapping_assist')
+    snap, scope = accessible(c, u, id_, 'mapping_confirmation' if confirmation else 'mapping_assist', allow_archived=True)
     items = loads(snap['items_json'], [])
     sites = {s['id']: s for s in rows(c, 'SELECT * FROM sites')}
     for item in items:
         item.pop('identity_hash', None)
         item.pop('order_evidence', None)
         item.pop('expected_mapping', None)
-        item['writable'] = can_write(u, sites[item['site_id']])
+        item['writable'] = can_write(u, sites[item['site_id']]) and not is_site_archived(sites[item['site_id']])
         item['site_url'] = sites[item['site_id']]['url']
     result = {k: snap[k] for k in ('id','status','complete','progress','error','expires_at')}
     result.update(items=items, counts=dict(Counter(i['state'] for i in items)),
@@ -320,6 +322,7 @@ def confirm(c, u, id_, data):
         c.rollback()
         raise SyncError('MAPPING_INPUT_CHANGED', 'SKU 主档或产品识别规则已改变，请重新读取')
     new_scope = dict(scope, purpose='mapping_confirmation', parent_id=id_, reason=reason.strip())
+    lock_site_connections(c, scope['site_ids'] + ([snap['site_id']] if snap['site_id'] else []))
     c.execute('''INSERT INTO stock_sync_catalog_snapshots(id,actor_id,site_id,scope_json,status,items_json,created_at,expires_at)
                  VALUES(?,?,?,?,'queued',?,?,?)''',
         (confirmation_id, u['id'], snap['site_id'], dumps(new_scope), dumps(approved), stamp(), snap['expires_at']))

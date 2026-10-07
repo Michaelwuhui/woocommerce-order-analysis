@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from woocommerce import API
 
 from celery_app import celery_app
+from site_connection_service import SiteConnectionError, lock_active_sites
 from sync_service import (
     _event,
     _refresh_run_completion,
@@ -315,6 +316,13 @@ def run_clean_site(payload: dict):
     connection = get_connection()
     locked = False
     try:
+        try:
+            lock_active_sites(connection, [site_id])
+        except SiteConnectionError as exc:
+            if exc.code not in {"SITE_ARCHIVED", "SITE_NOT_FOUND"}:
+                raise
+            connection.rollback()
+            return {"skipped": True, "archived": exc.code == "SITE_ARCHIVED"}
         row = connection.execute(
             """SELECT r.mode,r.status AS run_status,r.cancellation_requested,
                       p.status AS site_status,s.url,s.consumer_key,s.consumer_secret

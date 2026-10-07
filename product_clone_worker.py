@@ -10,6 +10,7 @@ import db_backend as sqlite3
 import time
 import traceback
 import uuid
+from site_connection_service import is_site_archived
 
 from product_clone_jobs import (
     claim_clone_job,
@@ -46,6 +47,8 @@ def resolve_site_for_worker(conn, site_id: int, *, get_api_endpoint):
     ).fetchone()
     if not site:
         raise ValueError(f"站点 {site_id} 不存在")
+    if is_site_archived(conn, site_id):
+        raise ValueError("站点连接已删除，未执行克隆")
     api_url, ck, cs = get_api_endpoint(conn, site)
     if not (api_url and ck and cs):
         raise ValueError("站点未配置完整的 WC REST API 凭据")
@@ -67,6 +70,8 @@ def resolve_catalog_clone_site(conn, site_id, actor_id):
     ).fetchone()
     if not site:
         raise ValueError("克隆站点不存在")
+    if is_site_archived(conn, site_id):
+        raise ValueError("站点连接已删除，未执行克隆")
     scoped = actor["username"] != "admin" and (actor["role"] != "admin" or actor["can_manage_own_products"] == 1)
     name = str(actor["name"] or "").strip()
     if scoped and (not name or name != str(site["manager"] or "").strip()):
@@ -80,6 +85,8 @@ def process_clone_job(conn, job: dict, *, clone_one, resolve_site) -> dict:
     """Process one claimed job and persist progress after every product."""
     direct = (job.get("options") or {}).get("_catalog_direct_sites") is True
     try:
+        if any(is_site_archived(conn, int(job[key])) for key in ("source_site_id", "target_site_id")):
+            raise ValueError("站点连接已删除，未执行克隆")
         if direct:
             source = resolve_catalog_clone_site(conn, int(job["source_site_id"]), job["created_by_id"])
             target = resolve_catalog_clone_site(conn, int(job["target_site_id"]), job["created_by_id"])
@@ -109,17 +116,22 @@ def process_clone_job(conn, job: dict, *, clone_one, resolve_site) -> dict:
         set_current_product(conn, job["id"], product_id)
         try:
             clone_options = dict(job.get("options") or {})
-            if direct:
-                # Reassigned or revoked operators cannot continue queued writes.
-                def check_direct_write():
+            # Recheck both legacy and direct jobs immediately before every
+            # remote write, including images and variants of an existing parent.
+            def check_clone_write():
+                if any(is_site_archived(conn, int(job[key])) for key in ("source_site_id", "target_site_id")):
+                    raise ValueError("克隆执行期间站点连接已删除，未继续写入")
+                if direct:
                     fresh_source = resolve_catalog_clone_site(conn, int(job["source_site_id"]), job["created_by_id"])
                     fresh_target = resolve_catalog_clone_site(conn, int(job["target_site_id"]), job["created_by_id"])
-                    if fresh_source[1:] != source[1:] or fresh_target[1:] != target[1:]:
-                        raise ValueError("克隆执行期间站点 URL 或 API 凭据已变化，未继续写入")
-                check_direct_write()
-                # A process-local callable never enters the persisted job JSON.
-                # App helpers invoke it immediately before each external write.
-                clone_options["_catalog_write_check"] = check_direct_write
+                else:
+                    fresh_source = resolve_site(conn, int(job["source_site_id"]))
+                    fresh_target = resolve_site(conn, int(job["target_site_id"]))
+                if fresh_source[1:] != source[1:] or fresh_target[1:] != target[1:]:
+                    raise ValueError("克隆执行期间站点 URL 或 API 凭据已变化，未继续写入")
+            check_clone_write()
+            # A process-local callable never enters the persisted job JSON.
+            clone_options["_catalog_write_check"] = check_clone_write
             result = clone_one(
                 src_url, src_ck, src_cs, tgt_url, tgt_ck, tgt_cs,
                 product_id, clone_options,

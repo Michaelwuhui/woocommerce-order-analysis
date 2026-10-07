@@ -7,6 +7,7 @@ import uuid
 
 from flask import Blueprint, current_app, jsonify, request, session
 from flask_login import current_user, login_required
+from site_connection_service import filter_active_sites, is_site_archived
 import requests
 
 from product_manager_catalog import _build_row, _configured, _public_site_url
@@ -248,12 +249,15 @@ def create_catalog_edit_blueprint(get_db_connection, product_manager_required,
         try:
             actor = connection.execute("SELECT username,name,role,can_manage_products,can_manage_own_products FROM users WHERE id=?", (current_user.id,)).fetchone()
             row = connection.execute(f"SELECT {SITE_FIELDS} FROM sites WHERE id=?", (site_id,)).fetchone()
+            archived = is_site_archived(connection, site_id)
         finally:
             connection.close()
         if not actor or (actor["username"] != "admin" and actor["can_manage_products"] != 1):
             raise CatalogEditError("PERMISSION_REVOKED", "产品管理权限已撤销，未继续提交修改。", 403)
         if row is None:
             raise CatalogEditError("SITE_NOT_FOUND", "站点不存在。", 404)
+        if archived:
+            raise CatalogEditError("SITE_ARCHIVED", "站点连接已删除，不能继续读取、编辑或克隆该站点商品。", 409)
         site = dict(row)
         scoped = actor["username"] != "admin" and (actor["role"] != "admin" or actor["can_manage_own_products"] == 1)
         name = str(actor["name"] or "").strip()
@@ -327,6 +331,7 @@ def create_catalog_edit_blueprint(get_db_connection, product_manager_required,
         connection = get_db_connection()
         try:
             sites = [dict(row) for row in connection.execute(f"SELECT {SITE_FIELDS} FROM sites ORDER BY country,url").fetchall()]
+            sites = filter_active_sites(connection, sites)
         finally:
             connection.close()
         visible = [{"id": site["id"], "url": _public_site_url(site["url"]),

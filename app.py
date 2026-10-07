@@ -35,6 +35,9 @@ from sales_board_rates import (
 from sales_target_inheritance import load_sales_targets_for_month
 from customer_spending import customer_spending_cny_by_email
 from customer_table_data import customer_table_context
+from site_connection_service import (
+    SiteConnectionError, filter_active_sites, is_site_archived, remove_connection,
+)
 from shipment_split import (
     ShipmentItemError,
     normalize_batch_items,
@@ -1386,9 +1389,8 @@ def _can_manage_all_settings(user):
 
 def _can_manage_site_sync(user, site_id):
     """Authorize one site using the current DB name-to-manager assignment."""
-    if _can_manage_all_settings(user):
-        return True
-    if not user.is_authenticated or not user.can_manage_own_site_sync():
+    from site_connection_service import is_site_archived
+    if not user.is_authenticated:
         return False
     try:
         site_id = int(site_id)
@@ -1396,6 +1398,12 @@ def _can_manage_site_sync(user, site_id):
         return False
     conn = get_db_connection()
     try:
+        if is_site_archived(conn, site_id):
+            return False
+        if _can_manage_all_settings(user):
+            return conn.execute('SELECT 1 FROM sites WHERE id = ?', (site_id,)).fetchone() is not None
+        if not user.can_manage_own_site_sync():
+            return False
         return conn.execute(
             '''
             SELECT 1
@@ -7342,6 +7350,7 @@ else:
 def settings():
     """Full settings, or the connected-sites card scoped to the user's sites."""
     from sync_site_health import load_site_health
+    from site_connection_service import filter_active_sites
 
     conn = get_db_connection()
     site_sync_only = not _can_manage_all_settings(current_user)
@@ -7357,6 +7366,7 @@ def settings():
             ''',
             (current_user.id,),
         ).fetchall()
+        sites = filter_active_sites(conn, sites)
         site_managers = sorted({
             (site['manager'] or '').strip()
             for site in sites
@@ -7384,6 +7394,7 @@ def settings():
         )
 
     sites = conn.execute('SELECT * FROM sites').fetchall()
+    sites = filter_active_sites(conn, sites)
     site_health = load_site_health(conn, [site['id'] for site in sites]) if sqlite3.is_postgres_backend() else {}
     site_managers = sorted({
         (site['manager'] or '').strip()
@@ -7736,12 +7747,15 @@ def _resolve_site_for_product_edit(conn, site_id):
     can edit its products. Super admin bypasses. This is stricter than
     user_site_permissions (used elsewhere for read access) — viewers and other
     users cannot edit even if they have read permission for the site."""
+    from site_connection_service import is_site_archived
     site = conn.execute(
         'SELECT id, url, consumer_key, consumer_secret, product_master_id, manager FROM sites WHERE id = ?',
         (site_id,)
     ).fetchone()
     if not site:
         raise ValueError(f'站点 {site_id} 不存在')
+    if is_site_archived(conn, site_id):
+        raise ValueError('站点连接已移除，请在系统设置中重新添加后操作')
 
     # Site-level permission check: own-scoped product managers must match the
     # site's named manager. Built-in super admin and unscoped admin-role users
@@ -9061,6 +9075,24 @@ def add_site():
 
     conn = get_db_connection()
     try:
+        existing = conn.execute(
+            'SELECT * FROM sites WHERE LOWER(RTRIM(url, \'/\')) = LOWER(?)', (url,)
+        ).fetchone()
+        if existing:
+            # Retain the identity used by historical orders and permission scopes.
+            if sqlite3.is_postgres_backend():
+                existing = conn.execute('SELECT * FROM sites WHERE id = ? FOR UPDATE', (existing['id'],)).fetchone()
+            if not is_site_archived(existing):
+                return jsonify({'error': '该站点连接已存在'}), 409
+            conn.execute('''UPDATE sites SET consumer_key = ?, consumer_secret = ?,
+                manager = ?, mask_id = ?, country = ?, product_master_id = ?,
+                api_status = 'unknown', last_api_error = NULL
+                WHERE id = ?''', (ck, cs, (data.get('manager') or '').strip() or existing['manager'],
+                    (data.get('mask_id') or '').strip() or existing['mask_id'],
+                    (data.get('country') or '').strip() or existing['country'],
+                    product_master_id, existing['id']))
+            conn.commit()
+            return jsonify({'success': True, 'id': existing['id'], 'restored': True})
         conn.execute('''INSERT INTO sites
             (url, consumer_key, consumer_secret, manager, mask_id, country, product_master_id)
             VALUES (?, ?, ?, ?, ?, ?, ?)''',
@@ -9103,6 +9135,14 @@ def update_site(site_id):
 
     conn = get_db_connection()
     try:
+        lock_sql = 'SELECT * FROM sites WHERE id = ?'
+        if sqlite3.is_postgres_backend():
+            lock_sql += ' FOR UPDATE'
+        existing = conn.execute(lock_sql, (site_id,)).fetchone()
+        if not existing:
+            return jsonify({'error': '站点不存在'}), 404
+        if is_site_archived(existing):
+            return jsonify({'error': '站点连接已移除，请通过添加站点恢复连接', 'code': 'SITE_ARCHIVED'}), 409
         if cod_on_hold_raw is None:
             conn.execute('''UPDATE sites
                 SET url = ?, consumer_key = ?, consumer_secret = ?,
@@ -9129,17 +9169,20 @@ def update_site(site_id):
 @login_required
 @admin_required
 def delete_site(site_id):
-    """Delete a WooCommerce site. Admin-only."""
-    print(f"Received delete request for site_id: {site_id}") # Debug log
+    """Remove connection credentials while preserving historical site identity."""
     conn = get_db_connection()
     try:
-        conn.execute('DELETE FROM sites WHERE id = ?', (site_id,))
+        result = remove_connection(conn, site_id, actor_id=current_user.id,
+                                   actor_name=current_user.name or current_user.username)
         conn.commit()
-        print(f"Successfully deleted site_id: {site_id}") # Debug log
-        return jsonify({'success': True})
-    except Exception as e:
-        print(f"Error deleting site: {e}") # Debug log
-        return jsonify({'error': str(e)}), 500
+        return jsonify(result)
+    except SiteConnectionError as exc:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(exc), 'code': exc.code}), exc.status
+    except Exception:
+        conn.rollback()
+        app.logger.exception('移除站点连接失败: site_id=%s', site_id)
+        return jsonify({'success': False, 'error': '连接暂时无法移除，请稍后重试'}), 500
     finally:
         conn.close()
 
@@ -9339,17 +9382,19 @@ def cancel_sync_run(run_id):
 @login_required
 def sync_own_sites():
     """Quick-sync the caller's current manager assignments, never client IDs."""
+    from site_connection_service import filter_active_sites
     if not current_user.can_manage_own_site_sync():
         return jsonify({'error': '没有本人站点同步权限'}), 403
     conn = get_db_connection()
     try:
-        site_ids = [row['id'] for row in conn.execute(
+        sites = conn.execute(
             '''SELECT s.id FROM sites s JOIN users u ON u.id = ?
                WHERE TRIM(COALESCE(u.name, '')) != ''
                  AND TRIM(COALESCE(s.manager, '')) = TRIM(u.name)
                ORDER BY s.id''',
             (current_user.id,),
-        ).fetchall()]
+        ).fetchall()
+        site_ids = [row['id'] for row in filter_active_sites(conn, sites)]
     finally:
         conn.close()
     if not site_ids:
@@ -9363,6 +9408,7 @@ def sync_own_sites():
 @login_required
 def sync_data():
     """Trigger data synchronization"""
+    from site_connection_service import is_site_archived, filter_active_sites
     import sync_utils
     import threading
 
@@ -9397,7 +9443,7 @@ def sync_data():
                 site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
                 conn.close()
                 
-                if not site:
+                if not site or is_site_archived(site):
                     SYNC_STATUS[site_id]['status'] = 'error'
                     SYNC_STATUS[site_id]['message'] = 'Site not found'
                     _publish_sync_status(site_id)
@@ -9470,6 +9516,7 @@ def sync_data():
 @login_required
 def deep_sync_site(site_id):
     """Trigger deep sync for a single site using 1.wooorders_sqlite.py"""
+    from site_connection_service import is_site_archived, filter_active_sites
     import subprocess
     import threading
 
@@ -9495,7 +9542,7 @@ def deep_sync_site(site_id):
                 site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
                 conn.close()
                 
-                if not site:
+                if not site or is_site_archived(site):
                     SYNC_STATUS[status_id]['status'] = 'error'
                     SYNC_STATUS[status_id]['message'] = 'Site not found'
                     _publish_sync_status(status_id)
@@ -9554,7 +9601,7 @@ def deep_sync_site(site_id):
                             
                             # Update site API status in database
                             conn = get_db_connection()
-                            conn.execute('UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ?', 
+                            conn.execute("UPDATE sites SET api_status = ?, last_api_error = ? WHERE id = ? AND COALESCE(api_status, '') != 'archived'",
                                          ('error', error_msg, site_id))
                             conn.commit()
                             conn.close()
@@ -9590,7 +9637,7 @@ def deep_sync_site(site_id):
                 
                 # Update last sync time and API status (success)
                 conn = get_db_connection()
-                conn.execute('UPDATE sites SET last_sync = ?, api_status = ?, last_api_error = NULL WHERE id = ?', 
+                conn.execute("UPDATE sites SET last_sync = ?, api_status = ?, last_api_error = NULL WHERE id = ? AND COALESCE(api_status, '') != 'archived'",
                              (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'ok', site_id))
                 conn.commit()
                 conn.close()
@@ -9660,7 +9707,7 @@ def check_site_api(site_id):
         conn.execute('''
             UPDATE sites
             SET api_read_status = ?, api_write_status = ?, last_api_error = ?
-            WHERE id = ?
+            WHERE id = ? AND COALESCE(api_status, '') != 'archived'
         ''', (read_status, 'unknown', error_msg, site_id))
         conn.commit()
     finally:
@@ -9679,11 +9726,15 @@ def check_site_api(site_id):
 @login_required
 def check_tracking_api(site_id):
     """Check if woo-tracking REST API plugin is available on the site"""
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
     
     conn = get_db_connection()
     site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
     
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         conn.close()
         return jsonify({'success': False, 'error': '站点不存在'}), 404
@@ -9746,11 +9797,15 @@ def check_tracking_api(site_id):
 @login_required
 def get_site_email_logs(site_id):
     """Get email logs from WordPress site via woo-tracking REST API"""
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
     
     conn = get_db_connection()
     site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
     
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         conn.close()
         return jsonify({'success': False, 'error': '站点不存在'}), 404
@@ -9792,11 +9847,15 @@ def get_site_email_logs(site_id):
 @login_required
 def get_site_email_stats(site_id):
     """Get email statistics from WordPress site via woo-tracking REST API"""
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
     
     conn = get_db_connection()
     site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
     
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         conn.close()
         return jsonify({'success': False, 'error': '站点不存在'}), 404
@@ -9838,11 +9897,13 @@ def check_all_sites_api():
     Each check uses the single-site endpoint and persists its own result. No
     process-local job state or long-lived Gunicorn background thread is needed.
     """
+    from site_connection_service import is_site_archived, filter_active_sites
     conn = get_db_connection()
     try:
         sites = [dict(row) for row in conn.execute(
             'SELECT id, url FROM sites ORDER BY id'
         ).fetchall()]
+        sites = filter_active_sites(conn, sites)
     finally:
         conn.close()
     return jsonify({'success': True, 'mode': 'sequential', 'sites': sites})
@@ -9859,6 +9920,7 @@ def get_check_status(check_id):
 @login_required
 def clean_sync_site(site_id):
     """Clean deleted orders for a single site"""
+    from site_connection_service import is_site_archived, filter_active_sites
     import threading
 
     if not _can_manage_site_sync(current_user, site_id):
@@ -9887,7 +9949,7 @@ def clean_sync_site(site_id):
                 site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
                 conn.close()
                 
-                if not site:
+                if not site or is_site_archived(site):
                     SYNC_STATUS[status_id]['status'] = 'error'
                     SYNC_STATUS[status_id]['message'] = 'Site not found'
                     _publish_sync_status(status_id)
@@ -10050,6 +10112,7 @@ def clean_sync_site(site_id):
 @all_site_sync_required
 def sync_all_data():
     """Trigger data synchronization for ALL sites"""
+    from site_connection_service import is_site_archived, filter_active_sites
     if sqlite3.is_postgres_backend():
         return _start_durable_sync('quick')
     import sync_utils
@@ -10081,7 +10144,7 @@ def sync_all_data():
         with app_context:
             try:
                 conn = get_db_connection()
-                sites = conn.execute('SELECT * FROM sites').fetchall()
+                sites = filter_active_sites(conn, conn.execute('SELECT * FROM sites').fetchall())
                 conn.close()
 
                 if not sites:
@@ -10386,10 +10449,14 @@ def _get_woosync():
 @admin_required
 def backup_site_diff():
     """只读：对比某站点'镜像有、线上没有'的订单（疑似该站回滚丢失的订单）。不修改任何数据。"""
+    from site_connection_service import is_site_archived, filter_active_sites
     data = request.json or {}
     site_id = data.get('site_id')
     conn = get_db_connection()
-    site = conn.execute('SELECT id, url, consumer_key, consumer_secret FROM sites WHERE id = ?', (site_id,)).fetchone()
+    site = conn.execute('SELECT id, url, consumer_key, consumer_secret, api_status FROM sites WHERE id = ?', (site_id,)).fetchone()
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         conn.close()
         return jsonify({'success': False, 'error': '站点不存在'}), 404
@@ -10759,10 +10826,11 @@ def get_sync_dashboard():
 @all_site_sync_required
 def get_sync_summary():
     """Get sync summary for all sites"""
+    from site_connection_service import is_site_archived, filter_active_sites
     conn = get_db_connection()
     
     # Get all sites with their latest sync info
-    sites = conn.execute('SELECT * FROM sites').fetchall()
+    sites = filter_active_sites(conn, conn.execute('SELECT * FROM sites').fetchall())
     
     summary = []
     for site in sites:
@@ -10880,6 +10948,7 @@ def trigger_deep_sync():
 @all_site_sync_required
 def clean_all_sites():
     """Clean deleted orders from all sites"""
+    from site_connection_service import is_site_archived, filter_active_sites
     if sqlite3.is_postgres_backend():
         return _start_durable_sync('clean')
     import threading
@@ -10903,7 +10972,7 @@ def clean_all_sites():
                 import random
                 
                 conn = get_db_connection()
-                sites = conn.execute('SELECT * FROM sites').fetchall()
+                sites = filter_active_sites(conn, conn.execute('SELECT * FROM sites').fetchall())
                 conn.close()
                 
                 total_deleted = 0
@@ -18793,6 +18862,7 @@ def ship_order():
     request. After that we (optionally) post a customer-visible note so WC
     sends the shipment email — same path the WP admin order-edit screen takes.
     """
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
     import time
 
@@ -18861,6 +18931,9 @@ def ship_order():
         }), 409
 
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         conn.close()
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
@@ -19660,6 +19733,7 @@ def ship_order():
 @order_site_editable
 def debug_tracking_sync(order_id):
     """Debug endpoint to manually resync tracking number to WordPress"""
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
     
     conn = get_db_connection()
@@ -19686,6 +19760,9 @@ def debug_tracking_sync(order_id):
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
     conn.close()
     
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
     
@@ -19757,6 +19834,7 @@ def debug_tracking_sync(order_id):
 @order_site_editable
 def complete_order(order_id):
     """Mark an order completed without ever repeating an ambiguous WC write."""
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
 
     conn = get_db_connection()
@@ -19783,6 +19861,9 @@ def complete_order(order_id):
         return jsonify({'success': False, 'error': completion_error}), 409
     
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         conn.close()
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
@@ -20275,6 +20356,7 @@ def get_order_emails(order_id):
     email-logging plugin is installed (FluentSMTP / WP Mail SMTP / Email Log)
     and returns a unified shape, so we just relay it.
     """
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
 
     conn = get_db_connection()
@@ -20284,6 +20366,9 @@ def get_order_emails(order_id):
         return jsonify({'success': False, 'error': '订单不存在'}), 404
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
     conn.close()
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
 
@@ -20412,11 +20497,15 @@ def get_customer_emails():
 def get_site_email_detail(site_id, log_id):
     """Fetch full email detail by (site, log_id). Used by the customer modal
     where there's no specific order to scope to."""
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
 
     conn = get_db_connection()
     site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
     conn.close()
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         return jsonify({'success': False, 'error': '站点不存在'}), 404
 
@@ -20447,6 +20536,7 @@ def get_order_email_detail(order_id, log_id):
     """Fetch full body / headers for one email log entry. Backed by the WP
     plugin's /orders/{id}/email-logs/{log_id} route, which auto-detects
     the site's logger plugin (FluentSMTP / WP Mail SMTP / etc)."""
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
 
     conn = get_db_connection()
@@ -20456,6 +20546,9 @@ def get_order_email_detail(order_id, log_id):
         return jsonify({'success': False, 'error': '订单不存在'}), 404
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
     conn.close()
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
 
@@ -20509,6 +20602,7 @@ def add_order_note(order_id):
     may have been written. Keep our read timeout below the proxy window, then
     verify by GET so the client still gets JSON.
     """
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
 
     data = request.json
@@ -20527,6 +20621,9 @@ def add_order_note(order_id):
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
     conn.close()
 
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404
 
@@ -20652,6 +20749,7 @@ def add_order_note(order_id):
 @order_site_editable
 def update_order_status(order_id):
     """Update order status manually"""
+    from site_connection_service import is_site_archived, filter_active_sites
     import requests as req
     
     data = request.json
@@ -20707,6 +20805,9 @@ def update_order_status(order_id):
     
     # Get site credentials
     site = conn.execute('SELECT * FROM sites WHERE url = ?', (order['source'],)).fetchone()
+    if site and is_site_archived(site):
+        conn.close()
+        return jsonify({'success': False, 'error': '站点连接已移除，请重新添加后操作', 'code': 'SITE_ARCHIVED'}), 409
     if not site:
         conn.close()
         return jsonify({'success': False, 'error': '站点配置不存在'}), 404

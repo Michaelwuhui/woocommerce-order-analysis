@@ -1,6 +1,6 @@
 """Durable immutable catalog snapshots; a failed page never means sold out."""
 import logging
-from stock_sync_common import SyncError, uid, rows, one, dumps, loads, stamp, event
+from stock_sync_common import SyncError, uid, rows, one, dumps, loads, stamp, event, lock_site_connections
 from stock_sync_permissions import actor, target_sites, reference_site
 from stock_sync_supply import mappings, mapping_hash
 from stock_sync_woo import Woo, stock_state
@@ -19,6 +19,7 @@ def create_scan(c, u, request):
         scope = {'mode':'explicit_sites','site_ids':[]}
     else:
         scope = {'mode':'explicit_sites','site_ids':[s['id'] for s in target_sites(c,u,scope)]}
+    lock_site_connections(c, [site_id] if site_id else scope['site_ids'])
     id_ = uid()
     c.execute('''INSERT INTO stock_sync_catalog_snapshots(id,actor_id,site_id,scope_json,status,created_at,expires_at)
         VALUES(?,?,?,?,'queued',?,?)''', (id_,u['id'],site_id,dumps(scope),stamp(),stamp(3600)))

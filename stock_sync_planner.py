@@ -1,7 +1,7 @@
 """Immutable plans, explicit intersections and input fingerprints."""
 from copy import deepcopy
 
-from stock_sync_common import SyncError, uid, rows, one, dumps, loads, digest, stamp, now, parse_time, event
+from stock_sync_common import SyncError, uid, rows, one, dumps, loads, digest, stamp, now, parse_time, event, lock_site_connections
 from stock_sync_permissions import actor, target_sites, reference_site, visible_site, can_release, require_object
 from stock_sync_catalog import enqueue, select_items
 from stock_sync_supply import mappings, mapping_hash, snapshot, strategy_conflict
@@ -59,6 +59,7 @@ def create_plan(c,u,data):
         'reference_sync_mode':data.get('reference_sync_mode','status_both')}
     if request['reference_sync_mode'] not in ('status_both','sold_out_only'):
         raise SyncError('INVALID_INPUT',status=400)
+    lock_site_connections(c, request['target_site_ids'] + ([source_id] if source_id else []))
     id_ = uid()
     c.execute('''INSERT INTO stock_sync_plans(id,actor_id,request_json,status,created_at,expires_at)
         VALUES(?,?,?,'building',?,?)''',(id_,u['id'],dumps(request),stamp(),stamp(600)))

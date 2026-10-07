@@ -18,7 +18,9 @@ from urllib3.util import connection as urllib3_connection
 from celery_app import celery_app
 from sync_site_health import clear_site_failure, due_site_rechecks
 from oid_utils import make_oid
+from site_connection_service import SiteConnectionError, lock_active_sites
 from sync_service import (
+    ACTIVE_RUN_STATUSES,
     _event,
     _json,
     _refresh_run_completion,
@@ -56,6 +58,17 @@ def configure_ipv4_preference() -> bool:
 
 
 IPV4_PREFERENCE_ACTIVE = configure_ipv4_preference()
+
+
+def _active_site_for_task(connection, site_id):
+    """Reject obsolete messages before using credentials or changing orders."""
+    try:
+        lock_active_sites(connection, [site_id])
+        return True
+    except SiteConnectionError as exc:
+        if exc.code in {"SITE_ARCHIVED", "SITE_NOT_FOUND"}:
+            return False
+        raise
 
 
 class TransientFetchError(RuntimeError):
@@ -266,6 +279,9 @@ def _claim_fetch(payload: dict[str, Any], task_id: str):
     page = int(payload["page"])
     connection = get_connection()
     try:
+        if not _active_site_for_task(connection, site_id):
+            connection.rollback()
+            return None
         row = connection.execute(
             """
             SELECT d.status,d.fetch_task_id,d.heartbeat_at,
@@ -289,7 +305,7 @@ def _claim_fetch(payload: dict[str, Any], task_id: str):
         if row["status"] in {"fetched", "writing", "completed", "cancelled", "error", "auth_error"}:
             connection.rollback()
             return None
-        if row["run_status"] in {"cancelled", "success", "error", "interrupted"}:
+        if row["run_status"] not in ACTIVE_RUN_STATUSES:
             connection.rollback()
             return None
         if bool(row["cancellation_requested"]):
@@ -440,16 +456,20 @@ def _queue_page_write(
     }
     connection = get_connection()
     try:
+        if not _active_site_for_task(connection, int(claim["site_id"])):
+            connection.rollback()
+            return content_hash
         dispatch = connection.execute(
             """
-            SELECT status FROM sync_page_dispatches
-            WHERE run_id=? AND site_id=? AND page=?
-            FOR UPDATE
+            SELECT d.status,r.status AS run_status FROM sync_page_dispatches d
+            JOIN sync_runs r ON r.run_id=d.run_id
+            WHERE d.run_id=? AND d.site_id=? AND d.page=?
+            FOR UPDATE OF d,r
             """,
             (claim["run_id"], claim["site_id"], claim["page"]),
         ).fetchone()
-        if not dispatch or dispatch["status"] in {
-            "fetched", "writing", "completed", "cancelled"
+        if not dispatch or dispatch["run_status"] not in ACTIVE_RUN_STATUSES or dispatch["status"] in {
+            "fetched", "writing", "completed", "cancelled", "error", "auth_error"
         }:
             connection.rollback()
             return content_hash
@@ -595,11 +615,15 @@ def _page_payload(payload: dict[str, Any]):
 def _claim_write(run_id: str, site_id: int, page: int, task_id: str) -> bool:
     connection = get_connection()
     try:
+        if not _active_site_for_task(connection, site_id):
+            connection.rollback()
+            return False
         dispatch = connection.execute(
             """
-            SELECT status FROM sync_page_dispatches
-            WHERE run_id=? AND site_id=? AND page=?
-            FOR UPDATE
+            SELECT d.status,r.status AS run_status FROM sync_page_dispatches d
+            JOIN sync_runs r ON r.run_id=d.run_id
+            WHERE d.run_id=? AND d.site_id=? AND d.page=?
+            FOR UPDATE OF d,r
             """,
             (run_id, site_id, page),
         ).fetchone()
@@ -616,7 +640,9 @@ def _claim_write(run_id: str, site_id: int, page: int, task_id: str) -> bool:
         if receipt:
             connection.rollback()
             return False
-        if dispatch["status"] == "cancelled":
+        if dispatch["run_status"] not in ACTIVE_RUN_STATUSES or dispatch["status"] in {
+            "completed", "cancelled", "error", "auth_error"
+        }:
             connection.rollback()
             return False
         connection.execute(
@@ -659,11 +685,16 @@ def _write_page_transaction(payload: dict[str, Any]):
     result = None
     run_status = None
     try:
+        if not _active_site_for_task(connection, site_id):
+            connection.rollback()
+            return {"duplicate": True, "archived": True, "written": 0, "changed": 0,
+                    "planning_candidates": []}
         dispatch = connection.execute(
             """
-            SELECT content_hash,status FROM sync_page_dispatches
-            WHERE run_id=? AND site_id=? AND page=?
-            FOR UPDATE
+            SELECT d.content_hash,d.status,r.status AS run_status FROM sync_page_dispatches d
+            JOIN sync_runs r ON r.run_id=d.run_id
+            WHERE d.run_id=? AND d.site_id=? AND d.page=?
+            FOR UPDATE OF d,r
             """,
             (run_id, site_id, page),
         ).fetchone()
@@ -687,6 +718,11 @@ def _write_page_transaction(payload: dict[str, Any]):
                 "changed": int(receipt["changed_count"]),
                 "planning_candidates": [],
             }
+        if dispatch["run_status"] not in ACTIVE_RUN_STATUSES or dispatch["status"] in {
+            "completed", "cancelled", "error", "auth_error"
+        }:
+            connection.rollback()
+            return {"duplicate": True, "written": 0, "changed": 0, "planning_candidates": []}
         if dispatch["content_hash"] and str(dispatch["content_hash"]) != content_hash:
             raise ValueError("dispatch content hash mismatch")
 
@@ -941,6 +977,9 @@ def write_page(self, payload: dict[str, Any]):
 def _claim_post_commit(run_id: str, site_id: int, page: int):
     connection = get_connection()
     try:
+        if not _active_site_for_task(connection, site_id):
+            connection.rollback()
+            return None
         receipt = connection.execute(
             """
             SELECT planning_candidates,post_commit_status

@@ -5,8 +5,9 @@ import secrets
 
 from flask import Blueprint, jsonify, request, session, render_template
 from flask_login import current_user, login_required
+from site_connection_service import filter_active_sites
 
-from stock_sync_common import SyncError, connect, one, rows, loads, dumps, stamp, uid, exists, enabled, event, begin, lock_clause
+from stock_sync_common import SyncError, connect, one, rows, loads, dumps, stamp, uid, exists, enabled, event, begin, lock_clause, lock_site_connections
 from stock_sync_permissions import actor, target_sites, reference_site, visible_site, require_object, can_write
 from stock_sync_catalog import create_scan, enqueue
 from stock_sync_planner import create_plan
@@ -58,7 +59,7 @@ def accessible_plan(c,u,id_):
     p=one(c,'SELECT * FROM stock_sync_plans WHERE id=?',(id_,))
     if not p: raise SyncError('NOT_FOUND',status=404)
     req=loads(p['request_json'])
-    require_object(c,u,p,req['target_site_ids'],req.get('source_site_id'))
+    require_object(c,u,p,req['target_site_ids'],req.get('source_site_id'),allow_archived=request.method in ('GET','HEAD'))
     return p,req
 
 
@@ -108,7 +109,7 @@ def page():
 @bp.route(PREFIX+'/options')
 @api
 def options(c,u):
-    all_sites=rows(c,'SELECT * FROM sites ORDER BY id')
+    all_sites=filter_active_sites(c,rows(c,'SELECT * FROM sites ORDER BY id'))
     targets=[s for s in all_sites if can_write(u,s)]
     refs=[]
     for s in all_sites:
@@ -149,7 +150,7 @@ def accessible_scan(c,u,id_):
     scope=loads(snap['scope_json'])
     if scope.get('purpose'):
         raise SyncError('NOT_FOUND',status=404)
-    require_object(c,u,snap,scope['site_ids'],snap['site_id'])
+    require_object(c,u,snap,scope['site_ids'],snap['site_id'],allow_archived=request.method in ('GET','HEAD'))
     return snap
 
 
@@ -275,6 +276,7 @@ def retry(c,u,id_):
     req['retry_control_ids']=[f'{i["id"]}:{n}' for i,d in zip(items,details) for n,_ in enumerate(d.get('changes',[]))]
     req['retry_of']=id_
     new=uid()
+    lock_site_connections(c, req['target_site_ids'] + ([req['source_site_id']] if req.get('source_site_id') else []))
     c.execute("INSERT INTO stock_sync_plans(id,actor_id,request_json,status,created_at,expires_at) VALUES(?,?,?,'building',?,?)",(new,u['id'],dumps(req),stamp(),stamp(600)))
     enqueue(c,'plan',new);event(c,'retry_preview',u['id'],new,{'job_id':id_,'item_ids':ids});c.commit()
     return jsonify(id=new),202
