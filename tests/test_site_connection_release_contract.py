@@ -121,6 +121,8 @@ def contract(monkeypatch):
             '2026-10-02',200,20,'cod',0,0,0,'{}','{}','[]');
         INSERT INTO orders VALUES('37-101','https://other.example.invalid','CZK','completed',
             '2026-10-02',300,30,'cod',0,0,0,'{}','{}','[]');
+        ALTER TABLE orders ADD COLUMN woo_id INTEGER;
+        UPDATE orders SET woo_id=CAST(substr(id,instr(id,'-')+1) AS INTEGER);
         CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT);
         CREATE TABLE exchange_rates(id INTEGER,year_month TEXT,currency TEXT,rate_to_cny REAL,updated_at TEXT);
         CREATE TABLE product_masters(id INTEGER PRIMARY KEY,label TEXT,url TEXT,consumer_key TEXT,
@@ -274,6 +276,29 @@ def test_restore_same_url_reuses_id_and_preserves_historical_permissions(contrac
     assert contract.raw.execute("SELECT COUNT(*) FROM sites").fetchone()[0] == 2
     assert snapshot(contract) == before
     assert contract.scope["_resolve_user_sites"](2) == [TARGET_URL]
+    watermarks = json.loads(contract.raw.execute(
+        "SELECT value FROM settings WHERE key='order_notification_auto_watermarks_json'"
+    ).fetchone()[0])
+    assert watermarks["site:7"]["max_woo_id"] == 102
+    assert watermarks["site:7"]["reason"] == "site_restored"
+    assert watermarks["site:7"]["not_before_gmt"]
+
+
+def test_restore_rolls_back_credentials_when_notification_watermark_is_invalid(contract):
+    remove(contract)
+    before = dict(contract.raw.execute("SELECT * FROM sites WHERE id=7").fetchone())
+    contract.raw.execute("INSERT INTO settings(key,value) VALUES (?,?)",
+        ("order_notification_auto_watermarks_json", "invalid-json"))
+    contract.raw.commit()
+
+    response = contract.client.post("/api/sites", json={"url": TARGET_URL,
+        "consumer_key": "replacement-key", "consumer_secret": "replacement-secret"})
+
+    assert response.status_code == 500
+    assert "Corrupt order_notification_auto_watermarks_json" in response.get_json()["error"]
+    assert dict(contract.raw.execute("SELECT * FROM sites WHERE id=7").fetchone()) == before
+    assert contract.raw.execute("SELECT value FROM settings WHERE key=?",
+        ("order_notification_auto_watermarks_json",)).fetchone()[0] == "invalid-json"
 
 
 def test_missing_connection_returns_404_without_business_mutation(contract):

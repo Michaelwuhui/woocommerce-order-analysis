@@ -9091,15 +9091,22 @@ def add_site():
                     (data.get('mask_id') or '').strip() or existing['mask_id'],
                     (data.get('country') or '').strip() or existing['country'],
                     product_master_id, existing['id']))
+            from order_notification_service import write_site_watermark
+            write_site_watermark(conn, existing['id'], url, reason="site_restored", not_before=True)
             conn.commit()
             return jsonify({'success': True, 'id': existing['id'], 'restored': True})
         conn.execute('''INSERT INTO sites
             (url, consumer_key, consumer_secret, manager, mask_id, country, product_master_id)
             VALUES (?, ?, ?, ?, ?, ?, ?)''',
                      (url, ck, cs, manager, mask_id, country, product_master_id))
+        new_row = conn.execute('SELECT id FROM sites WHERE url = ?', (url,)).fetchone()
+        new_id = new_row['id'] if new_row else None
+        from order_notification_service import write_site_watermark
+        write_site_watermark(conn, new_id, url, reason="site_added", not_before=True)
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
+        conn.rollback()
         return jsonify({'error': str(e)}), 500
     finally:
         conn.close()
@@ -9158,9 +9165,13 @@ def update_site(site_id):
                 WHERE id = ?''',
                          (url, ck, cs, manager, mask_id, country, product_master_id,
                           cod_on_hold_val, site_id))
+        if (url or '').rstrip('/').lower() != (existing['url'] or '').rstrip('/').lower():
+            from order_notification_service import write_site_watermark
+            write_site_watermark(conn, site_id, url, reason="site_url_changed")
         conn.commit()
         return jsonify({'success': True})
     except Exception as e:
+        conn.rollback()
         return jsonify({'error': str(e)}), 500
     finally:
         conn.close()
