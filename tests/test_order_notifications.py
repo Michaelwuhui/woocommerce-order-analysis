@@ -43,6 +43,7 @@ from order_notification_service import (
     enqueue_synced_orders,
     notification_summary,
     process_notification_job,
+    write_site_watermark,
 )
 
 
@@ -660,6 +661,203 @@ def test_automatic_sync_is_new_order_only_and_routes_to_production(
     assert verify.execute(
         "SELECT COUNT(*) FROM order_notification_jobs WHERE event_type!='ORDER_READY'"
     ).fetchone()[0] == 0
+    verify.close()
+
+
+def test_renamed_site_notifies_via_site_key(tmp_path, monkeypatch):
+    order_notification_service._ROLLOUT_SKIP_SEEN.clear()
+    db_path = tmp_path / "renamed-site.db"
+    setup = _conn(db_path)
+    old_store = "https://old.example.test"
+    setup.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,store_id,warehouse_id,environment,enabled)
+           VALUES ('production-route','生产群','FAKE',?,1,'production',1)""",
+        (STORE,),
+    )
+    setup.execute(
+        """INSERT INTO settings(key,value) VALUES
+           ('order_notification_auto_watermarks_json',?)""",
+        (json.dumps({old_store: {"max_woo_id": 1000, "activated_at": "test"}}),),
+    )
+    setup.commit()
+    setup.close()
+
+    def get_test_conn():
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    monkeypatch.setattr(fulfillment_common, "get_conn", get_test_conn)
+
+    enqueue_synced_orders(
+        [{"order_id": "1-1465", "status": "processing", "date_modified": "v1"}]
+    )
+    verify = get_test_conn()
+    assert verify.execute("SELECT COUNT(*) FROM order_notification_jobs").fetchone()[0] == 0
+    assert verify.execute(
+        "SELECT COUNT(*) FROM notification_audit_logs WHERE action='order_notification_rollout_skipped'"
+    ).fetchone()[0] == 1
+    verify.close()
+
+    enqueue_synced_orders(
+        [{"order_id": "1-1465", "status": "processing", "date_modified": "v1"}]
+    )
+    verify = get_test_conn()
+    assert verify.execute(
+        "SELECT COUNT(*) FROM notification_audit_logs WHERE action='order_notification_rollout_skipped'"
+    ).fetchone()[0] == 1
+    assert verify.execute("SELECT COUNT(*) FROM order_notification_jobs").fetchone()[0] == 0
+
+    verify.execute(
+        "UPDATE settings SET value=? WHERE key='order_notification_auto_watermarks_json'",
+        (json.dumps({
+            old_store: {"max_woo_id": 1000, "activated_at": "test"},
+            "site:1": {"max_woo_id": 1000, "activated_at": "test"},
+        }),),
+    )
+    verify.commit()
+    verify.close()
+
+    enqueue_synced_orders(
+        [{"order_id": "1-1465", "status": "processing", "date_modified": "v2"}]
+    )
+    verify = get_test_conn()
+    assert verify.execute("SELECT COUNT(*) FROM order_notification_jobs").fetchone()[0] == 1
+    job = verify.execute("SELECT event_type, target_id FROM order_notification_jobs").fetchone()
+    assert job["event_type"] == "ORDER_READY"
+    assert job["target_id"] == "production-route"
+    verify.close()
+
+
+def test_write_site_watermark_does_not_backfill(tmp_path, monkeypatch):
+    order_notification_service._ROLLOUT_SKIP_SEEN.clear()
+    db_path = tmp_path / "backfill.db"
+    setup = _conn(db_path)
+    old_store = "https://old.example.test"
+    setup.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,store_id,warehouse_id,environment,enabled)
+           VALUES ('production-route','生产群','FAKE',?,1,'production',1)""",
+        (STORE,),
+    )
+    setup.execute(
+        """INSERT INTO settings(key,value) VALUES
+           ('order_notification_auto_watermarks_json',?)""",
+        (json.dumps({old_store: {"max_woo_id": 50, "activated_at": "old"}}),),
+    )
+    setup.execute("DELETE FROM orders")
+    for wid in (100, 101, 102):
+        setup.execute(
+            """INSERT INTO orders
+               (id,woo_id,number,version,status,currency,total,payment_method,source,warehouse_id)
+               VALUES (?,?,?,'1','processing','PLN','100','cod',?,1)""",
+            (f"1-{wid}", wid, str(wid), STORE),
+        )
+    entry = write_site_watermark(setup, 1, STORE, reason="t")
+    setup.commit()
+
+    assert entry["max_woo_id"] == 102
+    assert entry["reason"] == "t"
+    assert entry["basis"] == "local_max"
+
+    cfg_row = setup.execute(
+        "SELECT value FROM settings WHERE key='order_notification_auto_watermarks_json'"
+    ).fetchone()
+    cfg = json.loads(cfg_row[0])
+    assert cfg[old_store]["max_woo_id"] == 50
+    assert cfg["site:1"]["max_woo_id"] == 102
+    setup.close()
+
+    def get_test_conn():
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    monkeypatch.setattr(fulfillment_common, "get_conn", get_test_conn)
+
+    enqueue_synced_orders(
+        [{"order_id": "1-102", "status": "processing", "date_modified": "v1"}]
+    )
+    verify = get_test_conn()
+    assert verify.execute("SELECT COUNT(*) FROM order_notification_jobs").fetchone()[0] == 0
+
+    verify.execute(
+        """INSERT INTO orders
+           (id,woo_id,number,version,status,currency,total,payment_method,source,warehouse_id)
+           VALUES ('1-103',103,'103','1','processing','PLN','100','cod',?,1)""",
+        (STORE,),
+    )
+    verify.commit()
+    verify.close()
+
+    enqueue_synced_orders(
+        [{"order_id": "1-103", "status": "processing", "date_modified": "v1"}]
+    )
+    verify = get_test_conn()
+    assert verify.execute("SELECT COUNT(*) FROM order_notification_jobs").fetchone()[0] == 1
+    job = verify.execute("SELECT order_id, event_type FROM order_notification_jobs").fetchone()
+    assert job["order_id"] == "1-103"
+    assert job["event_type"] == "ORDER_READY"
+    verify.close()
+
+
+def test_not_before_guard(tmp_path, monkeypatch):
+    order_notification_service._ROLLOUT_SKIP_SEEN.clear()
+    db_path = tmp_path / "not-before.db"
+    setup = _conn(db_path)
+    setup.execute("ALTER TABLE orders ADD COLUMN date_created_gmt TEXT")
+    setup.execute(
+        """INSERT INTO notification_targets
+           (id,name,channel_type,store_id,warehouse_id,environment,enabled)
+           VALUES ('production-route','生产群','FAKE',?,1,'production',1)""",
+        (STORE,),
+    )
+    entry = {"max_woo_id": 0, "not_before_gmt": "2026-10-10T00:00:00"}
+    setup.execute(
+        """INSERT INTO settings(key,value) VALUES
+           ('order_notification_auto_watermarks_json',?)""",
+        (json.dumps({"site:1": entry}),),
+    )
+    setup.execute(
+        "UPDATE orders SET date_created_gmt='2026-10-09T23:00:00' WHERE id='1-1465'"
+    )
+    setup.commit()
+    setup.close()
+
+    def get_test_conn():
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    monkeypatch.setattr(fulfillment_common, "get_conn", get_test_conn)
+
+    enqueue_synced_orders(
+        [{"order_id": "1-1465", "status": "processing", "date_modified": "v1"}]
+    )
+    verify = get_test_conn()
+    assert verify.execute("SELECT COUNT(*) FROM order_notification_jobs").fetchone()[0] == 0
+
+    verify.execute(
+        """INSERT INTO orders
+           (id,woo_id,number,version,status,currency,total,payment_method,source,warehouse_id,date_created_gmt)
+           VALUES ('1-1466',1466,'1466','1','processing','PLN','100','cod',?,1,'2026-10-10T01:00:00')""",
+        (STORE,),
+    )
+    verify.commit()
+    verify.close()
+
+    enqueue_synced_orders(
+        [{"order_id": "1-1466", "status": "processing", "date_modified": "v1"}]
+    )
+    verify = get_test_conn()
+    assert verify.execute("SELECT COUNT(*) FROM order_notification_jobs").fetchone()[0] == 1
+    job = verify.execute("SELECT order_id, event_type FROM order_notification_jobs").fetchone()
+    assert job["order_id"] == "1-1466"
+    assert job["event_type"] == "ORDER_READY"
     verify.close()
 
 

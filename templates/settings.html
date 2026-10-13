@@ -3095,6 +3095,8 @@ function deleteWarehouse(id, name) {
 
 <!-- Brand Management JavaScript -->
 <script>
+    // getModal() is otherwise only defined inside another <script> closure; Master add/edit buttons below need it (ReferenceError fix).
+    function getModal(id) { const el = document.getElementById(id); return el ? bootstrap.Modal.getOrCreateInstance(el) : null; }
     document.addEventListener('DOMContentLoaded', function () {
         // Load brands on page load
         loadBrands();

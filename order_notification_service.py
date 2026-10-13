@@ -88,6 +88,26 @@ ALERT_REASON_LABELS = {
     "provider_busy": "企业微信服务繁忙",
     "order_sequence_wait": "正在等待同订单较早任务",
 }
+_ROLLOUT_SKIP_SEEN: set[tuple[str, str, str]] = set()
+
+
+def _parse_iso19(val: Any) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.strftime("%Y-%m-%dT%H:%M:%S")
+    s = str(val).strip()
+    if len(s) < 19:
+        return None
+    if s[10] in (" ", "T"):
+        cand = s[:10] + "T" + s[11:19]
+    else:
+        return None
+    try:
+        datetime.strptime(cand, "%Y-%m-%dT%H:%M:%S")
+        return cand
+    except ValueError:
+        return None
 
 
 def _json(value: Any) -> str:
@@ -315,7 +335,22 @@ def _automatic_rollout_reason(conn, snapshot: dict) -> str | None:
         return "rollout_watermark_invalid"
     if not isinstance(configured, dict):
         return "rollout_watermark_invalid"
-    entry = configured.get(str(snapshot.get("store_id") or ""))
+
+    site_id = snapshot.get("site_id")
+    if site_id is None:
+        order_id_str = str(snapshot.get("order_id") or "")
+        if "-" in order_id_str:
+            prefix = order_id_str.split("-", 1)[0]
+            try:
+                site_id = int(prefix)
+            except (ValueError, TypeError):
+                site_id = None
+
+    entry = None
+    if site_id is not None:
+        entry = configured.get(f"site:{site_id}")
+    if not isinstance(entry, dict):
+        entry = configured.get(str(snapshot.get("store_id") or ""))
     if not isinstance(entry, dict):
         return "rollout_not_active"
     try:
@@ -325,7 +360,98 @@ def _automatic_rollout_reason(conn, snapshot: dict) -> str | None:
         return "rollout_watermark_invalid"
     if woo_id <= cutoff:
         return "before_activation_watermark"
+
+    not_before_raw = entry.get("not_before_gmt")
+    if not_before_raw:
+        not_before = _parse_iso19(not_before_raw)
+        if not not_before:
+            return "rollout_watermark_invalid"
+        try:
+            row = conn.execute(
+                "SELECT date_created_gmt FROM orders WHERE id=?",
+                (snapshot["order_id"],),
+            ).fetchone()
+        except Exception:
+            return "rollout_watermark_invalid"
+        if not row or row[0] is None:
+            return "rollout_watermark_invalid"
+        order_date = _parse_iso19(row[0])
+        if not order_date:
+            return "rollout_watermark_invalid"
+        if order_date < not_before:
+            return "before_activation_watermark"
+
     return None
+
+
+def write_site_watermark(
+    conn,
+    site_id: int,
+    url: str,
+    *,
+    reason: str,
+    not_before: bool = False,
+) -> dict:
+    """Activate automatic notifications for one site from *now* on (no backfill).
+
+    Writes a stable ``site:<id>`` key whose cutoff is the current local
+    MAX(woo_id) of that site. Errors propagate so the caller's transaction
+    fails instead of silently writing a 0 cutoff. Does not commit.
+    """
+    if site_id is None:
+        raise ValueError("site_id is required for the notification watermark")
+    row1 = conn.execute(
+        "SELECT MAX(CAST(woo_id AS BIGINT)) FROM orders WHERE source = ?",
+        (url,),
+    ).fetchone()
+    row2 = conn.execute(
+        "SELECT MAX(CAST(woo_id AS BIGINT)) FROM orders WHERE id LIKE ?",
+        (f"{site_id}-%",),
+    ).fetchone()
+    m1 = row1[0] if row1 and row1[0] is not None else 0
+    m2 = row2[0] if row2 and row2[0] is not None else 0
+    cutoff = max(int(m1), int(m2))
+
+    now = datetime.now(timezone.utc)
+    entry: dict[str, Any] = {
+        "max_woo_id": cutoff,
+        "activated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "basis": "local_max",
+        "reason": reason,
+    }
+    if not_before:
+        entry["not_before_gmt"] = now.strftime("%Y-%m-%dT%H:%M:%S")
+
+    is_pg = False
+    try:
+        import db_backend
+        is_pg = db_backend.is_postgres_backend()
+    except Exception:
+        is_pg = False
+
+    sql = (
+        "SELECT value FROM settings WHERE key=? FOR UPDATE"
+        if is_pg
+        else "SELECT value FROM settings WHERE key=?"
+    )
+    row = conn.execute(sql, ("order_notification_auto_watermarks_json",)).fetchone()
+    if row and row[0] is not None and str(row[0]).strip() != "":
+        try:
+            configured = json.loads(row[0])
+        except (TypeError, ValueError) as err:
+            raise ValueError("Corrupt order_notification_auto_watermarks_json setting") from err
+        if not isinstance(configured, dict):
+            raise ValueError("order_notification_auto_watermarks_json must be a JSON dict")
+    else:
+        configured = {}
+
+    configured[f"site:{site_id}"] = entry
+    val = json.dumps(configured, ensure_ascii=False, sort_keys=True)
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("order_notification_auto_watermarks_json", val),
+    )
+    return entry
 
 
 def _changes(previous: dict | None, current: dict, fields: list[str]) -> list[dict]:
@@ -1036,13 +1162,75 @@ def enqueue_synced_orders(
             for item in candidates:
                 raw = f"{item.get('order_id')}|{item.get('date_modified')}|{item.get('status')}"
                 event_id = "sync:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-                create_job_for_order(
+                res = create_job_for_order(
                     conn,
                     str(item["order_id"]),
                     event_id=event_id,
                     allowed_event_types=AUTOMATIC_EVENT_TYPES,
                     target_environment="production",
                 )
+                reason = res.get("reason") if isinstance(res, dict) else None
+                if reason in ("rollout_not_active", "rollout_watermark_invalid"):
+                    try:
+                        order_id_str = str(item.get("order_id") or "")
+                        prefix = order_id_str.split("-", 1)[0] if "-" in order_id_str else ""
+                        site_key = None
+                        if prefix:
+                            try:
+                                int(prefix)
+                                site_key = prefix
+                            except (ValueError, TypeError):
+                                site_key = None
+
+                        store_url = item.get("source") or item.get("store_id")
+                        if not store_url:
+                            row = conn.execute(
+                                "SELECT source FROM orders WHERE id=?", (order_id_str,)
+                            ).fetchone()
+                            store_url = str(row[0] if row and row[0] is not None else "")
+                        else:
+                            store_url = str(store_url)
+
+                        if site_key is None:
+                            site_key = store_url
+
+                        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        seen_key = (str(site_key), str(reason), today_utc)
+                        if seen_key not in _ROLLOUT_SKIP_SEEN:
+                            req_id = f"{today_utc}:{reason}"
+                            existing = conn.execute(
+                                """SELECT 1 FROM notification_audit_logs
+                                   WHERE action='order_notification_rollout_skipped'
+                                     AND object_type='site' AND object_id=? AND request_id=?""",
+                                (str(site_key), req_id),
+                            ).fetchone()
+                            if not existing:
+                                conn.execute(
+                                    """INSERT INTO notification_audit_logs
+                                       (action,object_type,object_id,actor_type,request_id,after_summary)
+                                       VALUES ('order_notification_rollout_skipped','site',?,'system',?,?)""",
+                                    (
+                                        str(site_key),
+                                        req_id,
+                                        _json(
+                                            {
+                                                "reason": reason,
+                                                "store_id": store_url,
+                                                "order_id": order_id_str,
+                                            }
+                                        ),
+                                    ),
+                                )
+                                conn.commit()
+                                print(
+                                    f"[order-notification] rollout skipped site={site_key} reason={reason} store={store_url}"
+                                )
+                            _ROLLOUT_SKIP_SEEN.add(seen_key)
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
         finally:
             conn.close()
     except Exception as exc:
