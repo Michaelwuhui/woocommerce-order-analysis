@@ -1,6 +1,7 @@
 """End-to-end clean-sync writes against an empty isolated PostgreSQL schema."""
 
 from datetime import datetime, timezone
+import json
 import os
 
 import pytest
@@ -72,6 +73,35 @@ def _order(woo_id):
     }
 
 
+def _empty_plan(connection, woo_id=WOO_MISSING):
+    order_id = make_oid(SITE_ID, woo_id)
+    connection.execute(
+        """INSERT INTO oms_order_items
+           (order_id,woo_line_item_id,line_index,name,ordered_qty,shortage_qty,raw_json)
+           VALUES (?,'1',0,'Synthetic missing-stock item',1,1,'{"id":1,"quantity":1}')""",
+        (order_id,),
+    )
+    connection.execute(
+        """INSERT INTO oms_order_fulfillment_state
+           (order_id,revision,plan_hash,aggregate_status,has_shortage,manual_review,manual_reason)
+           VALUES (?,1,'synthetic-plan','stock_shortage',1,1,'Automatic stock shortage')""",
+        (order_id,),
+    )
+    connection.execute(
+        """INSERT INTO oms_integration_jobs
+           (job_type,aggregate_type,aggregate_id,idempotency_key,status)
+           VALUES ('PLAN_ORDER','order',?,?,'succeeded')""",
+        (order_id, f"pytest:clean-plan:{order_id}"),
+    )
+    connection.execute(
+        """INSERT INTO oms_domain_events
+           (aggregate_type,aggregate_id,event_type,actor_type,to_status)
+           VALUES ('order',?,'fulfillment_planned','system','stock_shortage')""",
+        (order_id,),
+    )
+    connection.commit()
+
+
 @pytest.fixture()
 def isolated(monkeypatch):
     database = os.environ.get("WOO_DB_NAME_OVERRIDE", "")
@@ -115,6 +145,16 @@ def isolated(monkeypatch):
     try:
         connection.execute("DELETE FROM sync_task_outbox")
         connection.execute("DELETE FROM sync_runs")
+        order_ids = tuple(make_oid(SITE_ID, value) for value in (
+            WOO_MISSING, WOO_PRESENT, WOO_REFERENCED
+        ))
+        for table in ("oms_integration_jobs", "oms_domain_events"):
+            connection.execute(
+                f"DELETE FROM {table} WHERE aggregate_type='order' AND aggregate_id IN (?,?,?)",
+                order_ids,
+            )
+        for table in ("oms_order_items", "oms_order_fulfillment_state"):
+            connection.execute(f"DELETE FROM {table} WHERE order_id IN (?,?,?)", order_ids)
         for table in ("order_notes_archive", "order_notes", "order_note_sync_state"):
             connection.execute(
                 f"DELETE FROM {table} WHERE order_id IN (?,?,?)",
@@ -134,7 +174,12 @@ def isolated(monkeypatch):
         connection.close()
 
 
-def test_clean_run_archives_only_proven_unreferenced_order_and_is_idempotent(isolated):
+def test_clean_run_archives_empty_plan_preserves_business_history_and_is_idempotent(isolated):
+    connection = sync_service.get_connection()
+    try:
+        _empty_plan(connection)
+    finally:
+        connection.close()
     status, created = sync_service.start_sync(
         mode="clean", created_by="pytest:clean", site_ids=[SITE_ID], publish=False
     )
@@ -182,7 +227,93 @@ def test_clean_run_archives_only_proven_unreferenced_order_and_is_idempotent(iso
         assert connection.execute(
             "SELECT count(*) FROM orders WHERE id IN (?,?)", (present, referenced)
         ).fetchone()[0] == 2
+        for table in ("oms_order_items", "oms_order_fulfillment_state"):
+            assert connection.execute(
+                f"SELECT count(*) FROM {table} WHERE order_id=?", (missing,),
+            ).fetchone()[0] == 0
+        snapshot = json.loads(connection.execute(
+            """SELECT details FROM sync_events WHERE run_id=?
+               AND event_type='clean_order_derived_archived'""", (status["run_id"],),
+        ).fetchone()[0])["snapshot"]
+        assert snapshot["oms_order_items"][0]["order_id"] == missing
+        assert snapshot["oms_order_items"][0]["shortage_qty"] == 1
+        assert snapshot["oms_order_items"][0]["raw_json"] == '{"id":1,"quantity":1}'
+        assert snapshot["oms_order_fulfillment_state"][0]["aggregate_status"] == "stock_shortage"
+        assert connection.execute(
+            "SELECT status FROM oms_integration_jobs WHERE aggregate_id=?", (missing,),
+        ).fetchone()[0] == "succeeded"
+        assert connection.execute(
+            "SELECT event_type FROM oms_domain_events WHERE aggregate_id=?", (missing,),
+        ).fetchone()[0] == "fulfillment_planned"
     finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("table,field,value", [
+    ("oms_order_items", "allocated_qty", 1),
+    ("oms_order_items", "cancelled_qty", 1),
+    ("oms_order_fulfillment_state", "aggregate_status", "allocated"),
+    ("oms_order_fulfillment_state", "aggregate_status", "manual_review"),
+    ("oms_order_fulfillment_state", "completion_sync_status", "pending"),
+    ("oms_integration_jobs", "status", "pending"),
+    ("oms_integration_jobs", "status", "running"),
+    ("oms_integration_jobs", "job_type", "COMPLETE_WOOCOMMERCE_ORDER"),
+    ("oms_domain_events", "actor_type", "user"),
+    ("oms_domain_events", "event_type", "manual_review_required"),
+])
+def test_operational_state_and_unfinished_jobs_still_block_cleanup(isolated, table, field, value):
+    connection = sync_service.get_connection()
+    missing = make_oid(SITE_ID, WOO_MISSING)
+    try:
+        _empty_plan(connection)
+        key = "order_id" if table in clean_sync.DERIVED_OMS_TABLES else "aggregate_id"
+        connection.execute(f"UPDATE {table} SET {field}=? WHERE {key}=?", (value, missing))
+        connection.commit()
+    finally:
+        connection.close()
+    status, _ = sync_service.start_sync(
+        mode="clean", created_by="pytest:protected-state", site_ids=[SITE_ID], publish=False,
+    )
+    assert clean_sync.run_clean_site(
+        {"run_id": status["run_id"], "site_id": SITE_ID}
+    ) == {"removed": 0, "retained": 2}
+    connection = sync_service.get_connection()
+    try:
+        assert connection.execute("SELECT count(*) FROM orders WHERE id=?", (missing,)).fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM orders_archive WHERE id=?", (missing,)).fetchone()[0] == 0
+        assert connection.execute(f"SELECT {field} FROM {table} WHERE {key}=?", (missing,)).fetchone()[0] == value
+        assert connection.execute("SELECT count(*) FROM oms_order_items WHERE order_id=?", (missing,)).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM sync_events WHERE run_id=? AND event_type='clean_order_derived_archived'",
+            (status["run_id"],),
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_indirect_order_item_reference_blocks_cleanup(isolated):
+    connection = sync_service.get_connection()
+    missing = make_oid(SITE_ID, WOO_MISSING)
+    try:
+        _empty_plan(connection)
+        connection.execute("CREATE TABLE pytest_clean_item_links(order_item_id bigint)")
+        connection.execute(
+            "INSERT INTO pytest_clean_item_links SELECT id FROM oms_order_items WHERE order_id=?",
+            (missing,),
+        )
+        connection.commit()
+        status, _ = sync_service.start_sync(
+            mode="clean", created_by="pytest:indirect-reference", site_ids=[SITE_ID], publish=False,
+        )
+        assert clean_sync.run_clean_site(
+            {"run_id": status["run_id"], "site_id": SITE_ID}
+        ) == {"removed": 0, "retained": 2}
+        assert connection.execute("SELECT count(*) FROM orders WHERE id=?", (missing,)).fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM pytest_clean_item_links").fetchone()[0] == 1
+    finally:
+        connection.rollback()
+        connection.execute("DROP TABLE IF EXISTS pytest_clean_item_links")
+        connection.commit()
         connection.close()
 
 
@@ -260,6 +391,11 @@ def test_stale_clean_site_is_requeued_without_deleting_orders(isolated):
 
 
 def test_archive_and_order_removal_roll_back_together(isolated, monkeypatch):
+    connection = sync_service.get_connection()
+    try:
+        _empty_plan(connection)
+    finally:
+        connection.close()
     original_event = clean_sync._event
 
     def fail_after_writes(connection, run_id, event_type, message, **kwargs):
@@ -288,6 +424,16 @@ def test_archive_and_order_removal_roll_back_together(isolated, monkeypatch):
         ).fetchone()[0] == 1
         assert connection.execute(
             "SELECT COUNT(*) FROM order_notes_archive WHERE order_id=?", (missing,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM oms_order_items WHERE order_id=?", (missing,)
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT aggregate_status FROM oms_order_fulfillment_state WHERE order_id=?", (missing,)
+        ).fetchone()[0] == "stock_shortage"
+        assert connection.execute(
+            "SELECT count(*) FROM sync_events WHERE run_id=? AND event_type='clean_order_derived_archived'",
+            (status["run_id"],),
         ).fetchone()[0] == 0
     finally:
         connection.close()

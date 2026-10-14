@@ -28,6 +28,7 @@ TIMEZONE = ZoneInfo("Asia/Hong_Kong")
 MAX_PAGES = 1000
 MAX_CANDIDATES = 20
 ARCHIVED_ORDER_CHILDREN = {"order_notes", "order_note_sync_state", "order_notes_archive"}
+DERIVED_OMS_TABLES = {"oms_order_items", "oms_order_fulfillment_state"}
 
 
 class CleanSyncError(RuntimeError):
@@ -197,7 +198,73 @@ def _reference_tables(connection):
         """SELECT table_name FROM information_schema.columns
            WHERE table_schema='public' AND column_name='order_id'"""
     ).fetchall()
-    return sorted({row["table_name"] for row in rows} - ARCHIVED_ORDER_CHILDREN)
+    return sorted({row["table_name"] for row in rows} - ARCHIVED_ORDER_CHILDREN - DERIVED_OMS_TABLES)
+
+
+def _empty_oms_plan(connection, order_id):
+    """Allow only unused automatic planning data; keep operational history."""
+    snapshot = {
+        table: [dict(row) for row in connection.execute(
+            f"SELECT * FROM {_quote(table)} WHERE order_id=? FOR UPDATE",
+            (order_id,),
+        ).fetchall()]
+        for table in sorted(DERIVED_OMS_TABLES)
+    }
+    blockers = []
+    for state in snapshot["oms_order_fulfillment_state"]:
+        if state["aggregate_status"] not in {"unallocated", "stock_shortage", "allocation_blocked"} or (
+            state["completion_sync_status"] != "not_ready"
+        ):
+            blockers.append("oms_order_fulfillment_state")
+    if any(item["allocated_qty"] != 0 or item["cancelled_qty"] != 0
+           for item in snapshot["oms_order_items"]):
+        blockers.append("oms_order_items")
+    # Protect indirect references too, even if their parent fulfillment belongs
+    # to another order or a future table introduces a new item association.
+    item_tables = connection.execute(
+        """SELECT table_name FROM information_schema.columns
+           WHERE table_schema='public' AND column_name='order_item_id'"""
+    ).fetchall()
+    for row in item_tables:
+        table = row["table_name"]
+        if connection.execute(
+            f"SELECT 1 FROM {_quote(table)} child JOIN oms_order_items item "
+            "ON item.id=child.order_item_id WHERE item.order_id=? LIMIT 1",
+            (order_id,),
+        ).fetchone():
+            blockers.append(table)
+    # A queued/running planner must finish before cleanup. Completed automatic
+    # planning jobs and events remain available after the order is archived.
+    if connection.execute(
+        """SELECT 1 FROM oms_integration_jobs WHERE aggregate_type='order'
+           AND aggregate_id=? AND (status!='succeeded' OR job_type NOT IN
+           ('PLAN_ORDER','REPLAN_ORDER_AFTER_RESTOCK')) LIMIT 1""", (order_id,),
+    ).fetchone():
+        blockers.append("oms_integration_jobs")
+    if connection.execute(
+        """SELECT 1 FROM oms_domain_events WHERE aggregate_type='order'
+           AND aggregate_id=? AND (actor_type!='system' OR event_type NOT IN
+           ('fulfillment_planned','restock_replanned','aggregate_status_changed'))
+           LIMIT 1""", (order_id,),
+    ).fetchone():
+        blockers.append("oms_domain_events")
+    return {table: rows for table, rows in snapshot.items() if rows}, blockers
+
+
+def _archive_empty_oms_plan(connection, run_id, site_id, order_id, snapshot):
+    if not snapshot:
+        return
+    _event(
+        connection, run_id, "clean_order_derived_archived",
+        f"订单 {order_id} 的未分配自动履约计划已归档移出",
+        site_id=site_id, details={"order_id": order_id, "snapshot": snapshot},
+    )
+    for table, rows in snapshot.items():
+        deleted = connection.execute(
+            f"DELETE FROM {_quote(table)} WHERE order_id=?", (order_id,),
+        )
+        if deleted.rowcount != len(rows):
+            raise CleanSyncError(f"订单 {order_id} 的自动履约计划移出不完整")
 
 
 def _apply_candidates(connection, run_id, site_id, source, candidates, remote_count, pages, skipped):
@@ -237,6 +304,8 @@ def _apply_candidates(connection, run_id, site_id, source, candidates, remote_co
                     (order_id,),
                 ).fetchone()
             ]
+            snapshot, oms_references = _empty_oms_plan(connection, order_id)
+            references = sorted(set(references + oms_references))
             if references:
                 blocked += 1
                 _event(
@@ -271,6 +340,7 @@ def _apply_candidates(connection, run_id, site_id, source, candidates, remote_co
             )
             if inserted.rowcount != 1:
                 raise CleanSyncError(f"订单 {order_id} 归档失败")
+            _archive_empty_oms_plan(connection, run_id, site_id, order_id, snapshot)
             deleted = connection.execute(
                 "DELETE FROM orders WHERE id=? AND source=? AND woo_id=?",
                 (order_id, source, original["woo_id"]),
