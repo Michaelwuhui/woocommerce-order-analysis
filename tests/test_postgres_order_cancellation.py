@@ -35,10 +35,14 @@ def case(monkeypatch):
     assert c.execute('SELECT current_database()').fetchone()[0] == database
     c.execute("INSERT INTO sites(id,url,consumer_key,consumer_secret,country) VALUES"
               "(99188,'https://cancel-test.invalid','synthetic','synthetic','PL') ON CONFLICT(id) DO NOTHING")
+    c.execute("UPDATE sites SET manager=NULL,api_status='ok' WHERE id=99188")
     for uid, role, manage in [(99188,'admin',True),(99189,'admin',False),(99190,'viewer',False),(99191,'user',True)]:
         c.execute("""INSERT INTO users(id,username,password_hash,name,role,can_manage_inventory)
-                     VALUES (?,?,'unusable','Cancellation test',?,?) ON CONFLICT(id) DO NOTHING""",
+                     VALUES (?,?,'unusable','Cancellation test',?,?) ON CONFLICT(id) DO UPDATE
+                     SET name=excluded.name,role=excluded.role,can_manage_inventory=excluded.can_manage_inventory""",
                   (uid, f'cancel-user-{uid}', role, manage))
+    c.execute("DELETE FROM user_site_exclusions WHERE user_id BETWEEN 99188 AND 99191")
+    c.execute("DELETE FROM user_country_permissions WHERE user_id BETWEEN 99188 AND 99191")
     c.execute("INSERT INTO user_country_permissions(user_id,country) VALUES (99191,'CZ') ON CONFLICT DO NOTHING")
     c.execute("INSERT INTO warehouses(id,name,code,country) VALUES (99188,'Cancellation test','CANCEL-TEST','PL') ON CONFLICT(id) DO NOTHING")
     c.execute("""INSERT INTO oms_warehouse_integrations(warehouse_id,provider,config_json,is_enabled)
@@ -129,6 +133,95 @@ def test_cancel_from_order_details_is_idempotent(case):
     assert case['submit']().status_code==200
     assert case['state']['writes']==1
     assert_cancelled(case)
+
+
+def make_site_owner(case, uid=99189):
+    c=db.connect()
+    c.execute("UPDATE users SET name='Fixture Site Owner' WHERE id=?",(uid,))
+    c.execute("UPDATE sites SET manager='Fixture Site Owner' WHERE id=99188")
+    c.commit();c.close()
+
+
+def test_site_owner_cancels_from_order_details_without_warehouse_grants(case):
+    make_site_owner(case)
+    assert case['submit'](99189).status_code==200
+    assert case['submit'](99189).status_code==200
+    assert case['state']['writes']==1
+    assert_cancelled(case)
+    c=db.connect()
+    assert not c.execute("SELECT 1 FROM oms_warehouse_user_permissions WHERE user_id=99189").fetchone()
+    c.close()
+
+
+def test_delegated_editor_without_warehouse_grants_does_not_inherit_owner_authority(case):
+    c=db.connect()
+    c.execute("INSERT INTO user_country_permissions(user_id,country) VALUES (99189,'PL')")
+    c.execute("UPDATE sites SET manager='Different Owner' WHERE id=99188")
+    c.commit();c.close()
+    result=case['submit'](99189)
+    assert result.status_code==403 and result.get_json()['code']=='warehouse_forbidden'
+    assert case['state']['reads']==case['state']['writes']==0
+    assert case['snapshot']()['stock']['reserved']==2
+
+
+@pytest.mark.parametrize('restriction',['viewer','excluded','archived'])
+def test_owner_role_and_explicit_site_restrictions_still_block_cancellation(case,restriction):
+    make_site_owner(case)
+    c=db.connect()
+    if restriction=='viewer':
+        c.execute("UPDATE users SET role='viewer' WHERE id=99189")
+    elif restriction=='excluded':
+        c.execute("INSERT INTO user_site_exclusions(user_id,site_id) VALUES (99189,99188)")
+    else:
+        c.execute("UPDATE sites SET api_status='archived' WHERE id=99188")
+    c.commit();c.close()
+    assert case['submit'](99189).status_code==403
+    assert case['state']['writes']==0
+    assert case['snapshot']()['stock']['reserved']==2
+
+
+@pytest.mark.parametrize('change',['ownership','role','exclusion'])
+def test_site_owner_authority_is_rechecked_after_remote_preflight(case,change):
+    make_site_owner(case)
+    def changed():
+        c=db.connect()
+        if change=='ownership':
+            c.execute("UPDATE sites SET manager='Different Owner' WHERE id=99188")
+        elif change=='role':
+            c.execute("UPDATE users SET role='viewer' WHERE id=99189")
+        else:
+            c.execute("INSERT INTO user_site_exclusions(user_id,site_id) VALUES (99189,99188)")
+        c.commit();c.close()
+    case['state']['read_hook']=changed
+    result=case['submit'](99189)
+    assert result.status_code==403 and result.get_json()['code']=='warehouse_forbidden'
+    assert case['state']['reads']==1 and case['state']['writes']==0
+    assert case['snapshot']()['stock']['reserved']==2
+    assert case['snapshot']()['fulfillment']['status']=='ready_to_pick'
+
+
+@pytest.mark.parametrize('remote',[
+    {'status':'shipped'},
+    {'meta_data':[{'key':'_tracking_number','value':'EXISTING'}]},
+])
+def test_site_owner_does_not_bypass_remote_dispatch_evidence(case,remote):
+    make_site_owner(case)
+    case['state']['remote'].update(remote)
+    assert case['submit'](99189).status_code==409
+    assert case['state']['writes']==0
+    assert case['snapshot']()['stock']['reserved']==2
+
+
+def test_site_owner_does_not_gain_single_warehouse_operations(case):
+    make_site_owner(case)
+    import app as module
+    client=module.app.test_client()
+    with client.session_transaction() as session:
+        session['_user_id']='99189';session['_fresh']=True
+    response=client.post(f"/api/fulfillment/{case['fid']}/cancel",json={'reason':'Synthetic attempt'})
+    assert response.status_code==403
+    assert case['state']['writes']==0
+    assert case['snapshot']()['stock']['reserved']==2
 
 
 def test_cancel_previously_cancelled_fulfillment_matches_reported_bug(case):

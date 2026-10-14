@@ -106,3 +106,61 @@ def test_cancelled_unallocated_order_stays_stopped(case):
     c.execute('DELETE FROM oms_fulfillments WHERE id=?', (fid,))
     assert recompute_order_status(c, 'cancel-test')['aggregate_status'] == 'cancelled'
     assert plan_order(c, 'cancel-test')['action'] == 'locked_noop'
+
+
+@pytest.fixture
+def owner_case(case):
+    c, fid, warehouse = case
+    c.execute("ALTER TABLE users ADD COLUMN role TEXT")
+    c.execute("ALTER TABLE sites ADD COLUMN manager TEXT")
+    c.execute("ALTER TABLE sites ADD COLUMN api_status TEXT DEFAULT 'ok'")
+    c.execute("CREATE TABLE user_site_exclusions(user_id INTEGER,site_id INTEGER)")
+    c.execute("INSERT INTO users(id,username,name,role) VALUES (5,'owner','Site Owner','user')")
+    c.execute("INSERT INTO users(id,username,name,role) VALUES (6,'other','Other Editor','user')")
+    c.execute("UPDATE sites SET manager='Site Owner' WHERE url=(SELECT source FROM orders WHERE id='cancel-test')")
+    return case
+
+
+def owner_actor():
+    return {'type': 'user', 'id': 5, 'name': 'Site Owner'}
+
+
+def test_site_owner_cancels_whole_order_without_warehouse_grants(owner_case):
+    c, fid, warehouse = owner_case
+    assert stop_local_fulfillments(c, 'cancel-test', actor=owner_actor(), allowed_warehouse_ids=[]) == [fid]
+    assert c.execute('SELECT SUM(reserved) FROM inv_stock WHERE warehouse_id=?', (warehouse,)).fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM inv_movements WHERE order_id='cancel-test' AND movement_type='release'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('restriction', ['different_owner', 'viewer', 'excluded', 'archived', 'forged_name'])
+def test_site_owner_authority_requires_live_identity_and_site_scope(owner_case, restriction):
+    c, fid, warehouse = owner_case
+    actor = owner_actor()
+    if restriction == 'different_owner':
+        c.execute("UPDATE sites SET manager='Other Editor'")
+    elif restriction == 'viewer':
+        c.execute("UPDATE users SET role='viewer' WHERE id=5")
+    elif restriction == 'excluded':
+        c.execute("INSERT INTO user_site_exclusions SELECT 5,id FROM sites WHERE manager='Site Owner'")
+    elif restriction == 'archived':
+        c.execute("UPDATE sites SET api_status='archived'")
+    else:
+        actor['id'] = 6
+    with pytest.raises(DomainError) as error:
+        stop_local_fulfillments(c, 'cancel-test', actor=actor, allowed_warehouse_ids=[])
+    assert error.value.code == 'warehouse_forbidden'
+    assert c.execute('SELECT status FROM oms_fulfillments WHERE id=?', (fid,)).fetchone()[0] == 'ready_to_pick'
+    assert c.execute('SELECT SUM(reserved) FROM inv_stock WHERE warehouse_id=?', (warehouse,)).fetchone()[0] == 2
+
+
+@pytest.mark.parametrize('status', ['submitting', 'submission_unknown', 'accepted', 'cancel_pending',
+                                   'cancel_rejected', 'shipped', 'delivered', 'returned', 'exception'])
+def test_site_owner_authority_preserves_external_and_shipping_guards(owner_case, status):
+    c, fid, warehouse = owner_case
+    c.execute("""INSERT INTO oms_fulfillments(id,order_id,warehouse_id,revision,status,mode,provider,idempotency_key,submitted_at)
+                 VALUES ('other','cancel-test',2,1,?,'external_wms','hungary_wms','other','2026-09-18')""", (status,))
+    with pytest.raises(DomainError) as error:
+        stop_local_fulfillments(c, 'cancel-test', actor=owner_actor(), allowed_warehouse_ids=[])
+    assert error.value.code != 'warehouse_forbidden'
+    assert c.execute('SELECT status FROM oms_fulfillments WHERE id=?', (fid,)).fetchone()[0] == 'ready_to_pick'
+    assert c.execute('SELECT SUM(reserved) FROM inv_stock WHERE warehouse_id=?', (warehouse,)).fetchone()[0] == 2
