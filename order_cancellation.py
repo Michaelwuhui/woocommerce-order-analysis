@@ -28,7 +28,32 @@ PENDING_REASON = "仓库履约已停止，网站订单取消结果待确认；�
 HEADERS = {"User-Agent": "WooCommerce API Client-Python/3.0.0", "Accept": "application/json"}
 
 
-def cancellation_guard(conn, order_id, *, allowed_warehouse_ids=None, lock=False):
+def _site_owner_can_cancel(conn, order, actor, *, lock=False):
+    """An editable site's owner may stop their order across its warehouses.
+
+    Resolve identity and ownership from current rows, never from the actor's
+    display name. Recheck after the remote preflight; warehouse operations
+    outside this whole-order cancellation path keep their existing grants.
+    """
+    if not actor or actor.get("type") != "user":
+        return False
+    try:
+        user_id = int(actor.get("id"))
+    except (TypeError, ValueError):
+        return False
+    suffix = " FOR SHARE OF s,u" if lock and hasattr(conn, "_raw") else ""
+    return conn.execute(
+        """SELECT s.id FROM sites s JOIN users u ON u.id=?
+           WHERE s.url=? AND s.manager=TRIM(u.name)
+             AND COALESCE(TRIM(u.name),'')!='' AND u.role IN ('admin','user')
+             AND COALESCE(s.api_status,'')!='archived'
+             AND NOT EXISTS (SELECT 1 FROM user_site_exclusions e
+                             WHERE e.user_id=u.id AND e.site_id=s.id)""" + suffix,
+        (user_id, order["source"]),
+    ).fetchone() is not None
+
+
+def cancellation_guard(conn, order_id, *, allowed_warehouse_ids=None, actor=None, lock=False):
     """Validate every warehouse before changing any of them."""
     pg = hasattr(conn, "_raw")
     if lock and pg:
@@ -47,6 +72,8 @@ def cancellation_guard(conn, order_id, *, allowed_warehouse_ids=None, lock=False
         "SELECT * FROM oms_fulfillments WHERE order_id=? ORDER BY id"
         + (" FOR UPDATE" if lock and pg else ""), (order_id,),
     ).fetchall()
+    site_owner = (allowed_warehouse_ids is not None
+                  and _site_owner_can_cancel(conn, order, actor, lock=lock))
     for row in rows:
         if row["shipped_at"] or row["delivered_at"] or row["status"] in {
             "shipped", "delivered", "returning", "returned", "exception",
@@ -54,7 +81,8 @@ def cancellation_guard(conn, order_id, *, allowed_warehouse_ids=None, lock=False
             raise DomainError("已有仓库发货，请先联系仓库/承运商拦截，不能直接取消整单", "order_already_shipped")
         if row["status"] in {"cancelled", "superseded"}:
             continue
-        if allowed_warehouse_ids is not None and row["warehouse_id"] not in allowed_warehouse_ids:
+        if (allowed_warehouse_ids is not None
+                and row["warehouse_id"] not in allowed_warehouse_ids and not site_owner):
             raise DomainError("没有全部相关仓库的取消权限，请联系有权限的负责人取消整单", "warehouse_forbidden")
         if row["status"] in {"submitting", "submission_unknown", "cancel_pending", "cancel_rejected"}:
             raise DomainError("外部仓提交或取消结果尚未确认，请先在多仓履约核验/拦截外部单据", "external_cancellation_required")
@@ -89,7 +117,8 @@ def cancellation_guard(conn, order_id, *, allowed_warehouse_ids=None, lock=False
 
 
 def stop_local_fulfillments(conn, order_id, *, actor, allowed_warehouse_ids=None):
-    rows = cancellation_guard(conn, order_id, allowed_warehouse_ids=allowed_warehouse_ids, lock=True)
+    rows = cancellation_guard(conn, order_id, allowed_warehouse_ids=allowed_warehouse_ids,
+                              actor=actor, lock=True)
     cancelled = []
     for row in rows:
         if row["status"] == "superseded":
@@ -160,7 +189,7 @@ def cancel_fulfillment_order(conn, order_id, *, actor, allowed_warehouse_ids=Non
     """Return a JSON payload and HTTP status; caller closes the connection."""
     stopped = False
     try:
-        cancellation_guard(conn, order_id, allowed_warehouse_ids=allowed_warehouse_ids)
+        cancellation_guard(conn, order_id, allowed_warehouse_ids=allowed_warehouse_ids, actor=actor)
         order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
         site_row = conn.execute("SELECT * FROM sites WHERE url=?", (order["source"],)).fetchone()
         if not site_row:
