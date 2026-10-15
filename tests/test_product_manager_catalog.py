@@ -145,6 +145,129 @@ def test_misconfigured_url_does_not_expose_embedded_credentials(system):
     assert "ck_sensitive" not in response.get_data(as_text=True)
 
 
+@pytest.mark.parametrize("params, expected", [
+    ({"manager": "Michael"}, {1, 3}),
+    ({"country": "CZ"}, {2}),
+    ({"manager": "Michael", "country": "CZ"}, set()),
+    ({"manager": " Michael ", "country": " PL ", "site_ids": "1,2,3"}, {1, 3}),
+    ({"manager": "Michael", "site_ids": "1,2"}, {1}),
+    ({"site_ids": "2,2,999"}, {2}),
+    ({"site_id": "1"}, {1}),
+    ({"site_id": "1", "site_ids": "2,3"}, set()),
+    ({"site_ids": ""}, set()),
+    ({"site_ids": "  "}, set()),
+    ({"manager_mode": "unassigned"}, {4}),
+    ({"manager_mode": "all", "country_mode": "all"}, {1, 2, 3, 4}),
+])
+def test_load_scope_metadata_is_an_intersection_and_never_reads_woo(system, params, expected):
+    response = system["client"].get("/api/product-manager/catalog-sites", query_string=params)
+    assert response.status_code == 200
+    assert {site["id"] for site in response.get_json()["sites"]} == expected
+    assert "private_ck" not in response.get_data(as_text=True)
+    assert "private_cs" not in response.get_data(as_text=True)
+    assert system["calls"] == []
+
+
+def test_scope_modes_do_not_reserve_real_manager_or_country_labels(system):
+    conn = system["connect"]()
+    conn.executemany("INSERT INTO sites VALUES (?, ?, ?, ?, ?, ?, ?)", [
+        (5, "https://all.test", "all", "unassigned", "ck5", "cs5", None),
+        (6, "https://label.test", "__unassigned__", "all", "ck6", "cs6", None),
+        (7, "https://blank.test", "  ", None, "ck7", "cs7", None),
+    ])
+    conn.commit()
+    conn.close()
+    client = system["client"]
+    for manager, country, identity in [("all", "unassigned", 5), ("__unassigned__", "all", 6)]:
+        data = client.get("/api/product-manager/catalog-sites", query_string={
+            "manager_mode": "exact", "manager": manager,
+            "country_mode": "exact", "country": country,
+        }).get_json()
+        assert [site["id"] for site in data["sites"]] == [identity]
+    data = client.get("/api/product-manager/catalog-sites", query_string={
+        "manager_mode": "unassigned", "country_mode": "unassigned",
+    }).get_json()
+    assert [site["id"] for site in data["sites"]] == [7]
+    assert data["sites"][0]["manager"] == data["sites"][0]["country"] == ""
+    assert system["calls"] == []
+
+
+@pytest.mark.parametrize("params", [
+    {"site_ids": "0"}, {"site_ids": "-1"}, {"site_ids": "1,2.5"},
+    {"site_ids": "1,"}, {"site_ids": "all"}, {"site_ids": "1,,2"},
+    {"site_ids": "9223372036854775808"}, {"site_ids": ","},
+    {"site_ids": ",".join(["1"] * 1001)},
+    {"manager_mode": "other"}, {"country_mode": "other"},
+    {"manager_mode": "exact"}, {"country_mode": "exact", "country": " "},
+    {"manager_mode": "all", "manager": "Michael"},
+    {"manager_mode": "unassigned", "manager": "Michael"},
+    {"country_mode": "unassigned", "country": "PL"},
+    {"manager": "x" * 201}, {"country": "x" * 201},
+    [("manager", "Michael"), ("manager", "Jane")],
+    [("site_ids", "1"), ("site_ids", "2")],
+    [("site_id", "1"), ("site_id", "2")],
+])
+def test_invalid_load_scope_is_json_400_without_a_remote_read(system, params):
+    for path in ("/api/product-manager/catalog-sites", "/api/product-manager/catalog-page"):
+        response = system["client"].get(path, query_string=params)
+        assert response.status_code == 400 and response.is_json
+        assert response.get_json()["code"] == "invalid_arguments"
+    assert system["calls"] == []
+
+
+def test_load_scope_cannot_reveal_unauthorized_or_archived_sites(system):
+    conn = system["connect"]()
+    conn.execute("ALTER TABLE sites ADD COLUMN api_status TEXT")
+    conn.execute("UPDATE sites SET api_status = 'archived' WHERE id = 3")
+    conn.commit()
+    conn.close()
+    system["user"].own_scoped = True
+    for params, expected in [
+        ({"site_ids": "1,2,3,999"}, {1}),
+        ({"manager": "Jane"}, set()),
+        ({"manager_mode": "unassigned"}, set()),
+    ]:
+        response = system["client"].get("/api/product-manager/catalog-sites", query_string=params)
+        assert {site["id"] for site in response.get_json()["sites"]} == expected
+        assert "other.test" not in response.get_data(as_text=True)
+        assert "missing.test" not in response.get_data(as_text=True)
+    assert page(system, site_id=2, manager="Jane", country="CZ").status_code == 403
+    assert page(system, site_id=3, site_ids="3").status_code == 409
+    assert system["calls"] == []
+
+
+@pytest.mark.parametrize("params", [
+    {"site_ids": "2,3"}, {"site_ids": ""}, {"manager": "Jane"},
+    {"country": "CZ"}, {"manager_mode": "unassigned"},
+    {"country_mode": "unassigned"},
+])
+def test_page_rejects_sites_outside_the_selected_boundary_before_woo(system, params):
+    response = page(system, **params)
+    assert response.status_code == 403
+    assert response.get_json()["code"] == "scope_mismatch"
+    assert system["calls"] == []
+
+
+def test_rows_use_fresh_server_country_and_manager_even_with_a_signed_parent(system):
+    parent = product(10, type="variable", variations=[101])
+    system["responses"].append(Response([parent], total=1, pages=1))
+    loaded = page(system, site_ids="1", manager="Michael", country="PL").get_json()
+    assert loaded["country"] == "PL" and loaded["manager"] == "Michael"
+    token = loaded["variable_products"][0]["parent_token"]
+    conn = system["connect"]()
+    conn.execute("UPDATE sites SET country = ' HU ', manager = ' Jane ' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    system["responses"].append(Response([product(101, country="invented")], total=1, pages=1))
+    response = page(system, parent_id=10, parent_token=token, site_ids="1", manager="Jane", country="HU")
+    data = response.get_json()
+    assert data["complete_page"] is True
+    assert data["country"] == data["rows"][0]["country"] == "HU"
+    assert data["manager"] == data["rows"][0]["manager"] == "Jane"
+    assert len(system["calls"]) == 2
+    assert all(call[0].startswith("https://child.test/") for call in system["calls"])
+
+
 def test_reads_actual_child_and_scans_parent_directory_without_woo_search(system):
     system["responses"].append(Response([
         product(10, name="Generic variable", type="variable", variations=[101]),

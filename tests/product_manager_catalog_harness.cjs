@@ -35,7 +35,7 @@ async function crossSiteAndRetry() {
     let healed = false;
     const transitions = [];
     const fixture = abortableFetch(url => {
-        if (url.endsWith('catalog-sites')) return response({sites});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites});
         const params = new URL(url, 'https://app.example').searchParams;
         const site = Number(params.get('site_id')), parent = Number(params.get('parent_id')), number = Number(params.get('page'));
         assert.equal(params.get('search'), 'Blueberry Ice');
@@ -94,7 +94,7 @@ async function completenessFailures() {
         wrongSite: () => page(2, 0, 1, [10], [row(2, 10)]),
     };
     for (const [scenario, makePage] of Object.entries(scenarios)) {
-        const fixture = abortableFetch(url => url.endsWith('catalog-sites') ? response({sites: [sites[0]]}) : response(makePage(Number(new URL(url, 'https://app.example').searchParams.get('page')))));
+        const fixture = abortableFetch(url => new URL(url, 'https://app.example').pathname.endsWith('catalog-sites') ? response({sites: [sites[0]]}) : response(makePage(Number(new URL(url, 'https://app.example').searchParams.get('page')))));
         const controller = createController({fetch: fixture.fetch});
         await controller.load('blue');
         const state = controller.getSnapshot();
@@ -103,7 +103,7 @@ async function completenessFailures() {
         assert.match(state.siteStates[0].error, /不完整/, scenario);
     }
     const fixture = abortableFetch(url => {
-        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites: [sites[0]]});
         const parent = Number(new URL(url, 'https://app.example').searchParams.get('parent_id'));
         return response(parent ? page(1, 10, 1, [101, 103], [row(1, 10, 101), row(1, 10, 103)]) : page(1, 0, 1, [10], [], {variable_products: [{id: 10, name: 'Parent', variation_ids: [101, 102]}]}));
     });
@@ -125,7 +125,7 @@ async function childStatusAndWildcardSemantics() {
     ];
     for (const scenario of cases) {
         const fixture = abortableFetch(url => {
-            if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+            if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites: [sites[0]]});
             const parent = Number(new URL(url, 'https://app.example').searchParams.get('parent_id'));
             if (!parent) return response(page(1, 0, 1, [10], [], {variable_products: [{id: 10, name: 'Parent', variation_ids: scenario.expected}]}));
             return response(page(1, 10, 1, scenario.ids, scenario.ids.map(id => row(1, 10, id, {status: scenario.statuses && scenario.statuses[id] || 'publish'})), {source_statuses: scenario.statuses}));
@@ -137,7 +137,7 @@ async function childStatusAndWildcardSemantics() {
         if (scenario.complete) assert.equal(state.counts.matched, scenario.ids.length, 'draft and scheduled rows remain visible');
     }
     const wildcardController = createController({fetch: async url => {
-        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites: [sites[0]]});
         const parent = Number(new URL(url, 'https://app.example').searchParams.get('parent_id'));
         return response(parent ? page(1, 10, 1, [101], [row(1, 10, 101, {flavors: ['Blueberry Ice', 'Apple'], flavor_scope: 'any'})]) : page(1, 0, 1, [10], [], {variable_products: [{id: 10, name: 'Parent', variation_ids: [101]}]}));
     }});
@@ -152,7 +152,7 @@ async function childStatusAndWildcardSemantics() {
 async function brandQueriesAndModes() {
     let healed = false;
     const fixture = abortableFetch(url => {
-        if (url.endsWith('catalog-sites')) return response({sites});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites});
         const params = new URL(url, 'https://app.example').searchParams;
         assert.equal(params.get('search'), '', 'brand queries do not require or reuse a flavor keyword');
         assert.equal(params.get('brand'), 'ELFBAR');
@@ -192,7 +192,7 @@ async function brandQueriesAndModes() {
     const modeCalls = [];
     const modes = createController({fetch: async url => {
         modeCalls.push(url);
-        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites: [sites[0]]});
         return response(page(1, 0, 1, [10], [row(1, 10)]));
     }});
     await modes.load('unused', {queryMode: 'brand', brand: ''});
@@ -218,7 +218,7 @@ async function brandQueriesAndModes() {
     assert.equal(modes.getSnapshot().mode, 'flavor');
 
     const stoppedFixture = abortableFetch(url => {
-        if (url.endsWith('catalog-sites')) return response({sites});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites});
         const params = new URL(url, 'https://app.example').searchParams;
         assert.equal(params.get('brand'), 'ELFBAR');
         assert.equal(params.get('search'), '');
@@ -239,7 +239,7 @@ async function brandQueriesAndModes() {
         const ready = new Promise(resolve => { oldStarted = resolve; });
         const gate = new Promise(resolve => { releaseOld = resolve; });
         const races = createController({fetch: async url => {
-            if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+            if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites: [sites[0]]});
             const params = new URL(url, 'https://app.example').searchParams;
             const old = params.get('brand') === 'ELFBAR';
             if (old) { oldStarted(); await gate; }
@@ -274,7 +274,7 @@ async function mountedQueryControls() {
     const calls = [];
     const controller = mount({getElementById: id => elements[id]}, {fetch: async url => {
         calls.push(url);
-        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites: [sites[0]]});
         return response(page(1, 0, 1, [10], [row(1, 10)]));
     }});
     assert.equal(elements.pmCatalogQueryMode.value, 'brand', 'mount preserves brand default from template');
@@ -315,7 +315,7 @@ async function mountedQueryControls() {
 }
 
 async function cancelAndRace() {
-    const fixture = abortableFetch(url => url.endsWith('catalog-sites') ? response({sites}) : response(page(Number(new URL(url, 'https://app.example').searchParams.get('site_id')), 0, 1, [], [])), 15);
+    const fixture = abortableFetch(url => new URL(url, 'https://app.example').pathname.endsWith('catalog-sites') ? response({sites}) : response(page(Number(new URL(url, 'https://app.example').searchParams.get('site_id')), 0, 1, [], [])), 15);
     const controller = createController({fetch: fixture.fetch});
     const pending = controller.load('stop');
     await sleep(20);
@@ -332,7 +332,7 @@ async function cancelAndRace() {
 
     let stopOnce = true, streamingController;
     const streamingFixture = abortableFetch(url => {
-        if (url.endsWith('catalog-sites')) return response({sites});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites});
         const id = Number(new URL(url, 'https://app.example').searchParams.get('site_id'));
         return response(page(id, 0, 1, [10], [row(id, 10)]));
     });
@@ -350,7 +350,7 @@ async function cancelAndRace() {
     const oldGate = new Promise(resolve => { releaseOld = resolve; });
     let discovery = 0;
     const staleController = createController({fetch: async url => {
-        if (url.endsWith('catalog-sites')) {
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) {
             discovery++;
             if (discovery === 1) await oldGate; // Intentionally ignore AbortSignal to model a late response.
             return response({sites: [sites[0]]});
@@ -369,7 +369,7 @@ async function cancelAndRace() {
     const oldPageReady = new Promise(resolve => { oldPageStarted = resolve; });
     const oldPageGate = new Promise(resolve => { releasePage = resolve; });
     const latePageController = createController({fetch: async url => {
-        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites: [sites[0]]});
         const query = new URL(url, 'https://app.example').searchParams.get('search');
         if (query === 'old') { oldPageStarted(); await oldPageGate; }
         return response(page(1, 0, 1, [10], [row(1, 10, 0, {name: query, product_name: query})]));
@@ -389,7 +389,7 @@ async function errorsAndRendering() {
     assert.equal(slowController.getSnapshot().phase, 'error');
     assert.match(slowController.getSnapshot().error, /超时/);
     for (const [type, data, pattern] of [['text/html', {}, /非 JSON.*HTTP 502/], ['application/json', {error: '读取被拒绝', complete_page: false}, /读取被拒绝/]]) {
-        const controller = createController({fetch: async url => url.endsWith('catalog-sites') ? response({sites: [sites[0]]}) : response(data, type === 'text/html' ? 502 : 200, type)});
+        const controller = createController({fetch: async url => new URL(url, 'https://app.example').pathname.endsWith('catalog-sites') ? response({sites: [sites[0]]}) : response(data, type === 'text/html' ? 502 : 200, type)});
         await controller.load('no');
         const state = controller.getSnapshot();
         assert.equal(state.phase, 'incomplete');
@@ -397,7 +397,7 @@ async function errorsAndRendering() {
         assert.match(resultHtml(state), /不能据此判断全部站点没有/);
     }
     const malicious = row(1, 10, 0, {product_name: '<img src=x onerror=alert(1)>', name: 'Jabłko Blueberry-Ice Mr. Blue', brands: ['<script>'], flavors: ['" onclick="alert(1)'], permalink: 'javascript:alert(1)'});
-    const controller = createController({fetch: async url => url.endsWith('catalog-sites') ? response({sites: [Object.assign({}, sites[0], {manager: '<svg onload=x>'})]}) : response(page(1, 0, 1, [10], [malicious]))});
+    const controller = createController({fetch: async url => new URL(url, 'https://app.example').pathname.endsWith('catalog-sites') ? response({sites: [Object.assign({}, sites[0], {manager: '<svg onload=x>'})]}) : response(page(1, 0, 1, [10], [malicious]))});
     await controller.load('query');
     const html = resultHtml(controller.getSnapshot());
     assert(!html.includes('<img'));
@@ -415,7 +415,7 @@ async function errorsAndRendering() {
     assert.equal(controller.getSnapshot().filtered.length, 1, 'text filtering handles punctuation like the main search');
 
     const largeController = createController({fetch: async url => {
-        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites: [sites[0]]});
         return response(page(1, 0, 1, Array.from({length: 101}, (_, index) => index + 1), Array.from({length: 101}, (_, index) => row(1, index + 1))));
     }});
     await largeController.load('query');
@@ -427,7 +427,7 @@ async function errorsAndRendering() {
 async function boundedParentsTokensAndCaching() {
     const progress = [], activeParents = new Map(), peakParents = new Map();
     const fixture = abortableFetch(async url => {
-        if (url.endsWith('catalog-sites')) return response({sites: sites.slice(0, 3)});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites: sites.slice(0, 3)});
         const params = new URL(url, 'https://app.example').searchParams, site = Number(params.get('site_id')), parent = Number(params.get('parent_id'));
         if (!parent) {
             const descriptors = [10, 20, 30].map(id => ({id, name: 'Merrymi ' + id, variation_ids: [id * 10], parent_token: `synthetic-token-${site}-${id}`}));
@@ -455,7 +455,7 @@ async function boundedParentsTokensAndCaching() {
 async function progressThrottling() {
     let notices = 0;
     const controller = createController({fetch: async url => {
-        if (url.endsWith('catalog-sites')) return response({sites: [sites[0]]});
+        if (new URL(url, 'https://app.example').pathname.endsWith('catalog-sites')) return response({sites: [sites[0]]});
         const number = Number(new URL(url, 'https://app.example').searchParams.get('page'));
         return response(page(1, 0, number, [number], [row(1, number)], {total: 40, total_pages: 40, has_more: number < 40, next_page: number < 40 ? number + 1 : null}));
     }, onChange: () => { notices += 1; }});
