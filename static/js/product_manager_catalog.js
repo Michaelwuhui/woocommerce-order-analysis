@@ -3,7 +3,7 @@
 
     const PAGE_SIZE = 100;
     const FILTER_IDS = {
-        manager: 'pmCatalogManagerFilter', site: 'pmCatalogSiteFilter',
+        manager: 'pmCatalogManagerFilter', country: 'pmCatalogCountryFilter', site: 'pmCatalogSiteFilter',
         brand: 'pmCatalogBrandFilter', product: 'pmCatalogProductFilter',
         flavor: 'pmCatalogFlavorFilter', stock: 'pmCatalogStockFilter',
         publish: 'pmCatalogPublishFilter', text: 'pmCatalogTextFilter'
@@ -22,7 +22,41 @@
     const stockValue = row => str(row.stock_state || row.stock_status || 'unknown');
     const managerLabel = site => str(site.manager).trim() || '未分配负责人';
     const siteLabel = site => str(site.name || site.url || ('站点 ' + site.id));
-    const emptyFilters = () => ({manager: '', site: '', brand: '', product: '', flavor: '', stock: '', publish: '', text: ''});
+    const countryCode = row => str(row.country === undefined ? row.site && row.site.country : row.country).trim();
+    const countryKey = value => str(value).trim() ? valueKey(value) : 'missing:country';
+    const emptyFilters = () => ({manager: '', country: '', site: '', brand: '', product: '', flavor: '', stock: '', publish: '', text: ''});
+    const emptyScope = () => ({manager: '', managerMode: 'all', country: '', countryMode: 'all', siteId: ''});
+    function normalizeScope(input, previous) {
+        const scope = Object.assign(emptyScope(), previous || {}, input || {});
+        ['manager', 'country'].forEach(key => {
+            scope[key] = str(scope[key]).trim();
+            if (input && Object.prototype.hasOwnProperty.call(input, key) && !Object.prototype.hasOwnProperty.call(input, key + 'Mode')) scope[key + 'Mode'] = scope[key] ? 'exact' : 'all';
+            if (!['all', 'exact', 'unassigned'].includes(scope[key + 'Mode'])) throw new Error('加载范围方式无效。');
+            if (scope[key + 'Mode'] !== 'exact') scope[key] = '';
+        });
+        scope.siteId = str(scope.siteId).trim();
+        if (scope.siteId && (!Number.isSafeInteger(Number(scope.siteId)) || Number(scope.siteId) <= 0)) throw new Error('加载站点编号无效。');
+        if (scope.siteIds !== undefined) {
+            if (!Array.isArray(scope.siteIds) || scope.siteIds.some(id => !Number.isSafeInteger(Number(id)) || Number(id) <= 0)) throw new Error('加载站点范围无效。');
+            scope.siteIds = [...new Set(scope.siteIds.map(id => str(Number(id))))];
+        }
+        return scope;
+    }
+    function scopeMatches(site, scope) {
+        return ['manager', 'country'].every(key => scope[key + 'Mode'] === 'all' ||
+            (scope[key + 'Mode'] === 'unassigned' ? !str(site[key]).trim() : str(site[key]).trim() === scope[key])) &&
+            (!scope.siteId || str(site.id) === scope.siteId) && (!scope.siteIds || scope.siteIds.includes(str(site.id)));
+    }
+    function scopeParams(scope) {
+        const params = new URLSearchParams();
+        ['manager', 'country'].forEach(key => {
+            if (scope[key + 'Mode'] !== 'all') params.set(key + '_mode', scope[key + 'Mode']);
+            if (scope[key + 'Mode'] === 'exact') params.set(key, scope[key]);
+        });
+        if (scope.siteId) params.set('site_id', scope.siteId);
+        if (scope.siteIds) params.set('site_ids', scope.siteIds.join(','));
+        return params;
+    }
 
     function safeUrl(value) {
         try {
@@ -41,29 +75,33 @@
             site_id: str(site.id), product_id: productId, variation_id: variationId,
             key: `${site.id}:${productId}:${variationId}`, site: site,
             product_name: str(row.product_name || row.name), name: str(row.name),
-            sku: str(row.sku), brands: list(row.brands), flavors: list(row.flavors)
+            sku: str(row.sku), brands: list(row.brands), flavors: list(row.flavors),
+            country: str(row.country === undefined ? site.country : row.country).trim()
         });
     }
 
     function matchesFilters(row, filters) {
         return (!filters.manager || valueKey(managerLabel(row.site)) === filters.manager) &&
+            (!filters.country || countryKey(countryCode(row)) === filters.country) &&
             (!filters.site || str(row.site_id) === filters.site) &&
             (!filters.brand || (row.brands.length ? row.brands.some(value => valueKey(value) === filters.brand) : filters.brand === 'missing:brand')) &&
             (!filters.product || valueKey(row.product_name) === filters.product) &&
             (!filters.flavor || (row.flavors.length ? row.flavors.some(value => valueKey(value) === filters.flavor) : filters.flavor === 'missing:flavor')) &&
             (!filters.stock || stockValue(row) === filters.stock) &&
             (!filters.publish || str(row.status || 'unknown') === filters.publish) &&
-            (!searchNormalized(filters.text) || searchNormalized([siteLabel(row.site), managerLabel(row.site), row.product_name, row.name, row.sku, ...row.brands, ...row.flavors,
+            (!searchNormalized(filters.text) || searchNormalized([siteLabel(row.site), managerLabel(row.site), countryCode(row), row.product_name, row.name, row.sku, ...row.brands, ...row.flavors,
                 ...(Array.isArray(row.attributes) ? row.attributes.flatMap(attribute => list(attribute.values)) : [])].join(' ')).includes(searchNormalized(filters.text)));
     }
 
     function facetOptions(rows, sites) {
-        const maps = Object.fromEntries(['manager', 'site', 'brand', 'product', 'flavor', 'stock', 'publish'].map(key => [key, new Map()]));
+        const maps = Object.fromEntries(['manager', 'country', 'site', 'brand', 'product', 'flavor', 'stock', 'publish'].map(key => [key, new Map()]));
         sites.forEach(site => {
             maps.manager.set(valueKey(managerLabel(site)), managerLabel(site));
             maps.site.set(str(site.id), siteLabel(site));
+            maps.country.set(countryKey(site.country), str(site.country).trim() || '未设置国家');
         });
         rows.forEach(row => {
+            maps.country.set(countryKey(countryCode(row)), countryCode(row) || '未设置国家');
             row.brands.forEach(value => maps.brand.set(valueKey(value), value));
             if (!row.brands.length) maps.brand.set('missing:brand', '未识别品牌');
             maps.product.set(valueKey(row.product_name), row.product_name || '未提供产品名');
@@ -119,11 +157,22 @@
         const concurrency = Math.max(1, Math.min(3, Number(options.concurrency) || 3));
         const parentConcurrency = Math.max(1, Math.min(2, Number(options.parentConcurrency) || 2));
         const emitInterval = options.emitInterval === undefined ? 100 : Math.max(0, Number(options.emitInterval) || 0);
-        let epoch = 0, aborter = null;
+        let epoch = 0, aborter = null, metadataEpoch = 0, metadataAborter = null;
         let dataVersion = 0, filtersVersion = 0, cachedRowsVersion = -1, cachedFacetVersion = -1;
         let cachedFilterVersion = -1, cachedFilterDataVersion = -1, cachedRows = [], cachedFiltered = [], cachedFacets = {};
         let emitTimer = null;
-        const state = {phase: 'idle', queryMode: 'flavor', brand: '', keyword: '', sites: [], siteStates: new Map(), rows: new Map(), filters: emptyFilters(), page: 1, error: ''};
+        const state = {phase: 'idle', queryMode: 'flavor', brand: '', keyword: '', sites: [], siteStates: new Map(), rows: new Map(), filters: emptyFilters(), page: 1, error: '',
+            availableSites: [], metadataPhase: 'idle', metadataError: '', loadScope: emptyScope(), loadedScope: null, loadedAt: null};
+        function parseSites(data) {
+            if (!Array.isArray(data.sites)) throw new Error('站点列表格式无效，无法确认查询范围。');
+            const ids = new Set();
+            return data.sites.map(site => {
+                const id = Number(site.id);
+                if (!Number.isSafeInteger(id) || id <= 0 || ids.has(id)) throw new Error('站点列表有无效或重复编号，无法确认查询范围。');
+                ids.add(id);
+                return Object.assign({}, site, {id: str(id)});
+            });
+        }
         function snapshot() {
             if (cachedRowsVersion !== dataVersion) { cachedRows = [...state.rows.values()]; cachedRowsVersion = dataVersion; }
             const rows = cachedRows;
@@ -139,7 +188,11 @@
             const incomplete = siteStates.filter(site => ['failed', 'incomplete', 'stopped'].includes(site.status)).length;
             const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
             state.page = Math.max(1, Math.min(state.page, pages));
+            const selectedSites = state.availableSites.filter(site => scopeMatches(site, state.loadScope));
             return {phase: state.phase, queryMode: state.queryMode, mode: state.queryMode, brand: state.brand, keyword: state.keyword, sites: state.sites.slice(), siteStates,
+                availableSites: state.availableSites.slice(), metadataPhase: state.metadataPhase, metadataError: state.metadataError,
+                loadScope: Object.assign({}, state.loadScope), selectedSites, scopeCount: selectedSites.length,
+                loadedScope: state.loadedScope ? Object.assign({}, state.loadedScope, {siteIds: state.loadedScope.siteIds.slice()}) : null, loadedAt: state.loadedAt,
                 rows, filtered, filters: Object.assign({}, state.filters), options: cachedFacets, dataVersion,
                 page: state.page, pages, pageRows: filtered.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE),
                 counts: {matched: rows.length, filtered: filtered.length, totalSites: state.sites.length, completeSites: complete, failedSites: failed, incompleteSites: incomplete}, error: state.error,
@@ -158,6 +211,7 @@
         function current(run) { return run === epoch && aborter && !aborter.signal.aborted; }
         function begin() {
             if (aborter) aborter.abort();
+            state.siteStates.forEach(site => { if (site.status === 'loading' || site.status === 'pending') site.status = 'stopped'; });
             if (emitTimer !== null) clearTimeout(emitTimer);
             emitTimer = null;
             aborter = new AbortController();
@@ -170,6 +224,22 @@
             epoch += 1;
             state.siteStates.forEach(site => { if (site.status === 'loading' || site.status === 'pending') site.status = 'stopped'; });
             state.phase = 'stopped';
+            emit(true);
+        }
+        async function discoverSites() {
+            if (metadataAborter) metadataAborter.abort();
+            metadataAborter = new AbortController();
+            const run = ++metadataEpoch;
+            state.metadataPhase = 'loading'; state.metadataError = ''; emit(true);
+            try {
+                const data = await readJson(fetcher, '/api/product-manager/catalog-sites', metadataAborter.signal, options.requestTimeout);
+                if (run !== metadataEpoch) return;
+                state.availableSites = parseSites(data);
+                state.metadataPhase = 'ready';
+            } catch (error) {
+                if (run !== metadataEpoch) return;
+                state.metadataPhase = 'error'; state.metadataError = error.message || str(error);
+            }
             emit(true);
         }
         async function scanPages(siteState, parentId, run, parents) {
@@ -185,6 +255,10 @@
                 if (requestedPages.has(page)) throw new Error('分页重复，当前站点结果不完整。');
                 requestedPages.add(page);
                 const params = new URLSearchParams({site_id: siteState.site.id, parent_id: parentId, page, search: state.keyword, brand: state.brand, query_mode: state.queryMode});
+                if (state.loadedScope) scopeParams(state.loadedScope).forEach((value, key) => {
+                    // site_id is the page's actual site, while site_ids bounds the full run.
+                    if (key !== 'site_id') params.set(key, value);
+                });
                 if (parentId && parents.get(parentId).parent_token) params.set('parent_token', str(parents.get(parentId).parent_token));
                 const data = await readJson(fetcher, '/api/product-manager/catalog-page?' + params.toString(), aborter.signal, options.requestTimeout);
                 if (!current(run)) return;
@@ -333,51 +407,45 @@
             emit(true);
         }
         async function load(keyword, loadOptions) {
+            const queryMode = loadOptions && loadOptions.queryMode || 'flavor';
+            const brand = queryMode === 'brand' ? str(loadOptions && loadOptions.brand).trim() : '';
+            const search = queryMode === 'flavor' ? str(keyword).trim() : '';
+            const previousPhase = state.phase;
+            let requestedScope;
+            function invalid(message) {
+                if (!state.loadedScope) state.phase = 'error';
+                else if (state.phase === 'discovering') state.phase = previousPhase === 'loading' || previousPhase === 'discovering' ? 'stopped' : previousPhase;
+                state.error = state.loadedScope ? '本次未加载成功：' + message + ' 当前仍显示原加载范围的结果，原加载时间保持不变。' : message; emit(true);
+            }
+            if (!['flavor', 'brand', 'all'].includes(queryMode) || (queryMode === 'brand' && !brand)) return invalid(queryMode === 'brand' ? '请输入或选择一个品牌，再加载所选站点。' : '请选择有效的查询方式。');
+            if (brand.length > 200 || search.length > 200) return invalid('品牌或口味关键词不能超过 200 个字符。');
+            try { requestedScope = normalizeScope(loadOptions && loadOptions.scope || state.loadScope); }
+            catch (error) { return invalid(error.message); }
+            if (state.metadataPhase === 'ready') {
+                requestedScope.siteIds = state.availableSites.filter(site => scopeMatches(site, requestedScope)).map(site => site.id);
+                if (!requestedScope.siteIds.length) return invalid('当前加载范围没有符合条件的站点。请调整负责人、国家或站点后再加载；旧结果仍保留。');
+            } else if (requestedScope.siteIds && !requestedScope.siteIds.length) return invalid('当前加载范围没有站点，请调整后再加载。');
             const run = begin();
-            state.queryMode = loadOptions && loadOptions.queryMode || 'flavor';
-            state.brand = state.queryMode === 'brand' ? str(loadOptions && loadOptions.brand).trim() : '';
-            state.keyword = state.queryMode === 'flavor' ? str(keyword).trim() : '';
-            state.phase = 'discovering';
-            state.error = '';
-            state.rows.clear();
-            dataVersion += 1;
-            state.sites = [];
-            state.siteStates.clear();
-            state.page = 1;
-            if (!loadOptions || !loadOptions.preserveFilters) state.filters = emptyFilters();
-            filtersVersion += 1;
-            emit(true);
-            if (!['flavor', 'brand', 'all'].includes(state.queryMode) || (state.queryMode === 'brand' && !state.brand)) {
-                state.phase = 'error';
-                state.error = state.queryMode === 'brand' ? '请输入或选择一个品牌，再加载全部站点。' : '请选择有效的查询方式。';
-                emit(true);
-                return;
-            }
-            if (state.brand.length > 200 || state.keyword.length > 200) {
-                state.phase = 'error';
-                state.error = '品牌或口味关键词不能超过 200 个字符。';
-                emit(true);
-                return;
-            }
+            state.phase = 'discovering'; state.error = ''; emit(true);
             try {
-                const data = await readJson(fetcher, '/api/product-manager/catalog-sites', aborter.signal, options.requestTimeout);
+                const params = scopeParams(requestedScope), query = params.toString();
+                const data = await readJson(fetcher, '/api/product-manager/catalog-sites' + (query ? '?' + query : ''), aborter.signal, options.requestTimeout);
                 if (!current(run)) return;
-                if (!Array.isArray(data.sites)) throw new Error('站点列表格式无效，无法确认查询范围。');
-                const ids = new Set();
-                state.sites = data.sites.map(site => {
-                    const id = Number(site.id);
-                    if (!Number.isSafeInteger(id) || id <= 0 || ids.has(id)) throw new Error('站点列表有无效或重复编号，无法确认查询范围。');
-                    ids.add(id);
-                    return Object.assign({}, site, {id: str(id)});
-                });
+                const discovered = parseSites(data), selected = discovered.filter(site => scopeMatches(site, requestedScope));
+                if (!selected.length && (query || state.metadataPhase === 'ready')) return invalid('当前加载范围没有可读取的站点，可能权限或负责人已变化。旧结果仍保留，请重新选择范围。');
+                if (!query) { state.availableSites = discovered; state.metadataPhase = 'ready'; state.metadataError = ''; }
+                state.queryMode = queryMode; state.brand = brand; state.keyword = search;
+                state.rows.clear(); state.sites = selected; state.siteStates.clear(); state.page = 1;
+                state.loadedScope = Object.assign({}, requestedScope, {siteIds: selected.map(site => site.id)});
+                state.loadedAt = new Date().toISOString();
+                if (!loadOptions || !loadOptions.preserveFilters) state.filters = emptyFilters();
+                filtersVersion += 1;
                 dataVersion += 1;
                 state.sites.forEach(site => state.siteStates.set(str(site.id), newSiteState(site)));
                 await runSites(state.sites, run);
             } catch (error) {
                 if (!current(run)) return;
-                state.phase = 'error';
-                state.error = error.message || str(error);
-                emit(true);
+                invalid(error.message || str(error));
             }
         }
         async function retryIncomplete() {
@@ -392,9 +460,10 @@
             targets.forEach(site => state.siteStates.set(str(site.id), newSiteState(site)));
             await runSites(targets, run);
         }
-        return {load, stop, retryIncomplete, getSnapshot: snapshot,
-            loadQuery(query) { return load(query.keyword || query.search || '', {queryMode: query.queryMode || query.mode || 'flavor', brand: query.brand, preserveFilters: !!query.preserveFilters}); },
-            refresh() { return load(state.keyword, {queryMode: state.queryMode, brand: state.brand, preserveFilters: true}); },
+        return {load, stop, retryIncomplete, discoverSites, getSnapshot: snapshot,
+            setLoadScope(scope) { state.loadScope = normalizeScope(scope, state.loadScope); state.error = ''; emit(true); },
+            loadQuery(query) { return load(query.keyword || query.search || '', {queryMode: query.queryMode || query.mode || 'flavor', brand: query.brand, scope: query.scope, preserveFilters: !!query.preserveFilters}); },
+            refresh() { return load(state.keyword, {queryMode: state.queryMode, brand: state.brand, scope: state.loadedScope || state.loadScope, preserveFilters: true}); },
             updateRows(rows) {
                 rows.forEach(row => {
                     const site = state.sites.find(site => str(site.id) === str(row.site_id));
@@ -412,10 +481,10 @@
     function resultHtml(snapshot, editor) {
         if (!snapshot.pageRows.length) {
             let message;
-            if (snapshot.phase === 'idle') message = '选择按品牌、按口味或全部产品，点击「加载全部站点」开始查询。';
+            if (snapshot.phase === 'idle') message = '选择加载范围，再选择按品牌、按口味或全部产品，点击「加载所选站点」开始查询。';
             else if (snapshot.counts.matched) message = '已加载的匹配结果中没有符合当前筛选条件的产品。可清空筛选后查看。';
             else if (snapshot.busy) message = '正在逐站读取，暂未收到匹配结果，请查看读取进度。';
-            else if (snapshot.phase === 'complete' && snapshot.counts.totalSites) message = '已完整读取全部有权限站点，此次查询未匹配到产品或口味。';
+            else if (snapshot.phase === 'complete' && snapshot.counts.totalSites) message = '已完整读取本次所选站点，此次查询未匹配到产品或口味。';
             else if (snapshot.phase === 'complete') message = '当前账号没有可查询的站点，请联系管理员核对产品管理权限。';
             else message = '当前结果尚不完整，暂未匹配到产品。不能据此判断全部站点没有符合查询条件的产品，请重试异常站点或重新加载。';
             return '<div class="pm-empty-state">' + escapeHtml(message) + '</div>';
@@ -450,29 +519,31 @@
             (global.requestAnimationFrame || (callback => setTimeout(callback, 0)))(() => { scheduled = false; render(latest); });
         }
         const controller = createController({fetch: fetcher, onChange: scheduleRender});
+        const hasScopeControls = !!($('pmCatalogLoadManager') && $('pmCatalogLoadCountry') && $('pmCatalogLoadSite'));
         if (global.ProductManagerCatalogEditor && $('pmCatalogSelectedCount')) editor = global.ProductManagerCatalogEditor.createUI({document, root, catalog: controller, fetch: fetcher,
             onChange: () => scheduleRender(controller.getSnapshot())});
         function render(snapshot) {
             const editorBusy = editor && editor.getSnapshot().busy;
-            $('pmCatalogLoad').disabled = !!editorBusy; // A new keyword can replace an in-flight query.
+            $('pmCatalogLoad').disabled = !!editorBusy || (hasScopeControls && (snapshot.metadataPhase !== 'ready' || !snapshot.scopeCount));
             $('pmCatalogStop').disabled = !snapshot.busy;
             $('pmCatalogRetry').disabled = editorBusy || snapshot.busy || !snapshot.counts.incompleteSites;
-            $('pmCatalogRefresh').disabled = editorBusy || snapshot.phase === 'idle';
-            let status = {idle: '选择查询方式，一次查询全部有权限站点；加载后可继续组合筛选。', discovering: '正在确认当前账号有权限的全部站点…', loading: '正在读取各站产品与全部变体，匹配结果会陆续显示。', complete: '查询完成，全部站点读取完整。', incomplete: '查询结束，存在不完整站点；已保留成功读取的匹配结果。', stopped: '已停止；已读取的匹配结果保留，未完成站点可单独重试。', error: snapshot.error}[snapshot.phase];
+            $('pmCatalogRefresh').disabled = editorBusy || !snapshot.loadedScope;
+            let status = {idle: '选择加载范围和产品条件；加载后可在本页反复搜索、筛选。', discovering: '正在确认所选范围的站点权限…', loading: '正在读取所选站点的产品与全部变体，匹配结果会陆续显示。', complete: '查询完成，本次所选站点读取完整。', incomplete: '查询结束，存在不完整站点；已保留成功读取的匹配结果。', stopped: '已停止；已读取的匹配结果保留，未完成站点可单独重试。', error: snapshot.error}[snapshot.phase];
             if (snapshot.phase === 'complete' && !snapshot.counts.totalSites) status = '当前账号没有可查询的站点，请核对产品管理权限。';
             if (snapshot.phase === 'stopped' && !snapshot.counts.totalSites) status = '已停止确认站点范围，请重新加载以继续查询。';
-            if (snapshot.phase !== 'idle') {
+            if (snapshot.phase !== 'idle' && snapshot.phase !== 'discovering') {
                 const scope = snapshot.queryMode === 'brand' ? (snapshot.brand ? `品牌「${snapshot.brand}」` : '品牌查询') : snapshot.queryMode === 'all' || !snapshot.keyword ? '全部产品' : `口味 / 关键词「${snapshot.keyword}」`;
                 status = scope + '：' + status;
             }
-            $('pmCatalogStatus').textContent = status;
-            $('pmCatalogStatus').classList.toggle('text-warning', ['incomplete', 'stopped', 'error'].includes(snapshot.phase));
+            $('pmCatalogStatus').textContent = snapshot.error || status;
+            $('pmCatalogStatus').classList.toggle('text-warning', !!snapshot.error || ['incomplete', 'stopped', 'error'].includes(snapshot.phase));
+            renderScope(snapshot);
             const counts = snapshot.counts;
             $('pmCatalogCounts').textContent = `已匹配 ${counts.matched} 条 · 筛选后 ${counts.filtered} 条 · 完整站点 ${counts.completeSites} / ${counts.totalSites} · 失败 ${counts.failedSites} · 不完整 ${counts.incompleteSites}`;
             $('pmCatalogProgress').innerHTML = snapshot.siteStates.map(site => {
                 const problems = [site.error, ...site.warnings].filter(Boolean).map(escapeHtml).join('；');
                 const progress = `产品 ${site.productPages}${Number.isFinite(Number(site.productTotalPages)) && site.productTotalPages !== null ? ' / ' + Number(site.productTotalPages) : ''} 页 · 已检查 ${site.scanned} 项 · 匹配 ${site.matched} 条 · 变体 ${site.variableDone} / ${site.variableTotal} 个产品（${site.variationPages} 页）`;
-                return `<div class="border-bottom border-secondary border-opacity-25 py-2"><div class="d-flex justify-content-between gap-2"><strong>${escapeHtml(siteLabel(site.site))}</strong><span class="${site.status === 'complete' ? 'text-success' : ['failed', 'incomplete', 'stopped'].includes(site.status) ? 'text-warning' : 'text-info'}">${escapeHtml(SITE_LABELS[site.status])}</span></div><div class="small text-muted">${escapeHtml(managerLabel(site.site))} · ${escapeHtml(progress)}${site.currentProduct ? ' · 正在读取：' + escapeHtml(site.currentProduct) : ''}</div>${problems ? '<div class="small text-warning">' + problems + '</div>' : ''}</div>`;
+                return `<div class="border-bottom border-secondary border-opacity-25 py-2"><div class="d-flex justify-content-between gap-2"><strong>${escapeHtml(siteLabel(site.site))}</strong><span class="${site.status === 'complete' ? 'text-success' : ['failed', 'incomplete', 'stopped'].includes(site.status) ? 'text-warning' : 'text-info'}">${escapeHtml(SITE_LABELS[site.status])}</span></div><div class="small text-muted">${escapeHtml(managerLabel(site.site))} · ${escapeHtml(str(site.site.country).trim() || '未设置国家')} · ${escapeHtml(progress)}${site.currentProduct ? ' · 正在读取：' + escapeHtml(site.currentProduct) : ''}</div>${problems ? '<div class="small text-warning">' + problems + '</div>' : ''}</div>`;
             }).join('');
             Object.entries(FILTER_IDS).forEach(([key, id]) => {
                 const element = $(id);
@@ -497,6 +568,40 @@
             if (tableSignature !== signature) { $('pmCatalogResults').innerHTML = resultHtml(snapshot, editor); tableSignature = signature; }
             if (editor) editor.render(snapshot);
         }
+        function scopeValue(scope, key) { return scope[key + 'Mode'] === 'all' ? '' : scope[key + 'Mode'] === 'unassigned' ? 'unassigned' : 'exact:' + scope[key]; }
+        function renderScope(snapshot) {
+            if (!hasScopeControls) return;
+            ['manager', 'country'].forEach(key => {
+                const element = $(key === 'manager' ? 'pmCatalogLoadManager' : 'pmCatalogLoadCountry');
+                const values = [...new Set(snapshot.availableSites.map(site => str(site[key]).trim()))].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+                const choices = values.map(value => ({value: value ? 'exact:' + value : 'unassigned', label: value || (key === 'manager' ? '未分配负责人' : '未设置国家')}));
+                const selected = scopeValue(snapshot.loadScope, key);
+                if (selected && !choices.some(choice => choice.value === selected)) choices.push({value: selected, label: (snapshot.loadScope[key] || (key === 'manager' ? '未分配负责人' : '未设置国家')) + '（当前无可选站点）'});
+                const html = `<option value="">全部${key === 'manager' ? '负责人' : '国家'}</option>` + choices.map(choice => `<option value="${escapeHtml(choice.value)}">${escapeHtml(choice.label)}</option>`).join('');
+                if (element.catalogScopeOptions !== html) { element.innerHTML = html; element.catalogScopeOptions = html; }
+                element.value = scopeValue(snapshot.loadScope, key); element.disabled = snapshot.metadataPhase !== 'ready';
+            });
+            const siteElement = $('pmCatalogLoadSite');
+            const missingSite = snapshot.loadScope.siteId && !snapshot.availableSites.some(site => site.id === snapshot.loadScope.siteId) ? `<option value="${escapeHtml(snapshot.loadScope.siteId)}">站点 ${escapeHtml(snapshot.loadScope.siteId)}（当前不可用）</option>` : '';
+            const siteHtml = '<option value="">全部站点</option>' + snapshot.availableSites.map(site => `<option value="${escapeHtml(site.id)}">${escapeHtml(siteLabel(site))} · ${escapeHtml(managerLabel(site))} · ${escapeHtml(str(site.country).trim() || '未设置国家')}</option>`).join('') + missingSite;
+            if (siteElement.catalogScopeOptions !== siteHtml) { siteElement.innerHTML = siteHtml; siteElement.catalogScopeOptions = siteHtml; }
+            siteElement.value = snapshot.loadScope.siteId; siteElement.disabled = snapshot.metadataPhase !== 'ready';
+            if ($('pmCatalogScopeCount')) $('pmCatalogScopeCount').textContent = snapshot.metadataPhase === 'ready' ? `本次将加载 ${snapshot.scopeCount} / ${snapshot.availableSites.length} 个有权限站点` : snapshot.metadataPhase === 'error' ? '站点列表读取失败' : '正在获取可选站点（不读取网站商品）…';
+            if ($('pmCatalogReloadSites')) $('pmCatalogReloadSites').disabled = snapshot.metadataPhase === 'loading';
+            const changed = snapshot.loadedScope && (['manager', 'managerMode', 'country', 'countryMode', 'siteId'].some(key => snapshot.loadScope[key] !== snapshot.loadedScope[key]) || snapshot.selectedSites.map(site => site.id).join(',') !== snapshot.loadedScope.siteIds.join(','));
+            if ($('pmCatalogScopeStatus')) {
+                $('pmCatalogScopeStatus').textContent = snapshot.metadataError ? '站点列表未更新：' + snapshot.metadataError + (snapshot.loadedScope ? ' 原加载范围、结果和加载时间保持不变。' : ' 请点击「刷新站点列表」重试。') : (changed ? '待加载范围已修改；当前结果仍来自下方标明的原范围，点击「加载所选站点」才读取新范围。' : '调整范围只影响下一次加载，不会清除已有结果。只有加载、重新加载和重试会读取网站商品。');
+                $('pmCatalogScopeStatus').classList.toggle('text-warning', !!snapshot.metadataError);
+            }
+            if ($('pmCatalogLoadedScope') && snapshot.loadedScope) {
+                const scope = snapshot.loadedScope;
+                const manager = scope.managerMode === 'all' ? '全部负责人' : scope.managerMode === 'unassigned' ? '未分配负责人' : scope.manager;
+                const country = scope.countryMode === 'all' ? '全部国家' : scope.countryMode === 'unassigned' ? '未设置国家' : scope.country;
+                const site = scope.siteId ? siteLabel(snapshot.sites.find(site => site.id === scope.siteId) || {id: scope.siteId}) : '范围内全部站点';
+                const query = snapshot.queryMode === 'brand' ? `品牌「${snapshot.brand}」` : snapshot.queryMode === 'flavor' && snapshot.keyword ? `口味 / 关键词「${snapshot.keyword}」` : '全部产品';
+                $('pmCatalogLoadedScope').textContent = `本页已加载范围：${manager} · ${country} · ${site}（${scope.siteIds.length} 个站点）· ${query}。加载时间：${new Date(snapshot.loadedAt).toLocaleString()}。结果筛选仅在此范围内进行，刷新浏览器后需重新加载。`;
+            }
+        }
         function syncQueryForm() {
             const mode = $('pmCatalogQueryMode') ? $('pmCatalogQueryMode').value : 'flavor';
             if ($('pmCatalogFlavorInputWrap')) $('pmCatalogFlavorInputWrap').classList.toggle('d-none', mode !== 'flavor');
@@ -504,6 +609,8 @@
         }
         function loadFormQuery() {
             if (editor && !editor.canReload()) return;
+            const snapshot = controller.getSnapshot();
+            if (hasScopeControls && (snapshot.metadataPhase !== 'ready' || !snapshot.scopeCount)) return;
             const queryMode = $('pmCatalogQueryMode') ? $('pmCatalogQueryMode').value : 'flavor';
             return controller.load($('pmCatalogSearch').value, {queryMode, brand: $('pmCatalogBrandInput') ? $('pmCatalogBrandInput').value : ''});
         }
@@ -519,6 +626,19 @@
             if (event.key === 'Enter') { event.preventDefault(); loadFormQuery(); }
         }));
         if ($('pmCatalogQueryMode')) $('pmCatalogQueryMode').addEventListener('change', syncQueryForm);
+        if (hasScopeControls) {
+            function scopeFromForm() {
+                const scope = {siteId: $('pmCatalogLoadSite').value};
+                ['manager', 'country'].forEach(key => {
+                    const value = $(key === 'manager' ? 'pmCatalogLoadManager' : 'pmCatalogLoadCountry').value;
+                    scope[key + 'Mode'] = value === '' ? 'all' : value === 'unassigned' ? 'unassigned' : 'exact';
+                    scope[key] = value.startsWith('exact:') ? value.slice(6) : '';
+                });
+                controller.setLoadScope(scope);
+            }
+            ['pmCatalogLoadManager', 'pmCatalogLoadCountry', 'pmCatalogLoadSite'].forEach(id => $(id).addEventListener('change', scopeFromForm));
+            if ($('pmCatalogReloadSites')) $('pmCatalogReloadSites').addEventListener('click', controller.discoverSites);
+        }
         $('pmCatalogRefresh').addEventListener('click', () => { if (editor && !editor.canReload()) return; restoreLoadedQueryForm(); controller.refresh(); });
         $('pmCatalogStop').addEventListener('click', controller.stop);
         $('pmCatalogRetry').addEventListener('click', () => { restoreLoadedQueryForm(); controller.retryIncomplete(); });
@@ -543,6 +663,7 @@
         syncQueryForm(); // Preserve the template's initial mode, including its brand default.
         root.productManagerCatalog = controller;
         root.productManagerCatalogEditor = editor;
+        if (hasScopeControls) controller.discoverSites();
         return controller;
     }
 

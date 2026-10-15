@@ -182,6 +182,27 @@
     <div class="tab-pane fade show active" id="pmCatalogPane" role="tabpanel" aria-labelledby="pmCatalogTab">
         <div class="card data-card mb-3">
             <div class="card-body">
+                <div class="fw-semibold mb-2">1. 选择本次加载范围</div>
+                <div class="row g-3 mb-2">
+                    <div class="col-lg-3 col-md-4">
+                        <label for="pmCatalogLoadManager" class="form-label">站点负责人</label>
+                        <select id="pmCatalogLoadManager" class="form-select bg-dark text-white border-secondary" disabled><option value="">全部负责人</option></select>
+                    </div>
+                    <div class="col-lg-3 col-md-4">
+                        <label for="pmCatalogLoadCountry" class="form-label">国家</label>
+                        <select id="pmCatalogLoadCountry" class="form-select bg-dark text-white border-secondary" disabled><option value="">全部国家</option></select>
+                    </div>
+                    <div class="col-lg-6 col-md-4">
+                        <label for="pmCatalogLoadSite" class="form-label">站点</label>
+                        <select id="pmCatalogLoadSite" class="form-select bg-dark text-white border-secondary" disabled><option value="">全部站点</option></select>
+                    </div>
+                </div>
+                <div class="d-flex flex-wrap gap-2 align-items-center mb-1">
+                    <span id="pmCatalogScopeCount" class="small text-info" role="status">正在获取可选站点…</span>
+                    <button id="pmCatalogReloadSites" type="button" class="btn btn-sm btn-outline-secondary">刷新站点列表</button>
+                </div>
+                <div id="pmCatalogScopeStatus" class="small text-muted mb-3" aria-live="polite">获取站点列表只读取系统配置，不读取网站商品。</div>
+                <div class="fw-semibold mb-2">2. 选择要读取的产品</div>
                 <div class="row g-3 mb-3">
                     <div class="col-lg-3 col-md-4">
                         <label for="pmCatalogQueryMode" class="form-label">加载方式</label>
@@ -206,13 +227,14 @@
                     </div>
                 </div>
                 <div class="d-flex flex-wrap gap-2">
-                    <button id="pmCatalogLoad" class="btn btn-primary"><i class="bi bi-search me-1"></i>加载全部站点</button>
-                    <button id="pmCatalogRefresh" class="btn btn-outline-light">重新加载</button>
+                    <button id="pmCatalogLoad" class="btn btn-primary"><i class="bi bi-search me-1"></i>加载所选站点</button>
+                    <button id="pmCatalogRefresh" class="btn btn-outline-light">重新加载原范围</button>
                     <button id="pmCatalogStop" class="btn btn-outline-warning" disabled>停止加载</button>
                     <button id="pmCatalogRetry" class="btn btn-outline-info" disabled>重试未完成站点</button>
                 </div>
-                <div class="text-muted small mt-2">按品牌加载会列出该品牌在你有权限的各站点的所有产品与口味；加载后可直接按站点负责人筛选。结果筛选无需再次读取网站。</div>
-                <div id="pmCatalogStatus" class="small mt-3" role="status" aria-live="polite">选择或输入一个品牌，然后点击「加载全部站点」。</div>
+                <div class="text-muted small mt-2">想在不同品牌、产品和口味之间反复筛选，可选择「加载全部产品」，也可只按负责人限定站点。按品牌或口味加载只读取该查询的匹配产品，结果内搜索不会扩大范围。</div>
+                <div id="pmCatalogLoadedScope" class="alert alert-secondary small mt-3 mb-0" role="status" aria-live="polite">尚未加载产品。本页结果仅在当前页面内复用，刷新浏览器后需重新加载。</div>
+                <div id="pmCatalogStatus" class="small mt-3" role="status" aria-live="polite">选择加载范围和品牌，然后点击「加载所选站点」。</div>
                 <div id="pmCatalogCounts" class="small text-muted mt-2"></div>
                 <details class="mt-2">
                     <summary class="small text-muted">查看各站点加载进度与异常</summary>
@@ -222,8 +244,10 @@
         </div>
         <div class="card data-card mb-3">
             <div class="card-body py-3">
+                <div class="fw-semibold mb-1">3. 在本页已加载结果中筛选</div>
+                <div class="text-muted small mb-2">以下搜索、筛选和翻页均在当前结果中进行，不再访问网站；清空筛选也不会扩大加载范围。</div>
                 <div class="row g-2">
-                    {% for field, label in [('Manager', '站点负责人'), ('Site', '站点'), ('Brand', '品牌'), ('Product', '产品'), ('Flavor', '口味'), ('Stock', '库存状态'), ('Publish', '发布状态')] %}
+                    {% for field, label in [('Manager', '站点负责人'), ('Country', '国家'), ('Site', '站点'), ('Brand', '品牌'), ('Product', '产品'), ('Flavor', '口味'), ('Stock', '库存状态'), ('Publish', '发布状态')] %}
                     <div class="col-lg-3 col-md-4 col-6">
                         <label for="pmCatalog{{ field }}Filter" class="form-label small mb-1">{{ label }}</label>
                         <select id="pmCatalog{{ field }}Filter" class="form-select form-select-sm bg-dark text-white border-secondary">
@@ -236,7 +260,7 @@
                         <input id="pmCatalogTextFilter" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="产品名称 / SKU / 口味">
                     </div>
                 </div>
-                <button id="pmCatalogResetFilters" class="btn btn-sm btn-outline-secondary mt-2">清空筛选</button>
+                <button id="pmCatalogResetFilters" class="btn btn-sm btn-outline-secondary mt-2">清空结果筛选</button>
             </div>
         </div>
         <div class="card data-card mb-3">
@@ -520,7 +544,7 @@
     </div>
 </div>
 <script src="{{ url_for('static', filename='js/product_manager_catalog_editor.js') }}?v=20261007"></script>
-<script src="{{ url_for('static', filename='js/product_manager_catalog.js') }}?v=20261007"></script>
+<script src="{{ url_for('static', filename='js/product_manager_catalog.js') }}?v=20261015"></script>
 <script>
 (function() {
     // State

@@ -496,6 +496,67 @@ def _public_site_url(value):
         return ""
 
 
+def _site_scope_label(value):
+    return str(value or "").strip()
+
+
+def _load_scope(args):
+    """Parse an optional load boundary without reserving real metadata labels.
+
+    An omitted site_ids means all otherwise matching sites; an explicitly
+    empty site_ids means none. Separate modes keep a manager named "all" or
+    "unassigned" distinguishable from those UI choices.
+    """
+    scope = {}
+    for field in ("manager", "country"):
+        if len(args.getlist(field)) > 1 or len(args.getlist(f"{field}_mode")) > 1:
+            raise ValueError("加载范围不能重复指定负责人或国家。")
+        label = _site_scope_label(args.get(field))
+        mode = args.get(f"{field}_mode", "exact" if label else "all")
+        if len(label) > 200 or mode not in {"all", "unassigned", "exact"}:
+            raise ValueError("加载范围的负责人或国家无效。")
+        if (mode == "exact" and not label) or (mode != "exact" and label):
+            raise ValueError("加载范围的筛选模式与负责人或国家不一致。")
+        scope[field] = (mode, label)
+
+    def site_identity(value):
+        value = value.strip()
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", value):
+            raise ValueError("加载范围的站点编号必须为正整数。")
+        identity = int(value)
+        if identity > 9223372036854775807:
+            raise ValueError("加载范围的站点编号无效。")
+        return identity
+
+    selected = None
+    if "site_ids" in args:
+        if len(args.getlist("site_ids")) != 1:
+            raise ValueError("加载范围不能重复指定站点集合。")
+        raw = args["site_ids"].strip()
+        values = raw.split(",") if raw else []
+        if len(raw) > 20000 or len(values) > 1000:
+            raise ValueError("加载范围的站点数量过多。")
+        selected = {site_identity(value) for value in values}
+    if "site_id" in args:
+        if len(args.getlist("site_id")) != 1:
+            raise ValueError("加载范围不能重复指定站点编号。")
+        single = {site_identity(args["site_id"])}
+        selected = single if selected is None else selected & single
+    scope["site_ids"] = selected
+    return scope
+
+
+def _in_load_scope(site, scope):
+    if scope["site_ids"] is not None and site["id"] not in scope["site_ids"]:
+        return False
+    for field in ("manager", "country"):
+        mode, label = scope[field]
+        actual = _site_scope_label(site[field])
+        if (mode == "unassigned" and actual) or (mode == "exact" and actual != label):
+            return False
+    return True
+
+
 def create_catalog_blueprint(get_db_connection, product_manager_required, recognition_loader=None):
     """Build API routes without importing the application's mutable global state.
 
@@ -538,6 +599,10 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
     @login_required
     @product_manager_required
     def catalog_sites():
+        try:
+            scope = _load_scope(request.args)
+        except ValueError as exc:
+            return jsonify({"error": str(exc), "code": "invalid_arguments"}), 400
         conn = get_db_connection()
         try:
             sites = conn.execute(f"SELECT {_SITE_COLUMNS} FROM sites ORDER BY country, url").fetchall()
@@ -546,17 +611,21 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
             conn.close()
         return jsonify({"sites": [
             {
-                "id": site["id"], "url": _public_site_url(site["url"]), "manager": site["manager"] or "",
-                "country": site["country"] or "", "configured": _configured(site),
+                "id": site["id"], "url": _public_site_url(site["url"]), "manager": _site_scope_label(site["manager"]),
+                "country": _site_scope_label(site["country"]), "configured": _configured(site),
                 "product_master_id": site["product_master_id"],
             }
-            for site in sites if visible(site)
+            for site in sites if visible(site) and _in_load_scope(site, scope)
         ]})
 
     @blueprint.get("/api/product-manager/catalog-page")
     @login_required
     @product_manager_required
     def catalog_page():
+        try:
+            scope = _load_scope(request.args)
+        except ValueError as exc:
+            return jsonify({"error": str(exc), "code": "invalid_arguments"}), 400
         try:
             site_id = int(request.args.get("site_id", "0"))
             page = int(request.args.get("page", "1"))
@@ -599,8 +668,11 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
             return jsonify({"error": "站点连接已删除，历史记录仍保留，不能继续读取产品。", "code": "site_archived"}), 409
         if not visible(site):
             return jsonify({"error": "仅站点负责人可读取该站点产品。", "code": "site_forbidden"}), 403
+        if not _in_load_scope(site, scope):
+            return jsonify({"error": "该站点不在本次选择的加载范围内。", "code": "scope_mismatch"}), 403
         response_base = {
             "site_id": site_id, "parent_id": parent_id, "page": page, "per_page": PER_PAGE,
+            "manager": _site_scope_label(site["manager"]), "country": _site_scope_label(site["country"]),
             "rows": [], "variable_products": [], "complete_page": False,
         }
         try:
@@ -642,6 +714,8 @@ def create_catalog_blueprint(get_db_connection, product_manager_required, recogn
                     })
                 else:
                     leaf = _build_row(site_id, item, parent, recognition, brand_index)
+                    leaf["manager"] = response_base["manager"]
+                    leaf["country"] = response_base["country"]
                     if _matches(leaf, keyword, parent, item) and _matches_brand(leaf, brand_key, brand_index):
                         rows.append(leaf)
             return jsonify({
