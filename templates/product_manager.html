@@ -3,6 +3,7 @@
 {% block title %}产品管理 - 苍赋管理系统{% endblock %}
 
 {% block content %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/product_manager_selects.css') }}?v=20261016">
 <style>
     .pm-table th, .pm-table td { vertical-align: middle; }
     .pm-table .pm-sku { font-family: monospace; font-size: 0.8rem; color: #94a3b8; }
@@ -193,8 +194,9 @@
                         <select id="pmCatalogLoadCountry" class="form-select bg-dark text-white border-secondary" disabled><option value="">全部国家</option></select>
                     </div>
                     <div class="col-lg-6 col-md-4">
-                        <label for="pmCatalogLoadSite" class="form-label">站点</label>
-                        <select id="pmCatalogLoadSite" class="form-select bg-dark text-white border-secondary" disabled><option value="">全部站点</option></select>
+                        <label for="pmCatalogLoadSite" class="form-label">站点（可多选）</label>
+                        <select id="pmCatalogLoadSite" class="form-select bg-dark text-white border-secondary" multiple size="4" aria-describedby="pmCatalogLoadSiteHelp" disabled></select>
+                        <div id="pmCatalogLoadSiteHelp" class="form-text">可勾选多个站点；清空后不加载任何站点。</div>
                     </div>
                 </div>
                 <div class="d-flex flex-wrap gap-2 align-items-center mb-1">
@@ -543,8 +545,9 @@
         </div>
     </div>
 </div>
+<script src="{{ url_for('static', filename='js/product_manager_selects.js') }}?v=20261016"></script>
 <script src="{{ url_for('static', filename='js/product_manager_catalog_editor.js') }}?v=20261007"></script>
-<script src="{{ url_for('static', filename='js/product_manager_catalog.js') }}?v=20261015"></script>
+<script src="{{ url_for('static', filename='js/product_manager_catalog.js') }}?v=20261016"></script>
 <script>
 (function() {
     // State

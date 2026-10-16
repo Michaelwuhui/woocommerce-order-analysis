@@ -112,6 +112,43 @@ async function initialMetadataAndIntersection() {
     assert.match(c.getSnapshot().loadedAt, /^\d{4}-\d{2}-\d{2}T/);
 }
 
+async function explicitMultiselectAndMetadataChangesNeverExpand() {
+    const f = fixture(), c = f.controller;
+    await c.discoverSites();
+    assert.equal(c.getSnapshot().loadScope.siteIds, undefined, 'legacy unspecified scope still means all');
+    c.setLoadScope({siteIds: ['1', '3'], country: 'PL'});
+    const copyScope = c.getSnapshot().loadScope;
+    copyScope.siteIds.push('4');
+    assert.deepEqual(c.getSnapshot().loadScope.siteIds, ['1', '3'], 'snapshot array cannot mutate pending selections');
+    await c.load('', {queryMode: 'all'});
+    assert.deepEqual(loadedIds(c.getSnapshot()), ['1', '3']);
+    assert(f.productCalls().every(call => ['1', '3'].includes(call.params.get('site_id'))));
+    const oldScope = copy(c.getSnapshot().loadedScope), at = c.getSnapshot().loadedAt, oldRows = keys(c.getSnapshot());
+    let before = f.calls.length;
+    c.setLoadScope({siteIds: []});
+    assert.equal(c.getSnapshot().scopeCount, 0);
+    await c.load('', {queryMode: 'all'});
+    assert.equal(f.calls.length, before, 'clearing every checkbox must not fetch all sites');
+    assert.deepEqual(c.getSnapshot().loadedScope, oldScope);
+    assert.equal(c.getSnapshot().loadedAt, at);
+    assert.deepEqual(keys(c.getSnapshot()), oldRows);
+    c.setLoadScope({siteIds: ['1', '3']});
+    f.allowed = new Set([2, 4]);
+    await c.discoverSites();
+    assert.deepEqual(c.getSnapshot().loadScope.siteIds, ['1', '3'], 'metadata refresh keeps the explicit selection boundary');
+    assert.equal(c.getSnapshot().scopeCount, 0);
+    before = f.calls.length;
+    await c.load('', {queryMode: 'all'});
+    assert.equal(f.calls.length, before, 'lost selected sites must not fall back to other visible sites');
+    assert.deepEqual(c.getSnapshot().loadedScope, oldScope);
+    assert.equal(c.getSnapshot().loadedAt, at);
+    f.sites.push({id: 5, url: 'https://new.invalid', manager: 'Alice', country: 'PL', configured: true});
+    f.allowed = new Set([3, 4, 5]);
+    await c.discoverSites();
+    assert.deepEqual(selectedIds(c.getSnapshot()), ['3'], 'new metadata sites are not implicitly checked');
+    assert.deepEqual(c.getSnapshot().loadScope.siteIds, ['1', '3']);
+}
+
 async function emptyAndUnknownScopeNeverExpandOrRelabel() {
     const f = fixture(), c = f.controller;
     await c.discoverSites(); c.setLoadScope({manager: 'Alice', country: 'PL'});
@@ -182,11 +219,11 @@ async function freshCountryFacetAndLiteralScopeLabels() {
 
 async function retryRefreshAndPermissionChangeUseSubmittedScope() {
     const f = fixture({fail: [2]}), c = f.controller;
-    await c.discoverSites(); c.setLoadScope({manager: 'Alice'});
+    await c.discoverSites(); c.setLoadScope({manager: 'Alice', siteIds: ['1', '2']});
     await c.load('', {queryMode: 'all'});
     assert.equal(c.getSnapshot().phase, 'incomplete');
     const loaded = copy(c.getSnapshot().loadedScope), at = c.getSnapshot().loadedAt;
-    c.setLoadScope({manager: 'Bob', country: 'PL', siteId: '3'});
+    c.setLoadScope({manager: 'Bob', country: 'PL', siteIds: ['3', '4']});
     const before = f.calls.length; f.fail.clear();
     await c.retryIncomplete();
     assert(f.calls.slice(before).every(call => call.pathname.endsWith('/catalog-page') && call.params.get('site_id') === '2'));
@@ -276,6 +313,7 @@ class Element {
         this.options = [...value.matchAll(/<option\b[^>]*value="([^"]*)"[^>]*>([\s\S]*?)<\/option>/g)].map(match => ({value: match[1], textContent: match[2].replace(/<[^>]*>/g, '')}));
     }
     get innerHTML() { return this.html || ''; }
+    get selectedOptions() { return this.options.filter(option => option.selected); }
     addEventListener(type, callback) { const listeners = this.listeners.get(type) || []; listeners.push(callback); this.listeners.set(type, listeners); }
     async fire(type) { for (const callback of this.listeners.get(type) || []) await callback({target: this, preventDefault() {}}); }
     querySelectorAll() { return []; }
@@ -294,26 +332,54 @@ async function mountedPageLoadsOnlyMetadataAndExplainsReuse() {
     const nodes = new Map(ids.map(id => [id, new Element(id)]));
     const document = {getElementById: id => nodes.get(id) || null, activeElement: null};
     nodes.get('pmCatalogQueryMode').value = 'all';
+    const synced = [];
+    const previousSelects = global.ProductManagerSelects;
+    global.ProductManagerSelects = {sync: element => synced.push(element.id)};
     const c = mount(document, {fetch: f.fetch});
     await until(() => c.getSnapshot().metadataPhase === 'ready', 'mount metadata'); await sleep(3);
     assert.equal(f.metadataCalls().length, 1); assert.equal(f.productCalls().length, 0);
+    const siteElement = nodes.get('pmCatalogLoadSite');
+    assert.equal(siteElement.multiple, true);
+    assert.equal(siteElement.options.length, 4);
+    assert(siteElement.options.every(option => option.value && option.selected), 'initial native options are actual sites and all checked');
+    assert(synced.includes('pmCatalogLoadSite'), 'programmatic initial checkboxes synchronize the searchable widget');
+    const selectSites = async ids => {
+        siteElement.options.forEach(option => { option.selected = ids.includes(option.value); });
+        await siteElement.fire('change');
+    };
     const setOption = async (id, label) => {
         const element = nodes.get(id), option = element.options.find(option => option.textContent === label);
         assert(option, `${id} contains ${label}`); element.value = option.value; await element.fire('change');
     };
+    await selectSites(['1', '2']);
     await setOption('pmCatalogLoadManager', 'Alice'); await setOption('pmCatalogLoadCountry', 'PL');
     assert.deepEqual(selectedIds(c.getSnapshot()), ['1']);
+    assert.deepEqual(c.getSnapshot().loadScope.siteIds, ['1', '2']);
+    assert.equal(c.getSnapshot().loadScope.siteId, '');
+    assert.deepEqual(siteElement.selectedOptions.map(option => option.value), ['1', '2'], 'owner/country intersection does not uncheck other sites');
     await nodes.get('pmCatalogLoad').fire('click');
     await until(() => !c.getSnapshot().busy && c.getSnapshot().loadedAt, 'mount loaded'); await sleep(3);
     const range = nodes.get('pmCatalogLoadedScope').textContent;
     assert.match(range, /Alice/); assert.match(range, /PL/);
+    assert.match(range, /本次勾选站点/); assert.doesNotMatch(range, /范围内全部站点/);
     const before = f.calls.length;
+    const nativeOptions = siteElement.options;
     await setOption('pmCatalogLoadManager', 'Bob'); await sleep(3);
     assert.equal(nodes.get('pmCatalogLoadedScope').textContent, range, 'pending controls cannot relabel displayed results');
     nodes.get('pmCatalogCountryFilter').value = 'value:pl'; await nodes.get('pmCatalogCountryFilter').fire('change');
     nodes.get('pmCatalogTextFilter').value = 'mint'; await nodes.get('pmCatalogTextFilter').fire('input');
     await nodes.get('pmCatalogResetFilters').fire('click');
+    await sleep(3);
     assert.equal(f.calls.length, before);
+    assert.equal(siteElement.options, nativeOptions, 'local renders preserve native option identity and widget focus');
+    assert.deepEqual(siteElement.selectedOptions.map(option => option.value), ['1', '2']);
+    await selectSites([]); await sleep(3);
+    assert.deepEqual(c.getSnapshot().loadScope.siteIds, []);
+    assert.equal(c.getSnapshot().scopeCount, 0);
+    assert.equal(nodes.get('pmCatalogLoad').disabled, true);
+    assert.equal(nodes.get('pmCatalogLoadedScope').textContent, range);
+    assert.equal(f.calls.length, before);
+    await selectSites(['3']); await sleep(3);
     f.metadataError = true;
     await nodes.get('pmCatalogLoad').fire('click'); await sleep(3);
     assert.equal(nodes.get('pmCatalogLoadedScope').textContent, range);
@@ -322,10 +388,15 @@ async function mountedPageLoadsOnlyMetadataAndExplainsReuse() {
     const template = fs.readFileSync(path.join(__dirname, '../templates/product_manager.html'), 'utf8');
     assert.match(template, /当前页|本页/); assert.match(template, /重新加载|手动刷新/);
     assert.match(template, /负责人/); assert.match(template, /国家/);
+    assert.match(template, /id="pmCatalogLoadSite"[^>]*\bmultiple\b/);
+    assert.match(template, /product_manager_selects\.css.*20261016/);
+    assert.match(template, /product_manager_selects\.js.*20261016/);
+    assert.equal((template.match(/<script\s*>/g) || []).length, 1, 'legacy inline script remains a single block');
+    global.ProductManagerSelects = previousSelects;
 }
 
 (async () => {
-    await initialMetadataAndIntersection(); await emptyAndUnknownScopeNeverExpandOrRelabel();
+    await initialMetadataAndIntersection(); await explicitMultiselectAndMetadataChangesNeverExpand(); await emptyAndUnknownScopeNeverExpandOrRelabel();
     await localCountrySearchAndPaginationNeverFetch(); await freshCountryFacetAndLiteralScopeLabels();
     await retryRefreshAndPermissionChangeUseSubmittedScope();
     await preselectionDuringLoadDoesNotChangeInflightScan(); await failedReplacementLeavesOriginalWorkRetryable();

@@ -45,7 +45,7 @@
     function scopeMatches(site, scope) {
         return ['manager', 'country'].every(key => scope[key + 'Mode'] === 'all' ||
             (scope[key + 'Mode'] === 'unassigned' ? !str(site[key]).trim() : str(site[key]).trim() === scope[key])) &&
-            (!scope.siteId || str(site.id) === scope.siteId) && (!scope.siteIds || scope.siteIds.includes(str(site.id)));
+            (!scope.siteId || str(site.id) === scope.siteId) && (scope.siteIds === undefined || scope.siteIds.includes(str(site.id)));
     }
     function scopeParams(scope) {
         const params = new URLSearchParams();
@@ -54,7 +54,7 @@
             if (scope[key + 'Mode'] === 'exact') params.set(key, scope[key]);
         });
         if (scope.siteId) params.set('site_id', scope.siteId);
-        if (scope.siteIds) params.set('site_ids', scope.siteIds.join(','));
+        if (scope.siteIds !== undefined) params.set('site_ids', scope.siteIds.join(','));
         return params;
     }
 
@@ -191,7 +191,7 @@
             const selectedSites = state.availableSites.filter(site => scopeMatches(site, state.loadScope));
             return {phase: state.phase, queryMode: state.queryMode, mode: state.queryMode, brand: state.brand, keyword: state.keyword, sites: state.sites.slice(), siteStates,
                 availableSites: state.availableSites.slice(), metadataPhase: state.metadataPhase, metadataError: state.metadataError,
-                loadScope: Object.assign({}, state.loadScope), selectedSites, scopeCount: selectedSites.length,
+                loadScope: Object.assign({}, state.loadScope, state.loadScope.siteIds === undefined ? {} : {siteIds: state.loadScope.siteIds.slice()}), selectedSites, scopeCount: selectedSites.length,
                 loadedScope: state.loadedScope ? Object.assign({}, state.loadedScope, {siteIds: state.loadedScope.siteIds.slice()}) : null, loadedAt: state.loadedAt,
                 rows, filtered, filters: Object.assign({}, state.filters), options: cachedFacets, dataVersion,
                 page: state.page, pages, pageRows: filtered.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE),
@@ -520,6 +520,9 @@
         }
         const controller = createController({fetch: fetcher, onChange: scheduleRender});
         const hasScopeControls = !!($('pmCatalogLoadManager') && $('pmCatalogLoadCountry') && $('pmCatalogLoadSite'));
+        function syncSelect(element) {
+            if (global.ProductManagerSelects && element) global.ProductManagerSelects.sync(element);
+        }
         if (global.ProductManagerCatalogEditor && $('pmCatalogSelectedCount')) editor = global.ProductManagerCatalogEditor.createUI({document, root, catalog: controller, fetch: fetcher,
             onChange: () => scheduleRender(controller.getSnapshot())});
         function render(snapshot) {
@@ -556,13 +559,15 @@
                     choices.push({value: selected, label: old ? old.textContent : selected});
                 }
                 const previous = filterOptions.get(key), extra = selected && !sourceChoices.some(choice => choice.value === selected) ? selected : '';
+                let changed = false;
                 if (!previous || previous.source !== sourceChoices || previous.extra !== extra) {
                     const html = '<option value="">全部</option>' + choices.map(choice => `<option value="${escapeHtml(choice.value)}">${escapeHtml(choice.label)}</option>`).join('');
                     if (document.activeElement === element) element.pendingCatalogOptions = html;
-                    else { element.innerHTML = html; element.pendingCatalogOptions = null; }
+                    else { element.innerHTML = html; element.pendingCatalogOptions = null; changed = true; }
                     filterOptions.set(key, {source: sourceChoices, extra});
                 }
-                if (element.value !== selected && [...element.options].some(option => option.value === selected)) element.value = selected;
+                if (element.value !== selected && [...element.options].some(option => option.value === selected)) { element.value = selected; changed = true; }
+                if (changed) syncSelect(element);
             });
             const signature = JSON.stringify([snapshot.dataVersion, snapshot.phase, snapshot.page, snapshot.filters, editor ? editor.tableVersion : 0]);
             if (tableSignature !== signature) { $('pmCatalogResults').innerHTML = resultHtml(snapshot, editor); tableSignature = signature; }
@@ -578,14 +583,24 @@
                 const selected = scopeValue(snapshot.loadScope, key);
                 if (selected && !choices.some(choice => choice.value === selected)) choices.push({value: selected, label: (snapshot.loadScope[key] || (key === 'manager' ? '未分配负责人' : '未设置国家')) + '（当前无可选站点）'});
                 const html = `<option value="">全部${key === 'manager' ? '负责人' : '国家'}</option>` + choices.map(choice => `<option value="${escapeHtml(choice.value)}">${escapeHtml(choice.label)}</option>`).join('');
-                if (element.catalogScopeOptions !== html) { element.innerHTML = html; element.catalogScopeOptions = html; }
-                element.value = scopeValue(snapshot.loadScope, key); element.disabled = snapshot.metadataPhase !== 'ready';
+                let changed = false;
+                if (element.catalogScopeOptions !== html) { element.innerHTML = html; element.catalogScopeOptions = html; changed = true; }
+                if (element.value !== selected) { element.value = selected; changed = true; }
+                if (element.disabled !== (snapshot.metadataPhase !== 'ready')) { element.disabled = snapshot.metadataPhase !== 'ready'; changed = true; }
+                if (changed) syncSelect(element);
             });
             const siteElement = $('pmCatalogLoadSite');
-            const missingSite = snapshot.loadScope.siteId && !snapshot.availableSites.some(site => site.id === snapshot.loadScope.siteId) ? `<option value="${escapeHtml(snapshot.loadScope.siteId)}">站点 ${escapeHtml(snapshot.loadScope.siteId)}（当前不可用）</option>` : '';
-            const siteHtml = '<option value="">全部站点</option>' + snapshot.availableSites.map(site => `<option value="${escapeHtml(site.id)}">${escapeHtml(siteLabel(site))} · ${escapeHtml(managerLabel(site))} · ${escapeHtml(str(site.country).trim() || '未设置国家')}</option>`).join('') + missingSite;
-            if (siteElement.catalogScopeOptions !== siteHtml) { siteElement.innerHTML = siteHtml; siteElement.catalogScopeOptions = siteHtml; }
-            siteElement.value = snapshot.loadScope.siteId; siteElement.disabled = snapshot.metadataPhase !== 'ready';
+            const siteHtml = snapshot.availableSites.map(site => `<option value="${escapeHtml(site.id)}">${escapeHtml(siteLabel(site))} · ${escapeHtml(managerLabel(site))} · ${escapeHtml(str(site.country).trim() || '未设置国家')}</option>`).join('');
+            let sitesChanged = false;
+            if (!siteElement.multiple) { siteElement.multiple = true; sitesChanged = true; }
+            if (siteElement.catalogScopeOptions !== siteHtml) { siteElement.innerHTML = siteHtml; siteElement.catalogScopeOptions = siteHtml; sitesChanged = true; }
+            const chosenIds = snapshot.loadScope.siteIds === undefined ? null : new Set(snapshot.loadScope.siteIds);
+            [...siteElement.options].forEach(option => {
+                const selected = (!snapshot.loadScope.siteId || option.value === snapshot.loadScope.siteId) && (chosenIds === null || chosenIds.has(option.value));
+                if (option.selected !== selected) { option.selected = selected; sitesChanged = true; }
+            });
+            if (siteElement.disabled !== (snapshot.metadataPhase !== 'ready')) { siteElement.disabled = snapshot.metadataPhase !== 'ready'; sitesChanged = true; }
+            if (sitesChanged) syncSelect(siteElement);
             if ($('pmCatalogScopeCount')) $('pmCatalogScopeCount').textContent = snapshot.metadataPhase === 'ready' ? `本次将加载 ${snapshot.scopeCount} / ${snapshot.availableSites.length} 个有权限站点` : snapshot.metadataPhase === 'error' ? '站点列表读取失败' : '正在获取可选站点（不读取网站商品）…';
             if ($('pmCatalogReloadSites')) $('pmCatalogReloadSites').disabled = snapshot.metadataPhase === 'loading';
             const changed = snapshot.loadedScope && (['manager', 'managerMode', 'country', 'countryMode', 'siteId'].some(key => snapshot.loadScope[key] !== snapshot.loadedScope[key]) || snapshot.selectedSites.map(site => site.id).join(',') !== snapshot.loadedScope.siteIds.join(','));
@@ -597,7 +612,8 @@
                 const scope = snapshot.loadedScope;
                 const manager = scope.managerMode === 'all' ? '全部负责人' : scope.managerMode === 'unassigned' ? '未分配负责人' : scope.manager;
                 const country = scope.countryMode === 'all' ? '全部国家' : scope.countryMode === 'unassigned' ? '未设置国家' : scope.country;
-                const site = scope.siteId ? siteLabel(snapshot.sites.find(site => site.id === scope.siteId) || {id: scope.siteId}) : '范围内全部站点';
+                const names = snapshot.sites.slice(0, 2).map(siteLabel).join('、');
+                const site = '本次勾选站点' + (names ? `：${names}${scope.siteIds.length > 2 ? '等' : ''}` : '');
                 const query = snapshot.queryMode === 'brand' ? `品牌「${snapshot.brand}」` : snapshot.queryMode === 'flavor' && snapshot.keyword ? `口味 / 关键词「${snapshot.keyword}」` : '全部产品';
                 $('pmCatalogLoadedScope').textContent = `本页已加载范围：${manager} · ${country} · ${site}（${scope.siteIds.length} 个站点）· ${query}。加载时间：${new Date(snapshot.loadedAt).toLocaleString()}。结果筛选仅在此范围内进行，刷新浏览器后需重新加载。`;
             }
@@ -617,6 +633,7 @@
         function restoreLoadedQueryForm() {
             const snapshot = controller.getSnapshot();
             if ($('pmCatalogQueryMode')) $('pmCatalogQueryMode').value = snapshot.queryMode;
+            syncSelect($('pmCatalogQueryMode'));
             if ($('pmCatalogBrandInput')) $('pmCatalogBrandInput').value = snapshot.brand;
             $('pmCatalogSearch').value = snapshot.keyword;
             syncQueryForm();
@@ -628,7 +645,7 @@
         if ($('pmCatalogQueryMode')) $('pmCatalogQueryMode').addEventListener('change', syncQueryForm);
         if (hasScopeControls) {
             function scopeFromForm() {
-                const scope = {siteId: $('pmCatalogLoadSite').value};
+                const scope = {siteId: '', siteIds: [...$('pmCatalogLoadSite').selectedOptions].map(option => option.value)};
                 ['manager', 'country'].forEach(key => {
                     const value = $(key === 'manager' ? 'pmCatalogLoadManager' : 'pmCatalogLoadCountry').value;
                     scope[key + 'Mode'] = value === '' ? 'all' : value === 'unassigned' ? 'unassigned' : 'exact';
@@ -648,7 +665,7 @@
             $(id).addEventListener(key === 'text' ? 'input' : 'change', event => controller.setFilters({[key]: event.target.value}));
             if (key !== 'text') $(id).addEventListener('blur', () => {
                 const element = $(id);
-                if (element.pendingCatalogOptions) { element.innerHTML = element.pendingCatalogOptions; element.pendingCatalogOptions = null; element.value = controller.getSnapshot().filters[key]; }
+                if (element.pendingCatalogOptions) { element.innerHTML = element.pendingCatalogOptions; element.pendingCatalogOptions = null; element.value = controller.getSnapshot().filters[key]; syncSelect(element); }
             });
         });
         root.addEventListener('click', event => {
