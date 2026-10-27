@@ -99,8 +99,8 @@
                 </div>
                 <div class="col-md-1 text-end">
                     <span class="badge bg-warning text-dark d-block mb-1" id="pendingCount">待发货: 0</span>
-                    <span class="badge bg-info d-block mb-1" id="shippedCount">已发货: 0</span>
-                    <span class="badge bg-secondary d-block" id="outcomeCount">待确认: 0</span>
+                    <span class="badge bg-info d-block mb-1" id="shippedCount">已发货: —</span>
+                    <span class="badge bg-secondary d-block" id="outcomeCount">待确认: —</span>
                 </div>
             </div>
             <div class="row align-items-center g-3 mt-1 pt-2 border-top border-secondary border-opacity-25">
@@ -215,6 +215,10 @@
                                 </tr>
                             </tbody>
                         </table>
+                    </div>
+                    <div id="pendingPagination" class="d-none border-top border-secondary border-opacity-25 px-3 py-3 d-flex justify-content-between align-items-center gap-3 flex-wrap">
+                        <span id="pendingPageSummary" class="text-white-50 small"></span>
+                        <div id="pendingPageButtons" class="btn-group btn-group-sm" role="group" aria-label="待发货订单分页"></div>
                     </div>
                 </div>
             </div>
@@ -711,6 +715,7 @@
     </div>
 
     <script src="{{ url_for('static', filename='js/shipping_product_filter_compact1.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/shipping_list_view.js') }}"></script>
     <script>
         // Shipping EDIT permission. View-only users (can_view_shipping) see all
         // lists/tracking/查物流/print/export but no action controls. Every action
@@ -725,6 +730,10 @@
         }
         let pendingProductChoices = [];
         let pendingProductActiveIndex = -1;
+        let pendingOrdersCache = [];
+        let shippingFilterKey = null;
+        let shippingRequestId = 0;
+        let shippingLoadController = null;
 
         function hidePendingProductMenu() {
             const menu = document.getElementById('pendingProductMenu');
@@ -1211,6 +1220,180 @@
             document.getElementById('shippedTab').scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
 
+        function renderPendingPagination(pagination) {
+            const wrapper = document.getElementById('pendingPagination');
+            const summary = document.getElementById('pendingPageSummary');
+            const buttons = document.getElementById('pendingPageButtons');
+            if (!pagination.total) {
+                wrapper.classList.add('d-none');
+                summary.textContent = '';
+                buttons.innerHTML = '';
+                return;
+            }
+            const first = (pagination.page - 1) * pagination.per_page + 1;
+            const last = Math.min(pagination.page * pagination.per_page, pagination.total);
+            summary.textContent = `第 ${first}-${last} 单，共 ${pagination.total} 单 · 第 ${pagination.page}/${pagination.pages} 页`;
+            const items = [`<button type="button" class="btn btn-outline-light" ${pagination.has_previous ? '' : 'disabled'} onclick="changePendingPage(${pagination.page - 1})">上一页</button>`];
+            for (let number = Math.max(1, pagination.page - 2); number <= Math.min(pagination.pages, pagination.page + 2); number += 1) {
+                items.push(`<button type="button" class="btn ${number === pagination.page ? 'btn-info' : 'btn-outline-light'}" ${number === pagination.page ? 'aria-current="page"' : ''} onclick="changePendingPage(${number})">${number}</button>`);
+            }
+            items.push(`<button type="button" class="btn btn-outline-light" ${pagination.has_next ? '' : 'disabled'} onclick="changePendingPage(${pagination.page + 1})">下一页</button>`);
+            buttons.innerHTML = items.join('');
+            wrapper.classList.remove('d-none');
+        }
+
+        function changePendingPage(page) {
+            renderPendingOrders(pendingOrdersCache, page);
+            document.getElementById('pendingTab').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        function renderPendingOrders(orders, requestedPage = 1) {
+            const productInput = document.getElementById('pendingProductFilter');
+            const productOptions = ShippingProductFilter.productOptions(orders);
+            pendingProductChoices = productOptions;
+            hidePendingProductMenu();
+
+            const productResult = ShippingProductFilter.summarize(orders, productInput.value);
+            const page = ShippingListView.paginate(productResult.orders, requestedPage);
+            const visibleOrders = page.orders;
+            renderPendingPagination(page);
+            document.getElementById('pendingCount').textContent = `待发货: ${productResult.orderCount} 单 / ${productResult.units} 支`;
+            document.getElementById('pendingProductStats').textContent = productResult.query
+                ? `“${productResult.query}”：${productResult.orderCount} 个订单 · ${productResult.units} 支待发货${productResult.exactMatch ? '' : ' · 模糊匹配'}`
+                : `全部产品：${productResult.productCount} 种 · ${productResult.orderCount} 个订单 · ${productResult.units} 支待发货`;
+            const tbody = document.getElementById('pendingOrdersBody');
+            if (visibleOrders.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">没有符合该产品条件的待发货订单</td></tr>';
+                return;
+            }
+            tbody.innerHTML = visibleOrders.map(o => {
+            // High-risk rows: stronger tint to grab attention even when
+            // it's not also a "big order". Falls back to the big-order
+            // tint, then no tint.
+            const rowStyle = o.high_risk_postcode
+                ? ' style="background-color: rgba(220,53,69,0.32); outline: 3px solid #ff4d5e; outline-offset: -3px; box-shadow: inset 6px 0 0 #ff3045;"'
+                : (o.has_shortage || o.manual_review)
+                ? ' style="background-color: rgba(220,53,69,0.28); outline: 2px solid rgba(220,53,69,0.7);"'
+                : (o.customer_risk && o.customer_risk.level === 'high')
+                ? ' style="background-color: rgba(220,53,69,0.18);"'
+                : (o.customer_risk && o.customer_risk.level === 'medium')
+                    ? ' style="background-color: rgba(245,158,11,0.12);"'
+                    : (o.is_big_order ? ' style="background-color: rgba(220,53,69,0.1);"' : '');
+            const riskBadge = renderRiskBadge(o.customer_risk, { compact: true });
+            return `
+        <tr data-editsrc="${o.source || ''}"${rowStyle}>
+            <td class="ps-3">
+                <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.high_risk_postcode ? ` <span class="badge bg-danger border border-light" title="该邮编地区曾发生拒收退回后包裹内产品丢失"><i class="bi bi-shield-fill-exclamation me-1"></i>高危邮编 ${o.high_risk_postcode}</span>` : ''}${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.shipment_sync_pending ? ` <span class="badge bg-warning text-dark"><i class="bi bi-cloud-slash me-1"></i>同步${shipEscape(o.pending_shipment && o.pending_shipment.reconciliation ? o.pending_shipment.reconciliation.label : '待核验')}</span>` : (o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : '')}${o.has_shortage ? ' <span class="badge bg-danger"><i class="bi bi-exclamation-octagon-fill me-1"></i>缺货</span>' : ''}${o.manual_review ? ` <span class="badge bg-danger" title="${o.manual_reason || ''}">人工处理</span>` : ''}</div>
+                <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
+                ${o.fulfillment_warehouses && o.fulfillment_warehouses.length ? `<small class="d-block text-warning"><i class="bi bi-boxes me-1"></i>${o.fulfillment_warehouses.join(' + ')}</small>` : ''}
+                <small class="text-muted d-block"><i class="bi bi-calendar3 me-1"></i>下单 ${o.date_created ? o.date_created.replace('T', ' ').substring(0, 16) : '-'}</small>
+            </td>
+
+            <td>
+                <div class="fw-bold mb-1"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name}</a></div>
+                ${o.high_risk_postcode ? `
+                    <div class="alert alert-danger py-2 px-3 mb-2 border border-danger border-2" role="alert" style="box-shadow: 0 0 14px rgba(255,48,69,0.35);">
+                        <div class="fw-bold"><i class="bi bi-shield-fill-exclamation me-2"></i>白嫖风险地区 · 邮编 ${o.high_risk_postcode}</div>
+                        <div class="small mt-1">该邮编地区曾发生客户拒收、退回时包裹内产品丢失。发货前请联系客户并人工核查。</div>
+                    </div>
+                ` : ''}
+                ${riskBadge ? `<div class="mb-2">${riskBadge}</div>` : ''}
+
+                <!-- Contact Info -->
+                <div class="mb-2">
+                    ${o.customer_phone ? `<div class="d-flex align-items-center mb-1"><i class="bi bi-telephone text-secondary me-2"></i><span class="text-light small">${o.customer_phone}</span></div>` : ''}
+                    ${o.customer_social ? `<div class="d-flex align-items-center mb-1"><i class="bi bi-whatsapp text-success me-2"></i><span class="text-light small">${o.customer_social}</span></div>` : ''}
+                    <div class="d-flex align-items-center"><i class="bi bi-envelope text-secondary me-2"></i><span class="text-secondary small text-break">${o.customer_email}</span></div>
+                </div>
+
+                <!-- Smart Shipping Info -->
+                <div class="mt-1">
+                    ${(() => {
+                    const method = (o.shipping_method || '').toLowerCase();
+                    const isInPost = o.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
+                    const isDPD = method.includes('dpd');
+
+                    if (isInPost) {
+                        return `<div>
+                                <div class="d-flex align-items-center">
+                                    <span class="badge me-2" style="background-color: #FFCC00; color: #000; font-weight: 700;">InPost</span>
+                                    <span class="text-white small font-monospace">${o.customer_inpost_id || ''}</span>
+                                </div>
+                                ${o.customer_address_2 ? `<div class="text-warning small mt-1 font-monospace"><i class="bi bi-geo-alt me-1"></i>${o.customer_address_2}</div>` : ''}
+                                ${!o.customer_inpost_id ? `<div class="text-muted small text-break mt-1">${fmtAuAddr(o.customer_address)}</div>` : ''}
+                            </div>`;
+                    } else if (isDPD) {
+                        return `<div>
+                                <div class="mb-1"><span class="badge bg-primary text-white small">${o.shipping_method}</span></div>
+                                <div class="text-muted small text-break">${fmtAuAddr(o.customer_address) || '-'}</div>
+                            </div>`;
+                    } else {
+                        return `<div>
+                                <div class="mb-1"><span class="badge bg-secondary bg-opacity-50 text-light small">${o.shipping_method || 'Delivery'}</span></div>
+                                <div class="text-muted small text-break">${fmtAuAddr(o.customer_address) || '-'}</div>
+                            </div>`;
+                    }
+                })()}
+                </div>
+                ${o.state_mismatch ? `<div class="small mt-1" style="color:#fbbf24;" title="客户结账时选的州装不下这个邮编,按邮编应为 ${auStateFull(o.state_mismatch)}。澳邮按邮编路由,一般可正常投递,但打单时请以邮编为准。"><i class="bi bi-exclamation-triangle-fill me-1"></i>州与邮编不符 · 应为 ${auStateFull(o.state_mismatch)}</div>` : ''}
+            <td>
+                ${o.products.map(p => `
+                <div class="product-item" style="font-size: 0.9em;">
+                    <span class="product-name">${shipEscape(p.name)}${p.shortage_quantity ? ` <span class="badge bg-danger">缺货 ${p.shortage_quantity} 支</span>` : ''}</span>
+                    <span class="product-qty">×${p.quantity}</span>
+                    <span class="product-total">${p.total.toFixed(2)} ${o.currency}</span>
+                </div>
+                `).join('')}
+            </td>
+            <td class="text-end text-white">${o.product_count}</td>
+            <td class="text-end text-info">${o.shipping_total.toFixed(2)}</td>
+            <td class="text-end"><strong>${o.total}</strong></td>
+            <td>
+                ${o.customer_note ? `
+                    <div class="d-flex align-items-start">
+                        <span class="badge bg-info text-dark me-2 mt-1" title="客户留言"><i class="bi bi-person-fill"></i></span>
+                        <div class="small" style="min-width: 140px; max-width: 15vw; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis; word-break: break-word;" title="${o.customer_note.replace(/"/g, '&quot;')}">
+                            <span class="text-white">${o.customer_note}</span>
+                        </div>
+                    </div>
+                ` : '<span class="text-muted small">-</span>'}
+            </td>
+            <td>
+                ${o.latest_note ? `
+                    <div class="d-flex align-items-start">
+                        <span class="badge bg-warning text-dark me-2 mt-1" title="最新备注"><i class="bi bi-chat-text-fill"></i></span>
+                        <div class="small" style="min-width: 140px; max-width: 15vw; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis;" title="${o.latest_note.replace(/"/g, '&quot;')}">
+                            <span class="text-white">${o.latest_note}</span>
+                            ${o.latest_note_author ? `<div class="text-muted" style="font-size:0.8em">${o.latest_note_author}</div>` : ''}
+                        </div>
+                    </div>
+                ` : '<span class="text-muted small">-</span>'}
+            </td>
+            <td class="text-end pe-3 text-nowrap">
+                <a href="javascript:void(0)" class="ship-action text-secondary me-3 text-decoration-none" onclick="openNoteModal('${o.id}', '${o.number}')" title="备注">
+                    <i class="bi bi-chat-left-text"></i>
+                </a>
+                <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="printLabel('${o.id}')" title="打印">
+                    <i class="bi bi-printer"></i>
+                </a>
+                <button class="ship-action btn btn-sm ${o.fulfillment_status || o.parcels_shipped || o.shipment_sync_pending ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal("${o.id}", ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source_url || o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])}, ${JSON.stringify(encodeURIComponent(JSON.stringify(o.products || [])))}, ${JSON.stringify(o.fulfillment_status || "")}, ${JSON.stringify(o.pending_shipment || null)}, ${JSON.stringify(o.high_risk_postcode || "")})'><i class="bi bi-truck me-1"></i>${o.fulfillment_status ? '发货' : (o.shipment_sync_pending ? (o.pending_shipment && o.pending_shipment.reconciliation && !o.pending_shipment.reconciliation.retry_allowed ? '查看对账' : '重试同步') : (o.parcels_shipped ? '继续发货' : '发货'))}</button>
+            </td>
+        </tr>
+    `;
+            }).join('');
+        }
+
+        function shippingLoadFailed(error, bodyId, columns, requestId) {
+            if (error?.name === 'AbortError' || requestId !== shippingRequestId) return;
+            const cell = document.createElement('td');
+            cell.colSpan = columns;
+            cell.className = 'text-center py-4 text-danger';
+            cell.textContent = '加载失败，请点击刷新重试';
+            const row = document.createElement('tr');
+            row.appendChild(cell);
+            document.getElementById(bodyId).replaceChildren(row);
+        }
+
         function loadOrders(requestedShippedPage = 1, shippedOnly = false) {
             const source = document.getElementById('siteFilter').value;
             const country = document.getElementById('countryFilter').value;
@@ -1232,149 +1415,48 @@
                 page: shippedPage
             });
 
-            // Load pending orders unless this request only changes the shipped page.
-            if (!shippedOnly) {
-                fetch(`/api/shipping/pending?${params.toString()}`)
-                .then(res => res.json())
+            const activeTab = shippedOnly ? '#shippedTab'
+                : (document.querySelector('#shippingTabs .active')?.getAttribute('href') || '#pendingTab');
+            const filterKey = JSON.stringify([source, country, manager, dateFrom, dateTo, search]);
+            if (filterKey !== shippingFilterKey) {
+                shippingFilterKey = filterKey;
+                pendingOrdersCache = [];
+                pendingProductChoices = [];
+                document.getElementById('pendingPagination').classList.add('d-none');
+                document.getElementById('pendingCount').textContent = '待发货: —';
+                document.getElementById('shippedCount').textContent = '已发货: —';
+                document.getElementById('outcomeCount').textContent = '待确认: —';
+                document.getElementById('pendingProductStats').textContent = '全部产品：等待加载…';
+            }
+            if (shippingLoadController) shippingLoadController.abort();
+            shippingLoadController = new AbortController();
+            const requestId = ++shippingRequestId;
+            const requestOptions = { signal: shippingLoadController.signal };
+            const readResponse = response => {
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return response.json();
+            };
+
+            // Only request and render the visible tab.
+            if (activeTab === '#pendingTab') {
+                document.getElementById('pendingPagination').classList.add('d-none');
+                document.getElementById('pendingOrdersBody').innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">加载中...</td></tr>';
+                return fetch(`/api/shipping/pending?${params.toString()}`, requestOptions)
+                .then(readResponse)
                 .then(orders => {
-                    const productInput = document.getElementById('pendingProductFilter');
-                    const productOptions = ShippingProductFilter.productOptions(orders);
-                    pendingProductChoices = productOptions;
-                    hidePendingProductMenu();
-
-                    const productResult = ShippingProductFilter.summarize(orders, productInput.value);
-                    const visibleOrders = productResult.orders;
-                    document.getElementById('pendingCount').textContent = `待发货: ${productResult.orderCount} 单 / ${productResult.units} 支`;
-                    document.getElementById('pendingProductStats').textContent = productResult.query
-                        ? `“${productResult.query}”：${productResult.orderCount} 个订单 · ${productResult.units} 支待发货${productResult.exactMatch ? '' : ' · 模糊匹配'}`
-                        : `全部产品：${productResult.productCount} 种 · ${productResult.orderCount} 个订单 · ${productResult.units} 支待发货`;
-                    const tbody = document.getElementById('pendingOrdersBody');
-                    if (visibleOrders.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">没有符合该产品条件的待发货订单</td></tr>';
-                        return;
-                    }
-                    tbody.innerHTML = visibleOrders.map(o => {
-                    // High-risk rows: stronger tint to grab attention even when
-                    // it's not also a "big order". Falls back to the big-order
-                    // tint, then no tint.
-                    const rowStyle = o.high_risk_postcode
-                        ? ' style="background-color: rgba(220,53,69,0.32); outline: 3px solid #ff4d5e; outline-offset: -3px; box-shadow: inset 6px 0 0 #ff3045;"'
-                        : (o.has_shortage || o.manual_review)
-                        ? ' style="background-color: rgba(220,53,69,0.28); outline: 2px solid rgba(220,53,69,0.7);"'
-                        : (o.customer_risk && o.customer_risk.level === 'high')
-                        ? ' style="background-color: rgba(220,53,69,0.18);"'
-                        : (o.customer_risk && o.customer_risk.level === 'medium')
-                            ? ' style="background-color: rgba(245,158,11,0.12);"'
-                            : (o.is_big_order ? ' style="background-color: rgba(220,53,69,0.1);"' : '');
-                    const riskBadge = renderRiskBadge(o.customer_risk, { compact: true });
-                    return `
-                <tr data-editsrc="${o.source || ''}"${rowStyle}>
-                    <td class="ps-3">
-                        <div class="fw-bold"><a href="javascript:void(0)" onclick="showOrderDetail('${o.id}')" class="text-info text-decoration-none">#${o.number}</a>${o.high_risk_postcode ? ` <span class="badge bg-danger border border-light" title="该邮编地区曾发生拒收退回后包裹内产品丢失"><i class="bi bi-shield-fill-exclamation me-1"></i>高危邮编 ${o.high_risk_postcode}</span>` : ''}${o.is_big_order ? ` <span class="badge bg-danger" title="${(o.big_order_reasons || []).join(' · ')}"><i class="bi bi-exclamation-triangle-fill me-1"></i>大单</span>` : ''}${o.shipment_sync_pending ? ` <span class="badge bg-warning text-dark"><i class="bi bi-cloud-slash me-1"></i>同步${shipEscape(o.pending_shipment && o.pending_shipment.reconciliation ? o.pending_shipment.reconciliation.label : '待核验')}</span>` : (o.parcels_shipped ? ` <span class="badge bg-warning text-dark" title="已发 ${o.parcels_shipped} 个包裹，等待发完剩余批次"><i class="bi bi-boxes me-1"></i>分批中·已发${o.parcels_shipped}</span>` : '')}${o.has_shortage ? ' <span class="badge bg-danger"><i class="bi bi-exclamation-octagon-fill me-1"></i>缺货</span>' : ''}${o.manual_review ? ` <span class="badge bg-danger" title="${o.manual_reason || ''}">人工处理</span>` : ''}</div>
-                        <small class="text-muted">${o.manager ? '<span class="badge bg-info bg-opacity-25 text-info me-1">' + o.manager + '</span>' : ''}${o.source}</small>
-                        ${o.fulfillment_warehouses && o.fulfillment_warehouses.length ? `<small class="d-block text-warning"><i class="bi bi-boxes me-1"></i>${o.fulfillment_warehouses.join(' + ')}</small>` : ''}
-                        <small class="text-muted d-block"><i class="bi bi-calendar3 me-1"></i>下单 ${o.date_created ? o.date_created.replace('T', ' ').substring(0, 16) : '-'}</small>
-                    </td>
-
-                    <td>
-                        <div class="fw-bold mb-1"><a href="javascript:void(0)" onclick="showCustomerDetail('${o.customer_email}')" class="text-white text-decoration-none">${o.customer_name}</a></div>
-                        ${o.high_risk_postcode ? `
-                            <div class="alert alert-danger py-2 px-3 mb-2 border border-danger border-2" role="alert" style="box-shadow: 0 0 14px rgba(255,48,69,0.35);">
-                                <div class="fw-bold"><i class="bi bi-shield-fill-exclamation me-2"></i>白嫖风险地区 · 邮编 ${o.high_risk_postcode}</div>
-                                <div class="small mt-1">该邮编地区曾发生客户拒收、退回时包裹内产品丢失。发货前请联系客户并人工核查。</div>
-                            </div>
-                        ` : ''}
-                        ${riskBadge ? `<div class="mb-2">${riskBadge}</div>` : ''}
-
-                        <!-- Contact Info -->
-                        <div class="mb-2">
-                            ${o.customer_phone ? `<div class="d-flex align-items-center mb-1"><i class="bi bi-telephone text-secondary me-2"></i><span class="text-light small">${o.customer_phone}</span></div>` : ''}
-                            ${o.customer_social ? `<div class="d-flex align-items-center mb-1"><i class="bi bi-whatsapp text-success me-2"></i><span class="text-light small">${o.customer_social}</span></div>` : ''}
-                            <div class="d-flex align-items-center"><i class="bi bi-envelope text-secondary me-2"></i><span class="text-secondary small text-break">${o.customer_email}</span></div>
-                        </div>
-
-                        <!-- Smart Shipping Info -->
-                        <div class="mt-1">
-                            ${(() => {
-                            const method = (o.shipping_method || '').toLowerCase();
-                            const isInPost = o.customer_inpost_id || method.includes('inpost') || method.includes('paczkomat');
-                            const isDPD = method.includes('dpd');
-
-                            if (isInPost) {
-                                return `<div>
-                                        <div class="d-flex align-items-center">
-                                            <span class="badge me-2" style="background-color: #FFCC00; color: #000; font-weight: 700;">InPost</span>
-                                            <span class="text-white small font-monospace">${o.customer_inpost_id || ''}</span>
-                                        </div>
-                                        ${o.customer_address_2 ? `<div class="text-warning small mt-1 font-monospace"><i class="bi bi-geo-alt me-1"></i>${o.customer_address_2}</div>` : ''}
-                                        ${!o.customer_inpost_id ? `<div class="text-muted small text-break mt-1">${fmtAuAddr(o.customer_address)}</div>` : ''}
-                                    </div>`;
-                            } else if (isDPD) {
-                                return `<div>
-                                        <div class="mb-1"><span class="badge bg-primary text-white small">${o.shipping_method}</span></div>
-                                        <div class="text-muted small text-break">${fmtAuAddr(o.customer_address) || '-'}</div>
-                                    </div>`;
-                            } else {
-                                return `<div>
-                                        <div class="mb-1"><span class="badge bg-secondary bg-opacity-50 text-light small">${o.shipping_method || 'Delivery'}</span></div>
-                                        <div class="text-muted small text-break">${fmtAuAddr(o.customer_address) || '-'}</div>
-                                    </div>`;
-                            }
-                        })()}
-                        </div>
-                        ${o.state_mismatch ? `<div class="small mt-1" style="color:#fbbf24;" title="客户结账时选的州装不下这个邮编,按邮编应为 ${auStateFull(o.state_mismatch)}。澳邮按邮编路由,一般可正常投递,但打单时请以邮编为准。"><i class="bi bi-exclamation-triangle-fill me-1"></i>州与邮编不符 · 应为 ${auStateFull(o.state_mismatch)}</div>` : ''}
-                    <td>
-                        ${o.products.map(p => `
-                        <div class="product-item" style="font-size: 0.9em;">
-                            <span class="product-name">${shipEscape(p.name)}${p.shortage_quantity ? ` <span class="badge bg-danger">缺货 ${p.shortage_quantity} 支</span>` : ''}</span>
-                            <span class="product-qty">×${p.quantity}</span>
-                            <span class="product-total">${p.total.toFixed(2)} ${o.currency}</span>
-                        </div>
-                        `).join('')}
-                    </td>
-                    <td class="text-end text-white">${o.product_count}</td>
-                    <td class="text-end text-info">${o.shipping_total.toFixed(2)}</td>
-                    <td class="text-end"><strong>${o.total}</strong></td>
-                    <td>
-                        ${o.customer_note ? `
-                            <div class="d-flex align-items-start">
-                                <span class="badge bg-info text-dark me-2 mt-1" title="客户留言"><i class="bi bi-person-fill"></i></span>
-                                <div class="small" style="min-width: 140px; max-width: 15vw; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis; word-break: break-word;" title="${o.customer_note.replace(/"/g, '&quot;')}">
-                                    <span class="text-white">${o.customer_note}</span>
-                                </div>
-                            </div>
-                        ` : '<span class="text-muted small">-</span>'}
-                    </td>
-                    <td>
-                        ${o.latest_note ? `
-                            <div class="d-flex align-items-start">
-                                <span class="badge bg-warning text-dark me-2 mt-1" title="最新备注"><i class="bi bi-chat-text-fill"></i></span>
-                                <div class="small" style="min-width: 140px; max-width: 15vw; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis;" title="${o.latest_note.replace(/"/g, '&quot;')}">
-                                    <span class="text-white">${o.latest_note}</span>
-                                    ${o.latest_note_author ? `<div class="text-muted" style="font-size:0.8em">${o.latest_note_author}</div>` : ''}
-                                </div>
-                            </div>
-                        ` : '<span class="text-muted small">-</span>'}
-                    </td>
-                    <td class="text-end pe-3 text-nowrap">
-                        <a href="javascript:void(0)" class="ship-action text-secondary me-3 text-decoration-none" onclick="openNoteModal('${o.id}', '${o.number}')" title="备注">
-                            <i class="bi bi-chat-left-text"></i>
-                        </a>
-                        <a href="javascript:void(0)" class="text-info me-3 text-decoration-none" onclick="printLabel('${o.id}')" title="打印">
-                            <i class="bi bi-printer"></i>
-                        </a>
-                        <button class="ship-action btn btn-sm ${o.fulfillment_status || o.parcels_shipped || o.shipment_sync_pending ? 'btn-warning' : 'btn-primary'} px-3" onclick='openShipModal("${o.id}", ${JSON.stringify(o.number)}, ${JSON.stringify(o.customer_name)}, ${JSON.stringify(o.customer_address || "")}, ${JSON.stringify(o.source_url || o.source || "")}, ${o.is_big_order ? 'true' : 'false'}, ${JSON.stringify((o.big_order_reasons || []).join(" · "))}, ${JSON.stringify(o.warehouse_name || "")}, ${JSON.stringify(o.customer_risk || null)}, ${JSON.stringify(o.parcels || [])}, ${JSON.stringify(encodeURIComponent(JSON.stringify(o.products || [])))}, ${JSON.stringify(o.fulfillment_status || "")}, ${JSON.stringify(o.pending_shipment || null)}, ${JSON.stringify(o.high_risk_postcode || "")})'><i class="bi bi-truck me-1"></i>${o.fulfillment_status ? '发货' : (o.shipment_sync_pending ? (o.pending_shipment && o.pending_shipment.reconciliation && !o.pending_shipment.reconciliation.retry_allowed ? '查看对账' : '重试同步') : (o.parcels_shipped ? '继续发货' : '发货'))}</button>
-                    </td>
-                </tr>
-            `;
-                    }).join('');
-                });
+                    if (requestId !== shippingRequestId) return;
+                    pendingOrdersCache = orders;
+                    renderPendingOrders(orders, 1);
+                })
+                .catch(error => shippingLoadFailed(error, 'pendingOrdersBody', 9, requestId));
             }
 
-            // Load shipped orders
-            fetch(`/api/shipping/shipped?${params.toString()}`)
-                .then(res => res.json())
+            if (activeTab === '#shippedTab') {
+                document.getElementById('shippedOrdersBody').innerHTML = '<tr><td colspan="11" class="text-center py-4 text-muted">加载中...</td></tr>';
+                return fetch(`/api/shipping/shipped?${params.toString()}`, requestOptions)
+                .then(readResponse)
                 .then(data => {
+                    if (requestId !== shippingRequestId) return;
                     const orders = data.orders || [];
                     const pagination = data.pagination || { page: 1, per_page: 50, total: orders.length, pages: 1 };
                     document.getElementById('shippedCount').textContent = `已发货: ${pagination.total}`;
@@ -1499,13 +1581,16 @@
                 </tr>
             `;
                     }).join('');
-                });
+                })
+                .catch(error => shippingLoadFailed(error, 'shippedOrdersBody', 11, requestId));
+            }
 
-            // Load 待确认结局 unless this request only changes the shipped page.
-            if (!shippedOnly) {
-                fetch(`/api/shipping/pending-outcome?${params.toString()}`)
-                .then(res => res.json())
+            if (activeTab === '#outcomeTab') {
+                document.getElementById('outcomeOrdersBody').innerHTML = '<tr><td colspan="7" class="text-center py-4 text-muted">加载中...</td></tr>';
+                return fetch(`/api/shipping/pending-outcome?${params.toString()}`, requestOptions)
+                .then(readResponse)
                 .then(orders => {
+                    if (requestId !== shippingRequestId) return;
                     document.getElementById('outcomeCount').textContent = `待确认: ${orders.length}`;
                     const tbody = document.getElementById('outcomeOrdersBody');
                     if (!orders.length) {
@@ -1570,7 +1655,8 @@
                 </tr>`;
                     }).join('');
                     applyOutcomeFilter();
-                });
+                })
+                .catch(error => shippingLoadFailed(error, 'outcomeOrdersBody', 7, requestId));
             }
         }
 
