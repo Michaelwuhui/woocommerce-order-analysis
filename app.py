@@ -13312,7 +13312,7 @@ def api_recon_orders():
                    total, shipping_total, line_items, source, billing,
                    is_undelivered, shipping_loss_amount
             FROM orders WHERE {where_sql}
-            ORDER BY date_created DESC
+            ORDER BY date_created DESC, id DESC
             {limit_sql}
         ''', params).fetchall()
 
