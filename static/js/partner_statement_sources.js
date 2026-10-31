@@ -13,14 +13,14 @@
             <div class="d-flex align-items-center flex-wrap gap-2 mb-3"><h5 class="mb-0 text-white">按商品来源核算</h5><span class="badge bg-info text-dark">${live ? '实时参考' : `第 ${esc(snapshot.revision)} 版 · 冻结快照`}</span><span class="badge ${s.ready ? 'bg-success' : 'bg-warning text-dark'}">${esc(s.amounts_label)}</span></div>
             <div class="row g-2 mb-3">
                 ${card('自备货商品利润 · 合伙人',s.partner_profit,curr,'只计算合伙人自己备货的商品','#23332b')}
-                ${card('中转打包费 · 应付合伙人',s.packing_fee_cny,'CNY',`${s.packing_charges} 次收费 · 按实际出库月 · 不自动抵扣`,'#17324a')}
+                ${card('中转打包费 · 应付合伙人',s.packing_fee_cny,'CNY',`${s.packing_basis==='shipped_unit' ? s.packing_units+' 支'+(s.packing_unit_fee_cny==null?'':' × '+s.packing_unit_fee_cny+' 元/支')+' · '+s.packing_charges+' 个包裹' : s.packing_charges+' 次收费'} · 按实际出库月 · 不自动抵扣`,'#17324a')}
                 ${card('商品货款应收 · 我方',s.our_receivable,curr,'自备货应收 + 中转商品应交回；实收回款另核','#342b1b')}
             </div>
             <div class="table-responsive"><table class="table table-dark table-sm align-middle mb-2"><thead><tr><th>商品供货方式</th><th class="text-end">涉及订单 / 销售件数</th><th class="text-end">商品销售</th><th class="text-end">返还合伙人成本</th><th class="text-end">合伙人商品利润</th><th class="text-end">商品应收</th></tr></thead><tbody>
                 ${(snapshot.groups || []).map(g => `<tr><td><span class="badge ${g.mode === 'transit_service' ? 'bg-info text-dark' : g.mode === 'pending' ? 'bg-warning text-dark' : 'bg-success'}">${esc(g.label)}</span>${g.mode === 'transit_service' ? '<div class="small text-info mt-1">不返还备货成本 · 不参与商品分成</div>' : ''}</td><td class="text-end">${g.orders} 单 / ${g.quantity} 件</td><td class="text-end">${amount(g.revenue)}</td><td class="text-end">${groupAmount(g,'cost_recovery')}</td><td class="text-end">${groupAmount(g,'partner_profit')}</td><td class="text-end">${groupAmount(g,'our_receivable')}</td></tr>`).join('')}
             </tbody></table></div>
             <div class="small text-white-50">商品金额单位：${esc(curr)}。混合订单在各供货方式分别出现，订单数不直接相加。商品结算按下单月，打包费按实际出库月；本账只核对本合伙人绑定站点和币种。</div>
-            <div class="small text-white-50 mt-2">中转退件运费损失 ${amount(s.transit_shipping_loss_separate)} ${esc(curr)}，由我方另账核算；打包费与商品应收分别列示。普通补发收费，仓库漏发免收。</div>
+            <div class="small text-white-50 mt-2">中转退件运费损失 ${amount(s.transit_shipping_loss_separate)} ${esc(curr)}，由我方另账核算；打包费与商品应收分别列示。${esc(s.packing_policy || s.reship_policy || '普通补发收费，仓库漏发免收')}。</div>
             ${!s.ready ? `<div class="alert alert-warning py-2 mt-2 mb-0">${s.pending_orders} 单商品来源或成本待核实，${s.packing_pending} 条服务记录待核实。当前为已核实行小计，待补全后重新生成才能确认或锁定。</div>` : ''}
         </section>`;
     }
@@ -44,17 +44,20 @@
         const values = data.rows || [];
         if (kind === 'products') return table(['供货方式','商品 / 仓库','订单 / 件数','商品销售','返还合伙人成本','合伙人利润','商品应收','核算状态'],values.map(r=>[
             esc(r.mode_label),`${esc(r.product_name)}<div class="small text-white-50">${esc(r.warehouse_name)}</div>`,`${r.orders} 单 / ${r.quantity} 件`,amount(r.revenue),amount(r.cost_recovery),amount(r.partner_profit),amount(r.our_receivable),r.pending_count ? '<span class="text-warning">待核实</span>' : '已核算']));
-        if (kind === 'lines') return table(['订单 / 站点','商品','供货方式 / 仓库','分仓 / 实发数量','商品销售','返还合伙人成本','合伙人利润','商品应收','来源与成本凭证'],values.map(r=>[
+        if (kind === 'lines') return table(['订单 / 站点','商品','供货方式 / 仓库','来源归属 / OMS 实发数量','商品销售','返还合伙人成本','合伙人利润','商品应收','来源与成本凭证'],values.map(r=>[
             `<a href="/orders?search=${encodeURIComponent(r.order_number || r.order_id)}" target="_blank" rel="noopener">${esc(r.order_number || r.order_id)}</a><div class="small text-white-50">${esc(r.source)}<br>${esc(r.order_date)}<br>${esc(r.order_status)}</div>`,
             `${esc(r.product_name)}<div class="small text-white-50">商品行 ${esc(r.line_item_id)}${r.sku ? ' · '+esc(r.sku) : ''}</div>`,
             `${esc(r.mode_label)}<div class="small text-white-50">${esc(r.warehouse_name)}</div>`,`${r.quantity} / ${r.fulfilled_quantity || 0}`,
             amount(r.revenue),amount(r.cost_recovery),amount(r.partner_profit),amount(r.our_receivable),
             `<div class="small">${esc(r.source_basis)}${r.fulfillment_id ? '<br>履约单 '+esc(r.fulfillment_id) : ''}${r.source_override_id ? '<br>来源确认 '+esc(r.source_override_id)+'<br>'+esc(r.ownership_evidence) : ''}${r.cost_evidence?.cost_id ? '<br>成本 #'+esc(r.cost_evidence.cost_id)+' · '+esc(r.cost_evidence.effective_date) : ''}${r.pending?.length ? '<br><span class="text-warning">'+esc(r.pending.join('；'))+'</span>' : ''}</div>`]));
-        return table(['订单 / 站点','运单 / 实际出库','类型 / 计费依据','打包费 CNY','费用规则 / 核对依据'],values.map(r=>{
-            const canDecide = editable && (r.kind === 'reship' || (r.pending || []).some(p=>p.includes('原发/补发')));
+        return table(['订单 / 站点','运单 / 实际出库','包裹中转商品 / 实发支数','计费依据','打包费 CNY','费用规则 / 核对依据'],values.map(r=>{
+            const perUnit = r.billing_basis === 'shipped_unit';
+            const canDecide = !perUnit && editable && (r.kind === 'reship' || (r.pending || []).some(p=>p.includes('原发/补发')));
             const decision = r.decision || {};
             const control = canDecide ? `<div class="mt-2"><select class="form-select form-select-sm bg-dark text-white border-secondary" data-reship-decision="${esc(r.shipment_id)}"><option value="unknown">选择核对结果</option>${[['original','原订单首次发货'],['ordinary','普通补发 · 收费'],['warehouse_omission','仓库漏发补发 · 免收']].map(([key,label])=>`<option value="${key}" ${decision.reason===key?'selected':''}>${label}</option>`).join('')}</select><input class="form-control form-control-sm mt-1 bg-dark text-white border-secondary" data-reship-evidence="${esc(r.shipment_id)}" placeholder="填写核对依据" value="${esc(decision.evidence || '')}"></div>` : '';
-            return [`${esc(r.order_number || r.order_id)}<div class="small text-white-50">${esc(r.source)}</div>`,`${esc(r.tracking_number)}<div class="small text-white-50">${esc(r.shipped_at)}<br>${esc(r.shipment_id)}</div>`,`${r.kind==='reship'?'补发':'原订单'}<div class="small">${esc(r.reason)}</div>`,amount(r.amount_cny),`<div class="small text-white-50">${esc(r.rule_name)}<br>${esc(r.rule_id)}${r.pending?.length ? '<br><span class="text-warning">'+esc(r.pending.join('；'))+'</span>' : ''}</div>${control}`];
+            return [`${esc(r.order_number || r.order_id)}<div class="small text-white-50">${esc(r.source)}<br>${esc(r.order_status || '')}</div>`,`${esc(r.tracking_number)}<div class="small text-white-50">${esc(r.shipped_at)}<br>${esc(r.shipment_id)}</div>`,
+                perUnit ? (r.items || []).map(i=>`<div class="small">${esc(i.product_name)} · ${esc(i.quantity)} 支<br>商品行 ${esc(i.line_item_id)} / 履约商品 ${esc(i.fulfillment_item_id)}</div>`).join('') || '实发商品待核实' : '历史按订单计费',
+                `${perUnit ? (r.quantity==null?'支数待核实':esc(r.quantity)+' 支')+' × '+amount(r.unit_fee_cny)+' CNY/支' : r.kind==='reship'?'补发':'原订单'}<div class="small text-white-50">${esc(r.reason)}</div>`,amount(r.amount_cny),`<div class="small text-white-50">${esc(r.rule_name)}<br>${esc(r.rule_id)}${r.pending?.length ? '<br><span class="text-warning">'+esc(r.pending.join('；'))+'</span>' : ''}</div>${control}`];
         }));
     }
     function mount(body, statement, options) {
@@ -75,7 +78,7 @@
             $('[data-source-content]').innerHTML = '<div class="text-white-50 py-3">读取冻结明细…</div>';
             $('[data-source-prev]').disabled = true; $('[data-source-next]').disabled = true;
             $('[data-source-filters]').hidden = kind === 'versions';
-            $('[data-source-decision-save]').hidden = !(editable && kind === 'fees');
+            $('[data-source-decision-save]').hidden = !(editable && kind === 'fees' && statement.source_snapshot.settlement.packing_basis!=='shipped_unit');
             try {
                 if (kind === 'versions') {
                     const data = await options.api(`/api/reconciliation/statements/${statement.id}/versions`);
