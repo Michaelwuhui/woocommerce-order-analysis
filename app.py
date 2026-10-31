@@ -7079,6 +7079,8 @@ def init_partner_reconciliation_tables():
         )
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_stmt_orders_stmt ON reconciliation_statement_orders(statement_id)')
+    from partner_statement_sources import init_sqlite_schema
+    init_sqlite_schema(conn)
 
     # ---------- P2: extra columns on reconciliation_statements ----------
     # confirmed_name: typed by partner when confirming (e-signature)
@@ -11912,7 +11914,7 @@ def _build_dated_cost_index(conn=None, only_warehouse_ids=None):
     if own_conn:
         conn = get_db_connection()
     try:
-        sql = '''SELECT brand_id, series_id, puff_count, flavor, warehouse_id,
+        sql = '''SELECT id, brand_id, series_id, puff_count, flavor, warehouse_id,
                         cost_price, cost_currency, effective_date
                  FROM product_costs'''
         params = []
@@ -11937,6 +11939,7 @@ def _build_dated_cost_index(conn=None, only_warehouse_ids=None):
         f = (r['flavor'] or '').strip() or None
         w = r['warehouse_id']
         entry = {
+            'cost_id': r['id'],
             'effective_date': r['effective_date'] or '0000-00-00',
             'price': float(r['cost_price'] or 0),
             'currency': r['cost_currency'] or 'PLN',
@@ -11978,6 +11981,7 @@ def _cost_at_date(idx, brand_id, series_id, puff_count, flavor, warehouse_id, or
         for e in entries:
             if e['effective_date'] <= od:
                 return {
+                    'cost_id': e.get('cost_id'),
                     'price': e['price'],
                     'currency': e['currency'],
                     'effective_date': e['effective_date'],
@@ -11988,6 +11992,7 @@ def _cost_at_date(idx, brand_id, series_id, puff_count, flavor, warehouse_id, or
         # effort and tag it accordingly so the UI can warn.
         oldest = entries[-1]
         return {
+            'cost_id': oldest.get('cost_id'),
             'price': oldest['price'],
             'currency': oldest['currency'],
             'effective_date': oldest['effective_date'],
@@ -12089,7 +12094,7 @@ def _calc_partner_net_sales(partner_id, year, month):
     }
 
 
-def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manager_filter=None):
+def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manager_filter=None, db_conn=None):
     """Comprehensive monthly aggregation for the partner reconciliation drill-down.
 
     Returns the same numbers as _calc_partner_net_sales (so existing callers stay
@@ -12102,7 +12107,8 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
       manager_filter — manager name; only sites with that manager contribute
     Both are AND-applied. None means no filter.
     """
-    conn = get_db_connection()
+    own_conn = db_conn is None
+    conn = db_conn if db_conn is not None else get_db_connection()
     try:
         partner = conn.execute(
             'SELECT id, name, currency, cost_ratio, partner_profit_ratio, our_profit_ratio FROM partners WHERE id = ?',
@@ -12192,8 +12198,12 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
         for pm in pm_rows:
             product_mappings_cache[(normalize_raw_name(pm['raw_name']), pm['source'])] = pm
 
+        series_cache = [dict(r) for r in conn.execute('SELECT id,brand_id,name FROM series').fetchall()]
+        parsed_cache = {}
+
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
     # ---- Aggregate ----
     by_status = {  # status_label -> {orders, gross, shipping, net}
@@ -12330,7 +12340,8 @@ def _calc_partner_recon_detail(partner_id, year, month, site_filter=None, manage
             item_total = float(item.get('total', 0) or 0)
 
             b_id, s_id, p_cnt, flav = _resolve_product_to_brand(
-                raw_name, url, brands_cache, product_mappings_cache
+                raw_name, url, brands_cache, product_mappings_cache,
+                series_cache=series_cache, parsed_cache=parsed_cache
             )
 
             # Lookup cost effective on this order's date. Try the order's own
@@ -13145,12 +13156,24 @@ def api_list_statements():
     query += ' ORDER BY period_year DESC, period_month DESC, partner_id'
     rows = conn.execute(query, params).fetchall()
     # Load partner currencies for enrichment
-    partner_curr = {p['id']: p['currency'] for p in conn.execute('SELECT id, currency FROM partners').fetchall()}
+    partner_meta = {p['id']:dict(p) for p in conn.execute('SELECT id,currency,code FROM partners').fetchall()}
+    from partner_statement_sources import exists
+    version_metadata = {}
+    if rows and exists(conn,'reconciliation_statement_versions'):
+        marks = ','.join('?' for _ in rows)
+        version_metadata = {row['statement_id']:dict(row) for row in conn.execute(f'''SELECT v.statement_id,v.revision,
+            v.settlement_ready,v.packing_fee_cny,v.pending_orders FROM reconciliation_statement_versions v
+            WHERE v.statement_id IN ({marks}) AND v.revision=(SELECT MAX(v2.revision)
+              FROM reconciliation_statement_versions v2 WHERE v2.statement_id=v.statement_id)''',[row['id'] for row in rows]).fetchall()}
     conn.close()
     result = []
     for r in rows:
         d = dict(r)
-        d['currency'] = partner_curr.get(d['partner_id'], 'PLN')
+        d['currency'] = partner_meta.get(d['partner_id'],{}).get('currency') or 'PLN'
+        if d['id'] in version_metadata and partner_meta.get(d['partner_id'],{}).get('code')=='poland_jin':
+            version = version_metadata[d['id']]
+            d.update(source_revision=version['revision'],source_ready=bool(version['settlement_ready']),
+                     packing_fee_cny=float(version['packing_fee_cny']),source_pending_orders=version['pending_orders'])
         _enrich_statement_cny(d, d['currency'])
         result.append(d)
     return jsonify(result)
@@ -13179,6 +13202,7 @@ def api_preview_statement():
         detail = _calc_partner_recon_detail(partner_id, year, month)
         if detail is None:
             return jsonify({'error': '合伙人不存在'}), 404
+        detail['source_summary'] = _product_source_preview(partner_id,year,month,detail)
         return jsonify(detail)
 
     # No partner_id means "全部合伙人". Resolve the current user's allowed
@@ -13212,25 +13236,17 @@ def api_preview_statement():
 @login_required
 @reconciliation_api_required
 def api_recon_orders():
-    """Order list filtered by partner (their bound sites + currency + period).
-
-    Replicates the data-shape of /orders for embedding inside the partner
-    reconciliation page, INCLUDING the page-totals summary row used by the
-    "本页合计" header. When a year+month filter is set, returns ALL orders
-    for that month (capped at 5000) — no internal pagination, matching the
-    /orders page behavior where one month = one page.
-    """
+    """Paginated scoped orders and page totals; monthly summary is separate."""
     partner_id = request.args.get('partner_id', type=int)
     year = request.args.get('year', type=int)
     month = request.args.get('month', type=int)
     status_filter = (request.args.get('status') or '').strip()
     source_filter = (request.args.get('source') or '').strip()
     search = (request.args.get('search') or '').strip()
-    # Pagination — only kicks in when a month filter is NOT set. With a month
-    # filter, we dump the entire month in one response (5000-row safety cap).
+    # Monthly views also paginate; aggregate totals use the separate summary.
     requested_page = max(1, request.args.get('page', 1, type=int))
-    requested_per_page = min(5000, max(20, request.args.get('per_page', 200, type=int)))
-    use_pagination = not (year and month)
+    requested_per_page = min(200, max(20, request.args.get('per_page', 100, type=int)))
+    use_pagination = True
 
     if not partner_id:
         return jsonify({'error': '缺少 partner_id 参数'}), 400
@@ -13286,17 +13302,10 @@ def api_recon_orders():
 
         total = conn.execute(f'SELECT COUNT(*) FROM orders WHERE {where_sql}', params).fetchone()[0]
 
-        # Fetch rows — paginated only if no month filter
-        if use_pagination:
-            offset = (requested_page - 1) * requested_per_page
-            limit_sql = f'LIMIT {requested_per_page} OFFSET {offset}'
-            page_returned = requested_page
-            per_page_returned = requested_per_page
-        else:
-            # All-in-one-page mode: cap at 5000 rows for safety
-            limit_sql = 'LIMIT 5000'
-            page_returned = 1
-            per_page_returned = max(total, 1)
+        offset = (requested_page - 1) * requested_per_page
+        limit_sql = f'LIMIT {requested_per_page} OFFSET {offset}'
+        page_returned = requested_page
+        per_page_returned = requested_per_page
 
         rows = conn.execute(f'''
             SELECT id, number, status, payment_method, currency, date_created,
@@ -13349,6 +13358,8 @@ def api_recon_orders():
             product_mappings_cache[(normalize_raw_name(pm['raw_name']), pm['source'])] = pm
 
         # Aggregator for "本页合计" — mirrors the orders.html displayed_totals.
+        series_cache = [dict(r) for r in conn.execute('SELECT id,brand_id,name FROM series').fetchall()]
+        parsed_cache = {}
         totals = {
             'order_count': 0,
             'undelivered_count': 0,
@@ -13467,7 +13478,8 @@ def api_recon_orders():
                     raw_name = it.get('name', '') or ''
                     line_total = float(it.get('total', 0) or 0)
                     b_id, s_id, p_cnt, flav = _resolve_product_to_brand(
-                        raw_name, r['source'], brands_cache, product_mappings_cache
+                        raw_name, r['source'], brands_cache, product_mappings_cache,
+                        series_cache=series_cache, parsed_cache=parsed_cache
                     )
                     cost_entry = None
                     if b_id and effective_wh_ids:
@@ -13740,6 +13752,8 @@ def api_recon_products():
         'period_month': month,
         'currency': detail['currency'],
         'products': products,
+        'source_summary': _product_source_preview(partner_id,year,month,detail,
+                                                 site_filter=source_filter,manager_filter=manager_filter),
         'totals': {
             'revenue': detail['total_gross_pln'] - detail['total_shipping_pln'],
             'actual_cost': detail['actual_cost_pln'],
@@ -13825,6 +13839,8 @@ def api_recon_unmapped_products():
             product_mappings_cache[(normalize_raw_name(pm['raw_name']), pm['source'])] = pm
 
         # CNY rate for the period — for revenue conversion
+        series_cache = [dict(r) for r in conn.execute('SELECT id,brand_id,name FROM series').fetchall()]
+        parsed_cache = {}
         rate_cny, _ = _lookup_partner_rate(currency, year, month)
 
         # Group unmapped by (brand, puffs, country, flavor)
@@ -13845,7 +13861,8 @@ def api_recon_unmapped_products():
                 raw_name = item.get('name', '') or ''
                 item_total = float(item.get('total', 0) or 0)
                 b_id, s_id, p_cnt, flav = _resolve_product_to_brand(
-                    raw_name, o['source'], brands_cache, product_mappings_cache
+                    raw_name, o['source'], brands_cache, product_mappings_cache,
+                    series_cache=series_cache, parsed_cache=parsed_cache
                 )
                 cost_entry = None
                 if b_id and effective_wh_ids:
@@ -14271,110 +14288,171 @@ def _compute_statement_split(net, actual_cost, cost_ratio, pp_ratio, op_ratio, m
     return round(succ_net * cr, 2), round(succ_net * pp - half, 2), round(succ_net * op - half, 2)
 
 
+def _build_product_source_statement(conn, partner, year, month, mode, business, decisions=None,
+                                    site_filter=None, manager_filter=None):
+    """Batch metadata once; product cost evidence stays tied to its supplier warehouse."""
+    from partner_statement_sources import build_snapshot
+    brands = []
+    for row in conn.execute('SELECT id,name,aliases FROM brands').fetchall():
+        aliases = parse_json_field(row['aliases']) or []
+        brands.append({'id':row['id'],'name':row['name'],
+                       'patterns':[row['name'].upper()]+[str(alias).upper() for alias in aliases]})
+    mappings = {(normalize_raw_name(row['raw_name']),row['source']):row for row in conn.execute(
+        'SELECT raw_name,source,brand_id,series_id,puff_count,flavor FROM product_mappings').fetchall()}
+    series = [dict(row) for row in conn.execute('SELECT id,brand_id,name FROM series').fetchall()]
+    index = _build_dated_cost_index(conn=conn)
+    parsed, costs, rates = {}, {}, {}
+    currency = partner['currency'] or 'PLN'
+    period = f'{year:04d}-{month:02d}'
+    def rate(unit):
+        if unit == 'CNY':
+            return {'rate_to_cny':1,'year_month':period}
+        if unit not in rates:
+            row = conn.execute('''SELECT rate_to_cny,year_month FROM exchange_rates
+                WHERE currency=? AND year_month<=? ORDER BY year_month DESC LIMIT 1''',(unit,period)).fetchone()
+            rates[unit] = dict(row) if row else None
+        return rates[unit]
+    def lookup(name, source, warehouse_id, order_date):
+        key = (name,source,warehouse_id,order_date)
+        if key in costs:
+            return costs[key]
+        b,s,p,f = _resolve_product_to_brand(name,source,brands,mappings,series_cache=series,parsed_cache=parsed)
+        entry = _cost_at_date(index,b,s,p,f,warehouse_id,order_date) if b else None
+        result = {'warehouse_id':warehouse_id}
+        if entry and not entry['match_level'].endswith('_future'):
+            result.update(entry)
+            if entry['currency'] == currency:
+                result['unit_cost'] = entry['price']
+            else:
+                cost_rate, market_rate = rate(entry['currency']),rate(currency)
+                if cost_rate and market_rate and (cost_rate['rate_to_cny'] or 0)>0 and (market_rate['rate_to_cny'] or 0)>0:
+                    result.update(unit_cost=entry['price']*cost_rate['rate_to_cny']/market_rate['rate_to_cny'],
+                                  cost_fx=cost_rate,market_fx=market_rate)
+        costs[key] = result
+        return result
+    return build_snapshot(conn,dict(partner),year,month,mode,business,lookup,decisions=decisions,
+                          site_filter=site_filter,manager_filter=manager_filter)
+
+
+def _product_source_preview(partner_id, year, month, business, site_filter=None, manager_filter=None):
+    conn = get_db_connection()
+    try:
+        partner = conn.execute('SELECT * FROM partners WHERE id=?',(partner_id,)).fetchone()
+        if not partner or partner['code'] != 'poland_jin':
+            return None
+        snapshot = _build_product_source_statement(conn,partner,year,month,'actual',dict(business),
+                                                  site_filter=site_filter,manager_filter=manager_filter)
+        return {key:value for key,value in snapshot.items() if key not in ('source_lines','service_lines','business_detail')}
+    finally:
+        conn.close()
+
+
 @app.route('/api/reconciliation/statements/generate', methods=['POST'])
 @login_required
 @reconciliation_api_required
 def api_generate_statement():
-    """Generate (or refresh) a monthly statement from order data"""
+    """Generate one frozen product-source revision; preserve the previous bill."""
     if not _is_reconciliation_admin():
-        return jsonify({'error': '无权生成对账单'}), 403
-    data = request.json
-    partner_id = int(data.get('partner_id'))
-    if not _check_partner_access(partner_id):
-        return jsonify({'error': '无权生成此合伙人的对账单'}), 403
-    year = int(data.get('year'))
-    month = int(data.get('month'))
-
-    conn = get_db_connection()
-    partner = conn.execute('SELECT * FROM partners WHERE id = ?', (partner_id,)).fetchone()
-    if not partner:
-        conn.close()
-        return jsonify({'error': '合伙人不存在'}), 404
-
-    # Check if already locked/settled
-    existing = conn.execute('''SELECT id, status FROM reconciliation_statements
-        WHERE partner_id=? AND period_year=? AND period_month=?''',
-        (partner_id, year, month)).fetchone()
-    if existing and existing['status'] in ('locked', 'settled'):
-        conn.close()
-        return jsonify({'error': '该月份对账单已锁定，无法重新生成'}), 400
-
-    # Use the full detail aggregator so we also capture actual_cost_pln_snapshot
-    detail = _calc_partner_recon_detail(partner_id, year, month)
-    if detail is None:
-        conn.close()
-        return jsonify({'error': '合伙人数据计算失败'}), 500
-    net = detail['total_net_pln']
-    actual_cost_snapshot = detail['actual_cost_pln']
-
-    # Guard against generating an EMPTY statement. If the chosen period has no
-    # successful (revenue-generating) orders, total_orders/net are 0 and every
-    # split below comes out all-zeros. Silently saving that produces a blank
-    # "bill" that reports success but shows nothing — exactly the
-    # "按照实际毛利生成的账单是空的" report. This happens when a period with no
-    # orders is picked (the year dropdown offers future / pre-launch months),
-    # or while order data is briefly unavailable. Refuse instead of writing the
-    # empty row (and, on regenerate, refuse so we never clobber a good
-    # statement with zeros). A genuinely zero-activity month never needs an
-    # auto-generated statement; 手工录入 covers that rare case.
-    if (detail.get('total_orders') or 0) == 0 and (net or 0) == 0:
-        conn.close()
-        return jsonify({'error': f'{year}-{month:02d} 期间没有可对账的成功订单（净销售额为 0），未生成对账单。请确认所选合伙人与月份正确、且订单已同步后重试。'}), 400
-
-    mode = data.get('mode') or 'contract'
-    if mode not in ('contract', 'actual'):
-        mode = 'contract'
-    cost, p_profit, our_recv = _compute_statement_split(
-        net, actual_cost_snapshot, partner['cost_ratio'],
-        partner['partner_profit_ratio'], partner['our_profit_ratio'], mode,
-        shipping_loss=detail.get('shipping_loss') or 0)
-    # In 实际毛利 mode the margin is only trustworthy if every product has a real
-    # cost; unmapped lines fall back to a 50% estimate (would inflate margin).
-    unmapped_qty = detail.get('cost_unmapped_qty') or 0
-
-    # Auto-lookup exchange rate from system settings
-    rate, _ = _lookup_partner_rate(partner['currency'], year, month)
-    our_recv_cny = round(our_recv * rate, 2) if rate else None
-
+        return jsonify({'error':'无权生成对账单'}),403
+    data = request.get_json(silent=True) or {}
     try:
-        is_regenerate = bool(existing)
+        partner_id,year,month = int(data.get('partner_id')),int(data.get('year')),int(data.get('month'))
+        if not 1 <= month <= 12 or not 2000 <= year <= 2200:
+            raise ValueError()
+    except (ValueError,TypeError):
+        return jsonify({'error':'合伙人与对账期间无效'}),400
+    if not _check_partner_access(partner_id):
+        return jsonify({'error':'无权生成此合伙人的对账单'}),403
+    from partner_statement_sources import read_version,save_version
+    conn = get_db_connection()
+    try:
+        if hasattr(conn,'_raw'):
+            conn._raw.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+            conn.execute('SELECT pg_advisory_xact_lock(?)',(7100000000+partner_id*100000+year*100+month,))
+        else:
+            conn.execute('BEGIN IMMEDIATE')
+        partner = conn.execute('SELECT * FROM partners WHERE id=?',(partner_id,)).fetchone()
+        if not partner:
+            return jsonify({'error':'合伙人不存在'}),404
+        existing = conn.execute('''SELECT * FROM reconciliation_statements
+            WHERE partner_id=? AND period_year=? AND period_month=?''',(partner_id,year,month)).fetchone()
+        if existing and existing['status'] in ('locked','settled','confirmed','disputed'):
+            return jsonify({'error':'该对账单已确认、存在异议或已锁定，请保留原单并按更正流程处理'}),400
+        if existing and conn.execute('SELECT COUNT(*) FROM partner_receipts WHERE statement_id=?',(existing['id'],)).fetchone()[0]:
+            return jsonify({'error':'该对账单已有关联收款，不能覆盖，请先核对更正流程'}),400
+        detail = _calc_partner_recon_detail(partner_id,year,month,db_conn=conn)
+        if not detail or (partner['code']!='poland_jin' and not detail.get('total_orders') and not detail.get('total_net_pln')):
+            return jsonify({'error':f'{year}-{month:02d} 期间没有可对账的成功订单，未生成对账单'}),400
+        mode = data.get('mode') or 'contract'
+        if mode not in ('contract','actual'):
+            return jsonify({'error':'计算口径无效'}),400
+        snapshot = {'schema_version':0,'business_detail':detail,'source_lines':[],'service_lines':[]}
+        net,actual_cost = detail['total_net_pln'],detail['actual_cost_pln']
+        cost,p_profit,our_recv = _compute_statement_split(net,actual_cost,partner['cost_ratio'],
+            partner['partner_profit_ratio'],partner['our_profit_ratio'],mode,shipping_loss=detail.get('shipping_loss') or 0)
+        if partner['code'] == 'poland_jin':
+            if not isinstance(data.get('reship_decisions') or {},dict) or any(not isinstance(value,dict)
+                for value in (data.get('reship_decisions') or {}).values()):
+                raise ValueError('补发分类格式无效')
+            old = read_version(conn,existing['id'],details=True) if existing else None
+            decisions = {row['shipment_id']:row['decision'] for row in (old or {}).get('service_lines',[])
+                         if row.get('decision')}
+            decisions.update(data.get('reship_decisions') or {})
+            snapshot = _build_product_source_statement(conn,partner,year,month,mode,detail,decisions)
+            # Explicit parcel classifications also apply to future months.
+            import uuid
+            from datetime import timezone
+            for shipment_id,decision in (data.get('reship_decisions') or {}).items():
+                if decision.get('reason') in ('original','ordinary','warehouse_omission'):
+                    service = next(row for row in snapshot['service_lines'] if row['shipment_id']==shipment_id)
+                    ident = str(uuid.uuid4())
+                    fact = {'shipment_id':shipment_id,'order_id':service['order_id'],
+                            'reason':decision['reason'],'evidence':str(decision.get('evidence') or '').strip()}
+                    conn.execute('INSERT INTO rec_objects(id,kind,name,data,created_at,actor) VALUES(?,?,?,?,?,?)',
+                        (ident,'legacy_shipment_classification','发货分类确认',json.dumps(fact,ensure_ascii=False),
+                         datetime.now(timezone.utc).isoformat(),str(current_user.id)))
+                    service['classification_id'] = ident
+            settlement = snapshot['settlement']
+            if not detail.get('total_orders') and not settlement['net'] and not snapshot['service_lines']:
+                raise ValueError('本期没有商品结算或中转出库服务记录，未生成空账单')
+            net,cost,p_profit,our_recv = (settlement[key] for key in ('net','cost_recovery','partner_profit','our_receivable'))
+            actual_cost = cost if mode=='actual' else sum(row.get('actual_partner_cost') or 0 for row in snapshot['source_lines'])
+        rate,_ = _lookup_partner_rate(partner['currency'],year,month)
+        our_cny = round(our_recv*rate,2) if rate else None
+        previous = {}
         if existing:
-            conn.execute('''UPDATE reconciliation_statements
-                SET total_orders=?, total_gross_pln=?, total_net_pln=?,
-                    cost_amount_pln=?, partner_profit_pln=?, our_receivable_pln=?,
-                    exchange_rate_cny=?, our_receivable_cny=?,
-                    actual_cost_pln_snapshot=?, calc_mode=?,
-                    status='generated', updated_at=CURRENT_TIMESTAMP
-                WHERE id=?''',
-                (detail['total_orders'], detail['total_gross_pln'], net,
-                 cost, p_profit, our_recv, rate, our_recv_cny,
-                 actual_cost_snapshot, mode, existing['id']))
+            previous = {'statement':dict(existing),'orders':[dict(row) for row in conn.execute(
+                'SELECT * FROM reconciliation_statement_orders WHERE statement_id=?',(existing['id'],)).fetchall()]}
             stmt_id = existing['id']
+            conn.execute('''UPDATE reconciliation_statements SET total_orders=?,total_gross_pln=?,total_net_pln=?,
+                cost_amount_pln=?,partner_profit_pln=?,our_receivable_pln=?,exchange_rate_cny=?,our_receivable_cny=?,
+                actual_cost_pln_snapshot=?,calc_mode=?,status='generated',updated_at=CURRENT_TIMESTAMP WHERE id=?''',
+                (detail['total_orders'],detail['total_gross_pln'],net,cost,p_profit,our_recv,rate,our_cny,actual_cost,mode,stmt_id))
         else:
             cursor = conn.execute('''INSERT INTO reconciliation_statements
-                (partner_id, period_year, period_month, total_orders, total_gross_pln, total_net_pln,
-                 cost_amount_pln, partner_profit_pln, our_receivable_pln,
-                 exchange_rate_cny, our_receivable_cny, actual_cost_pln_snapshot, calc_mode, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generated')''',
-                (partner_id, year, month, detail['total_orders'], detail['total_gross_pln'], net,
-                 cost, p_profit, our_recv, rate, our_recv_cny,
-                 actual_cost_snapshot, mode))
+                (partner_id,period_year,period_month,total_orders,total_gross_pln,total_net_pln,cost_amount_pln,
+                partner_profit_pln,our_receivable_pln,exchange_rate_cny,our_receivable_cny,actual_cost_pln_snapshot,calc_mode,status)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'generated')''',
+                (partner_id,year,month,detail['total_orders'],detail['total_gross_pln'],net,cost,p_profit,our_recv,rate,our_cny,actual_cost,mode))
             stmt_id = cursor.lastrowid
-
-        # P2: snapshot the orders that contributed to this statement
-        snapshot_count = _snapshot_statement_orders(stmt_id, partner_id, year, month, conn)
-
-        # P2: audit log
-        mode_label = '实际毛利' if mode == 'actual' else '约定毛利'
-        _audit_log(stmt_id, 'regenerate' if is_regenerate else 'create',
-                   note=f'口径={mode_label}, 净销售={net} {partner["currency"] or "PLN"}, 实际成本={actual_cost_snapshot}, 快照订单 {snapshot_count} 条', conn=conn)
-
+        revision = save_version(conn,stmt_id,snapshot,current_user.id,previous)
+        snapshot_count = _snapshot_statement_orders(stmt_id,partner_id,year,month,conn)
+        _audit_log(stmt_id,'regenerate' if existing else 'create',note=f'按商品来源冻结第 {revision} 版；口径={mode}；商品应收={our_recv}；订单快照 {snapshot_count} 条；原版与明细已保留',conn=conn)
         conn.commit()
-        return jsonify({'success': True, 'id': stmt_id, 'exchange_rate_cny': rate,
-                        'snapshot_orders': snapshot_count, 'actual_cost_pln': actual_cost_snapshot,
-                        'calc_mode': mode, 'unmapped_qty': unmapped_qty})
+        return jsonify({'success':True,'id':stmt_id,'revision':revision,'calc_mode':mode,
+            'unmapped_qty':detail.get('cost_unmapped_qty',0),'snapshot_orders':snapshot_count,
+            'settlement':snapshot.get('settlement')})
+    except ValueError as exc:
+        conn.rollback()
+        return jsonify({'error':str(exc)}),400
+    except sqlite3.Error as exc:
+        conn.rollback()
+        if getattr(exc,'sqlstate',None) in ('40001','40P01','23505'):
+            return jsonify({'error':'账单或来源数据正被其他操作更新，请刷新后重新生成'}),409
+        raise
     finally:
         conn.close()
+
 
 
 @app.route('/api/reconciliation/statements/manual', methods=['POST'])
@@ -14399,6 +14477,13 @@ def api_manual_statement():
         return jsonify({'error': '合伙人不存在'}), 404
 
     # Manual entries are historical (no order data → no real cost) → contract basis.
+    from partner_statement_sources import read_version
+    existing_manual_target = conn.execute('''SELECT id,status FROM reconciliation_statements
+        WHERE partner_id=? AND period_year=? AND period_month=?''',(partner_id,year,month)).fetchone()
+    if existing_manual_target and (read_version(conn,existing_manual_target['id'])
+                                  or existing_manual_target['status'] in ('locked','settled','confirmed','disputed')):
+        conn.close()
+        return jsonify({'error':'已有冻结或已确认账单，不能以手工录入覆盖，请保留原版并使用更正流程'}),400
     cost, p_profit, our_recv = _compute_statement_split(
         net, 0, partner['cost_ratio'],
         partner['partner_profit_ratio'], partner['our_profit_ratio'], 'contract')
@@ -14429,67 +14514,106 @@ def api_manual_statement():
 @login_required
 @reconciliation_api_required
 def api_get_statement(stmt_id):
-    """Get statement detail"""
+    """Saved totals and saved breakdown only: opening a bill never recalculates a month."""
+    from partner_statement_sources import read_version
     conn = get_db_connection()
-    stmt = conn.execute('''
-        SELECT s.*, p.name as partner_name, p.currency
-        FROM reconciliation_statements s
-        JOIN partners p ON s.partner_id = p.id
-        WHERE s.id = ?
-    ''', (stmt_id,)).fetchone()
-    if not stmt:
+    try:
+        if hasattr(conn,'_raw'):
+            conn._raw.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+        stmt = conn.execute('''SELECT s.*,p.name AS partner_name,p.currency FROM reconciliation_statements s
+            JOIN partners p ON p.id=s.partner_id WHERE s.id=?''',(stmt_id,)).fetchone()
+        if not stmt:
+            return jsonify({'error':'对账单不存在'}),404
+        if not _check_partner_access(stmt['partner_id']):
+            return jsonify({'error':'无权查看'}),403
+        receipts = [dict(row) for row in conn.execute('SELECT * FROM partner_receipts WHERE statement_id=? ORDER BY receipt_date DESC',(stmt_id,)).fetchall()]
+        snapshot = read_version(conn,stmt_id)
+    finally:
         conn.close()
-        return jsonify({'error': '对账单不存在'}), 404
-    if not _check_partner_access(stmt['partner_id']):
-        conn.close()
-        return jsonify({'error': '无权查看'}), 403
-    receipts = conn.execute('''
-        SELECT * FROM partner_receipts WHERE statement_id = ? ORDER BY receipt_date DESC
-    ''', (stmt_id,)).fetchall()
-    conn.close()
     result = dict(stmt)
-    _enrich_statement_cny(result, stmt['currency'] or 'PLN')
+    _enrich_statement_cny(result,stmt['currency'] or 'PLN')
+    result['receipts'] = receipts
+    result['total_received_pln'] = round(sum(row['amount_pln'] or 0 for row in receipts),2)
+    result['outstanding_pln'] = round((stmt['our_receivable_pln'] or 0)-result['total_received_pln'],2)
     rate = result.get('effective_rate_cny')
-    result['receipts'] = [dict(r) for r in receipts]
-    result['total_received_pln'] = round(sum(r['amount_pln'] or 0 for r in receipts), 2)
-    result['outstanding_pln'] = round((stmt['our_receivable_pln'] or 0) - result['total_received_pln'], 2)
     if rate:
-        result['total_received_cny'] = round(result['total_received_pln'] * rate, 2)
-        result['outstanding_cny'] = round(result['outstanding_pln'] * rate, 2)
-
-    # Attach live drill-down detail (status / site / product breakdown) so the
-    # detail modal can show how the saved totals were composed. The saved
-    # *_pln fields above are the locked snapshot — drill-down is recomputed
-    # from current data; if orders changed since generation the live numbers
-    # may differ, which is intentional (user wants to see what's there now).
-    if not stmt['is_manual']:
-        try:
-            live_detail = _calc_partner_recon_detail(
-                stmt['partner_id'], stmt['period_year'], stmt['period_month']
-            )
-            if live_detail:
-                result['live_detail'] = {
-                    'success_orders': live_detail['success_orders'],
-                    'failed_orders': live_detail['failed_orders'],
-                    'cancelled_orders': live_detail['cancelled_orders'],
-                    'undelivered_orders': live_detail['undelivered_orders'],
-                    'pending_orders': live_detail['pending_orders'],
-                    'shipping_loss': live_detail['shipping_loss'],
-                    'actual_cost_pln': live_detail['actual_cost_pln'],
-                    # Contract-basis cost reference (净销售 × cost_ratio, loss carved
-                    # out) — needed so the 约定 vs 实际 差额 in the detail modal compares
-                    # against the CONTRACT cost, not the statement's stored cost
-                    # (which equals the actual cost on an 实际毛利 statement → diff 0).
-                    'cost_amount_pln': live_detail['cost_amount_pln'],
-                    'cost_unmapped_revenue_pln': live_detail['cost_unmapped_revenue_pln'],
-                    'cost_unmapped_qty': live_detail['cost_unmapped_qty'],
-                    'by_status': live_detail['by_status'],
-                    'by_site': live_detail['by_site'],
-                    'by_product': live_detail['by_product'],
-                }
-        except Exception as e:
-            app.logger.warning(f"live_detail failed for stmt {stmt_id}: {e}")
+        result['total_received_cny'] = round(result['total_received_pln']*rate,2)
+        result['outstanding_cny'] = round(result['outstanding_pln']*rate,2)
+    if snapshot:
+        if snapshot.get('schema_version') == 1:
+            result['source_snapshot'] = {key:value for key,value in snapshot.items()
+                                         if key not in ('business_detail','source_products','scope_sites')}
+        else:
+            result['live_detail'] = snapshot.get('business_detail')
+        result['detail_basis'] = '生成时冻结快照'
+        result['revision'] = snapshot['revision']
+    else:
+        result['legacy_needs_regeneration'] = not bool(stmt['is_manual'])
+        result['detail_basis'] = '历史账单原始金额；未保存商品来源快照'
     return jsonify(result)
+
+
+@app.route('/api/reconciliation/statements/<int:stmt_id>/source-detail')
+@login_required
+@reconciliation_api_required
+def api_statement_source_detail(stmt_id):
+    from partner_statement_sources import read_version
+    kind = request.args.get('kind','lines')
+    if kind not in ('lines','products','fees'):
+        return jsonify({'error':'明细类型无效'}),400
+    conn = get_db_connection()
+    try:
+        stmt = conn.execute('SELECT partner_id FROM reconciliation_statements WHERE id=?',(stmt_id,)).fetchone()
+        if not stmt:
+            return jsonify({'error':'对账单不存在'}),404
+        if not _check_partner_access(stmt['partner_id']):
+            return jsonify({'error':'无权查看'}),403
+        snapshot = read_version(conn,stmt_id,details=kind if kind in ('lines','fees') else False,
+                                revision=request.args.get('revision',type=int))
+    finally:
+        conn.close()
+    if not snapshot:
+        return jsonify({'error':'此版本没有商品来源快照，请先生成新版账单'}),404
+    collection = snapshot.get({'lines':'source_lines','products':'source_products','fees':'service_lines'}[kind],[])
+    source_mode = request.args.get('mode')
+    search = (request.args.get('search') or '').strip().casefold()
+    if source_mode:
+        collection = [row for row in collection if row.get('mode')==source_mode]
+    if request.args.get('pending')=='1':
+        collection = [row for row in collection if row.get('pending') or row.get('pending_count')]
+    if search:
+        collection = [row for row in collection if search in ' '.join(str(row.get(field) or '') for field in
+            ('order_id','order_number','product_name','source','sku','tracking_number')).casefold()]
+    page = max(1,request.args.get('page',1,type=int))
+    size = min(200,max(1,request.args.get('per_page',50,type=int)))
+    count = len(collection)
+    return jsonify({'rows':collection[(page-1)*size:page*size],'count':count,'page':page,'per_page':size,
+                    'revision':snapshot['revision'],'kind':kind,'settlement':snapshot.get('settlement')})
+
+
+@app.route('/api/reconciliation/statements/<int:stmt_id>/versions')
+@login_required
+@reconciliation_api_required
+def api_statement_source_versions(stmt_id):
+    from partner_statement_sources import exists
+    conn = get_db_connection()
+    try:
+        stmt = conn.execute('SELECT partner_id FROM reconciliation_statements WHERE id=?',(stmt_id,)).fetchone()
+        if not stmt:
+            return jsonify({'error':'对账单不存在'}),404
+        if not _check_partner_access(stmt['partner_id']):
+            return jsonify({'error':'无权查看'}),403
+        result = []
+        if exists(conn,'reconciliation_statement_versions'):
+            for row in conn.execute('''SELECT revision,created_at,summary_json,previous_json
+                FROM reconciliation_statement_versions WHERE statement_id=? ORDER BY revision DESC''',(stmt_id,)).fetchall():
+                summary,previous = json.loads(row['summary_json']),json.loads(row['previous_json'])
+                result.append({'revision':row['revision'],'created_at':row['created_at'],
+                    'settlement':summary.get('settlement'),'previous_statement':previous.get('statement'),
+                    'previous_order_count':len(previous.get('orders',[]))})
+        return jsonify({'versions':result})
+    finally:
+        conn.close()
 
 
 @app.route('/api/reconciliation/statements/<int:stmt_id>/export', methods=['GET'])
@@ -14527,6 +14651,8 @@ def api_export_statement(stmt_id):
         'SELECT * FROM partner_receipts WHERE statement_id = ? ORDER BY receipt_date DESC',
         (stmt_id,)
     ).fetchall()
+    from partner_statement_sources import read_version
+    snapshot = read_version(conn,stmt_id,details=True)
     conn.close()
 
     data = dict(stmt)
@@ -14538,14 +14664,9 @@ def api_export_statement(stmt_id):
     received_cny = round(total_received * rate, 2) if rate else None
     outstanding_cny = round(outstanding * rate, 2) if rate else None
 
-    # Live drill-down (status / site / product) — only for system-generated stmts
-    live = None
-    if not data.get('is_manual'):
-        try:
-            live = _calc_partner_recon_detail(
-                data['partner_id'], data['period_year'], data['period_month'])
-        except Exception as e:
-            app.logger.warning(f"export: live detail failed for stmt {stmt_id}: {e}")
+    # Saved versions and exports share exactly the same source, with no live recosting.
+    live = snapshot.get('business_detail') if snapshot else None
+    source_bill = snapshot if snapshot and snapshot.get('schema_version') == 1 else None
 
     STATUS_LABELS = {
         'draft': '草稿', 'generated': '已生成', 'disputed': '合伙人有异议',
@@ -14572,6 +14693,7 @@ def api_export_statement(stmt_id):
 
     def put(ws, r, c, value=None, font=None, fill=None, align=None, fmt=None, bd=True):
         cell = ws.cell(row=r, column=c, value=value)
+        if isinstance(value,str): cell.data_type = 's'
         if font: cell.font = font
         if fill: cell.fill = fill
         if align: cell.alignment = align
@@ -14667,7 +14789,18 @@ def api_export_statement(stmt_id):
         summary_rows.append(('减：运费成本（成功订单）', -ship_succ, round(-ship_succ * rate, 2) if rate else None, False, False))
         summary_rows.append(('减：运费损失（未送达）', -loss, round(-loss * rate, 2) if rate else None, False, False))
     summary_rows.append(('净销售额', data.get('total_net_pln'), data.get('total_net_cny'), True, False))
-    if (data.get('calc_mode') or 'contract') == 'actual':
+    if source_bill:
+        settled = source_bill['settlement']
+        summary_rows.extend([
+            ('核算状态：'+settled['amounts_label'],None,None,False,False),
+            ('自备货成本返还（合伙人）',settled['cost_recovery'],round(settled['cost_recovery']*rate,2) if rate else None,False,False),
+            ('自备货商品利润（合伙人）',settled['partner_profit'],round(settled['partner_profit']*rate,2) if rate else None,False,False),
+            ('中转商品应交回（回款待核）',settled['transit_goods_receivable'],round(settled['transit_goods_receivable']*rate,2) if rate else None,False,False),
+            ('商品货款应收（未扣打包费）',settled['our_receivable'],round(settled['our_receivable']*rate,2) if rate else None,True,False),
+            ('中转打包费（单列 CNY）',None,settled['packing_fee_cny'],False,False),
+            ('中转退件运费损失（我方另账）',settled['transit_shipping_loss_separate'],round(settled['transit_shipping_loss_separate']*rate,2) if rate else None,False,False),
+        ])
+    elif (data.get('calc_mode') or 'contract') == 'actual':
         # 实际毛利口径: cost leg = real product cost; profit/receivable are shares
         # of the actual margin (净销售 − 实际成本).
         cost_amt = data.get('cost_amount_pln') or 0
@@ -14732,7 +14865,7 @@ def api_export_statement(stmt_id):
                     money_cols=(7, 8, 9, 10), int_cols=(4, 5, 6), total_last=True)
 
     # ===================== Sheet 3: 按产品 =====================
-    if live and live.get('by_product'):
+    if live and live.get('by_product') and not source_bill:
         prod_cols = ['产品', '品牌', '口数', '口味', '销量',
                      f'销售额（{currency}）', '成本', '毛利', '毛利率%', '有成本']
         prod_rows = []
@@ -14759,6 +14892,34 @@ def api_export_statement(stmt_id):
                 rc['payment_method'] or '', rc['reference_no'] or '', rc['notes'] or '',
             ])
         write_table(wb.create_sheet('收款记录'), rcpt_cols, rcpt_rows, money_cols=(2, 4))
+
+    if source_bill:
+        product_columns = ['结算方式','产品','仓库','销量','销售额','返还合伙人成本','合伙人商品利润','商品应收','运费损失（按归属另列）','待核实行']
+        product_rows = [[row.get(key,'') for key in ('mode_label','product_name','warehouse_name','quantity','revenue',
+            'cost_recovery','partner_profit','our_receivable','shipping_loss','pending_count')] for row in source_bill['source_products']]
+        write_table(wb.create_sheet('按产品来源'),product_columns,product_rows,money_cols=(5,6,7,8,9),int_cols=(4,10))
+        detail_columns = ['订单编号','订单系统ID','站点','下单时间','订单状态','商品','商品行ID','结算方式','供货仓库',
+            '分仓数量','实发数量','商品销售额','返还合伙人成本','合伙人利润','商品应收','运费损失','来源依据',
+            '履约单ID','履约商品ID','成本记录ID','成本生效日','待核实原因','供货确认ID','供货确认依据']
+        detail_rows = []
+        for row in source_bill['source_lines']:
+            cost_evidence = row.get('cost_evidence') or {}
+            detail_rows.append([row.get(key,'') for key in ('order_number','order_id','source','order_date','order_status',
+                'product_name','line_item_id','mode_label','warehouse_name','quantity','fulfilled_quantity','revenue',
+                'cost_recovery','partner_profit','our_receivable','shipping_loss','source_basis','fulfillment_id',
+                'fulfillment_item_id')]+[cost_evidence.get('cost_id',''),cost_evidence.get('effective_date',''),'；'.join(row.get('pending',[])),
+                row.get('source_override_id',''),row.get('ownership_evidence','')])
+        write_table(wb.create_sheet('商品来源明细'),detail_columns,detail_rows,money_cols=(12,13,14,15,16),int_cols=(10,11))
+        fee_columns = ['订单编号','订单系统ID','站点','下单时间','实际出库时间','运单号','包裹ID','类型','打包费(CNY)','计费依据','规则ID','补发分类凭证','待核实原因']
+        fee_rows = [[row.get(key,'') for key in ('order_number','order_id','source','order_date','shipped_at',
+            'tracking_number','shipment_id','kind','amount_cny','reason','rule_id')]+[
+                (row.get('decision') or {}).get('evidence',''),'；'.join(row.get('pending',[]))] for row in source_bill['service_lines']]
+        write_table(wb.create_sheet('中转打包费明细'),fee_columns,fee_rows,money_cols=(9,))
+        scope_rows = [['账单版本',source_bill['revision']],['冻结时间',source_bill['snapshot_created_at']],
+            ['状态',source_bill['settlement']['amounts_label']],['商品核算期间','下单月份'],['服务费期间','实际出库月份'],
+            ['补发口径','普通补发收费，仓库漏发免收'],['资金口径',source_bill['settlement']['note']],
+            ['待核实商品订单',source_bill['settlement']['pending_orders']],['待核实服务记录',source_bill['settlement']['packing_pending']]]
+        write_table(wb.create_sheet('版本与口径'),['项目','保存值'],scope_rows)
 
     output = BytesIO()
     wb.save(output)
@@ -14790,6 +14951,11 @@ def api_update_statement(stmt_id):
 
     is_admin = _is_reconciliation_admin()
     try:
+        if data.get('action') in ('confirm','lock','settle'):
+            from partner_statement_sources import read_version
+            source_version = read_version(conn,stmt_id)
+            if source_version and source_version.get('settlement') and not source_version['settlement']['ready']:
+                return jsonify({'error':'商品来源、成本或补发费用仍有待核实项，请补全并重新生成后确认结算'}),400
         # ----- Partner-only actions (confirm) -----
         if not is_admin:
             if data.get('action') == 'confirm' and stmt['status'] == 'generated':
@@ -15020,47 +15186,35 @@ def api_get_statement_audit_log(stmt_id):
 @login_required
 @reconciliation_api_required
 def api_get_statement_snapshot_orders(stmt_id):
-    """Return the frozen order list (with optional comparison to current state)."""
+    """Batch-join current state once; optional pagination for old order snapshots."""
     conn = get_db_connection()
-    stmt = conn.execute('SELECT partner_id FROM reconciliation_statements WHERE id = ?', (stmt_id,)).fetchone()
-    if not stmt:
+    try:
+        stmt = conn.execute('SELECT partner_id FROM reconciliation_statements WHERE id=?',(stmt_id,)).fetchone()
+        if not stmt:
+            return jsonify({'error':'对账单不存在'}),404
+        if not _check_partner_access(stmt['partner_id']):
+            return jsonify({'error':'无权查看'}),403
+        saved = conn.execute('''SELECT s.*,o.id AS live_order_id,o.status AS status_now,o.total AS total_now,
+            o.shipping_total AS shipping_now,o.shipping_loss_amount AS shipping_loss_now,o.is_undelivered AS is_undelivered_now
+            FROM reconciliation_statement_orders s LEFT JOIN orders o ON o.id=s.order_id
+            WHERE s.statement_id=? ORDER BY s.date_created,s.order_id''',(stmt_id,)).fetchall()
+    finally:
         conn.close()
-        return jsonify({'error': '对账单不存在'}), 404
-    if not _check_partner_access(stmt['partner_id']):
-        conn.close()
-        return jsonify({'error': '无权查看'}), 403
-    snap = conn.execute('''
-        SELECT * FROM reconciliation_statement_orders
-        WHERE statement_id = ? ORDER BY date_created
-    ''', (stmt_id,)).fetchall()
     out = []
-    drift_count = 0
-    for s in snap:
-        d = dict(s)
-        cur = conn.execute('''SELECT status, total, shipping_total,
-                                     COALESCE(shipping_loss_amount,0) AS sla,
-                                     COALESCE(is_undelivered, 0) AS undel
-                              FROM orders WHERE id = ?''', (s['order_id'],)).fetchone()
-        if cur:
-            d['status_now'] = cur['status']
-            d['total_now'] = cur['total']
-            d['shipping_now'] = cur['shipping_total']
-            d['shipping_loss_now'] = cur['sla']
-            d['is_undelivered_now'] = bool(cur['undel'])
-            d['drifted'] = (
-                (cur['status'] != s['status_at_gen']) or
-                (abs(float(cur['total'] or 0) - float(s['total_at_gen'] or 0)) > 0.01) or
-                (abs(float(cur['shipping_total'] or 0) - float(s['shipping_at_gen'] or 0)) > 0.01) or
-                (bool(cur['undel']) != bool(s['is_undelivered_at_gen']))
-            )
-        else:
-            d['drifted'] = True  # order deleted from DB
-            d['status_now'] = '_DELETED_'
-        if d.get('drifted'):
-            drift_count += 1
-        out.append(d)
-    conn.close()
-    return jsonify({'orders': out, 'count': len(out), 'drift_count': drift_count})
+    for row in saved:
+        item = dict(row)
+        item['drifted'] = (not item.pop('live_order_id') or item['status_now']!=item['status_at_gen']
+            or abs(float(item['total_now'] or 0)-float(item['total_at_gen'] or 0))>.01
+            or abs(float(item['shipping_now'] or 0)-float(item['shipping_at_gen'] or 0))>.01
+            or abs(float(item['shipping_loss_now'] or 0)-float(item['shipping_loss_at_gen'] or 0))>.01
+            or bool(item['is_undelivered_now'])!=bool(item['is_undelivered_at_gen']))
+        out.append(item)
+    count,drift = len(out),sum(item['drifted'] for item in out)
+    page = max(1,request.args.get('page',1,type=int))
+    size = min(200,max(1,request.args.get('per_page',100,type=int)))
+    if request.args.get('page') or request.args.get('per_page'):
+        out = out[(page-1)*size:page*size]
+    return jsonify({'orders':out,'count':count,'drift_count':drift,'page':page,'per_page':size})
 
 
 @app.route('/api/reconciliation/statements/<int:stmt_id>', methods=['DELETE'])

@@ -8,6 +8,8 @@ Woo Analysis 是面向多个 WooCommerce 站点的内部运营系统，集中处
 
 模块化货权、管理费、利润与资金核销：参见 [合伙人对账 V2 使用与部署](docs/partner-reconciliation-v2.md)。新模块须显式迁移和启用，旧账单保持原入口。
 
+金谷金毅的原对账入口支持[按商品供货来源区分自备货分成与中转打包费](docs/partner-statement-product-sources.md)，保存冻结明细与更正版本，账单和明细按需读取。
+
 ## 主要功能
 
 | 模块与入口 | 当前能力 |
