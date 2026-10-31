@@ -653,6 +653,7 @@
                 </div>
                 <div class="card-body">
                     <!-- Section 1: 订单分布 -->
+                    <div id="previewSourceSummary"></div>
                     <div class="preview-section preview-section-orders">
                         <div class="preview-section-title">
                             <span class="pst-icon"><i class="bi bi-bar-chart-steps"></i></span>
@@ -1128,6 +1129,7 @@
                 </div>
             </div>
 
+            <div id="productSourceSummary"></div>
             <!-- Cards row — 6 cards: revenue / cost / shipping / margin / margin% / unmapped
                  Layout: 2 cols on phones, 3 on tablets, 6 on desktops. -->
             <div class="row g-3 mb-3 row-cols-2 row-cols-md-3 row-cols-xl-6">
@@ -1505,6 +1507,7 @@
 </div>
 {% endif %}
 
+<script src="{{ url_for('static', filename='js/partner_statement_sources.js') }}?v={{ cache_bust }}"></script>
 <script>
 // Template version: v26 (2026-05-08) — REVERT 50% fallback (back to v23 cost=0 behavior)
 //                                       so inflated margin% becomes a forcing function;
@@ -1925,7 +1928,14 @@ function bindReconStatePersistence() {
 }
 
 // ========== API helpers ==========
+const reconReadCache = new Map();
 async function api(url, opts={}) {
+    const method = (opts.method || 'GET').toUpperCase();
+    const cacheable = method === 'GET' && /\/api\/reconciliation\/(products\?|summary-stats\?|statements\/preview\?)/.test(url);
+    if (method !== 'GET') reconReadCache.clear();
+    const cached = cacheable ? reconReadCache.get(url) : null;
+    if (cached && Date.now() - cached.at < 20000) return structuredClone(await cached.promise);
+    const pending = (async () => {
     const res = await fetch(url, {
         headers: {'Content-Type':'application/json'},
         ...opts
@@ -1935,6 +1945,13 @@ async function api(url, opts={}) {
         throw new Error(err.error || `HTTP ${res.status}`);
     }
     return res.json();
+    })();
+    if (cacheable) {
+        if (reconReadCache.size > 30) reconReadCache.clear();
+        reconReadCache.set(url,{at:Date.now(),promise:pending});
+    }
+    try { return structuredClone(await pending); }
+    catch (error) { if (cacheable) reconReadCache.delete(url); throw error; }
 }
 
 function fmt(n) { return (n||0).toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2}); }
@@ -2114,7 +2131,8 @@ async function loadOverview() {
 // hitting the backend again.
 let _lastPreviewData = null;
 
-async function refreshPreview() {
+async function refreshPreview(force=false) {
+    if (force) reconReadCache.clear();
     const y = document.getElementById('previewYear').value;
     const m = document.getElementById('previewMonth').value;
     const partnerId = document.getElementById('partnerSelector').value;
@@ -2148,6 +2166,9 @@ function previewAmount(data, field, cnyField) {
 // data (no extra API roundtrip).
 function renderPreviewCards(data) {
     if (!data) return;
+    const sourcePanel = document.getElementById('previewSourceSummary');
+    sourcePanel.innerHTML = PartnerStatementSources.summary(data.source_summary,true);
+    for (const child of sourcePanel.parentElement.children) if (child!==sourcePanel) child.hidden = Boolean(data.source_summary);
     try {
         const curr = data.currency || 'PLN';
         const rateBadge = document.getElementById('pvRateBadge');
@@ -2946,6 +2967,8 @@ async function loadOrderDetailTab() {
     // no client-side pagination needed.
     const params = new URLSearchParams({partner_id: partnerId, year: y, month: parseInt(m)});
     const orderParams = new URLSearchParams(params);
+    orderParams.set('page',odCurrentPage);
+    orderParams.set('per_page',odPerPage);
     if (status) orderParams.set('status', status);
     if (source) orderParams.set('source', source);
     if (search) orderParams.set('search', search);
@@ -3405,6 +3428,10 @@ async function loadProductDetailTab() {
 // Pure render — used by both initial load and grouping-level toggle.
 function renderPdCardsAndTable(data) {
     if (!data) return;
+    const sourceSummary = document.getElementById('productSourceSummary');
+    sourceSummary.innerHTML = PartnerStatementSources.summary(data.source_summary,true);
+    if (data.source_summary) sourceSummary.innerHTML += PartnerStatementSources.renderRows({rows:data.source_summary.source_products},'products',false);
+    if (data.source_summary) sourceSummary.innerHTML += '<div class="alert alert-secondary small">以下为全量商品经营参考，包含中转商品；合伙人应结金额以以上“按商品来源核算”为准。</div>';
     const curr = data.currency || 'PLN';
     const t = data.totals || {};
     const level = getPdGroupLevel();
@@ -3968,12 +3995,13 @@ async function loadStatements() {
             const statusBadge = getStatusBadge(s.status);
             const manualTag = s.is_manual ? '<span class="badge bg-warning text-dark ms-1">手工</span>' : '';
             const modeTag = s.calc_mode === 'actual' ? '<span class="badge ms-1" style="background:rgba(56,189,248,0.85);color:#04293a;">实际毛利</span>' : '';
+            const sourceTag = s.source_revision ? `<div class="small mt-1"><span class="badge bg-info text-dark">按商品来源 · 第 ${s.source_revision} 版</span>${!s.source_ready ? ' <span class="badge bg-warning text-dark">待核实</span>' : ''}<div class="text-white-50 mt-1">打包费 ${fmt(s.packing_fee_cny)} CNY（单列）</div></div>` : '';
             const curr = s.currency || 'PLN';
             const rateDisplay = s.effective_rate_cny
                 ? `<span class="badge bg-secondary">1 ${curr} = ${s.effective_rate_cny}</span>`
                 : `<span class="text-warning small"><i class="bi bi-exclamation-triangle"></i> 未配置</span>`;
             return `<tr>
-                <td class="ps-4 text-white">${s.period_year}-${String(s.period_month).padStart(2,'0')}${manualTag}${modeTag}</td>
+                <td class="ps-4 text-white">${s.period_year}-${String(s.period_month).padStart(2,'0')}${manualTag}${modeTag}${sourceTag}</td>
                 <td class="text-white-50">${partnerMap[s.partner_id] || '-'}</td>
                 <td class="text-end text-white-50">${s.total_orders || 0}</td>
                 <td class="text-end text-info">${dual(s.total_net_pln, s.total_net_cny, curr)}</td>
@@ -4024,7 +4052,13 @@ function getStatusBadge(status) {
     return map[status] || `<span class="badge bg-secondary">${status}</span>`;
 }
 
+let statementGenerationPending = false;
 async function generateStatement() {
+    if (statementGenerationPending) return;
+    statementGenerationPending = true;
+    const generateButton = document.getElementById('btnGenStmt');
+    generateButton.disabled = true;
+    generateButton.textContent = '核算并保存快照…';
     const partner_id = parseInt(document.getElementById('genPartner').value);
     const year = parseInt(document.getElementById('genYear').value);
     const month = parseInt(document.getElementById('genMonth').value);
@@ -4034,14 +4068,18 @@ async function generateStatement() {
         const res = await api('/api/reconciliation/statements/generate', {method:'POST', body: JSON.stringify({partner_id, year, month, mode})});
         bootstrap.Modal.getInstance(document.getElementById('genStmtModal')).hide();
         const modeLabel = mode === 'actual' ? '实际毛利' : '约定毛利';
-        if (mode === 'actual' && res && res.unmapped_qty > 0) {
-            showToast(`对账单已生成（${modeLabel}）。注意：有 ${res.unmapped_qty} 件产品未配置成本，已按 50% 估算，毛利可能偏高`, 'warning');
+        if (res.settlement && !res.settlement.ready) {
+            showToast(`第 ${res.revision} 版账单已生成；${res.settlement.pending_orders} 单商品及 ${res.settlement.packing_pending} 条服务记录待核实，当前显示已核实行小计`, 'warning');
+        } else if (mode === 'actual' && res && res.unmapped_qty > 0) {
+            showToast(`对账单已生成（${modeLabel}）。有 ${res.unmapped_qty} 件产品成本待补全`, 'warning');
         } else {
             showToast(`对账单已生成（${modeLabel}）`, 'success');
         }
         loadStatements();
         loadOverview();
+        openStatementDetail(res.id);
     } catch (e) { showToast('生成失败: ' + e.message, 'danger'); }
+    finally { statementGenerationPending=false;generateButton.disabled=false;generateButton.textContent='生成'; }
 }
 
 async function manualStatement() {
@@ -4080,9 +4118,17 @@ function exportStatement(id) {
     window.location.href = `/api/reconciliation/statements/${id}/export`;
 }
 
+let statementDetailRequest = 0;
+document.getElementById('stmtDetailModal').addEventListener('hide.bs.modal',()=>{statementDetailRequest++;});
 async function openStatementDetail(id) {
+    const requestId = ++statementDetailRequest;
+    document.getElementById('stmtDetailTitle').textContent = '正在读取已保存对账单…';
+    document.getElementById('stmtDetailBody').innerHTML = '<div class="text-center text-white-50 py-5">读取冻结账单内容…</div>';
+    document.getElementById('stmtDetailFooter').innerHTML = '<button class="btn btn-outline-light" data-bs-dismiss="modal">关闭</button>';
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('stmtDetailModal')).show();
     try {
         const s = await api(`/api/reconciliation/statements/${id}`);
+        if (requestId !== statementDetailRequest) return;
         const body = document.getElementById('stmtDetailBody');
         const footer = document.getElementById('stmtDetailFooter');
         const titleEl = document.getElementById('stmtDetailTitle');
@@ -4098,7 +4144,7 @@ async function openStatementDetail(id) {
         const pctOfNet = (amt) => sNet ? ` (${((amt || 0) / sNet * 100).toFixed(0)}%)` : '';
         const pctOfMargin = (amt) => sMargin ? ` (实际毛利的 ${((amt || 0) / sMargin * 100).toFixed(0)}%)` : '';
 
-        titleEl.textContent = `${s.partner_name} · ${s.period_year}-${String(s.period_month).padStart(2,'0')} · ${stmtMode === 'actual' ? '实际毛利' : '约定毛利'}`;
+        titleEl.textContent = `${s.partner_name} · ${s.period_year}-${String(s.period_month).padStart(2,'0')} · ${stmtMode === 'actual' ? '实际毛利' : '约定毛利'}${s.source_snapshot ? ' · 按商品来源 · 第 '+s.revision+'版' : ''}`;
 
         const rateBlock = rate
             ? `<div class="d-flex align-items-center gap-2 flex-wrap">
@@ -4344,7 +4390,10 @@ async function openStatementDetail(id) {
             </div>
         `;
 
-        body.innerHTML = section1 + section2 + section3 + section4 + sectionTail + sectionAudit;
+        const sourceContent = s.source_snapshot ? PartnerStatementSources.render(s) :
+            (s.legacy_needs_regeneration ? '<div class="alert alert-warning">历史账单原始金额；尚无商品来源冻结明细。重新生成可保存分仓区分和明细版本，原账单会保留。</div>' : '');
+        body.innerHTML = s.source_snapshot ? sourceContent+sectionTail+sectionAudit : sourceContent+section1+section2+section3+section4+sectionTail+sectionAudit;
+        if (s.source_snapshot) PartnerStatementSources.mount(body,s,{api,editable:IS_RECON_ADMIN,toast:showToast,refresh:()=>{openStatementDetail(id);loadStatements();loadOverview();}});
 
         // Lazy-load the audit timeline
         loadAuditTimeline(id);
@@ -4374,6 +4423,7 @@ async function openStatementDetail(id) {
         let actions = `<button class="btn btn-outline-light" data-bs-dismiss="modal">关闭</button>`;
         actions += ` <button class="btn btn-outline-success" id="btnExportStmt"><i class="bi bi-file-earmark-excel me-1"></i>导出 Excel</button>`;
         if (IS_RECON_ADMIN) {
+            if (s.status === 'generated' && !(s.receipts || []).length) actions += ' <button class="btn btn-outline-primary" id="btnRegenerateSource">重新核算并保留原版</button>';
             if (s.status === 'disputed') {
                 // Admin must process the dispute
                 actions += ` <button class="btn btn-success" id="btnResolveStmt"><i class="bi bi-check2-circle me-1"></i>处理异议</button>`;
@@ -4394,6 +4444,19 @@ async function openStatementDetail(id) {
             }
         }
         footer.innerHTML = actions;
+        if (s.source_snapshot && !s.source_snapshot.settlement.ready) {
+            for (const buttonId of ['btnLockStmt','btnSettleStmt','btnConfirmStmt']) {
+                const button = document.getElementById(buttonId);
+                if (button) { button.disabled = true; button.title = '请先处理待核实项并重新生成'; }
+            }
+        }
+        document.getElementById('btnRegenerateSource')?.addEventListener('click',async event=>{
+            event.target.disabled = true;
+            try {
+                await api('/api/reconciliation/statements/generate',{method:'POST',body:JSON.stringify({partner_id:s.partner_id,year:s.period_year,month:s.period_month,mode:s.calc_mode || 'contract'})});
+                await openStatementDetail(id);loadStatements();loadOverview();
+            } catch(error) {showToast(error.message,'danger');event.target.disabled=false;}
+        });
 
         const btnExportStmt = document.getElementById('btnExportStmt');
         if (btnExportStmt) btnExportStmt.addEventListener('click', () => exportStatement(id));
@@ -4438,8 +4501,11 @@ async function openStatementDetail(id) {
         const btnResolve = document.getElementById('btnResolveStmt');
         if (btnResolve) btnResolve.addEventListener('click', () => openResolveModal(id));
 
-        bootstrap.Modal.getOrCreateInstance(document.getElementById('stmtDetailModal')).show();
-    } catch (e) { showToast('加载失败: ' + e.message, 'danger'); }
+    } catch (e) {
+        if (requestId !== statementDetailRequest) return;
+        document.getElementById('stmtDetailBody').innerHTML = `<div class="alert alert-danger">${PartnerStatementSources.esc(e.message)}</div>`;
+        showToast('加载失败: ' + e.message, 'danger');
+    }
 }
 
 async function updateStatement(id, payload) {
