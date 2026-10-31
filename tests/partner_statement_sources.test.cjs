@@ -22,3 +22,9 @@ test('unverified amounts remain unknown and product references cannot inject mar
     assert.equal(view.amount(null),'待核实');
     assert.equal(view.amount(0),'0.00');
 });
+
+test('unassigned supply source displays unknown rights rather than zero', () => {
+    const html=view.summary({currency:'PLN',revision:1,settlement:{ready:false,pending_orders:1,packing_pending:0},
+        groups:[{mode:'pending',label:'来源待核实',orders:1,quantity:1,revenue:100,pending_count:1,cost_recovery:0,partner_profit:0,our_receivable:0}]},false);
+    assert.equal((html.match(/<span class="text-warning">待核实<\/span>/g)||[]).length,3);
+});
