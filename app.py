@@ -14582,8 +14582,9 @@ def api_statement_source_detail(stmt_id):
     if request.args.get('pending')=='1':
         collection = [row for row in collection if row.get('pending') or row.get('pending_count')]
     if search:
-        collection = [row for row in collection if search in ' '.join(str(row.get(field) or '') for field in
-            ('order_id','order_number','product_name','source','sku','tracking_number')).casefold()]
+        collection = [row for row in collection if search in (' '.join(str(row.get(field) or '') for field in
+            ('order_id','order_number','product_name','source','sku','tracking_number'))+' '+
+            ' '.join(str(item.get('product_name') or '') for item in row.get('items',[]))).casefold()]
     page = max(1,request.args.get('page',1,type=int))
     size = min(200,max(1,request.args.get('per_page',50,type=int)))
     count = len(collection)
@@ -14912,7 +14913,7 @@ def api_export_statement(stmt_id):
             'cost_recovery','partner_profit','our_receivable','shipping_loss','pending_count')] for row in source_bill['source_products']]
         write_table(wb.create_sheet('按产品来源'),product_columns,product_rows,money_cols=(5,6,7,8,9),int_cols=(4,10))
         detail_columns = ['订单编号','订单系统ID','站点','下单时间','订单状态','商品','商品行ID','结算方式','供货仓库',
-            '分仓数量','实发数量','商品销售额','返还合伙人成本','合伙人利润','商品应收','运费损失','来源依据',
+            '来源归属数量','OMS实发数量','商品销售额','返还合伙人成本','合伙人利润','商品应收','运费损失','来源依据',
             '履约单ID','履约商品ID','成本记录ID','成本生效日','待核实原因','供货确认ID','供货确认依据']
         detail_rows = []
         for row in source_bill['source_lines']:
@@ -14923,14 +14924,27 @@ def api_export_statement(stmt_id):
                 'fulfillment_item_id')]+[cost_evidence.get('cost_id',''),cost_evidence.get('effective_date',''),'；'.join(row.get('pending',[])),
                 row.get('source_override_id',''),row.get('ownership_evidence','')])
         write_table(wb.create_sheet('商品来源明细'),detail_columns,detail_rows,money_cols=(12,13,14,15,16),int_cols=(10,11))
-        fee_columns = ['订单编号','订单系统ID','站点','下单时间','实际出库时间','运单号','包裹ID','类型','打包费(CNY)','计费依据','规则ID','补发分类凭证','待核实原因']
+        fee_columns = ['订单编号','订单系统ID','站点','下单时间','实际出库时间','运单号','包裹ID','类型','打包费(CNY)','计费依据','规则ID','补发分类凭证','待核实原因','实发支数','每支单价(CNY)','计费单位','订单状态']
         fee_rows = [[row.get(key,'') for key in ('order_number','order_id','source','order_date','shipped_at',
             'tracking_number','shipment_id','kind','amount_cny','reason','rule_id')]+[
-                (row.get('decision') or {}).get('evidence',''),'；'.join(row.get('pending',[]))] for row in source_bill['service_lines']]
-        write_table(wb.create_sheet('中转打包费明细'),fee_columns,fee_rows,money_cols=(9,))
+                (row.get('decision') or {}).get('evidence',''),'；'.join(row.get('pending',[])),row.get('quantity'),
+                row.get('unit_fee_cny') if row.get('billing_basis')=='shipped_unit' else None,
+                '实发支数' if row.get('billing_basis')=='shipped_unit' else '历史按订单',row.get('order_status','')] for row in source_bill['service_lines']]
+        write_table(wb.create_sheet('中转打包费明细'),fee_columns,fee_rows,money_cols=(9,15),int_cols=(14,))
+        packing_items = []
+        for row in source_bill['service_lines']:
+            for item in row.get('items',[]):
+                packing_items.append([row.get(key,'') for key in ('order_number','order_id','source','shipped_at','tracking_number','shipment_id')]+[
+                    item.get('line_item_id'),item.get('fulfillment_item_id'),item.get('product_name'),item.get('warehouse_name'),
+                    item.get('quantity'),row.get('unit_fee_cny'),
+                    round(item['quantity']*row['unit_fee_cny'],2) if row.get('amount_cny') is not None else None,row.get('rule_id')])
+        write_table(wb.create_sheet('打包商品明细'),['订单编号','订单系统ID','站点','实际出库时间','运单号','包裹ID',
+            '商品行ID','履约商品ID','商品','供货仓库','实发支数','每支单价(CNY)','打包费(CNY)','规则ID'],packing_items,money_cols=(12,13),int_cols=(11,))
         scope_rows = [['账单版本',source_bill['revision']],['冻结时间',source_bill['snapshot_created_at']],
             ['状态',source_bill['settlement']['amounts_label']],['商品核算期间','下单月份'],['服务费期间','实际出库月份'],
-            ['补发口径','普通补发收费，仓库漏发免收'],['资金口径',source_bill['settlement']['note']],
+            ['打包费口径',source_bill['settlement'].get('packing_policy','每原订单首次出库收费；普通补发收费，仓库漏发免收')],
+            ['已核实打包支数',source_bill['settlement'].get('packing_units')],
+            ['补发口径',source_bill['settlement'].get('reship_policy','普通补发收费，仓库漏发免收')],['资金口径',source_bill['settlement']['note']],
             ['待核实商品订单',source_bill['settlement']['pending_orders']],['待核实服务记录',source_bill['settlement']['packing_pending']]]
         write_table(wb.create_sheet('版本与口径'),['项目','保存值'],scope_rows)
 

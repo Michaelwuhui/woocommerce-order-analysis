@@ -80,8 +80,17 @@ def test_real_postgres_joint_parcel_source_fee_and_immutable_revision(pg):
     assert value['settlement']['packing_fee_cny']==20
     assert value['settlement']['ready'] is True
     save_version(c,123,value,1);c.commit()
+    per_unit={**rule,'partner_id':999,'billing_basis':'shipped_unit','unit_fee_cny':'10.00'}
+    c.execute('INSERT INTO rec_objects(id,kind,name,data,created_at,actor) VALUES(?,?,?,?,?,?)',
+              (str(uuid.uuid4()),'partner_packing_rule','Synthetic per unit',json.dumps(per_unit),'2026-10-31','1'))
+    latest=build_snapshot(c,partner,2026,9,'actual',{},lambda *args:{'unit_cost':40})
+    assert latest['settlement']['packing_fee_cny']==10
+    assert latest['settlement']['packing_units']==1
+    assert latest['service_lines'][0]['items'][0]['quantity']==1
+    save_version(c,123,latest,1);c.commit()
     c.close();c=connect()
     c.execute("UPDATE orders SET total=900 WHERE id='1-source-pg'")
-    assert read_version(c,123,details=True)['settlement']==value['settlement']
+    assert read_version(c,123,details=True,revision=1)['settlement']==value['settlement']
+    assert read_version(c,123,details=True)['settlement']==latest['settlement']
     assert read_version(c,123,details=True)['service_lines'][0]['shipment_id']==shipment['id']
     c.rollback();c.close()

@@ -134,6 +134,14 @@ def _success(order, site):
             and not (status == 'on-hold' and (pm == 'bacs' or not site.get('cod_on_hold_is_shipped'))))
 
 
+def _confirmation_matches(item, confirmation):
+    return (str(confirmation.get('product_id') or 0)==str(item.get('product_id') or 0)
+            and str(confirmation.get('variation_id') or 0)==str(item.get('variation_id') or 0)
+            and dec(confirmation.get('quantity'))==dec(item.get('quantity'))
+            and confirmation.get('mode') in ('partner_stock','transit_service')
+            and bool(str(confirmation.get('evidence') or '').strip()))
+
+
 def _source_parts(order, item, index, evidence, warehouses, default_warehouse, confirmation=None):
     quantity = dec(item.get('quantity'))
     candidates = [part for part in evidence if
@@ -171,12 +179,7 @@ def _source_parts(order, item, index, evidence, warehouses, default_warehouse, c
                       'warehouse_code': warehouse.get('code', ''), 'warehouse_name': warehouse.get('name', ''),
                       'source_basis': basis, 'fulfilled_quantity': 0})
     if confirmation:
-        valid = (str(confirmation.get('product_id') or 0)==str(item.get('product_id') or 0)
-                 and str(confirmation.get('variation_id') or 0)==str(item.get('variation_id') or 0)
-                 and dec(confirmation.get('quantity'))==quantity
-                 and confirmation.get('mode') in ('partner_stock','transit_service')
-                 and str(confirmation.get('evidence') or '').strip())
-        if not valid:
+        if not _confirmation_matches(item,confirmation):
             return [{'mode':'pending','quantity':quantity,'warehouse_id':None,'warehouse_name':'',
                      'warehouse_code':'','source_basis':'供货来源确认与当前商品身份或数量不一致'}]
         for part in parts:
@@ -186,7 +189,126 @@ def _source_parts(order, item, index, evidence, warehouses, default_warehouse, c
     return parts
 
 
+def _unit_service_lines(conn, start, end, scope_sql, scope_args, warehouses, rules):
+    """Charge physical transit units, independently of order outcome or reships.
+
+    Parcel items are the quantity evidence. A repeated carrier/tracking number
+    is one physical parcel; conflicting item quantities remain unknown.
+    """
+    confirmations = {}
+    if exists(conn,'rec_objects'):
+        for record in rows(conn,"SELECT id,data FROM rec_objects WHERE kind='legacy_product_source' ORDER BY created_at,id"):
+            value = json.loads(record['data'])
+            confirmations[(str(value.get('order_id')),str(value.get('line_item_id')))] = {**value,'id':record['id']}
+    shipped = rows(conn, f'''SELECT s.id,s.carrier_slug,s.tracking_number,s.shipped_at,s.status,
+        f.order_id,f.warehouse_id AS primary_warehouse_id,o.number,o.source,o.currency,
+        o.date_created,o.status AS order_status,o.line_items,
+        si.fulfillment_item_id,si.quantity,fi.fulfilled_qty,item_f.warehouse_id,
+        item_f.order_id AS item_order_id,oi.woo_line_item_id
+        FROM oms_shipments s JOIN oms_fulfillments f ON f.id=s.fulfillment_id
+        JOIN orders o ON o.id=f.order_id
+        LEFT JOIN oms_shipment_items si ON si.shipment_id=s.id
+        LEFT JOIN oms_fulfillment_items fi ON fi.id=si.fulfillment_item_id
+        LEFT JOIN oms_fulfillments item_f ON item_f.id=fi.fulfillment_id
+        LEFT JOIN oms_order_items oi ON oi.id=fi.order_item_id
+        WHERE {scope_sql} AND s.shipped_at<? AND s.shipped_at<>''
+        ORDER BY s.shipped_at,s.id,si.fulfillment_item_id''', scope_args+[end])
+    dispatched = set()
+    needs_proof = sorted({row['id'] for row in shipped if row['status'] in ('label_pending','cancelled')})
+    if needs_proof and exists(conn, 'oms_tracking_events'):
+        marks = ','.join('?' for _ in needs_proof)
+        dispatched = {row['shipment_id'] for row in rows(conn, f'''SELECT DISTINCT shipment_id
+            FROM oms_tracking_events WHERE shipment_id IN ({marks}) AND normalized_status IN
+            ('shipped','in_transit','out_for_delivery','delivered','returned','undelivered')''',needs_proof)}
+    parcels, order_items = {}, {}
+    for row in shipped:
+        if row['status'] in ('label_pending','cancelled') and row['id'] not in dispatched:
+            continue
+        tracking = (row['tracking_number'] or '').strip()
+        key = ((row['carrier_slug'] or '').strip().casefold(),tracking.casefold()) if tracking else ('missing',row['id'])
+        parcel = parcels.setdefault(key, {'first':row,'ids':set(),'orders':set(),'items':{},'pending':[]})
+        parcel['ids'].add(row['id']);parcel['orders'].add(row['order_id'])
+        transit = warehouses.get(row['warehouse_id'],{}).get('code') == TRANSIT_CODE
+        if row['order_id'] not in order_items:
+            order_items[row['order_id']] = {str(i.get('id')):i for i in json.loads(row['line_items'] or '[]')}
+        original_item = order_items[row['order_id']].get(str(row['woo_line_item_id']),{})
+        confirmation = confirmations.get((row['order_id'],str(row['woo_line_item_id'])))
+        if confirmation:
+            if _confirmation_matches(original_item,confirmation):
+                transit = confirmation['mode']=='transit_service'
+            else:
+                transit = True
+                parcel['pending'].append('供货来源确认与当前包裹商品身份或数量不一致')
+        if not transit:
+            if row['fulfillment_item_id'] is None and warehouses.get(row['primary_warehouse_id'],{}).get('code') == TRANSIT_CODE:
+                parcel['pending'].append('缺少包裹实发商品及数量凭证')
+            continue
+        item_id = row['fulfillment_item_id']
+        previous = parcel['items'].get(item_id)
+        if previous and dec(previous['quantity']) != dec(row['quantity']):
+            parcel['pending'].append('同一运单商品数量冲突')
+        parcel['items'][item_id] = row
+    result = []
+    for parcel in parcels.values():
+        first = parcel['first'];stamp = first['shipped_at'][:10]
+        rule = next((r for r in reversed(rules) if r['effective_from'] <= stamp < r['effective_to']),None)
+        if not rule or not start <= stamp < end or not (parcel['items'] or parcel['pending']):
+            continue
+        pending = list(parcel['pending'])
+        if not (first['tracking_number'] or '').strip():pending.append('已出库但缺少运单号')
+        if len(parcel['orders']) != 1:pending.append('同一运单关联多个订单，需核实包裹商品')
+        quantity, items = Decimal(0), []
+        original_items = json.loads(first['line_items'] or '[]')
+        original_items = {str(item.get('id')):item for item in original_items}
+        for item_id, item in parcel['items'].items():
+            qty = dec(item['quantity'])
+            if qty <= 0 or qty != qty.to_integral_value():pending.append('包裹实发支数缺失或无效')
+            if dec(item['fulfilled_qty']) < qty:pending.append('包裹数量超过履约实发数量')
+            if item['item_order_id'] != first['order_id']:pending.append('包裹商品与订单身份不一致')
+            source_item = original_items.get(str(item['woo_line_item_id']))
+            if not source_item:pending.append('无法匹配原订单商品行')
+            quantity += qty
+            items.append({'fulfillment_item_id':item_id,'line_item_id':item['woo_line_item_id'],
+                'product_name':(source_item or {}).get('name',''),'quantity':int(qty),
+                'warehouse_id':item['warehouse_id'],'warehouse_name':warehouses[item['warehouse_id']]['name']})
+        price = dec(rule['unit_fee_cny']) if rule.get('unit_fee_cny') is not None else None
+        if price is None:pending.append('每支打包费缺失')
+        elif price < 0:raise ValueError('打包费规则金额不能为负')
+        pending = list(dict.fromkeys(pending))
+        result.append({'event_key':'transit:'+first['id'],'order_id':first['order_id'],
+            'order_number':first['number'],'source':first['source'],'order_date':first['date_created'],
+            'order_status':first['order_status'],'market_currency':first['currency'],
+            'shipment_id':first['id'],'shipment_ids':sorted(parcel['ids']),
+            'tracking_number':(first['tracking_number'] or '').strip(),'carrier_slug':first['carrier_slug'],
+            'shipped_at':first['shipped_at'],'kind':'shipped_units','billing_basis':'shipped_unit',
+            'quantity':int(quantity) if items and not pending else None,'items':items,
+            'warehouse_id':rule['warehouse_id'],'warehouse_name':warehouses[rule['warehouse_id']]['name'],
+            'rule_id':rule['id'],'rule_name':rule['name'],'provider_id':rule.get('provider_id'),
+            'unit_fee_cny':num(price) if price is not None else None,
+            'amount_cny':num(quantity*price) if not pending else None,
+            'reason':'中转实发支数 × 每支打包费；失败、取消、退款、退回和补发均计费',
+            'decision':{},'pending':pending,'reship_policy':'charge_all_shipped_units','return_policy':'keep'})
+    return result
+
+
 def _service_lines(conn, partner, start, end, scope_sql, scope_args, warehouses, decisions):
+    rules = []
+    if exists(conn,'rec_objects'):
+        for row in rows(conn,"SELECT id,name,data FROM rec_objects WHERE kind='partner_packing_rule' ORDER BY created_at,id"):
+            rule = json.loads(row['data'])
+            if rule.get('partner_id') == partner['id'] and warehouses.get(rule.get('warehouse_id'),{}).get('code') == TRANSIT_CODE:
+                if rule.get('billing_basis') != 'shipped_unit':raise ValueError('中转打包费计费单位无效')
+                if rule['effective_from'] < end and rule['effective_to'] > start:
+                    rules.append({**rule,'id':row['id'],'name':row['name']})
+    if not exists(conn,'oms_shipments'):return [],rules
+    legacy = _legacy_service_lines(conn,partner,start,end,scope_sql,scope_args,warehouses,decisions)
+    if not rules:return legacy,[]
+    legacy = [line for line in legacy if not any(r['effective_from'] <= line['shipped_at'][:10] < r['effective_to'] for r in rules)]
+    units = _unit_service_lines(conn,start,end,scope_sql,scope_args,warehouses,rules)
+    return sorted(legacy+units,key=lambda row:(row['shipped_at'],row['shipment_id'])),rules
+
+
+def _legacy_service_lines(conn, partner, start, end, scope_sql, scope_args, warehouses, decisions):
     transit_ids = [ident for ident, warehouse in warehouses.items() if warehouse['code'] == TRANSIT_CODE]
     if not transit_ids or not exists(conn, 'oms_shipments'):
         return []
@@ -448,7 +570,7 @@ def build_snapshot(conn, partner, year, month, mode, business, cost_lookup, *, d
         key = ('partner_stock',row.get('warehouse_id'),row['product_name'],row.get('product_id'),row.get('variation_id'))
         source_products[key]['partner_profit'] += float(change)
         source_products[key]['our_receivable'] -= float(change)
-    fees = _service_lines(conn,partner,start,end,scope_sql,scope_args,warehouses,decisions or {})
+    fees, fee_rules = _service_lines(conn,partner,start,end,scope_sql,scope_args,warehouses,decisions or {})
     for bucket in list(group.values())+list(source_products.values()):
         bucket['orders'] = len(bucket.pop('order_ids'))
         for field in ('revenue','known_revenue','cost_recovery','partner_profit','our_receivable','shipping_loss'):
@@ -460,6 +582,8 @@ def build_snapshot(conn, partner, year, month, mode, business, cost_lookup, *, d
     profit = num(sum(dec(bucket['partner_profit']) for bucket in group.values()))
     receivable = num(sum(dec(bucket['our_receivable']) for bucket in group.values()))
     ready = not pending_orders and not fee_pending
+    unit_billing = bool(fee_rules)
+    unit_rates = {str(money(rule['unit_fee_cny'])) for rule in fee_rules if rule.get('unit_fee_cny') is not None}
     return {'schema_version':1,'calc_mode':mode,'currency':partner['currency'] or 'PLN',
         'period_year':year,'period_month':month,'partner_id':partner['id'],
         'business_detail':business,'groups':list(group.values()),
@@ -470,10 +594,14 @@ def build_snapshot(conn, partner, year, month, mode, business, cost_lookup, *, d
             'transit_goods_receivable':group['transit_service']['our_receivable'],
             'transit_shipping_loss_separate':group['transit_service']['shipping_loss'],
             'packing_fee_cny':fee_total,'packing_charges':sum(dec(row['amount_cny'] or 0)>0 for row in fees),
+            'packing_units':sum(row.get('quantity') or 0 for row in fees if row.get('billing_basis')=='shipped_unit' and not row['pending']) if unit_billing else None,
+            'packing_basis':'shipped_unit' if unit_billing else 'original_order',
+            'packing_unit_fee_cny':num(next(iter(unit_rates))) if len(unit_rates)==1 else None,
+            'packing_policy':'按中转实发支数计费；失败、取消、退款、退回及补发均收费' if unit_billing else '每原订单首次出库收费；普通补发收费，仓库漏发免收',
             'packing_pending':fee_pending,'pending_orders':len(pending_orders),'ready':ready,
             'amounts_label':'完整核算' if ready else '已核实行小计 · 待核实行未计入',
             'service_fee_offset':False,'sales_date_basis':'下单月份','service_date_basis':'实际出库月份',
-            'reship_policy':'普通补发收费，仓库漏发免收',
+            'reship_policy':'所有实际发出的中转商品逐支收费' if unit_billing else '普通补发收费，仓库漏发免收',
             'note':'中转商品不返还合伙人备货成本、不分商品利润；中转退件运费损失归我方另账。打包费以 CNY 单列，不自动抵扣商品货款。代收及实收回款另核凭证。'},
         'ratios':{'cost':str(cr),'partner_profit':str(pp),'our_profit':str(op)},
         'scope_sites':[site['url'] for site in sites]}

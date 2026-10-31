@@ -43,7 +43,7 @@ def db():
         CREATE TABLE oms_order_items(id INTEGER PRIMARY KEY,woo_line_item_id TEXT,line_index INTEGER);
         CREATE TABLE oms_fulfillments(id TEXT PRIMARY KEY,order_id TEXT,warehouse_id INTEGER,status TEXT);
         CREATE TABLE oms_fulfillment_items(id INTEGER PRIMARY KEY,fulfillment_id TEXT,order_item_id INTEGER,allocated_qty INTEGER,fulfilled_qty INTEGER,cancelled_qty INTEGER);
-        CREATE TABLE oms_shipments(id TEXT PRIMARY KEY,fulfillment_id TEXT,tracking_number TEXT,shipped_at TEXT,status TEXT);
+        CREATE TABLE oms_shipments(id TEXT PRIMARY KEY,fulfillment_id TEXT,tracking_number TEXT,shipped_at TEXT,status TEXT,carrier_slug TEXT DEFAULT 'inpost');
         CREATE TABLE oms_shipment_items(shipment_id TEXT,fulfillment_item_id INTEGER,quantity INTEGER);
         CREATE TABLE shipping_logs(id INTEGER PRIMARY KEY,order_id TEXT,tracking_number TEXT,is_reship INTEGER,reship_reason TEXT,shipped_at TEXT,status TEXT);
         CREATE TABLE rec_objects(id TEXT,kind TEXT,name TEXT,data TEXT,created_at TEXT,actor TEXT);
@@ -85,7 +85,7 @@ def assign(db, ident, line_id, warehouse, qty=1, *, status='delivered', fulfille
 
 
 def parcel(db, ident, sid, parts, *, primary=10, date='2026-09-11', reship=False, logs=True):
-    db.execute('INSERT INTO oms_shipments VALUES (?,?,?,?,?)',(sid,ident+':'+str(primary),'TRACK-'+sid,date,'shipped'))
+    db.execute('INSERT INTO oms_shipments(id,fulfillment_id,tracking_number,shipped_at,status) VALUES (?,?,?,?,?)',(sid,ident+':'+str(primary),'TRACK-'+sid,date,'shipped'))
     for part in parts:
         db.execute('INSERT INTO oms_shipment_items VALUES (?,?,?)',(sid,part,1))
     if logs:
