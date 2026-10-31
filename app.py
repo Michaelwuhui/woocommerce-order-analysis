@@ -14788,7 +14788,20 @@ def api_export_statement(stmt_id):
         loss = live.get('shipping_loss') or 0
         summary_rows.append(('减：运费成本（成功订单）', -ship_succ, round(-ship_succ * rate, 2) if rate else None, False, False))
         summary_rows.append(('减：运费损失（未送达）', -loss, round(-loss * rate, 2) if rate else None, False, False))
-    summary_rows.append(('净销售额', data.get('total_net_pln'), data.get('total_net_cny'), True, False))
+    if source_bill:
+        business_net = (live or {}).get('total_net_pln',0)
+        pending_goods = round(sum((row['revenue']-row.get('known_revenue',row['revenue']))
+                                  for row in source_bill['groups']),2)
+        pending_loss = sum(row['shipping_loss'] for row in source_bill['groups'] if row['mode']=='pending')
+        transit_loss = source_bill['settlement']['transit_shipping_loss_separate']
+        summary_rows.extend([
+            ('原业务净额（参考）',business_net,round(business_net*rate,2) if rate else None,False,False),
+            ('减：待核实商品销售',-pending_goods,round(-pending_goods*rate,2) if rate else None,False,False),
+            ('加：待核实损失暂不分配',pending_loss,round(pending_loss*rate,2) if rate else None,False,False),
+            ('加：中转运费损失由我方另账',transit_loss,round(transit_loss*rate,2) if rate else None,False,False),
+        ])
+    summary_rows.append(('本账商品结算净额（已核实）' if source_bill else '净销售额',
+                         data.get('total_net_pln'),data.get('total_net_cny'),True,False))
     if source_bill:
         settled = source_bill['settlement']
         summary_rows.extend([
@@ -14861,7 +14874,7 @@ def api_export_statement(stmt_id):
                 round(sum(x[6] for x in site_rows), 2), round(sum(x[7] for x in site_rows), 2),
                 round(sum(x[8] for x in site_rows), 2), round(sum(x[9] for x in site_rows), 2),
             ])
-        write_table(wb.create_sheet('按站点'), site_cols, site_rows,
+        write_table(wb.create_sheet('按站点（业务参考）' if source_bill else '按站点'), site_cols, site_rows,
                     money_cols=(7, 8, 9, 10), int_cols=(4, 5, 6), total_last=True)
 
     # ===================== Sheet 3: 按产品 =====================

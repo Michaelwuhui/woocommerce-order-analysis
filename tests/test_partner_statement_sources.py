@@ -354,6 +354,22 @@ def test_export_uses_same_frozen_items_and_separate_fee_currency(db):
     assert book['商品来源明细'].cell(2,14).value==0
 
 
+def test_export_explains_difference_between_business_sales_and_known_settlement(db):
+    saved(db);assign(db,'o1',11,10)
+    value=snapshot(db)
+    assert value['settlement']['net']==100 and value['settlement']['pending_orders']==1
+    save_version(db,59,value,1)
+    db.execute('UPDATE reconciliation_statements SET total_net_pln=100,our_receivable_pln=100 WHERE id=59')
+    db.commit();app,ns=routes(db)
+    response=app.test_client().get('/api/reconciliation/statements/59/export')
+    book=load_workbook(BytesIO(response.data),data_only=True)
+    values={row[0]:row[1] for row in book['对账单汇总'].iter_rows(values_only=True) if row[0]}
+    assert values['原业务净额（参考）']==200
+    assert values['减：待核实商品销售']==-100
+    assert values['加：中转运费损失由我方另账']==0
+    assert values['本账商品结算净额（已核实）']==100
+
+
 def test_incomplete_bill_cannot_be_confirmed_or_locked(db):
     order(db,warehouse=1);result=snapshot(db,lookup=lambda *a:None)
     db.execute("INSERT INTO reconciliation_statements(id,partner_id,status) VALUES(59,1,'generated')")

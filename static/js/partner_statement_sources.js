@@ -8,6 +8,7 @@
     function summary(snapshot, live) {
         if (!snapshot?.settlement) return '';
         const s = snapshot.settlement, curr = snapshot.currency || 'PLN';
+        const groupAmount = (row,key) => row.mode==='pending' && row.pending_count ? '<span class="text-warning">待核实</span>' : amount(row[key]);
         return `<section class="source-summary mb-3" data-source-summary>
             <div class="d-flex align-items-center flex-wrap gap-2 mb-3"><h5 class="mb-0 text-white">按商品来源核算</h5><span class="badge bg-info text-dark">${live ? '实时参考' : `第 ${esc(snapshot.revision)} 版 · 冻结快照`}</span><span class="badge ${s.ready ? 'bg-success' : 'bg-warning text-dark'}">${esc(s.amounts_label)}</span></div>
             <div class="row g-2 mb-3">
@@ -16,7 +17,7 @@
                 ${card('商品货款应收 · 我方',s.our_receivable,curr,'自备货应收 + 中转商品应交回；实收回款另核','#342b1b')}
             </div>
             <div class="table-responsive"><table class="table table-dark table-sm align-middle mb-2"><thead><tr><th>商品供货方式</th><th class="text-end">涉及订单 / 销售件数</th><th class="text-end">商品销售</th><th class="text-end">返还合伙人成本</th><th class="text-end">合伙人商品利润</th><th class="text-end">商品应收</th></tr></thead><tbody>
-                ${(snapshot.groups || []).map(g => `<tr><td><span class="badge ${g.mode === 'transit_service' ? 'bg-info text-dark' : g.mode === 'pending' ? 'bg-warning text-dark' : 'bg-success'}">${esc(g.label)}</span>${g.mode === 'transit_service' ? '<div class="small text-info mt-1">不返还备货成本 · 不参与商品分成</div>' : ''}</td><td class="text-end">${g.orders} 单 / ${g.quantity} 件</td><td class="text-end">${amount(g.revenue)}</td><td class="text-end">${amount(g.cost_recovery)}</td><td class="text-end">${amount(g.partner_profit)}</td><td class="text-end">${amount(g.our_receivable)}</td></tr>`).join('')}
+                ${(snapshot.groups || []).map(g => `<tr><td><span class="badge ${g.mode === 'transit_service' ? 'bg-info text-dark' : g.mode === 'pending' ? 'bg-warning text-dark' : 'bg-success'}">${esc(g.label)}</span>${g.mode === 'transit_service' ? '<div class="small text-info mt-1">不返还备货成本 · 不参与商品分成</div>' : ''}</td><td class="text-end">${g.orders} 单 / ${g.quantity} 件</td><td class="text-end">${amount(g.revenue)}</td><td class="text-end">${groupAmount(g,'cost_recovery')}</td><td class="text-end">${groupAmount(g,'partner_profit')}</td><td class="text-end">${groupAmount(g,'our_receivable')}</td></tr>`).join('')}
             </tbody></table></div>
             <div class="small text-white-50">商品金额单位：${esc(curr)}。混合订单在各供货方式分别出现，订单数不直接相加。商品结算按下单月，打包费按实际出库月；本账只核对本合伙人绑定站点和币种。</div>
             <div class="small text-white-50 mt-2">中转退件运费损失 ${amount(s.transit_shipping_loss_separate)} ${esc(curr)}，由我方另账核算；打包费与商品应收分别列示。普通补发收费，仓库漏发免收。</div>
