@@ -305,7 +305,7 @@ def routes(db):
         'get_db_connection':lambda:db,'_check_partner_access':lambda pid:pid==1,
         '_is_reconciliation_admin':lambda:True,'_enrich_statement_cny':lambda result,curr:result.update(effective_rate_cny=2),
         '_audit_log':lambda *args,**kwargs:None}
-    names={'api_get_statement','api_statement_source_detail','api_statement_source_versions',
+    names={'api_get_statement','api_statement_source_detail','api_statement_source_versions','api_recon_orders',
            'api_get_statement_snapshot_orders','api_export_statement','api_update_statement','api_generate_statement'}
     tree=ast.parse((Path(__file__).resolve().parents[1]/'app.py').read_text(encoding='utf-8'))
     selected=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in names]
@@ -389,6 +389,26 @@ def test_current_snapshot_drift_is_one_join_not_per_order_queries(db):
     response=app.test_client().get('/api/reconciliation/statements/59/snapshot-orders?per_page=10&page=2')
     assert response.json['count']==50 and len(response.json['orders'])==10
     assert db.statements==2
+
+
+def test_monthly_order_pages_are_complete_and_stable_when_timestamps_tie(db):
+    db.executescript('''CREATE TABLE brands(id INTEGER,name TEXT,aliases TEXT);
+        CREATE TABLE series(id INTEGER,brand_id INTEGER,name TEXT);
+        CREATE TABLE product_mappings(raw_name TEXT,source TEXT,brand_id INTEGER,series_id INTEGER,puff_count INTEGER,flavor TEXT);''')
+    for index in range(55):order(db,'o'+str(index).zfill(3),warehouse=1)
+    db.execute("ALTER TABLE orders ADD COLUMN billing TEXT DEFAULT '{}'")
+    app,ns=routes(db)
+    ns.update(_lookup_partner_rate=lambda *a:(2,'2026-09'),_build_dated_cost_index=lambda **k:{},
+              parse_json_field=lambda value:json.loads(value or '{}'),normalize_raw_name=lambda value:value,
+              _resolve_product_to_brand=lambda *a,**k:(None,None,None,None))
+    seen=[]
+    for page in range(1,4):
+        response=app.test_client().get(f'/api/reconciliation/orders?partner_id=1&year=2026&month=9&page={page}&per_page=20')
+        assert response.status_code==200,response.json
+        assert response.json['total']==55 and response.json['use_pagination'] is True
+        seen.extend(row['id'] for row in response.json['orders'])
+    assert seen==['o'+str(index).zfill(3) for index in range(54,-1,-1)]
+    assert len(set(seen))==55
 
 
 @pytest.mark.parametrize('status', ['locked','settled','confirmed','disputed'])
