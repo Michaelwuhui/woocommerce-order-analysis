@@ -47,8 +47,8 @@
     <!-- Filter Section -->
     <div class="card filter-card mb-4">
         <div class="card-body">
-            <form method="GET" action="{{ url_for('customers') }}" class="row g-3 align-items-end">
-                <input type="hidden" name="quick_date" value="{{ current_filters.quick_date }}">
+            <form method="GET" action="{{ url_for('customers') }}" id="customersFilterForm" class="row g-3 align-items-end">
+                <input type="hidden" name="quick_date" id="quickDateInput" value="{{ current_filters.quick_date }}">
                 <div class="col-md-2">
                     <label class="form-label">国家</label>
                     <select name="country" class="form-select" onchange="this.form.submit()">
@@ -407,12 +407,64 @@
             }).join('');
         }).catch(function (e) { body.innerHTML = '<div class="text-danger py-3">加载失败: ' + e + '</div>'; });
     }
-    // Date range pickers for the filter bar (flatpickr is loaded globally in base.html).
+    // 日期选择器初始化及快捷预设联动清理
     document.addEventListener('DOMContentLoaded', function () {
         if (window.flatpickr) {
-            var dateConfig = { locale: 'zh', dateFormat: 'Y-m-d', altInput: true, altFormat: 'Y年m月d日', allowInput: true, disableMobile: true };
-            flatpickr('#dateFrom', dateConfig);
-            flatpickr('#dateTo', dateConfig);
+            var filterForm = document.getElementById('customersFilterForm');
+            var quickDateInput = document.getElementById('quickDateInput');
+            var clearQuickDate = function () {
+                if (quickDateInput) {
+                    quickDateInput.value = '';
+                }
+                document.querySelectorAll('.quick-filters .btn-quick.active').forEach(function (btn) {
+                    btn.classList.remove('active');
+                });
+            };
+            var bindDatePicker = function (selector) {
+                var inputEl = document.querySelector(selector);
+                if (!inputEl) return null;
+                var initialVal = inputEl.value;
+                var fp = flatpickr(inputEl, {
+                    locale: 'zh',
+                    dateFormat: 'Y-m-d',
+                    altInput: true,
+                    altFormat: 'Y年m月d日',
+                    allowInput: true,
+                    disableMobile: true,
+                    onChange: function (selectedDates, dateStr) {
+                        if (dateStr !== initialVal) {
+                            clearQuickDate();
+                        }
+                    }
+                });
+                var syncEmptyAlt = function () {
+                    if (fp && fp.altInput && fp.altInput.value.trim() === '' && inputEl.value !== '') {
+                        inputEl.value = '';
+                        clearQuickDate();
+                    }
+                };
+                if (fp && fp.altInput) {
+                    fp.altInput.addEventListener('input', function () {
+                        clearQuickDate();
+                    });
+                    fp.altInput.addEventListener('blur', syncEmptyAlt);
+                    fp.altInput.addEventListener('change', syncEmptyAlt);
+                }
+                inputEl.addEventListener('change', function () {
+                    if (inputEl.value !== initialVal) {
+                        clearQuickDate();
+                    }
+                });
+                return { syncEmptyAlt: syncEmptyAlt };
+            };
+            var pickerFrom = bindDatePicker('#dateFrom');
+            var pickerTo = bindDatePicker('#dateTo');
+            if (filterForm) {
+                filterForm.addEventListener('submit', function () {
+                    if (pickerFrom) pickerFrom.syncEmptyAlt();
+                    if (pickerTo) pickerTo.syncEmptyAlt();
+                });
+            }
         }
 
         // 复购率口径切换：人头 / 按订单 / 按金额。记住上次选择。
