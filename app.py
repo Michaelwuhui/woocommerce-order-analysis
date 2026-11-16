@@ -2310,11 +2310,59 @@ def dashboard():
                          api_error_sites=api_error_sites)
 
 
+def _quick_date_bounds(quick_date, today):
+    """根据快捷日期标识返回 (date_from, date_to) 字符串元组。"""
+    from datetime import timedelta
+    if quick_date == 'this_month':
+        return today.replace(day=1).isoformat(), today.isoformat()
+    if quick_date == 'last_month':
+        first_of_this_month = today.replace(day=1)
+        last_month_end = first_of_this_month - timedelta(days=1)
+        return last_month_end.replace(day=1).isoformat(), last_month_end.isoformat()
+    if quick_date == 'last_quarter':
+        return (today - timedelta(days=90)).isoformat(), today.isoformat()
+    if quick_date == 'half_year':
+        return (today - timedelta(days=180)).isoformat(), today.isoformat()
+    if quick_date == 'one_year':
+        return (today - timedelta(days=365)).isoformat(), today.isoformat()
+    return '', ''
+
+
+def _resolve_date_filter_params(args, default_quick_date='this_month', has_search=False, today=None):
+    """解析快捷日期与自定义起止日期参数，避免表单隐藏域中的旧 quick_date 覆盖手动选择的日期。"""
+    from datetime import date as _date
+    if today is None:
+        today = _date.today()
+
+    quick_date = (args.get('quick_date') or '').strip()
+    date_from = (args.get('date_from') or '').strip()
+    date_to = (args.get('date_to') or '').strip()
+    has_date_inputs = ('date_from' in args) or ('date_to' in args)
+
+    if has_date_inputs:
+        if quick_date:
+            preset_from, preset_to = _quick_date_bounds(quick_date, today)
+            if (date_from, date_to) == (preset_from, preset_to):
+                return quick_date, date_from, date_to
+            if not date_from and not date_to:
+                return ('all' if not has_search else ''), '', ''
+            return '', date_from, date_to
+        if not date_from and not date_to:
+            return ('all' if not has_search else ''), '', ''
+        return '', date_from, date_to
+
+    if not quick_date and not has_search:
+        quick_date = default_quick_date
+    if quick_date:
+        preset_from, preset_to = _quick_date_bounds(quick_date, today)
+        return quick_date, preset_from, preset_to
+    return '', '', ''
+
+
 @app.route('/orders')
 @login_required
 def orders():
     """Order list with filtering and summary statistics"""
-    from datetime import date, timedelta
     conn = get_db_connection()
     
     # Get user's allowed sources for permission filtering
@@ -2323,10 +2371,12 @@ def orders():
     # Get filter parameters
     source_filter = request.args.get('source', '')
     status_filter = request.args.get('status', '')
-    date_from = request.args.get('date_from', '')
-    date_to = request.args.get('date_to', '')
     search = request.args.get('search', '')
-    quick_date = request.args.get('quick_date', '')
+    quick_date, date_from, date_to = _resolve_date_filter_params(
+        request.args,
+        default_quick_date='this_month',
+        has_search=bool(search),
+    )
     manager_filter = request.args.get('manager', '')
     country_filter = request.args.get('country', '')
     try:
@@ -2339,10 +2389,6 @@ def orders():
         requested_per_page = 50
     per_page = requested_per_page if requested_per_page in (20, 50, 100) else 50
     
-    # Default to 'this_month' if no filters are active
-    if not any([quick_date, date_from, date_to, search]):
-        quick_date = 'this_month'
-    
     # Get all managers
     all_managers = get_all_managers()
     
@@ -2353,27 +2399,6 @@ def orders():
     # Validate source_filter against allowed sources
     if source_filter and allowed_sources is not None and source_filter not in allowed_sources:
         source_filter = ''
-    
-    # Process quick date filter
-    today = date.today()
-    if quick_date == 'this_month':
-        date_from = today.replace(day=1).isoformat()
-        date_to = today.isoformat()
-    elif quick_date == 'last_month':
-        first_of_this_month = today.replace(day=1)
-        last_month_end = first_of_this_month - timedelta(days=1)
-        last_month_start = last_month_end.replace(day=1)
-        date_from = last_month_start.isoformat()
-        date_to = last_month_end.isoformat()
-    elif quick_date == 'last_quarter':
-        date_from = (today - timedelta(days=90)).isoformat()
-        date_to = today.isoformat()
-    elif quick_date == 'half_year':
-        date_from = (today - timedelta(days=180)).isoformat()
-        date_to = today.isoformat()
-    elif quick_date == 'one_year':
-        date_from = (today - timedelta(days=365)).isoformat()
-        date_to = today.isoformat()
     
     # Build base conditions with permission filter
     conditions = []
@@ -4637,33 +4662,12 @@ def customers():
     manager_filter = request.args.get('manager', '')
     country_filter = request.args.get('country', '')
 
-    # Period filter (period口径: every number reflects only orders in range).
-    # Default is 'all' so the page keeps showing the lifetime customer base
-    # until the user explicitly scopes to a month.
-    quick_date = request.args.get('quick_date', 'all')
-    date_from = request.args.get('date_from', '')
-    date_to = request.args.get('date_to', '')
-    # Explicit dates win; otherwise derive the range from the quick preset.
-    if not date_from and not date_to:
-        today = date.today()
-        if quick_date == 'this_month':
-            date_from = today.replace(day=1).isoformat()
-            date_to = today.isoformat()
-        elif quick_date == 'last_month':
-            first_of_this = today.replace(day=1)
-            last_month_end = first_of_this - timedelta(days=1)
-            date_from = last_month_end.replace(day=1).isoformat()
-            date_to = last_month_end.isoformat()
-        elif quick_date == 'last_quarter':
-            date_from = (today - timedelta(days=90)).isoformat()
-            date_to = today.isoformat()
-        elif quick_date == 'half_year':
-            date_from = (today - timedelta(days=180)).isoformat()
-            date_to = today.isoformat()
-        elif quick_date == 'one_year':
-            date_from = (today - timedelta(days=365)).isoformat()
-            date_to = today.isoformat()
-        # 'all' (or anything else) → no date bounds
+    # 期间口径筛选：默认显示全部，自定义起止日期优先于隐藏域中的旧快捷预设
+    quick_date, date_from, date_to = _resolve_date_filter_params(
+        request.args,
+        default_quick_date='all',
+        has_search=False,
+    )
 
     # Build the shared date-range SQL fragment (applied to BOTH the customer
     # aggregation query and the identity-resolution scan so they stay in sync).

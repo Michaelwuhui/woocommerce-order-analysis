@@ -38,8 +38,8 @@
     <!-- Filter Section -->
     <div class="card filter-card mb-4">
         <div class="card-body">
-            <form method="GET" action="{{ url_for('orders') }}" class="row g-3 align-items-end">
-                <input type="hidden" name="quick_date" value="{{ current_filters.quick_date }}">
+            <form method="GET" action="{{ url_for('orders') }}" id="ordersFilterForm" class="row g-3 align-items-end">
+                <input type="hidden" name="quick_date" id="quickDateInput" value="{{ current_filters.quick_date }}">
                 <div class="col-md-2">
                     <label class="form-label">国家</label>
                     <select name="country" class="form-select" onchange="this.form.submit()">
@@ -752,17 +752,64 @@
 
 <script>
     document.addEventListener('DOMContentLoaded', function () {
-        var dateConfig = {
-            locale: 'zh',
-            dateFormat: 'Y-m-d',
-            altInput: true,
-            altFormat: 'Y年m月d日',
-            allowInput: true,
-            disableMobile: true
+        var filterForm = document.getElementById('ordersFilterForm');
+        var quickDateInput = document.getElementById('quickDateInput');
+        var clearQuickDate = function () {
+            if (quickDateInput) {
+                quickDateInput.value = '';
+            }
+            document.querySelectorAll('.quick-filters .btn-quick.active').forEach(function (btn) {
+                btn.classList.remove('active');
+            });
         };
 
-        flatpickr('#dateFrom', dateConfig);
-        flatpickr('#dateTo', dateConfig);
+        var bindDatePicker = function (selector) {
+            var inputEl = document.querySelector(selector);
+            if (!inputEl) return null;
+            var initialVal = inputEl.value;
+            var fp = flatpickr(inputEl, {
+                locale: 'zh',
+                dateFormat: 'Y-m-d',
+                altInput: true,
+                altFormat: 'Y年m月d日',
+                allowInput: true,
+                disableMobile: true,
+                onChange: function (selectedDates, dateStr) {
+                    if (dateStr !== initialVal) {
+                        clearQuickDate();
+                    }
+                }
+            });
+            var syncEmptyAlt = function () {
+                if (fp && fp.altInput && fp.altInput.value.trim() === '' && inputEl.value !== '') {
+                    inputEl.value = '';
+                    clearQuickDate();
+                }
+            };
+            if (fp && fp.altInput) {
+                fp.altInput.addEventListener('input', function () {
+                    clearQuickDate();
+                });
+                fp.altInput.addEventListener('blur', syncEmptyAlt);
+                fp.altInput.addEventListener('change', syncEmptyAlt);
+            }
+            inputEl.addEventListener('change', function () {
+                if (inputEl.value !== initialVal) {
+                    clearQuickDate();
+                }
+            });
+            return { syncEmptyAlt: syncEmptyAlt };
+        };
+
+        var pickerFrom = bindDatePicker('#dateFrom');
+        var pickerTo = bindDatePicker('#dateTo');
+
+        if (filterForm) {
+            filterForm.addEventListener('submit', function () {
+                if (pickerFrom) pickerFrom.syncEmptyAlt();
+                if (pickerTo) pickerTo.syncEmptyAlt();
+            });
+        }
     });
 </script>
 {% endblock %}
