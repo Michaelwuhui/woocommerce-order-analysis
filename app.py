@@ -5445,9 +5445,70 @@ def get_order_details(order_id):
                 ff_output.append(ff_data)
             order_dict['fulfillment'] = {'state': dict(ff_state), 'fulfillments': ff_output}
 
+    from order_item_modification import evaluate_order_modification_eligibility
+    mod_check = evaluate_order_modification_eligibility(conn, order, current_user, lock=False)
+    order_dict['can_modify_items'] = bool(mod_check['can_modify'])
+    order_dict['is_site_owner_for_items'] = bool(mod_check['is_owner'])
+    order_dict['modify_items_block_reason'] = mod_check['block_reason']
+
     conn.close()
 
     return jsonify(order_dict)
+
+
+@app.route('/api/order/<order_id>/item-options', methods=['GET'])
+@login_required
+def api_order_item_options(order_id):
+    """获取订单所属站点指定产品的全部可选口味与规格变体（仅限本人负责站点）"""
+    from order_item_modification import get_product_options_for_order
+    conn = get_db_connection()
+    try:
+        result, status = get_product_options_for_order(
+            conn,
+            order_id,
+            user=current_user,
+            product_id=request.args.get('product_id'),
+        )
+        return jsonify(result), status
+    finally:
+        conn.close()
+
+
+@app.route('/api/order/<order_id>/search-products', methods=['GET'])
+@login_required
+def api_order_search_products(order_id):
+    """在订单所属站点搜索可更换的在售产品列表（仅限本人负责站点）"""
+    from order_item_modification import search_site_products_for_order
+    conn = get_db_connection()
+    try:
+        result, status = search_site_products_for_order(
+            conn,
+            order_id,
+            user=current_user,
+            query=request.args.get('q', ''),
+            page=request.args.get('page', 1),
+        )
+        return jsonify(result), status
+    finally:
+        conn.close()
+
+
+@app.route('/api/order/<order_id>/modify-item', methods=['POST'])
+@login_required
+def api_order_modify_item(order_id):
+    """修改订单商品行口味或更换产品并同步至源站及仓库预留（仅限本人负责站点）"""
+    from order_item_modification import modify_order_line_item
+    conn = get_db_connection()
+    try:
+        result, status = modify_order_line_item(
+            conn,
+            order_id,
+            request.get_json(silent=True) or {},
+            user=current_user,
+        )
+        return jsonify(result), status
+    finally:
+        conn.close()
 
 
 @app.route('/api/customer/<email>')

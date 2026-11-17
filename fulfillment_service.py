@@ -950,12 +950,26 @@ def sync_order_items(conn: sqlite3.Connection, order_id: str) -> list[dict]:
         )
     if active_keys:
         placeholders = ",".join("?" for _ in active_keys)
+        # 未分配且未被任何履约明细引用的旧商品行可直接清理；曾被历史修订引用的旧行将订购数归零，防止重算时重复分仓
         conn.execute(
-            f"DELETE FROM oms_order_items WHERE order_id=? AND woo_line_item_id NOT IN ({placeholders}) AND allocated_qty=0",
+            f"""DELETE FROM oms_order_items
+                WHERE order_id=? AND woo_line_item_id NOT IN ({placeholders})
+                  AND allocated_qty=0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM oms_fulfillment_items fi
+                      WHERE fi.order_item_id = oms_order_items.id
+                  )""",
+            (order_id, *active_keys),
+        )
+        conn.execute(
+            f"""UPDATE oms_order_items
+                SET ordered_qty=0, cancelled_qty=0, allocated_qty=0, shortage_qty=0,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE order_id=? AND woo_line_item_id NOT IN ({placeholders})""",
             (order_id, *active_keys),
         )
     return [dict(r) for r in conn.execute(
-        "SELECT * FROM oms_order_items WHERE order_id=? ORDER BY line_index, id", (order_id,)
+        "SELECT * FROM oms_order_items WHERE order_id=? AND ordered_qty>0 ORDER BY line_index, id", (order_id,)
     ).fetchall()]
 
 
@@ -1356,12 +1370,15 @@ def _source_items_match_synced(conn: sqlite3.Connection, order: sqlite3.Row | di
     source = json_load(order["line_items"], []) or []
     expected = []
     for index, item in enumerate(source):
+        qty = int(item.get("quantity") or 0)
+        if qty <= 0:
+            continue
         line_id = str(item.get("id") if item.get("id") is not None else f"idx-{index}")
         expected.append((
             line_id,
             int(item.get("product_id") or 0),
             int(item.get("variation_id") or 0),
-            int(item.get("quantity") or 0),
+            qty,
         ))
     actual = [
         (
@@ -1372,7 +1389,7 @@ def _source_items_match_synced(conn: sqlite3.Connection, order: sqlite3.Row | di
         )
         for row in conn.execute(
             '''SELECT woo_line_item_id,wc_product_id,wc_variation_id,ordered_qty
-               FROM oms_order_items WHERE order_id=? ORDER BY line_index,id''',
+               FROM oms_order_items WHERE order_id=? AND ordered_qty>0 ORDER BY line_index,id''',
             (order["id"],),
         ).fetchall()
     ]
