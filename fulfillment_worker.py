@@ -79,6 +79,24 @@ def _bucket(minutes: int = 60) -> str:
     return now.replace(minute=minute, second=0, microsecond=0).strftime("%Y%m%d%H%M")
 
 
+HIGH_PRIORITY_JOB_TYPES = (
+    "ORDER_NOTIFICATION",
+    "ORDER_NOTIFICATION_ALERT",
+    "PLAN_ORDER",
+    "CANCEL_HU_FULFILLMENT",
+    "CANCEL_PL_FULFILLMENT",
+    "SUBMIT_HU_FULFILLMENT",
+    "SUBMIT_PL_FULFILLMENT",
+    "SYNC_SHIPMENT_TO_WOOCOMMERCE",
+    "COMPLETE_WOOCOMMERCE_ORDER",
+    "RECOMPUTE_ORDER_STATUS",
+)
+LOW_PRIORITY_JOB_TYPES = (
+    "POLL_SHIPMENT_TRACKING",
+    "RECONCILE",
+)
+
+
 def claim_job(conn) -> dict | None:
     conn.execute("BEGIN" if sqlite3.is_postgres_backend() else "BEGIN IMMEDIATE")
     conn.execute(
@@ -90,13 +108,24 @@ def claim_job(conn) -> dict | None:
         (utcnow(),),
     )
     lock_clause = " FOR UPDATE SKIP LOCKED" if sqlite3.is_postgres_backend() else ""
+    high_marks = ",".join("?" for _ in HIGH_PRIORITY_JOB_TYPES)
+    low_marks = ",".join("?" for _ in LOW_PRIORITY_JOB_TYPES)
+    # 实时通知、分仓锁库存与出入库指令优先于后台批量物流轨迹轮询执行
     row = conn.execute(
-        '''SELECT * FROM oms_integration_jobs
+        f'''SELECT * FROM oms_integration_jobs
            WHERE status IN ('pending','retry')
              AND available_at <= ?
              AND attempts < max_attempts
-           ORDER BY available_at, id LIMIT 1''' + lock_clause,
-        (utcnow(),),
+           ORDER BY
+             CASE
+               WHEN job_type IN ({high_marks}) THEN 0
+               WHEN job_type IN ({low_marks}) THEN 2
+               ELSE 1
+             END,
+             available_at,
+             id
+           LIMIT 1''' + lock_clause,
+        (utcnow(), *HIGH_PRIORITY_JOB_TYPES, *LOW_PRIORITY_JOB_TYPES),
     ).fetchone()
     if not row:
         conn.commit()
@@ -1343,13 +1372,23 @@ def handle_poll_tracking(conn, job: dict, payload: dict):
         (sid,),
     ).fetchone()
     if not shipment or shipment["status"] in {"delivered", "returned", "cancelled"}:
+        conn.commit()
         return {"noop": True}
+
+    integration = None
+    if shipment["provider"] in {"hungary_wms", "poland_wms"}:
+        integration = conn.execute(
+            "SELECT * FROM oms_warehouse_integrations WHERE warehouse_id=?",
+            (shipment["warehouse_id"],),
+        ).fetchone()
+    key_row = conn.execute("SELECT value FROM settings WHERE key='track718_api_key'").fetchone()
+    key = key_row["value"] if key_row else None
+    # 在发起任何外部仓库或第三方物流网络请求前先提交读事务，防止触发 PostgreSQL 60 秒空闲事务超时
+    conn.commit()
+
     tracking = shipment["tracking_number"]
     official_ok = third_party_ok = False
     if shipment["provider"] == "hungary_wms":
-        integration = conn.execute(
-            "SELECT * FROM oms_warehouse_integrations WHERE warehouse_id=?", (shipment["warehouse_id"],)
-        ).fetchone()
         client = WmsClient(base_url=integration["base_url"] if integration else None)
         correlation = uuid.uuid4().hex
         try:
@@ -1367,14 +1406,12 @@ def handle_poll_tracking(conn, job: dict, payload: dict):
                     location=event.get("location"), description=event.get("description"),
                     raw_payload=event.get("raw"), correlation_id=correlation, commit=False,
                 )
+            conn.commit()
             official_ok = bool(events)
         except WmsError as exc:
             _audit_wms_error(conn, job, "tracking", exc, correlation)
+            conn.commit()
     elif shipment["provider"] == "poland_wms":
-        integration = conn.execute(
-            "SELECT * FROM oms_warehouse_integrations WHERE warehouse_id=?",
-            (shipment["warehouse_id"],),
-        ).fetchone()
         correlation = uuid.uuid4().hex
         try:
             client, _ = _poland_client(integration)
@@ -1408,16 +1445,18 @@ def handle_poll_tracking(conn, job: dict, payload: dict):
                     correlation_id=correlation,
                     commit=False,
                 )
+            conn.commit()
             official_ok = bool(events)
         except PolandWmsError as exc:
             _audit_poland_error(conn, job, "tracking", exc, correlation)
+            conn.commit()
 
-    key_row = conn.execute("SELECT value FROM settings WHERE key='track718_api_key'").fetchone()
-    key = key_row["value"] if key_row else None
+    # 先在事务外完成外部第三方物流 HTTP 查询，拿到结果后再统一开启短事务落库
     carrier = carrier_tracking.classify_carrier(shipment["carrier_slug"], tracking)
+    pending_events: list[dict[str, Any]] = []
     try:
         if carrier == "expressone_hu":
-            result = carrier_tracking.expressone_hu_detail(tracking)
+            result = carrier_tracking.expressone_hu_detail(tracking, timeout=12)
             if result.get("ok"):
                 outcome = result.get("outcome")
                 normalized = {
@@ -1425,18 +1464,18 @@ def handle_poll_tracking(conn, job: dict, payload: dict):
                     "returned": "returned", "delivered": "delivered",
                 }.get(outcome, "exception")
                 for event in (result.get("events") or [])[:20]:
-                    add_tracking_event(
-                        conn, sid, "expressone_hu", normalized,
-                        raw_status=str(event.get("code") or outcome or ""),
-                        event_at=event.get("time"), description=event.get("status"),
-                        raw_payload=result, commit=False,
-                    )
+                    pending_events.append({
+                        "source": "expressone_hu",
+                        "normalized": normalized,
+                        "raw_status": str(event.get("code") or outcome or ""),
+                        "event_at": event.get("time"),
+                        "description": event.get("status"),
+                        "raw_payload": result,
+                    })
                 official_ok = True
-            # The official Express One page is authoritative; Track718 remains
-            # an independent supplemental source when configured.
             if key:
                 third = carrier_tracking.track718_detail(
-                    tracking, key, code=None, poll=2, poll_wait=1
+                    tracking, key, code=None, timeout=12, poll=1, poll_wait=1.0
                 )
                 if third.get("ok"):
                     outcome = third.get("outcome")
@@ -1445,23 +1484,28 @@ def handle_poll_tracking(conn, job: dict, payload: dict):
                         "returned": "returned", "delivered": "delivered",
                     }.get(outcome, "exception")
                     for event in (third.get("events") or [{}])[:20]:
-                        add_tracking_event(
-                            conn, sid, "track718", normalized,
-                            raw_status=str(third.get("result") or outcome or ""),
-                            event_at=event.get("time"), description=event.get("status"),
-                            raw_payload=third, commit=False,
-                        )
+                        pending_events.append({
+                            "source": "track718",
+                            "normalized": normalized,
+                            "raw_status": str(third.get("result") or outcome or ""),
+                            "event_at": event.get("time"),
+                            "description": event.get("status"),
+                            "raw_payload": third,
+                        })
                     third_party_ok = True
         elif carrier == "inpost":
-            result = carrier_tracking.inpost_status(tracking)
+            result = carrier_tracking.inpost_status(tracking, timeout=12)
             if result.get("ok"):
                 outcome = result.get("outcome")
                 normalized = {"in_transit": "in_transit", "attention": "exception", "returned": "returned", "delivered": "delivered"}.get(outcome, "exception")
-                add_tracking_event(
-                    conn, sid, "inpost", normalized, raw_status=result.get("raw"),
-                    event_at=result.get("last_event_at"), description=result.get("last_event"),
-                    raw_payload=result, commit=False,
-                )
+                pending_events.append({
+                    "source": "inpost",
+                    "normalized": normalized,
+                    "raw_status": result.get("raw"),
+                    "event_at": result.get("last_event_at"),
+                    "description": result.get("last_event"),
+                    "raw_payload": result,
+                })
                 third_party_ok = True
         elif key:
             code = (
@@ -1469,21 +1513,38 @@ def handle_poll_tracking(conn, job: dict, payload: dict):
                 else carrier_tracking.TRACK718_PACKETA if carrier == "packeta"
                 else None
             )
-            result = carrier_tracking.track718_detail(tracking, key, code=code, poll=2, poll_wait=1)
+            result = carrier_tracking.track718_detail(
+                tracking, key, code=code, timeout=12, poll=1, poll_wait=1.0
+            )
             if result.get("ok"):
                 outcome = result.get("outcome")
                 normalized = {"in_transit": "in_transit", "attention": "exception", "returned": "returned", "delivered": "delivered"}.get(outcome, "exception")
                 events = result.get("events") or [{}]
                 for event in events[:20]:
-                    add_tracking_event(
-                        conn, sid, "track718", normalized,
-                        raw_status=str(result.get("result") or outcome or ""),
-                        event_at=event.get("time"), description=event.get("status"),
-                        raw_payload=result, commit=False,
-                    )
+                    pending_events.append({
+                        "source": "track718",
+                        "normalized": normalized,
+                        "raw_status": str(result.get("result") or outcome or ""),
+                        "event_at": event.get("time"),
+                        "description": event.get("status"),
+                        "raw_payload": result,
+                    })
                 third_party_ok = True
     except Exception:
         pass
+
+    for ev in pending_events:
+        add_tracking_event(
+            conn,
+            sid,
+            ev["source"],
+            ev["normalized"],
+            raw_status=ev["raw_status"],
+            event_at=ev["event_at"],
+            description=ev["description"],
+            raw_payload=ev["raw_payload"],
+            commit=False,
+        )
     current = conn.execute("SELECT status FROM oms_shipments WHERE id=?", (sid,)).fetchone()["status"]
     if current not in {"delivered", "returned", "cancelled"}:
         enqueue_job(
@@ -1638,12 +1699,31 @@ def run_one(conn) -> bool:
         dead_job(conn, job, exc, code=exc.code)
     except Exception as exc:
         print(traceback.format_exc(), file=sys.stderr, flush=True)
-        # PostgreSQL rejects every statement after one statement in the
-        # transaction fails.  Clear that failed transaction before recording
-        # the durable retry; SQLite accepts the same rollback safely.
-        conn.rollback()
-        retry_job(conn, job, exc, code="unhandled")
+        # PostgreSQL 在单个语句失败或连接断开时需先清理事务；若原连接已失效则使用新连接持久化退避状态
+        try:
+            conn.rollback()
+            retry_job(conn, job, exc, code="unhandled")
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            fallback_conn = get_conn()
+            try:
+                retry_job(fallback_conn, job, exc, code="db_connection_lost")
+            finally:
+                fallback_conn.close()
     return True
+
+
+def _conn_unusable(conn) -> bool:
+    """检查当前数据库连接是否已关闭或底层网络会话已损坏。"""
+    if conn is None or getattr(conn, "_closed", False):
+        return True
+    raw = getattr(conn, "_raw", None)
+    if raw is not None and (getattr(raw, "closed", False) or getattr(raw, "broken", False)):
+        return True
+    return False
 
 
 def run_iteration(conn, *, seed: bool = False) -> bool:
@@ -1677,8 +1757,26 @@ def main():
     last_seed = 0.0
     try:
         while True:
+            if _conn_unusable(conn):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = get_conn()
             should_seed = time.monotonic() - last_seed > 60
-            worked = run_iteration(conn, seed=should_seed)
+            try:
+                worked = run_iteration(conn, seed=should_seed)
+            except Exception as exc:
+                print(f"[worker] 循环连接异常，准备自动重连: {exc}", file=sys.stderr, flush=True)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+                if args.once:
+                    raise
+                time.sleep(2.0)
+                continue
             if should_seed:
                 last_seed = time.monotonic()
             if args.once:
@@ -1686,7 +1784,11 @@ def main():
             if not worked:
                 time.sleep(max(0.5, args.idle_sleep))
     finally:
-        conn.close()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
