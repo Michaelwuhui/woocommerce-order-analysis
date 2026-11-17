@@ -586,6 +586,125 @@
     </div>
 </div>
 
+<!-- 实时订单 Webhook 同步卡片 -->
+<div class="card data-card mb-4" id="webhookSyncCard">
+    <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <div class="d-flex align-items-center gap-2">
+            <h5 class="card-title text-white mb-0">
+                <i class="bi bi-lightning-charge-fill text-warning me-2"></i>实时订单 Webhook 同步
+            </h5>
+            <span class="badge bg-secondary" id="whGlobalBadge">加载中…</span>
+        </div>
+        <div class="d-flex align-items-center gap-2 flex-wrap">
+            <div class="form-check form-switch mb-0 me-2">
+                <input class="form-check-input" type="checkbox" id="whEnableToggle">
+                <label class="form-check-label text-white-50 small" for="whEnableToggle">实时推送总开关</label>
+            </div>
+            <button type="button" class="btn btn-sm btn-outline-light" id="whRefreshBtn" title="刷新实时状态">
+                <i class="bi bi-arrow-clockwise"></i> 刷新
+            </button>
+            <button type="button" class="btn btn-sm btn-primary" id="whProvisionAllBtn">
+                <i class="bi bi-cloud-check me-1"></i>一键全站部署 / 巡检修复
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-info" id="whToggleDetailBtn">
+                <i class="bi bi-list-check me-1"></i>站点状态与推送明细
+            </button>
+        </div>
+    </div>
+    <div class="card-body">
+        <p class="text-white-50 small mb-3">
+            源站产生新订单（<code>order.created</code>）或状态变更（<code>order.updated</code>）时主动秒级推送至本系统，回读权威订单并实时触发多仓履约锁库存与企微通知；同时保留定时自动增量同步做双保险兜底，并每 30 分钟自动巡检修复异常站点。
+        </p>
+        <div id="whActionFeedback" class="mb-2"></div>
+        <div class="row g-3 mb-2">
+            <div class="col-md-3">
+                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                    <div class="card-body text-center py-3">
+                        <div class="text-white-50 small">已就绪活跃站点</div>
+                        <div class="fs-5 fw-bold text-white mt-1" id="whStatSites">- / -</div>
+                        <div class="text-muted small mt-1" id="whStatSitesSub">加载中…</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                    <div class="card-body text-center py-3">
+                        <div class="text-white-50 small">近 1 小时实时同步</div>
+                        <div class="fs-5 fw-bold text-info mt-1" id="whStat1h">-</div>
+                        <div class="text-muted small mt-1" id="whStat1hSub">等待数据…</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                    <div class="card-body text-center py-3">
+                        <div class="text-white-50 small">近 24 小时实时同步</div>
+                        <div class="fs-5 fw-bold text-success mt-1" id="whStat24h">-</div>
+                        <div class="text-muted small mt-1" id="whStat24hSub">等待数据…</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-black bg-opacity-25 border border-secondary border-opacity-25 h-100">
+                    <div class="card-body text-center py-3">
+                        <div class="text-white-50 small">定时增量兜底</div>
+                        <div class="fs-6 fw-bold text-white mt-1" id="whStatFallback">-</div>
+                        <div class="text-muted small mt-1" id="whStatLatency">平均入库耗时：-</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="whDetailCollapse" style="display: none;" class="mt-3 pt-3 border-top border-secondary border-opacity-25">
+            <div class="row g-3">
+                <div class="col-lg-7">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <span class="text-white small fw-semibold"><i class="bi bi-globe2 me-1"></i>各站点 Webhook 部署状态</span>
+                        <span class="text-muted small" id="whPublicUrlHint"></span>
+                    </div>
+                    <div class="table-responsive" style="max-height: 360px; overflow-y: auto;">
+                        <table class="table table-dark table-sm table-hover align-middle mb-0">
+                            <thead>
+                                <tr>
+                                    <th>站点</th>
+                                    <th>负责人</th>
+                                    <th>新建推送</th>
+                                    <th>更新推送</th>
+                                    <th>最近收到推送</th>
+                                    <th class="text-end">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="whSitesTableBody">
+                                <tr><td colspan="6" class="text-center text-muted py-3">加载中…</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="col-lg-5">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <span class="text-white small fw-semibold"><i class="bi bi-broadcast-pin me-1"></i>最近 25 条实时推送流水</span>
+                    </div>
+                    <div class="table-responsive" style="max-height: 360px; overflow-y: auto;">
+                        <table class="table table-dark table-sm table-hover align-middle mb-0">
+                            <thead>
+                                <tr>
+                                    <th>时间</th>
+                                    <th>站点 / 订单</th>
+                                    <th>事件</th>
+                                    <th>结果 / 耗时</th>
+                                </tr>
+                            </thead>
+                            <tbody id="whDeliveriesTableBody">
+                                <tr><td colspan="4" class="text-center text-muted py-3">暂无推送记录</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Cron Settings Card -->
 <div class="card data-card mb-4">
     <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3">
@@ -4006,6 +4125,244 @@ function deleteWarehouse(id, name) {
                     </table></div>
                     <div class="small text-warning mt-1">以上 ${d.missing_count} 单在镜像中存在、但该站线上已查不到——疑似回滚丢失。回灌功能待加（将逐单确认）。</div>`;
             }).catch(e => { btn.disabled = false; btn.innerHTML = html; result.innerHTML = `<div class="text-danger small">请求失败：${e.message}</div>`; });
+        });
+    });
+})();
+</script>
+
+<script>
+(function () {
+    function whEsc(v) {
+        return String(v == null ? '' : v)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function whFmtTime(iso) {
+        if (!iso) return '-';
+        const normalized = String(iso).includes('T') ? String(iso) : String(iso).replace(' ', 'T') + 'Z';
+        const dt = new Date(normalized);
+        if (isNaN(dt.getTime())) return whEsc(iso);
+        return dt.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+    }
+
+    function whStatusBadge(st) {
+        if (st === 'active') return '<span class="badge bg-success">正常</span>';
+        if (st === 'error' || st === 'disabled') return '<span class="badge bg-danger">异常</span>';
+        if (st === 'paused') return '<span class="badge bg-warning text-dark">暂停</span>';
+        return '<span class="badge bg-secondary">待部署</span>';
+    }
+
+    function whDeliveryBadge(row) {
+        const st = row.status;
+        const ms = row.latency_ms != null ? ` · ${(row.latency_ms / 1000).toFixed(1)}s` : '';
+        if (st === 'synced') return `<span class="text-success small">已入库${ms}</span>`;
+        if (st === 'queued' || st === 'fetching') return '<span class="text-info small">同步中…</span>';
+        if (st === 'coalesced') return '<span class="text-white-50 small">合并去重</span>';
+        if (st === 'ignored') return '<span class="text-muted small">已忽略</span>';
+        return `<span class="text-danger small" title="${whEsc(row.error_message || '')}">失败</span>`;
+    }
+
+    let whPollTimer = null;
+
+    function renderWebhookDashboard(data) {
+        if (!data || !data.ready) return;
+        const toggle = document.getElementById('whEnableToggle');
+        const badge = document.getElementById('whGlobalBadge');
+        if (toggle) toggle.checked = !!data.enabled;
+
+        const sum = data.summary || {};
+        if (badge) {
+            if (!data.enabled) {
+                badge.className = 'badge bg-secondary';
+                badge.textContent = '已暂停实时接收';
+            } else if (sum.healthy_sites >= sum.total_active_sites && sum.total_active_sites > 0) {
+                badge.className = 'badge bg-success';
+                badge.textContent = '全站实时就绪';
+            } else if (sum.healthy_sites > 0) {
+                badge.className = 'badge bg-info text-dark';
+                badge.textContent = `运行中（${sum.healthy_sites}/${sum.total_active_sites} 站就绪）`;
+            } else {
+                badge.className = 'badge bg-warning text-dark';
+                badge.textContent = '待部署站点 Webhook';
+            }
+        }
+
+        document.getElementById('whStatSites').textContent = `${sum.healthy_sites || 0} / ${sum.total_active_sites || 0}`;
+        const errCnt = sum.error_sites || 0;
+        const missCnt = sum.missing_sites || 0;
+        document.getElementById('whStatSitesSub').innerHTML = errCnt > 0
+            ? `<span class="text-warning">${errCnt} 个站点待修复（自动巡检自愈中）</span>`
+            : (missCnt > 0 ? `${missCnt} 个站点待部署` : '<span class="text-success">全部活跃站点已挂载</span>');
+
+        document.getElementById('whStat1h').textContent = `${sum.distinct_orders_1h || 0} 单`;
+        document.getElementById('whStat1hSub').textContent = `收到推送 ${sum.deliveries_1h || 0} 次`;
+
+        document.getElementById('whStat24h').textContent = `${sum.distinct_orders_24h || 0} 单`;
+        document.getElementById('whStat24hSub').textContent = `收到推送 ${sum.deliveries_24h || 0} 次`;
+
+        const fb = data.autosync_fallback || {};
+        const mins = Math.round((fb.interval || 3600) / 60);
+        document.getElementById('whStatFallback').innerHTML = fb.enabled
+            ? `<span class="text-success">已开启（每 ${mins >= 60 ? (mins / 60) + ' 小时' : mins + ' 分钟'}）</span>`
+            : '<span class="text-warning">未开启定时兜底</span>';
+        document.getElementById('whStatLatency').textContent = sum.avg_latency_ms_24h != null
+            ? `24h 平均耗时：${(sum.avg_latency_ms_24h / 1000).toFixed(2)} 秒`
+            : '24h 平均耗时：暂无样本';
+
+        const urlHint = document.getElementById('whPublicUrlHint');
+        if (urlHint && data.public_base_url) {
+            urlHint.textContent = `回调域名：${data.public_base_url}`;
+        }
+
+        const sBody = document.getElementById('whSitesTableBody');
+        if (sBody) {
+            const sites = data.sites || [];
+            sBody.innerHTML = sites.map(s => {
+                const host = String(s.url || '').replace(/^https?:\/\//, '');
+                const errRow = s.last_error
+                    ? `<div class="text-danger small mt-1">${whEsc(s.last_error)}</div>`
+                    : '';
+                return `<tr>
+                    <td class="small"><span class="text-white">${whEsc(host)}</span>${errRow}</td>
+                    <td class="small text-white-50">${whEsc(s.manager || '-')}</td>
+                    <td>${whStatusBadge(s.created_status)}</td>
+                    <td>${whStatusBadge(s.updated_status)}</td>
+                    <td class="small text-white-50">${whFmtTime(s.last_delivery_at)}</td>
+                    <td class="text-end">
+                        <button type="button" class="btn btn-sm btn-outline-primary py-0 px-2 wh-fix-site-btn" data-site-id="${s.site_id}">
+                            同步修复
+                        </button>
+                    </td>
+                </tr>`;
+            }).join('') || '<tr><td colspan="6" class="text-center text-muted py-3">暂无活跃站点</td></tr>';
+        }
+
+        const dBody = document.getElementById('whDeliveriesTableBody');
+        if (dBody) {
+            const list = data.recent_deliveries || [];
+            dBody.innerHTML = list.map(d => {
+                const host = String(d.site_url || '').replace(/^https?:\/\//, '');
+                const topicLabel = d.topic === 'order.created' ? '新订单' : '订单更新';
+                return `<tr>
+                    <td class="small text-white-50">${whFmtTime(d.received_at)}</td>
+                    <td class="small">
+                        <div class="text-white">${whEsc(host)}</div>
+                        <div class="text-muted">#${whEsc(d.woo_order_id || '-')} ${d.order_status ? '(' + whEsc(d.order_status) + ')' : ''}</div>
+                    </td>
+                    <td class="small">${whEsc(topicLabel)}</td>
+                    <td>${whDeliveryBadge(d)}</td>
+                </tr>`;
+            }).join('') || '<tr><td colspan="4" class="text-center text-muted py-3">暂无实时推送记录</td></tr>';
+        }
+    }
+
+    function loadWebhookDashboard() {
+        return fetch('/api/settings/webhooks/status')
+            .then(r => r.json())
+            .then(renderWebhookDashboard)
+            .catch(() => {});
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+        const card = document.getElementById('webhookSyncCard');
+        if (!card) return;
+        loadWebhookDashboard();
+
+        document.getElementById('whRefreshBtn').addEventListener('click', loadWebhookDashboard);
+
+        document.getElementById('whToggleDetailBtn').addEventListener('click', function () {
+            const box = document.getElementById('whDetailCollapse');
+            if (box.style.display === 'none') {
+                box.style.display = 'block';
+                loadWebhookDashboard();
+            } else {
+                box.style.display = 'none';
+            }
+        });
+
+        document.getElementById('whEnableToggle').addEventListener('change', function () {
+            const enabled = this.checked;
+            const fb = document.getElementById('whActionFeedback');
+            fetch('/api/settings/webhooks/toggle', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enabled })
+            }).then(r => r.json()).then(d => {
+                if (!d.success) {
+                    alert('切换失败：' + (d.error || '未知错误'));
+                } else if (fb) {
+                    fb.innerHTML = `<div class="text-info small">已${d.enabled ? '开启' : '暂停'}全局实时订单推送接收。</div>`;
+                }
+                loadWebhookDashboard();
+            }).catch(e => alert('请求失败：' + e.message));
+        });
+
+        document.getElementById('whProvisionAllBtn').addEventListener('click', function () {
+            const btn = this;
+            const origHtml = btn.innerHTML;
+            const fb = document.getElementById('whActionFeedback');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>正在下发全站配置…';
+            fetch('/api/settings/webhooks/provision', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({})
+            }).then(r => r.json()).then(d => {
+                btn.disabled = false;
+                btn.innerHTML = origHtml;
+                if (!d.success) {
+                    if (fb) fb.innerHTML = `<div class="text-danger small">任务提交失败：${whEsc(d.error || '')}</div>`;
+                    return;
+                }
+                if (fb) {
+                    fb.innerHTML = `<div class="text-success small"><i class="bi bi-check-circle me-1"></i>${whEsc(d.message || '全站部署与巡检已完成')}（面板每 3 秒自动刷新进度）</div>`;
+                }
+                document.getElementById('whDetailCollapse').style.display = 'block';
+                loadWebhookDashboard();
+                if (whPollTimer) clearInterval(whPollTimer);
+                let rounds = 0;
+                whPollTimer = setInterval(function () {
+                    rounds += 1;
+                    loadWebhookDashboard();
+                    if (rounds >= 10) {
+                        clearInterval(whPollTimer);
+                        whPollTimer = null;
+                    }
+                }, 3000);
+            }).catch(e => {
+                btn.disabled = false;
+                btn.innerHTML = origHtml;
+                if (fb) fb.innerHTML = `<div class="text-danger small">请求异常：${whEsc(e.message)}</div>`;
+            });
+        });
+
+        document.getElementById('whSitesTableBody').addEventListener('click', function (ev) {
+            const btn = ev.target.closest('.wh-fix-site-btn');
+            if (!btn) return;
+            const siteId = parseInt(btn.getAttribute('data-site-id'), 10);
+            if (!siteId) return;
+            const origHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '同步中…';
+            fetch('/api/settings/webhooks/provision', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ site_id: siteId })
+            }).then(r => r.json()).then(d => {
+                btn.disabled = false;
+                btn.innerHTML = origHtml;
+                if (!d.success) {
+                    alert('单站同步失败：' + ((d.result && d.result.error) || d.error || '请检查站点连接'));
+                }
+                loadWebhookDashboard();
+            }).catch(e => {
+                btn.disabled = false;
+                btn.innerHTML = origHtml;
+                alert('请求异常：' + e.message);
+            });
         });
     });
 })();
