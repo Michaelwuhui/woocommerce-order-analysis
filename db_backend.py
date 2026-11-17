@@ -557,11 +557,20 @@ class PgCompatConnection:
         if self._closed:
             return
         try:
-            if self._raw.info.transaction_status != TransactionStatus.IDLE:
+            if (
+                not getattr(self._raw, "closed", False)
+                and not getattr(self._raw, "broken", False)
+                and self._raw.info.transaction_status != TransactionStatus.IDLE
+            ):
                 self._raw.rollback()
+        except Exception:
+            # 底层连接若已因超时或网络中断失效，忽略回滚异常并交由连接池回收淘汰
+            pass
         finally:
-            self._pool.putconn(self._raw)
-            self._closed = True
+            try:
+                self._pool.putconn(self._raw)
+            finally:
+                self._closed = True
 
     def __del__(self):
         # Backstop for legacy call sites that raise before their explicit
