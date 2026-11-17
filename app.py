@@ -7398,6 +7398,8 @@ if sqlite3.is_sqlite_backend():
         try:
             init_product_clone_jobs(_clone_jobs_conn)
             init_sync_runtime_status(_clone_jobs_conn)
+            from woo_order_webhooks import init_woo_order_webhook_tables
+            init_woo_order_webhook_tables(_clone_jobs_conn)
         finally:
             _clone_jobs_conn.close()
 else:
@@ -9161,6 +9163,7 @@ def add_site():
             from order_notification_service import write_site_watermark
             write_site_watermark(conn, existing['id'], url, reason="site_restored", not_before=True)
             conn.commit()
+            _schedule_site_webhook_sync_async(existing['id'])
             return jsonify({'success': True, 'id': existing['id'], 'restored': True})
         conn.execute('''INSERT INTO sites
             (url, consumer_key, consumer_secret, manager, mask_id, country, product_master_id)
@@ -9171,6 +9174,8 @@ def add_site():
         from order_notification_service import write_site_watermark
         write_site_watermark(conn, new_id, url, reason="site_added", not_before=True)
         conn.commit()
+        if new_id:
+            _schedule_site_webhook_sync_async(new_id)
         return jsonify({'success': True})
     except Exception as e:
         conn.rollback()
@@ -9236,12 +9241,25 @@ def update_site(site_id):
             from order_notification_service import write_site_watermark
             write_site_watermark(conn, site_id, url, reason="site_url_changed")
         conn.commit()
+        _schedule_site_webhook_sync_async(site_id)
         return jsonify({'success': True})
     except Exception as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 500
     finally:
         conn.close()
+
+
+def _schedule_site_webhook_sync_async(site_id):
+    """在新增、恢复或更新站点配置后，异步为该站点自动挂载/更新订单 Webhook。"""
+    if not sqlite3.is_postgres_backend():
+        return
+    try:
+        from sync_tasks import reconcile_webhooks
+        reconcile_webhooks.apply_async(kwargs={'site_ids': [int(site_id)], 'force_verify': True})
+    except Exception as exc:
+        app.logger.warning('异步触发单站 Webhook 注册暂缓（将由定时巡检补偿）: site_id=%s err=%s', site_id, exc)
+
 
 @app.route('/api/sites/<int:site_id>', methods=['DELETE'])
 @login_required
@@ -26393,6 +26411,12 @@ try:
     app.register_blueprint(mail_center_readonly_bp)
 except Exception as _e:
     app.logger.warning('邮件中心订单只读 API 未加载: %s', _e)
+
+try:
+    from woo_order_webhooks import woo_order_webhook_bp
+    app.register_blueprint(woo_order_webhook_bp)
+except Exception as _e:
+    app.logger.warning('订单实时 Webhook 同步模块未加载: %s', _e)
 
 @app.context_processor
 def inject_inventory_perms():

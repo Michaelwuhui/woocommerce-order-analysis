@@ -74,6 +74,9 @@ celery_app.conf.update(
         "woo_sync.schedule_deep": {"queue": "sync_write", "routing_key": "sync_write"},
         "woo_sync.schedule_clean": {"queue": "sync_write", "routing_key": "sync_write"},
         "woo_sync.clean_site": {"queue": "sync_write", "routing_key": "sync_write"},
+        "woo_sync.fetch_webhook_order": {"queue": "sync_fetch", "routing_key": "sync_fetch"},
+        "woo_sync.write_webhook_order": {"queue": "sync_write", "routing_key": "sync_write"},
+        "woo_sync.reconcile_webhooks": {"queue": "sync_fetch", "routing_key": "sync_fetch"},
     },
     beat_schedule={
         "shipment-result-reconciliation": {
@@ -103,6 +106,10 @@ celery_app.conf.update(
         "clean-sync-due-check": {
             "task": "woo_sync.schedule_clean",
             "schedule": 60.0,
+        },
+        "webhook-health-reconciliation": {
+            "task": "woo_sync.reconcile_webhooks",
+            "schedule": 1800.0,
         },
     },
 )

@@ -1076,7 +1076,14 @@ def post_commit_page(self, payload: dict[str, Any]):
     reject_on_worker_lost=True,
 )
 def maintenance():
-    return recover_stale_work()
+    from woo_order_webhooks import recover_pending_webhook_deliveries
+
+    counts = recover_stale_work()
+    try:
+        counts["webhook_recovered"] = recover_pending_webhook_deliveries(limit=50)
+    except Exception:
+        counts["webhook_recovered"] = 0
+    return counts
 
 
 @celery_app.task(
@@ -1307,3 +1314,200 @@ def schedule_deep():
         params={"per_page": 50, "notes_per_page": 0},
     )
     return {"run_id": status["run_id"], "created": created, "schedule": schedule}
+
+
+@celery_app.task(
+    bind=True,
+    name="woo_sync.fetch_webhook_order",
+    acks_late=True,
+    reject_on_worker_lost=True,
+    max_retries=MAX_FETCH_RETRIES,
+    soft_time_limit=60,
+    time_limit=75,
+)
+def fetch_webhook_order(self, site_id: int, woo_order_id: int):
+    """由 Webhook 实时触发，回源站单笔拉取权威订单与备注后移交串行写队列。"""
+    import redis
+    from celery_app import BROKER_URL
+    from woo_order_webhooks import (
+        WooWebhookApiError,
+        dispatch_webhook_order_fetch,
+        fetch_single_order_from_woo,
+        mark_webhook_delivery_error,
+        webhook_tables_exist,
+    )
+
+    site_id = int(site_id)
+    woo_order_id = int(woo_order_id)
+    seq_key = f"woo-analysis:wh-seq:{site_id}:{woo_order_id}"
+    lock_key = f"woo-analysis:wh-queued:{site_id}:{woo_order_id}"
+
+    broker = None
+    seq_before = 0
+    release_lock_on_exit = True
+    try:
+        try:
+            broker = redis.Redis.from_url(BROKER_URL, socket_connect_timeout=1.5, socket_timeout=1.5)
+            seq_before = int(broker.get(seq_key) or 0)
+            broker.expire(lock_key, 180)
+        except Exception:
+            pass
+
+        connection = get_connection()
+        try:
+            if not _active_site_for_task(connection, site_id):
+                connection.rollback()
+                return {"site_id": site_id, "woo_order_id": woo_order_id, "archived": True}
+            site_row = connection.execute(
+                "SELECT url, consumer_key, consumer_secret FROM sites WHERE id=?",
+                (site_id,),
+            ).fetchone()
+            if not site_row:
+                connection.rollback()
+                return {"site_id": site_id, "woo_order_id": woo_order_id, "missing_site": True}
+            if webhook_tables_exist(connection):
+                connection.execute(
+                    "UPDATE woo_webhook_deliveries SET status='fetching' "
+                    "WHERE site_id=? AND woo_order_id=? AND status IN ('queued','coalesced')",
+                    (site_id, woo_order_id),
+                )
+            connection.commit()
+            site_url = str(site_row["url"] or "").strip().rstrip("/")
+            ck = str(site_row["consumer_key"] or "")
+            cs = str(site_row["consumer_secret"] or "")
+        finally:
+            connection.close()
+
+        fetched = fetch_single_order_from_woo(
+            site_url, ck, cs, site_id, woo_order_id
+        )
+        write_webhook_order.apply_async(
+            args=[
+                {
+                    "site_id": site_id,
+                    "woo_order_id": woo_order_id,
+                    "not_found": bool(fetched.get("not_found")),
+                    "order": fetched.get("order"),
+                    "notes": fetched.get("notes") or [],
+                }
+            ]
+        )
+        return {
+            "site_id": site_id,
+            "woo_order_id": woo_order_id,
+            "not_found": bool(fetched.get("not_found")),
+        }
+    except WooWebhookApiError as exc:
+        if exc.status_code in {401, 403} or int(self.request.retries or 0) >= MAX_FETCH_RETRIES:
+            mark_webhook_delivery_error(site_id, woo_order_id, str(exc))
+            return {"site_id": site_id, "woo_order_id": woo_order_id, "error": str(exc)}
+        release_lock_on_exit = False
+        raise self.retry(
+            exc=exc,
+            countdown=_retry_delay(int(self.request.retries or 0)),
+            max_retries=MAX_FETCH_RETRIES,
+        )
+    except Exception as exc:
+        if int(self.request.retries or 0) >= MAX_FETCH_RETRIES:
+            mark_webhook_delivery_error(site_id, woo_order_id, str(exc))
+            raise
+        release_lock_on_exit = False
+        raise self.retry(
+            exc=exc,
+            countdown=_retry_delay(int(self.request.retries or 0)),
+            max_retries=MAX_FETCH_RETRIES,
+        )
+    finally:
+        if broker is not None:
+            try:
+                if release_lock_on_exit:
+                    broker.delete(lock_key)
+                    seq_after = int(broker.get(seq_key) or 0)
+                    if seq_after > seq_before:
+                        dispatch_webhook_order_fetch(site_id, woo_order_id)
+            except Exception:
+                pass
+            finally:
+                try:
+                    broker.close()
+                except Exception:
+                    pass
+
+
+@celery_app.task(
+    bind=True,
+    name="woo_sync.write_webhook_order",
+    acks_late=True,
+    reject_on_worker_lost=True,
+    max_retries=MAX_WRITE_RETRIES,
+    soft_time_limit=120,
+    time_limit=150,
+)
+def write_webhook_order(self, payload: dict[str, Any]):
+    """在串行写队列落库单笔 Webhook 订单，并联动触发多仓履约与订单通知。"""
+    from woo_order_webhooks import apply_webhook_order_write, mark_webhook_delivery_error
+
+    site_id = int(payload.get("site_id") or 0)
+    woo_order_id = int(payload.get("woo_order_id") or 0)
+    if site_id <= 0 or woo_order_id <= 0:
+        raise ValueError("invalid webhook order write payload")
+
+    try:
+        return apply_webhook_order_write(
+            site_id=site_id,
+            woo_order_id=woo_order_id,
+            order=payload.get("order"),
+            notes=payload.get("notes") or [],
+            not_found=bool(payload.get("not_found")),
+        )
+    except Exception as exc:
+        if int(self.request.retries or 0) >= MAX_WRITE_RETRIES:
+            mark_webhook_delivery_error(
+                site_id, woo_order_id, f"写库异常：{type(exc).__name__}"
+            )
+            raise
+        raise self.retry(
+            exc=exc,
+            countdown=_retry_delay(int(self.request.retries or 0)),
+            max_retries=MAX_WRITE_RETRIES,
+        )
+
+
+@celery_app.task(
+    name="woo_sync.reconcile_webhooks",
+    acks_late=True,
+    reject_on_worker_lost=True,
+    soft_time_limit=300,
+    time_limit=360,
+)
+def reconcile_webhooks(
+    site_ids: list[int] | None = None, force_verify: bool = False
+):
+    """批量注册或定期自愈各活跃站点的 WooCommerce 订单 Webhook，并清理过期收件箱日志。"""
+    from woo_order_webhooks import (
+        get_db_conn,
+        is_webhook_sync_enabled,
+        provision_all_active_sites,
+        prune_old_webhook_deliveries,
+        webhook_tables_exist,
+    )
+
+    conn = get_db_conn()
+    try:
+        if not webhook_tables_exist(conn):
+            return {"ready": False}
+        enabled = is_webhook_sync_enabled(conn)
+    finally:
+        conn.close()
+
+    pruned = prune_old_webhook_deliveries(retention_days=14)
+    if not enabled and not force_verify:
+        return {"enabled": False, "pruned": pruned}
+
+    summary = provision_all_active_sites(
+        site_ids=site_ids,
+        force_verify=bool(force_verify),
+        max_workers=6,
+    )
+    summary["pruned"] = pruned
+    return summary

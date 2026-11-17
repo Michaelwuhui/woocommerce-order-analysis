@@ -275,6 +275,12 @@ def remove_connection(conn, site_id, actor_id=None, actor_name=""):
         before = _public_site(site)
         conn.execute("UPDATE sites SET consumer_key='',consumer_secret='',"
                      "product_master_id=NULL,api_status=? WHERE id=?", (ARCHIVED_STATUS, site_id))
+        if _exists(conn, "woo_site_webhooks"):
+            conn.execute(
+                "UPDATE woo_site_webhooks SET remote_status='archived', updated_at=CURRENT_TIMESTAMP "
+                "WHERE site_id=?",
+                (site_id,),
+            )
         if not already_archived and _exists(conn, "inv_site_sync_audit"):
             after = dict(before, configured=False, product_master_id=None, api_status=ARCHIVED_STATUS)
             conn.execute("INSERT INTO inv_site_sync_audit "
