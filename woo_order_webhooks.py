@@ -840,7 +840,7 @@ def provision_site_webhooks(
             "GET",
             webhooks_endpoint,
             auth=auth,
-            params={"per_page": 100, "status": "all"},
+            params={"status": "all"},
         )
         if not isinstance(remote_list, list):
             raise WooWebhookApiError("源站返回的 Webhook 列表格式无效")
