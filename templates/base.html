@@ -367,6 +367,127 @@
         </div>
     </div>
 
+    <!-- 修改订单商品/更换口味子弹窗（仅站点负责人可操作本人站点未发货订单） -->
+    <div class="modal fade" id="modifyOrderItemModal" tabindex="-1" style="z-index: 1070;">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content bg-dark border border-secondary border-opacity-25">
+                <div class="modal-header border-bottom border-secondary border-opacity-25">
+                    <h5 class="modal-title text-white">
+                        <i class="bi bi-arrow-left-right me-2 text-info"></i>更换口味 / 修改商品
+                        <small class="text-white-50 ms-2" id="modItemOrderBadge"></small>
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <!-- 原商品信息卡片 -->
+                    <div class="p-3 rounded mb-3" style="background: rgba(15, 23, 42, 0.75); border: 1px solid rgba(99, 102, 241, 0.3);">
+                        <div class="small text-info mb-1"><i class="bi bi-box-seam me-1"></i>当前选中商品行</div>
+                        <div class="fw-bold text-white" id="modOrigItemName">-</div>
+                        <div class="d-flex flex-wrap gap-3 mt-1 small text-white-50">
+                            <span>SKU：<code class="text-light" id="modOrigItemSku">-</code></span>
+                            <span>订购数量：<strong class="text-warning" id="modOrigItemQty">0</strong></span>
+                            <span>原行实付小计：<strong class="text-success" id="modOrigItemTotal">0.00</strong></span>
+                        </div>
+                    </div>
+
+                    <!-- 模式切换：同款换口味 vs 换其他产品 -->
+                    <div class="mb-3">
+                        <label class="form-label text-white-50 small mb-1">1. 选择更换范围</label>
+                        <div class="btn-group w-100" role="group">
+                            <button type="button" class="btn btn-outline-info active" id="modModeSameBtn" onclick="switchModifyItemMode('same')">
+                                <i class="bi bi-palette me-1"></i>同款产品换口味（保持原金额）
+                            </button>
+                            <button type="button" class="btn btn-outline-info" id="modModeOtherBtn" onclick="switchModifyItemMode('other')">
+                                <i class="bi bi-search me-1"></i>换成站内其他产品 / 口味
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- 跨款搜索区（仅在“换其他产品”模式下显示） -->
+                    <div id="modProductSearchBox" class="mb-3 d-none">
+                        <label class="form-label text-white-50 small mb-1">搜索站内产品（输入品牌、型号或 SKU）</label>
+                        <div class="input-group input-group-sm mb-2">
+                            <input type="text" class="form-control bg-dark text-white border-secondary" id="modProductSearchInput"
+                                placeholder="例如：Fumot 15000 / Blade / SKU..." onkeydown="if(event.key==='Enter'){event.preventDefault();searchSiteProductsForMod(1);}">
+                            <button class="btn btn-primary" type="button" onclick="searchSiteProductsForMod(1)">
+                                <i class="bi bi-search me-1"></i>搜索产品
+                            </button>
+                        </div>
+                        <div id="modProductSearchResults" class="rounded border border-secondary border-opacity-25 p-2"
+                            style="max-height: 185px; overflow-y: auto; background: rgba(15, 23, 42, 0.5);">
+                            <div class="text-center text-muted small py-2">请输入关键词搜索，或加载站点在售商品...</div>
+                        </div>
+                    </div>
+
+                    <!-- 目标口味/规格选择区 -->
+                    <div class="mb-3">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <label class="form-label text-white-50 small mb-0">
+                                2. 选择目标口味 / 规格 <span class="text-info ms-1" id="modSelectedProductTitle"></span>
+                            </label>
+                            <input type="text" class="form-control form-control-sm bg-dark text-white border-secondary"
+                                id="modFlavorFilterInput" style="width: 210px;" placeholder="快速筛选口味名称..."
+                                oninput="renderModFlavorOptions()">
+                        </div>
+                        <div id="modFlavorOptionsList" class="rounded border border-secondary border-opacity-25 p-2"
+                            style="max-height: 220px; overflow-y: auto; background: rgba(15, 23, 42, 0.6);">
+                            <div class="text-center text-muted small py-3">正在拉取站点口味列表...</div>
+                        </div>
+                    </div>
+
+                    <!-- 更换数量与金额规则 -->
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-5">
+                            <label class="form-label text-white-50 small mb-1">3. 更换数量</label>
+                            <div class="input-group input-group-sm">
+                                <input type="number" class="form-control bg-dark text-white border-secondary" id="modReplaceQtyInput"
+                                    min="1" max="1" value="1" oninput="updateModPricePreview()">
+                                <span class="input-group-text bg-secondary border-secondary text-white" id="modQtyMaxHint">/ 1</span>
+                            </div>
+                            <div class="form-text text-white-50 small mt-1" id="modSplitHintText">整行全部更换</div>
+                        </div>
+                        <div class="col-md-7">
+                            <label class="form-label text-white-50 small mb-1">4. 金额处理规则</label>
+                            <div id="modSameProductPriceNotice" class="p-2 rounded small text-info"
+                                style="background: rgba(14, 165, 233, 0.12); border: 1px solid rgba(14, 165, 233, 0.3);">
+                                <i class="bi bi-shield-check me-1"></i>同款产品更换不同口味，固定保持原成交金额不变。
+                            </div>
+                            <div id="modCrossProductPriceRadios" class="d-none">
+                                <div class="form-check mb-1">
+                                    <input class="form-check-input" type="radio" name="modPriceMode" id="modPriceKeepRadio"
+                                        value="keep" checked onchange="updateModPricePreview()">
+                                    <label class="form-check-label text-light small" for="modPriceKeepRadio">
+                                        保持原成交金额不变（推荐：差价可作为客户福利赠送）
+                                    </label>
+                                </div>
+                                <div class="form-check">
+                                    <input class="form-check-input" type="radio" name="modPriceMode" id="modPriceSyncRadio"
+                                        value="sync" onchange="updateModPricePreview()">
+                                    <label class="form-check-label text-light small" for="modPriceSyncRadio">
+                                        按新产品站点售价同步更新订单金额
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 实时变更与金额预览 -->
+                    <div id="modPreviewSummaryBox" class="p-2 px-3 rounded small"
+                        style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.35); color: #d1fae5;">
+                        请选择需要更换的目标口味或产品。
+                    </div>
+                    <div id="modErrorAlertBox" class="alert alert-danger py-2 mt-2 mb-0 small d-none"></div>
+                </div>
+                <div class="modal-footer border-top border-secondary border-opacity-25">
+                    <button type="button" class="btn btn-outline-light btn-sm" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary btn-sm px-3" id="confirmModifyItemBtn" onclick="submitModifyOrderItem()" disabled>
+                        <i class="bi bi-check2-circle me-1"></i>保存并同步至站点
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Problem Return Modal (shared) — record a return whose contents were
          wrong / missing / damaged (e.g. the brick-swap scam) -->
     <div class="modal fade" id="problemReturnModal" tabindex="-1" style="z-index: 1070;">
@@ -833,10 +954,13 @@
         }
 
         function showOrderDetail(orderId) {
-            var modal = new bootstrap.Modal(document.getElementById('orderDetailModal'));
+            var modalEl = document.getElementById('orderDetailModal');
+            var modal = bootstrap.Modal.getOrCreateInstance(modalEl);
             document.getElementById('modalOrderNumber').textContent = orderId;
             document.getElementById('orderDetailContent').innerHTML = '<div class="text-center py-5"><div class="spinner-border text-primary"></div><p class="mt-2 text-muted">加载中...</p></div>';
-            modal.show();
+            if (!modalEl.classList.contains('show')) {
+                modal.show();
+            }
 
             fetch('/api/order/' + orderId)
                 .then(function (response) { return response.json(); })
@@ -845,6 +969,7 @@
                         document.getElementById('orderDetailContent').innerHTML = '<div class="alert alert-danger bg-danger bg-opacity-10 text-danger border-danger border-opacity-25">订单未找到</div>';
                         return;
                     }
+                    window._currentDetailOrder = order;
 
                     var statusLabels = {
                         'pending': '待付款', 'processing': '处理中', 'on-hold': '已发货',
@@ -1194,16 +1319,31 @@
                     }
                     html += '</div></div></div>';
 
-                    // Line Items
+                    // 产品明细（站点负责人可对本人站点未发货订单执行更换口味/产品）
+                    var canModifyItems = !!order.can_modify_items;
+                    var modHeaderBadge = '';
+                    if (canModifyItems) {
+                        modHeaderBadge = '<span class="badge bg-info bg-opacity-25 text-info"><i class="bi bi-arrow-left-right me-1"></i>负责人可更换口味/产品</span>';
+                    } else if (order.is_site_owner_for_items && order.modify_items_block_reason) {
+                        modHeaderBadge = '<span class="badge bg-secondary bg-opacity-25 text-secondary"><i class="bi bi-lock me-1"></i>' + trackingEsc(order.modify_items_block_reason) + '</span>';
+                    }
                     html += '<div class="col-12">';
-                    html += '<div class="info-card"><div class="card-header"><h6><i class="bi bi-box-seam me-2"></i>产品明细</h6></div>';
+                    html += '<div class="info-card"><div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2"><h6 class="mb-0"><i class="bi bi-box-seam me-2"></i>产品明细</h6>' + modHeaderBadge + '</div>';
                     html += '<div class="card-body p-0"><table class="table product-table mb-0">';
-                    html += '<thead><tr><th>产品名称</th><th>SKU</th><th class="text-center">数量</th><th class="text-end">单价</th><th class="text-end">小计</th></tr></thead><tbody>';
-                    lineItems.forEach(function (item) {
-                        html += '<tr><td>' + trackingEsc(item.display_name || item.name || '-') + '</td><td><code style="color: #94a3b8; background: rgba(99,102,241,0.1); padding: 2px 6px; border-radius: 4px;">' + (item.sku || '-') + '</code></td>';
+                    html += '<thead><tr><th>产品名称</th><th>SKU</th><th class="text-center">数量</th><th class="text-end">单价</th><th class="text-end">小计</th>' + (canModifyItems ? '<th class="text-end">操作</th>' : '') + '</tr></thead><tbody>';
+                    lineItems.forEach(function (item, itemIdx) {
+                        html += '<tr><td>' + trackingEsc(item.display_name || item.name || '-') + '</td><td><code style="color: #94a3b8; background: rgba(99,102,241,0.1); padding: 2px 6px; border-radius: 4px;">' + trackingEsc(item.sku || '-') + '</code></td>';
                         html += '<td class="text-center">' + (item.quantity || 0) + '</td>';
                         html += '<td class="text-end">' + parseFloat(item.price || 0).toFixed(2) + '</td>';
-                        html += '<td class="text-end" style="color: #e2e8f0; font-weight: 500;">' + parseFloat(item.total || 0).toFixed(2) + '</td></tr>';
+                        html += '<td class="text-end" style="color: #e2e8f0; font-weight: 500;">' + parseFloat(item.total || 0).toFixed(2) + '</td>';
+                        if (canModifyItems) {
+                            if (item.id && Number(item.quantity || 0) > 0) {
+                                html += '<td class="text-end"><button type="button" class="btn btn-sm btn-outline-info py-0 px-2" style="font-size:12px;" onclick="openModifyOrderItemModal(' + itemIdx + ')"><i class="bi bi-arrow-left-right me-1"></i>修改</button></td>';
+                            } else {
+                                html += '<td class="text-end text-muted small">-</td>';
+                            }
+                        }
+                        html += '</tr>';
                     });
                     html += '</tbody></table></div></div></div>';
 
@@ -1845,7 +1985,423 @@
                 prBtn.dataset.bound = '1';
                 prBtn.addEventListener('click', confirmProblemReturn);
             }
+            var detailModalEl = document.getElementById('orderDetailModal');
+            if (detailModalEl && !detailModalEl.dataset.modReloadBound) {
+                detailModalEl.dataset.modReloadBound = '1';
+                detailModalEl.addEventListener('hidden.bs.modal', function () {
+                    if (window._orderItemModifiedReloadNeeded) {
+                        window._orderItemModifiedReloadNeeded = false;
+                        if (typeof loadOrders === 'function') {
+                            try { loadOrders(); } catch (e) {}
+                        } else if (window.location.pathname === '/orders') {
+                            window.location.reload();
+                        }
+                    }
+                });
+            }
         });
+
+        // ---- 订单详情：更换口味 / 修改商品逻辑 ----
+        var _modItemState = {
+            order: null,
+            origItem: null,
+            mode: 'same',
+            selectedProduct: null,
+            options: [],
+            selectedOptionKey: '',
+            searchedProducts: []
+        };
+
+        function _modEsc(val) {
+            return String(val == null ? '' : val).replace(/[&<>"']/g, function (c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
+
+        function _modSetError(msg) {
+            var box = document.getElementById('modErrorAlertBox');
+            if (!box) return;
+            if (msg) {
+                box.textContent = msg;
+                box.classList.remove('d-none');
+            } else {
+                box.textContent = '';
+                box.classList.add('d-none');
+            }
+        }
+
+        function openModifyOrderItemModal(itemIdx) {
+            var order = window._currentDetailOrder;
+            if (!order || !order.can_modify_items) return;
+            var item = (order.line_items || [])[itemIdx];
+            if (!item || !item.id) return;
+
+            var origQty = Math.max(1, parseInt(item.quantity || 1, 10));
+            var currency = order.currency || '';
+            _modItemState = {
+                order: order,
+                origItem: item,
+                mode: item.product_id ? 'same' : 'other',
+                selectedProduct: null,
+                options: [],
+                selectedOptionKey: '',
+                searchedProducts: []
+            };
+
+            document.getElementById('modItemOrderBadge').textContent = '#' + (order.number || order.id);
+            document.getElementById('modOrigItemName').textContent = item.display_name || item.name || '-';
+            document.getElementById('modOrigItemSku').textContent = item.sku || '-';
+            document.getElementById('modOrigItemQty').textContent = origQty + ' 件';
+            document.getElementById('modOrigItemTotal').textContent = parseFloat(item.total || 0).toFixed(2) + ' ' + currency;
+
+            var qtyInput = document.getElementById('modReplaceQtyInput');
+            qtyInput.min = '1';
+            qtyInput.max = String(origQty);
+            qtyInput.value = String(origQty);
+            document.getElementById('modQtyMaxHint').textContent = '/ 共 ' + origQty + ' 件';
+            document.getElementById('modFlavorFilterInput').value = '';
+            document.getElementById('modProductSearchInput').value = '';
+            document.getElementById('modPriceKeepRadio').checked = true;
+            _modSetError('');
+
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('modifyOrderItemModal')).show();
+            switchModifyItemMode(_modItemState.mode);
+        }
+
+        function switchModifyItemMode(mode) {
+            if (!_modItemState.origItem) return;
+            if (mode === 'same' && !_modItemState.origItem.product_id) {
+                mode = 'other';
+            }
+            _modItemState.mode = mode;
+            _modItemState.selectedOptionKey = '';
+            _modItemState.options = [];
+            _modSetError('');
+
+            var sameBtn = document.getElementById('modModeSameBtn');
+            var otherBtn = document.getElementById('modModeOtherBtn');
+            var searchBox = document.getElementById('modProductSearchBox');
+            var sameNotice = document.getElementById('modSameProductPriceNotice');
+            var crossRadios = document.getElementById('modCrossProductPriceRadios');
+
+            sameBtn.classList.toggle('active', mode === 'same');
+            otherBtn.classList.toggle('active', mode === 'other');
+            searchBox.classList.toggle('d-none', mode !== 'other');
+
+            if (mode === 'same') {
+                sameNotice.classList.remove('d-none');
+                crossRadios.classList.add('d-none');
+                document.getElementById('modPriceKeepRadio').checked = true;
+                loadProductOptionsForMod(_modItemState.origItem.product_id);
+            } else {
+                sameNotice.classList.add('d-none');
+                crossRadios.classList.remove('d-none');
+                document.getElementById('modSelectedProductTitle').textContent = '（请先在上方点选一款目标产品）';
+                document.getElementById('modFlavorOptionsList').innerHTML = '<div class="text-center text-muted small py-3">请先在上方搜索并点选要更换的产品</div>';
+                updateModPricePreview();
+                searchSiteProductsForMod(1);
+            }
+        }
+
+        function searchSiteProductsForMod(page) {
+            if (!_modItemState.order) return;
+            var q = (document.getElementById('modProductSearchInput').value || '').trim();
+            var container = document.getElementById('modProductSearchResults');
+            container.innerHTML = '<div class="text-center text-muted small py-2"><span class="spinner-border spinner-border-sm me-1"></span>正在读取站点产品...</div>';
+
+            var url = '/api/order/' + encodeURIComponent(_modItemState.order.id)
+                + '/search-products?page=' + encodeURIComponent(page || 1)
+                + (q ? '&q=' + encodeURIComponent(q) : '');
+
+            fetch(url)
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (!data.success) {
+                        container.innerHTML = '<div class="text-danger small py-2">' + _modEsc(data.error || '读取产品列表失败') + '</div>';
+                        return;
+                    }
+                    var products = data.products || [];
+                    _modItemState.searchedProducts = products;
+                    if (!products.length) {
+                        container.innerHTML = '<div class="text-center text-muted small py-2">未找到匹配的在售商品</div>';
+                        return;
+                    }
+                    var currency = data.currency || _modItemState.order.currency || '';
+                    container.innerHTML = products.map(function (p) {
+                        var isOrig = Number(p.product_id) === Number(_modItemState.origItem.product_id);
+                        var stockBadge = p.in_stock
+                            ? '<span class="badge bg-success bg-opacity-25 text-success">在售</span>'
+                            : '<span class="badge bg-danger bg-opacity-25 text-danger">缺货</span>';
+                        var typeHint = p.type === 'variable' ? ('多口味' + (p.variation_count ? ' · ' + p.variation_count + '款' : '')) : '单品';
+                        var priceText = p.price != null ? (p.price + ' ' + currency) : '待查规格价';
+                        return '<div class="d-flex justify-content-between align-items-center p-2 mb-1 rounded mod-prod-row" '
+                            + 'style="cursor:pointer; background:rgba(30,41,59,0.65); border:1px solid rgba(148,163,184,0.18);" '
+                            + 'onclick="selectSearchedProductForMod(' + Number(p.product_id) + ')">'
+                            + '<div class="me-2" style="min-width:0;">'
+                            + '<div class="text-light small fw-semibold text-truncate">' + _modEsc(p.name)
+                            + (isOrig ? ' <span class="badge bg-secondary ms-1">原同款</span>' : '') + '</div>'
+                            + '<div class="text-white-50" style="font-size:11px;">' + _modEsc(typeHint) + (p.sku ? ' · SKU: ' + _modEsc(p.sku) : '') + '</div>'
+                            + '</div>'
+                            + '<div class="text-end text-nowrap">'
+                            + '<div class="text-info small fw-semibold">' + _modEsc(priceText) + '</div>'
+                            + stockBadge
+                            + '</div></div>';
+                    }).join('');
+                })
+                .catch(function (err) {
+                    container.innerHTML = '<div class="text-danger small py-2">请求失败：' + _modEsc(err) + '</div>';
+                });
+        }
+
+        function selectSearchedProductForMod(productId) {
+            var isSame = Number(productId) === Number(_modItemState.origItem.product_id);
+            document.getElementById('modSameProductPriceNotice').classList.toggle('d-none', !isSame);
+            document.getElementById('modCrossProductPriceRadios').classList.toggle('d-none', isSame);
+            if (isSame) {
+                document.getElementById('modPriceKeepRadio').checked = true;
+            }
+            loadProductOptionsForMod(productId);
+        }
+
+        function loadProductOptionsForMod(productId) {
+            if (!_modItemState.order || !productId) return;
+            var listEl = document.getElementById('modFlavorOptionsList');
+            listEl.innerHTML = '<div class="text-center text-muted small py-3"><span class="spinner-border spinner-border-sm me-1"></span>正在拉取站点口味规格...</div>';
+            _modItemState.selectedOptionKey = '';
+            _modItemState.options = [];
+            updateModPricePreview();
+
+            var url = '/api/order/' + encodeURIComponent(_modItemState.order.id)
+                + '/item-options?product_id=' + encodeURIComponent(productId);
+            fetch(url)
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (!data.success) {
+                        listEl.innerHTML = '<div class="text-danger small py-2">' + _modEsc(data.error || '拉取口味列表失败') + '</div>';
+                        return;
+                    }
+                    _modItemState.selectedProduct = data.product || { product_id: productId };
+                    _modItemState.options = data.options || [];
+                    document.getElementById('modSelectedProductTitle').textContent = '· ' + (_modItemState.selectedProduct.name || '');
+                    renderModFlavorOptions();
+                    updateModPricePreview();
+                })
+                .catch(function (err) {
+                    listEl.innerHTML = '<div class="text-danger small py-2">请求失败：' + _modEsc(err) + '</div>';
+                });
+        }
+
+        function _isSameAsOriginalOption(opt) {
+            var orig = _modItemState.origItem;
+            if (!orig) return false;
+            if (Number(opt.product_id) !== Number(orig.product_id || 0)) return false;
+            if (Number(opt.variation_id || 0) !== Number(orig.variation_id || 0)) return false;
+            if (opt.explicit_meta && opt.explicit_meta.length > 0) {
+                var disp = String(orig.display_name || orig.name || '').toLowerCase();
+                return disp.indexOf(String(opt.flavor_label || '').toLowerCase()) !== -1;
+            }
+            return true;
+        }
+
+        function renderModFlavorOptions() {
+            var listEl = document.getElementById('modFlavorOptionsList');
+            var kw = (document.getElementById('modFlavorFilterInput').value || '').trim().toLowerCase();
+            var options = _modItemState.options || [];
+            if (!options.length) {
+                listEl.innerHTML = '<div class="text-center text-muted small py-3">该商品暂无可用规格</div>';
+                return;
+            }
+            var filtered = kw ? options.filter(function (o) {
+                return String(o.flavor_label || '').toLowerCase().indexOf(kw) !== -1
+                    || String(o.full_name || '').toLowerCase().indexOf(kw) !== -1
+                    || String(o.sku || '').toLowerCase().indexOf(kw) !== -1;
+            }) : options;
+
+            if (!filtered.length) {
+                listEl.innerHTML = '<div class="text-center text-muted small py-3">没有匹配筛选词的口味</div>';
+                return;
+            }
+
+            var currency = (_modItemState.order && _modItemState.order.currency) || '';
+            listEl.innerHTML = filtered.map(function (opt, idx) {
+                var isCurrentOrig = _isSameAsOriginalOption(opt);
+                var isSelected = opt.option_key === _modItemState.selectedOptionKey;
+                var stockBadge = opt.in_stock
+                    ? '<span class="badge bg-success bg-opacity-25 text-success">现货' + (opt.stock_quantity != null ? ' ' + opt.stock_quantity : '') + '</span>'
+                    : '<span class="badge bg-warning bg-opacity-25 text-warning">源站缺货</span>';
+                var priceLabel = opt.price != null ? (opt.price + ' ' + currency) : '-';
+                var borderStyle = isSelected
+                    ? 'border: 1px solid #38bdf8; background: rgba(56, 189, 248, 0.16);'
+                    : (isCurrentOrig
+                        ? 'border: 1px dashed rgba(148,163,184,0.25); background: rgba(15,23,42,0.35); opacity: 0.55;'
+                        : 'border: 1px solid rgba(148,163,184,0.18); background: rgba(30,41,59,0.65); cursor: pointer;');
+                var clickAttr = isCurrentOrig ? '' : 'onclick="selectModOptionByKey(\'' + _modEsc(opt.option_key) + '\')"';
+                return '<div class="d-flex justify-content-between align-items-center p-2 mb-1 rounded" style="' + borderStyle + '" ' + clickAttr + '>'
+                    + '<div class="d-flex align-items-center gap-2 me-2" style="min-width:0;">'
+                    + '<i class="bi ' + (isSelected ? 'bi-check-circle-fill text-info' : (isCurrentOrig ? 'bi-dash-circle text-muted' : 'bi-circle text-secondary')) + '"></i>'
+                    + '<div style="min-width:0;">'
+                    + '<div class="text-light small fw-semibold">' + _modEsc(opt.flavor_label)
+                    + (isCurrentOrig ? ' <span class="badge bg-secondary ms-1">当前原口味</span>' : '') + '</div>'
+                    + (opt.sku ? '<div class="text-white-50" style="font-size:11px;">SKU: ' + _modEsc(opt.sku) + '</div>' : '')
+                    + '</div></div>'
+                    + '<div class="text-end text-nowrap">'
+                    + '<span class="text-info small me-2">' + _modEsc(priceLabel) + '</span>'
+                    + stockBadge
+                    + '</div></div>';
+            }).join('');
+        }
+
+        function selectModOptionByKey(optionKey) {
+            _modItemState.selectedOptionKey = optionKey;
+            _modSetError('');
+            renderModFlavorOptions();
+            updateModPricePreview();
+        }
+
+        function _getSelectedModOption() {
+            var key = _modItemState.selectedOptionKey;
+            if (!key) return null;
+            var opts = _modItemState.options || [];
+            for (var i = 0; i < opts.length; i++) {
+                if (opts[i].option_key === key) return opts[i];
+            }
+            return null;
+        }
+
+        function updateModPricePreview() {
+            var btn = document.getElementById('confirmModifyItemBtn');
+            var previewEl = document.getElementById('modPreviewSummaryBox');
+            var splitHintEl = document.getElementById('modSplitHintText');
+            var orig = _modItemState.origItem;
+            var order = _modItemState.order;
+            if (!orig || !order) return;
+
+            var origQty = Math.max(1, parseInt(orig.quantity || 1, 10));
+            var rawQty = parseInt(document.getElementById('modReplaceQtyInput').value || '0', 10);
+            var replaceQty = isNaN(rawQty) ? 0 : rawQty;
+            var remainQty = origQty - replaceQty;
+
+            if (replaceQty < 1 || replaceQty > origQty) {
+                splitHintEl.innerHTML = '<span class="text-danger">更换数量须在 1 ～ ' + origQty + ' 之间</span>';
+                btn.disabled = true;
+                return;
+            }
+            if (remainQty === 0) {
+                splitHintEl.textContent = '整行全部更换（共 ' + replaceQty + ' 件）';
+            } else {
+                splitHintEl.textContent = '拆分数量：原口味保留 ' + remainQty + ' 件 + 新口味 ' + replaceQty + ' 件';
+            }
+
+            var chosen = _getSelectedModOption();
+            if (!chosen) {
+                previewEl.textContent = '请先在列表中点击选择要更换的目标口味 / 规格。';
+                btn.disabled = true;
+                return;
+            }
+
+            var isSameProduct = Number(chosen.product_id) === Number(orig.product_id || 0);
+            var priceMode = isSameProduct ? 'keep' : (document.getElementById('modPriceSyncRadio').checked ? 'sync' : 'keep');
+            var currency = order.currency || '';
+            var origTotalCents = Math.round(parseFloat(orig.total || 0) * 100);
+            var orderTotalCents = Math.round(parseFloat(order.total || 0) * 100);
+
+            var remCents = remainQty === 0 ? 0 : Math.round(origTotalCents * remainQty / origQty);
+            var newCents = 0;
+            if (priceMode === 'keep') {
+                newCents = origTotalCents - remCents;
+            } else {
+                if (chosen.price == null || isNaN(parseFloat(chosen.price))) {
+                    previewEl.innerHTML = '<span class="text-warning">该目标规格未设置站点售价，请切换为「保持原成交金额不变」。</span>';
+                    btn.disabled = true;
+                    return;
+                }
+                newCents = Math.round(parseFloat(chosen.price) * 100) * replaceQty;
+            }
+
+            var deltaCents = (remCents + newCents) - origTotalCents;
+            var nextOrderTotal = ((orderTotalCents + deltaCents) / 100).toFixed(2);
+            var parts = [];
+            if (remainQty > 0) {
+                parts.push('保留原商品 ×' + remainQty + '（' + (remCents / 100).toFixed(2) + ' ' + currency + '）');
+            }
+            parts.push('新增「' + chosen.full_name + '」×' + replaceQty + '（' + (newCents / 100).toFixed(2) + ' ' + currency + '）');
+
+            var deltaText = deltaCents === 0
+                ? '订单总金额保持 ' + nextOrderTotal + ' ' + currency + ' 不变'
+                : '订单总金额将由 ' + (orderTotalCents / 100).toFixed(2) + ' 更新为 ' + nextOrderTotal + ' ' + currency
+                    + '（' + (deltaCents > 0 ? '+' : '') + (deltaCents / 100).toFixed(2) + ' ' + currency + '）';
+
+            previewEl.innerHTML = '<strong>变更预览：</strong>' + _modEsc(parts.join(' + ')) + ' · <strong>' + _modEsc(deltaText) + '</strong>';
+            btn.disabled = false;
+        }
+
+        function submitModifyOrderItem() {
+            var order = _modItemState.order;
+            var orig = _modItemState.origItem;
+            var chosen = _getSelectedModOption();
+            if (!order || !orig || !chosen) return;
+
+            var origQty = Math.max(1, parseInt(orig.quantity || 1, 10));
+            var replaceQty = parseInt(document.getElementById('modReplaceQtyInput').value || '0', 10);
+            if (isNaN(replaceQty) || replaceQty < 1 || replaceQty > origQty) {
+                _modSetError('请填写有效的更换数量（1 ～ ' + origQty + '）');
+                return;
+            }
+
+            var isSameProduct = Number(chosen.product_id) === Number(orig.product_id || 0);
+            var priceMode = isSameProduct ? 'keep' : (document.getElementById('modPriceSyncRadio').checked ? 'sync' : 'keep');
+
+            var btn = document.getElementById('confirmModifyItemBtn');
+            var originalHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>同步站点与库存中...';
+            _modSetError('');
+
+            fetch('/api/order/' + encodeURIComponent(order.id) + '/modify-item', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    line_item_id: orig.id,
+                    expected_original_qty: origQty,
+                    replace_qty: replaceQty,
+                    target_product_id: chosen.product_id,
+                    target_variation_id: chosen.variation_id || 0,
+                    target_flavor: chosen.flavor_label || '',
+                    price_mode: priceMode
+                })
+            })
+                .then(function (res) {
+                    return res.text().then(function (txt) {
+                        var data;
+                        try { data = txt ? JSON.parse(txt) : {}; } catch (e) {
+                            data = { success: false, error: '服务器返回异常响应（HTTP ' + res.status + '），请刷新订单详情确认是否已生效' };
+                        }
+                        return data;
+                    });
+                })
+                .then(function (data) {
+                    btn.disabled = false;
+                    btn.innerHTML = originalHtml;
+                    if (data && data.success) {
+                        var subModal = bootstrap.Modal.getInstance(document.getElementById('modifyOrderItemModal'));
+                        if (subModal) subModal.hide();
+                        window._orderItemModifiedReloadNeeded = true;
+                        if (typeof showToast === 'function') {
+                            showToast(data.message || '订单商品修改成功', 'success');
+                        } else {
+                            alert(data.message || '订单商品修改成功');
+                        }
+                        showOrderDetail(order.id);
+                    } else {
+                        _modSetError((data && data.error) || '修改失败，请稍后重试');
+                    }
+                })
+                .catch(function (err) {
+                    btn.disabled = false;
+                    btn.innerHTML = originalHtml;
+                    _modSetError('网络请求失败：' + err);
+                });
+        }
 
         // Open the per-email detail modal. Loads body lazily.
         // Supports two scoping modes:
