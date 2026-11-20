@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic sync from HK order system to CZ1 Umami every 30 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Unit=woo-umami-state-sync.service
+
+[Install]
+WantedBy=timers.target

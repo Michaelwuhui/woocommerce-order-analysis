@@ -190,7 +190,7 @@
         <div class="spinner-border text-primary mb-3" role="status">
             <span class="visually-hidden">加载中...</span>
         </div>
-        <p class="text-muted">正在从 51.la API 获取流量数据...</p>
+        <p class="text-muted">正在加载流量数据（历史固化 + Umami 实时）...</p>
     </div>
 
     <div id="fxWarning" class="alert alert-warning bg-warning bg-opacity-10 text-warning border-warning border-opacity-25" style="display: none;">
@@ -391,7 +391,7 @@
 
 <script>
     // Global Constants
-    const REPORT_DATA_CACHE_VERSION = 'v7';
+    const REPORT_DATA_CACHE_VERSION = 'v8';
     const ALL_METRICS = [
         { key: 'uv', label: 'UV (访客数)', class: 'metric-uv', sum: true },
         { key: 'pv', label: 'PV (浏览量)', class: 'metric-pv', sum: true },

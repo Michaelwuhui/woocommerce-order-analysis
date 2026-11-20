@@ -9117,6 +9117,50 @@ def product_manager():
                            catalog_brands=catalog_brands)
 
 
+def _sync_site_umami_after_save(conn, site_id, url, manager, country, umami_website_id, provision=False):
+    """保存站点后与 CZ1 Umami 双向同步（新建一键建站，编辑局部推负责人/国家）。"""
+    import umami_bridge
+    norm_dom = umami_bridge.normalize_domain(url)
+    if not norm_dom:
+        return None, None
+    try:
+        if provision:
+            order_rows = conn.execute(
+                "SELECT source, COUNT(*) AS cnt FROM orders WHERE source IS NOT NULL AND source != '' "
+                "AND status NOT IN ('checkout-draft', 'trash') GROUP BY source"
+            ).fetchall()
+            cnt = sum(int(r['cnt'] or 0) for r in order_rows if umami_bridge.normalize_domain(r['source']) == norm_dom)
+            um_res = umami_bridge.provision_site(
+                url,
+                manager=(manager or '').strip(),
+                country=(country or '').strip(),
+                umami_website_id=(umami_website_id or '').strip(),
+                has_orders=(cnt > 0),
+                order_count=cnt,
+                in_order_system=True,
+            )
+            wid = (um_res.get('website_id') or '').strip()
+            fill_mgr = (um_res.get('manager') or '').strip()
+            fill_country = (um_res.get('country_code') or '').strip()
+            if fill_country == 'OTHER':
+                fill_country = ''
+            if wid:
+                conn.execute(
+                    '''UPDATE sites SET umami_website_id = ?,
+                           manager = COALESCE(NULLIF(TRIM(COALESCE(manager, '')), ''), ?),
+                           country = COALESCE(NULLIF(TRIM(COALESCE(country, '')), ''), ?)
+                       WHERE id = ?''',
+                    (wid, fill_mgr, fill_country, site_id),
+                )
+                conn.commit()
+            return um_res, None
+        umami_bridge.sync_all_sites_state(conn, force_meta=True, only_domain=url)
+        return None, None
+    except Exception as exc:
+        app.logger.warning('Umami 跨服同步暂未完成(不影响站点保存): site_id=%s err=%s', site_id, exc)
+        return None, str(exc)
+
+
 @app.route('/api/sites', methods=['POST'])
 @login_required
 @admin_required
@@ -9128,17 +9172,17 @@ def add_site():
     url = data.get('url')
     ck = data.get('consumer_key')
     cs = data.get('consumer_secret')
-    manager = data.get('manager', '')
-    mask_id = data.get('mask_id', '')
-    country = data.get('country', '')
-    # product_master_id: optional. Empty string / None / 0 / "" → NULL (standalone site)
+    manager = (data.get('manager') or '').strip()
+    mask_id = (data.get('mask_id') or '').strip()
+    umami_website_id = (data.get('umami_website_id') or '').strip()
+    country = (data.get('country') or '').strip()
+    sync_to_umami = data.get('sync_to_umami') in (True, 'true', 1, '1', 'on')
     raw_pm = data.get('product_master_id')
     product_master_id = int(raw_pm) if raw_pm not in (None, '', 0, '0') else None
 
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
 
-    # Remove trailing slash from URL
     if url.endswith('/'):
         url = url[:-1]
 
@@ -9148,27 +9192,30 @@ def add_site():
             'SELECT * FROM sites WHERE LOWER(RTRIM(url, \'/\')) = LOWER(?)', (url,)
         ).fetchone()
         if existing:
-            # Retain the identity used by historical orders and permission scopes.
             if sqlite3.is_postgres_backend():
                 existing = conn.execute('SELECT * FROM sites WHERE id = ? FOR UPDATE', (existing['id'],)).fetchone()
             if not is_site_archived(existing):
                 return jsonify({'error': '该站点连接已存在'}), 409
+            final_mgr = manager or (existing['manager'] or '')
+            final_mask = mask_id or (existing['mask_id'] or '')
+            final_umami = umami_website_id or (existing['umami_website_id'] or '')
+            final_country = country or (existing['country'] or '')
             conn.execute('''UPDATE sites SET consumer_key = ?, consumer_secret = ?,
-                manager = ?, mask_id = ?, country = ?, product_master_id = ?,
+                manager = ?, mask_id = ?, umami_website_id = ?, country = ?, product_master_id = ?,
                 api_status = 'unknown', last_api_error = NULL
-                WHERE id = ?''', (ck, cs, (data.get('manager') or '').strip() or existing['manager'],
-                    (data.get('mask_id') or '').strip() or existing['mask_id'],
-                    (data.get('country') or '').strip() or existing['country'],
-                    product_master_id, existing['id']))
+                WHERE id = ?''', (ck, cs, final_mgr, final_mask, final_umami, final_country, product_master_id, existing['id']))
             from order_notification_service import write_site_watermark
             write_site_watermark(conn, existing['id'], url, reason="site_restored", not_before=True)
             conn.commit()
             _schedule_site_webhook_sync_async(existing['id'])
-            return jsonify({'success': True, 'id': existing['id'], 'restored': True})
+            um_res, um_warn = _sync_site_umami_after_save(
+                conn, existing['id'], url, final_mgr, final_country, final_umami, provision=sync_to_umami
+            )
+            return jsonify({'success': True, 'id': existing['id'], 'restored': True, 'umami': um_res, 'umami_warning': um_warn})
         conn.execute('''INSERT INTO sites
-            (url, consumer_key, consumer_secret, manager, mask_id, country, product_master_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                     (url, ck, cs, manager, mask_id, country, product_master_id))
+            (url, consumer_key, consumer_secret, manager, mask_id, umami_website_id, country, product_master_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                     (url, ck, cs, manager, mask_id, umami_website_id, country, product_master_id))
         new_row = conn.execute('SELECT id FROM sites WHERE url = ?', (url,)).fetchone()
         new_id = new_row['id'] if new_row else None
         from order_notification_service import write_site_watermark
@@ -9176,7 +9223,12 @@ def add_site():
         conn.commit()
         if new_id:
             _schedule_site_webhook_sync_async(new_id)
-        return jsonify({'success': True})
+        um_res, um_warn = (None, None)
+        if new_id:
+            um_res, um_warn = _sync_site_umami_after_save(
+                conn, new_id, url, manager, country, umami_website_id, provision=sync_to_umami
+            )
+        return jsonify({'success': True, 'id': new_id, 'umami': um_res, 'umami_warning': um_warn})
     except Exception as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 500
@@ -9194,21 +9246,15 @@ def update_site(site_id):
     url = data.get('url')
     ck = data.get('consumer_key')
     cs = data.get('consumer_secret')
-    manager = data.get('manager', '')
-    mask_id = data.get('mask_id', '')
-    country = data.get('country', '')
-    # product_master_id: optional. Empty string / None / 0 / "" → NULL (un-link / standalone)
+    manager = (data.get('manager') or '').strip()
+    country = (data.get('country') or '').strip()
     raw_pm = data.get('product_master_id')
     product_master_id = int(raw_pm) if raw_pm not in (None, '', 0, '0') else None
-    # Whether on-hold means "shipped" for this site (PL COD convention).
-    # Defaults to current DB value when the client doesn't send the flag, so
-    # legacy callers (e.g. the import-from-script path) keep their setting.
     cod_on_hold_raw = data.get('cod_on_hold_is_shipped', None)
 
     if not all([url, ck, cs]):
         return jsonify({'error': 'Missing required fields'}), 400
 
-    # Remove trailing slash from URL
     if url.endswith('/'):
         url = url[:-1]
 
@@ -9222,27 +9268,30 @@ def update_site(site_id):
             return jsonify({'error': '站点不存在'}), 404
         if is_site_archived(existing):
             return jsonify({'error': '站点连接已移除，请通过添加站点恢复连接', 'code': 'SITE_ARCHIVED'}), 409
+        mask_id = (data.get('mask_id') or '').strip() if 'mask_id' in data else (existing['mask_id'] or '')
+        umami_website_id = (data.get('umami_website_id') or '').strip() if 'umami_website_id' in data else (existing['umami_website_id'] or '')
         if cod_on_hold_raw is None:
             conn.execute('''UPDATE sites
                 SET url = ?, consumer_key = ?, consumer_secret = ?,
-                    manager = ?, mask_id = ?, country = ?, product_master_id = ?
+                    manager = ?, mask_id = ?, umami_website_id = ?, country = ?, product_master_id = ?
                 WHERE id = ?''',
-                         (url, ck, cs, manager, mask_id, country, product_master_id, site_id))
+                         (url, ck, cs, manager, mask_id, umami_website_id, country, product_master_id, site_id))
         else:
             cod_on_hold_val = 1 if cod_on_hold_raw in (1, '1', True, 'true', 'on') else 0
             conn.execute('''UPDATE sites
                 SET url = ?, consumer_key = ?, consumer_secret = ?,
-                    manager = ?, mask_id = ?, country = ?, product_master_id = ?,
+                    manager = ?, mask_id = ?, umami_website_id = ?, country = ?, product_master_id = ?,
                     cod_on_hold_is_shipped = ?
                 WHERE id = ?''',
-                         (url, ck, cs, manager, mask_id, country, product_master_id,
+                         (url, ck, cs, manager, mask_id, umami_website_id, country, product_master_id,
                           cod_on_hold_val, site_id))
         if (url or '').rstrip('/').lower() != (existing['url'] or '').rstrip('/').lower():
             from order_notification_service import write_site_watermark
             write_site_watermark(conn, site_id, url, reason="site_url_changed")
         conn.commit()
         _schedule_site_webhook_sync_async(site_id)
-        return jsonify({'success': True})
+        _, um_warn = _sync_site_umami_after_save(conn, site_id, url, manager, country, umami_website_id, provision=False)
+        return jsonify({'success': True, 'umami_warning': um_warn})
     except Exception as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 500
@@ -9279,6 +9328,96 @@ def delete_site(site_id):
         conn.rollback()
         app.logger.exception('移除站点连接失败: site_id=%s', site_id)
         return jsonify({'success': False, 'error': '连接暂时无法移除，请稍后重试'}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/umami/lookup', methods=['GET'])
+@login_required
+@admin_required
+def umami_lookup_site():
+    """根据 URL/域名反查 CZ1 Umami 已有站点、负责人、国家与统计代码。"""
+    import umami_bridge
+    target = (request.args.get('url') or request.args.get('domain') or '').strip()
+    if not target:
+        return jsonify({'success': False, 'found': False, 'error': '请先填写站点域名或 URL'}), 400
+    try:
+        res = umami_bridge.lookup_site(target)
+        return jsonify({'success': True, **res})
+    except Exception as exc:
+        app.logger.warning('查询 CZ1 Umami 站点失败: target=%s err=%s', target, exc)
+        return jsonify({'success': False, 'found': False, 'error': f'查询 Umami 失败: {exc}'}), 502
+
+
+@app.route('/api/sites/<int:site_id>/umami-provision', methods=['POST'])
+@login_required
+@admin_required
+def provision_site_umami(site_id):
+    """一键在 CZ1 Umami 创建/复用站点，同步负责人与国家，并回填统计代码。"""
+    import umami_bridge
+    conn = get_db_connection()
+    try:
+        site = conn.execute('SELECT * FROM sites WHERE id = ?', (site_id,)).fetchone()
+        if not site:
+            return jsonify({'success': False, 'error': '站点不存在'}), 404
+        if is_site_archived(site):
+            return jsonify({'success': False, 'error': '已归档站点不可接入 Umami'}), 409
+        body = request.get_json(silent=True) or {}
+        req_wid = (body.get('umami_website_id') or site['umami_website_id'] or '').strip()
+        req_mgr = (body.get('manager') if 'manager' in body else site['manager']) or ''
+        req_country = (body.get('country') if 'country' in body else site['country']) or ''
+        norm_dom = umami_bridge.normalize_domain(site['url'])
+        order_rows = conn.execute(
+            "SELECT source, COUNT(*) AS cnt FROM orders WHERE source IS NOT NULL AND source != '' "
+            "AND status NOT IN ('checkout-draft', 'trash') GROUP BY source"
+        ).fetchall()
+        cnt = sum(int(r['cnt'] or 0) for r in order_rows if umami_bridge.normalize_domain(r['source']) == norm_dom)
+        um_res = umami_bridge.provision_site(
+            site['url'],
+            manager=req_mgr.strip(),
+            country=req_country.strip(),
+            umami_website_id=req_wid,
+            has_orders=(cnt > 0),
+            order_count=cnt,
+            in_order_system=True,
+        )
+        wid = (um_res.get('website_id') or '').strip()
+        fill_mgr = (um_res.get('manager') or '').strip()
+        fill_country = (um_res.get('country_code') or '').strip()
+        if fill_country == 'OTHER':
+            fill_country = ''
+        if wid:
+            conn.execute(
+                '''UPDATE sites SET umami_website_id = ?,
+                       manager = COALESCE(NULLIF(TRIM(COALESCE(manager, '')), ''), ?),
+                       country = COALESCE(NULLIF(TRIM(COALESCE(country, '')), ''), ?)
+                   WHERE id = ?''',
+                (wid, fill_mgr, fill_country, site_id),
+            )
+            conn.commit()
+        return jsonify({'success': True, **um_res})
+    except Exception as exc:
+        conn.rollback()
+        app.logger.exception('一键接入 Umami 失败: site_id=%s', site_id)
+        return jsonify({'success': False, 'error': f'接入 Umami 失败: {exc}'}), 502
+    finally:
+        conn.close()
+
+
+@app.route('/api/umami/sync-all', methods=['POST'])
+@login_required
+@admin_required
+def umami_sync_all_sites():
+    """手动触发香港订单系统与 CZ1 Umami 双向状态/负责人同步及 ID 回填。"""
+    import umami_bridge
+    conn = get_db_connection()
+    try:
+        res = umami_bridge.sync_all_sites_state(conn, force_meta=False)
+        return jsonify({'success': True, **res})
+    except Exception as exc:
+        conn.rollback()
+        app.logger.exception('手动同步 Umami 状态失败')
+        return jsonify({'success': False, 'error': f'同步失败: {exc}'}), 502
     finally:
         conn.close()
 
@@ -23209,9 +23348,15 @@ def get_orders_for_report(start_date, end_date, granularity='month', source=None
 def report():
     """Combined traffic and orders report page"""
     conn = get_db_connection()
-    all_countries = conn.execute('SELECT DISTINCT country FROM sites WHERE country IS NOT NULL AND country != "" ORDER BY country').fetchall()
+    all_countries = conn.execute(
+        "SELECT DISTINCT country FROM sites WHERE COALESCE(api_status, '') != 'archived' "
+        "AND country IS NOT NULL AND country != '' ORDER BY country"
+    ).fetchall()
     all_countries = [c['country'] for c in all_countries]
-    all_managers = conn.execute('SELECT DISTINCT manager FROM sites WHERE manager IS NOT NULL AND manager != "" ORDER BY manager').fetchall()
+    all_managers = conn.execute(
+        "SELECT DISTINCT manager FROM sites WHERE COALESCE(api_status, '') != 'archived' "
+        "AND manager IS NOT NULL AND manager != '' ORDER BY manager"
+    ).fetchall()
     all_managers = [m['manager'] for m in all_managers]
     conn.close()
     resp = make_response(render_template('report.html', all_countries=all_countries, all_managers=all_managers))
@@ -23224,52 +23369,49 @@ def report():
 @login_required
 @report_viewer_required
 def api_report_data():
-    """API to get combined report data with granularity support"""
+    """API to get combined report data with granularity support (固化 51.la 历史 + Umami 实时数据)"""
     from datetime import datetime, timedelta
-    
+    import umami_bridge
+
     start_date = request.args.get('start_date', '')
     end_date = request.args.get('end_date', '')
-    granularity = request.args.get('granularity', 'month')  # day, week, month
+    granularity = request.args.get('granularity', 'month')
     country = request.args.get('country', '')
     manager = request.args.get('manager', '')
-    
-    # Validate granularity
+
     if granularity not in ('day', 'week', 'month'):
         granularity = 'month'
-    
+
     if not end_date:
         end_date = datetime.now().strftime('%Y-%m-%d')
     if not start_date:
         start_dt = datetime.now() - timedelta(days=180)
         start_date = start_dt.strftime('%Y-%m-%d')
-    
-    # Cache Logic - include granularity, country, and manager in key
-    report_cache_version = 'v7'
+
+    report_cache_version = 'v8'
     cache_key = f"traffic_{report_cache_version}_{start_date}_{end_date}_{granularity}_{country}_{manager}"
     force_refresh = request.args.get('force', 'false') == 'true'
-    
-    # Try load from server cache first (if not forced)
+
     conn = get_db_connection()
     if not force_refresh:
         try:
             cached_row = conn.execute('SELECT cache_value FROM report_cache WHERE cache_key = ?', (cache_key,)).fetchone()
             if cached_row and cached_row['cache_value']:
-                print(f"DEBUG: Hit server cache for {cache_key}")
                 cached_data = json.loads(cached_row['cache_value'])
                 conn.close()
                 return jsonify(cached_data)
         except Exception as e:
-            print(f"Cache read error: {e}")
-    
-    all_traffic = {}
-    # Use the new function with granularity support
+            app.logger.warning('Report cache read error: %s', e)
+
     orders_data = get_orders_for_report(start_date, end_date, granularity, country=country, manager=manager)
-    
-    # Get sites config from database
-    db_sites = conn.execute('SELECT url, mask_id, manager, country FROM sites').fetchall()
-    
+
+    db_sites = conn.execute(
+        "SELECT url, mask_id, umami_website_id, manager, country FROM sites WHERE COALESCE(api_status, '') != 'archived'"
+    ).fetchall()
+
     def normalize_domain(url):
-        if not url: return "unknown"
+        if not url:
+            return "unknown"
         url = url.lower().strip()
         if 'https://' in url:
             url = url.replace('https://', '')
@@ -23287,23 +23429,26 @@ def api_report_data():
             if granularity == 'day':
                 return date_str
             if granularity == 'week':
-                dt = datetime.strptime(date_str, '%Y-%m-%d')
-                return f"{dt.isocalendar()[0]}-W{dt.isocalendar()[1]:02d}"
+                d_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                return f"{d_obj.isocalendar()[0]}-W{d_obj.isocalendar()[1]:02d}"
             return date_str[:7]
         except Exception:
             return date_str[:7]
 
-    # Create mask_id mapping (normalized)
-    site_mask_map = {}
+    excluded_retired = {'vaportrail.ae', 'vaporburst.ae'}
+    site_umami_map = {}
     site_meta = {}
+    active_domains = set()
     for site in db_sites:
         domain = normalize_domain(site['url'])
+        active_domains.add(domain)
         site_meta[domain] = {
             'country': site['country'] or '',
-            'manager': site['manager'] or ''
+            'manager': site['manager'] or '',
         }
-        if site['mask_id']:
-            site_mask_map[domain] = site['mask_id']
+        wid = (site['umami_website_id'] or '').strip()
+        if wid:
+            site_umami_map[domain] = wid
 
     first_order_rows = conn.execute('''
         SELECT source, MIN(date_created) AS first_order_at
@@ -23320,10 +23465,11 @@ def api_report_data():
             site_first_periods[domain] = first_period
 
     for domain, first_period in site_first_periods.items():
+        if domain in excluded_retired:
+            continue
         site_meta.setdefault(domain, {'country': '', 'manager': ''})
         site_meta[domain]['first_order_period'] = first_period
-            
-    # Filter sites by country / manager if selected
+
     if country or manager:
         filtered_domains = set()
         for site in db_sites:
@@ -23332,39 +23478,87 @@ def api_report_data():
             if manager and (site['manager'] or '') != manager:
                 continue
             filtered_domains.add(normalize_domain(site['url']))
+        site_umami_map = {k: v for k, v in site_umami_map.items() if k in filtered_domains}
+        known_domains = filtered_domains - excluded_retired
+    else:
+        legacy_extra = {normalize_domain(d) for d in LA_API_CONFIG['sites'].keys()} - {'vapeprime.pl'}
+        for d in legacy_extra:
+            site_meta.setdefault(d, {'country': '', 'manager': ''})
+        known_domains = (active_domains | legacy_extra) - excluded_retired
 
-        site_mask_map = {k: v for k, v in site_mask_map.items() if k in filtered_domains}
-            
-    # Add hardcoded sites if not in DB (backward compatibility)
-    if not country and not manager:
-        for site, mask_id in LA_API_CONFIG['sites'].items():
-            norm_site = normalize_domain(site)
-            if norm_site not in site_mask_map:
-                site_mask_map[norm_site] = mask_id
-            site_meta.setdefault(norm_site, {'country': '', 'manager': ''})
-            
-    # Fetch traffic data for each site
-    for site_name, mask_id in site_mask_map.items():
-        traffic = fetch_51la_traffic(mask_id, start_date, end_date)
-        if traffic:
-            all_traffic[site_name] = traffic
+    frozen_daily_by_dom = {}
+    frozen_daily_rows = conn.execute(
+        '''
+        SELECT domain, stat_date::text AS stat_date, uv, pv, new_user_count, sv, ip, bounce_rate
+        FROM traffic_daily_51la_frozen
+        WHERE stat_date >= ? AND stat_date <= ?
+        ORDER BY domain, stat_date
+        ''',
+        (start_date[:10], end_date[:10]),
+    ).fetchall()
+    for row in frozen_daily_rows:
+        dom = row['domain']
+        if dom not in known_domains:
+            continue
+        frozen_daily_by_dom.setdefault(dom, {})[row['stat_date']] = {
+            'time': row['stat_date'],
+            'uv': int(row['uv'] or 0),
+            'pv': int(row['pv'] or 0),
+            'newUserCount': int(row['new_user_count'] or 0),
+            'sv': int(row['sv'] or 0),
+            'ip': int(row['ip'] or 0),
+            'bounceRate': float(row['bounce_rate'] or 0.0),
+        }
+
+    umami_first_dates = {}
+    umami_daily_by_wid = {}
+    umami_warning = None
+    if site_umami_map:
+        try:
+            um_res = umami_bridge.fetch_umami_daily_traffic(
+                list(site_umami_map.values()), start_date[:10], end_date[:10], timezone='Asia/Shanghai'
+            )
+            umami_first_dates = um_res.get('first_dates') or {}
+            umami_daily_by_wid = um_res.get('daily') or {}
+        except Exception as um_exc:
+            umami_warning = str(um_exc)
+            app.logger.warning('Umami 实时流量查询失败，已自动降级为仅读取固化表: %s', um_exc)
+
+    all_traffic = {}
+    umami_only_monthly = {}
+    for dom in sorted(known_domains):
+        wid = site_umami_map.get(dom, '')
+        first_um_date = umami_first_dates.get(wid, '') if wid else ''
+        merged_days = {}
+        for day_s, item in (frozen_daily_by_dom.get(dom) or {}).items():
+            if not first_um_date or day_s < first_um_date:
+                merged_days[day_s] = item
+        um_list = umami_daily_by_wid.get(wid, []) if wid else []
+        if um_list and granularity == 'month':
+            umami_only_monthly[dom] = aggregate_traffic_by_month(um_list)
+        for item in um_list:
+            day_s = str(item.get('time') or '')[:10]
+            if not day_s:
+                continue
+            if not first_um_date or day_s >= first_um_date:
+                merged_days[day_s] = item
+        if merged_days:
+            all_traffic[dom] = [merged_days[k] for k in sorted(merged_days)]
 
     combined = {}
     all_periods = set()
-    
-    # Select aggregation function based on granularity
+
     for site_name, traffic_list in all_traffic.items():
         if site_name not in combined:
             combined[site_name] = {}
-        
-        # Aggregate traffic based on granularity
+
         if granularity == 'day':
             aggregated_traffic = aggregate_traffic_by_day(traffic_list)
         elif granularity == 'week':
             aggregated_traffic = aggregate_traffic_by_week(traffic_list)
         else:
             aggregated_traffic = aggregate_traffic_by_month(traffic_list)
-        
+
         for period, data in aggregated_traffic.items():
             first_period = site_first_periods.get(site_name)
             if first_period and period < first_period:
@@ -23376,42 +23570,84 @@ def api_report_data():
             combined[site_name][period]['pv'] = data['pv']
             combined[site_name][period]['newUserCount'] = data['newUserCount']
             combined[site_name][period]['bounceRate'] = data['bounceRate']
-    
-    # Process orders data (new structure with currency)
-    site_currencies = {}  # Store currency per site
+
+    if granularity == 'month':
+        monthly_frozen_rows = conn.execute(
+            '''
+            SELECT domain, stat_month, uv, pv, new_user_count, bounce_rate
+            FROM traffic_monthly_51la_frozen
+            WHERE stat_month >= ? AND stat_month <= ?
+            ORDER BY domain, stat_month
+            ''',
+            (start_date[:7], end_date[:7]),
+        ).fetchall()
+        for row in monthly_frozen_rows:
+            dom = row['domain']
+            ym = row['stat_month']
+            if dom not in known_domains:
+                continue
+            first_period = site_first_periods.get(dom)
+            if first_period and ym < first_period:
+                continue
+            wid = site_umami_map.get(dom, '')
+            first_um_date = umami_first_dates.get(wid, '') if wid else ''
+            first_um_month = first_um_date[:7] if first_um_date else ''
+            m_uv = int(row['uv'] or 0)
+            m_pv = int(row['pv'] or 0)
+            m_new = int(row['new_user_count'] or 0)
+            m_br = float(row['bounce_rate'] or 0.0)
+
+            if not first_um_month or ym < first_um_month:
+                all_periods.add(ym)
+                target = combined.setdefault(dom, {}).setdefault(ym, {})
+                target['uv'] = m_uv
+                target['pv'] = m_pv
+                target['newUserCount'] = m_new
+                target['bounceRate'] = m_br
+            elif ym == first_um_month and start_date[:10] <= f"{ym}-14" and first_um_date >= f"{ym}-15":
+                um_m = (umami_only_monthly.get(dom) or {}).get(ym) or {}
+                all_periods.add(ym)
+                target = combined.setdefault(dom, {}).setdefault(ym, {})
+                target['uv'] = m_uv + int(um_m.get('uv') or 0)
+                target['pv'] = m_pv + int(um_m.get('pv') or 0)
+                target['newUserCount'] = m_new + int(um_m.get('newUserCount') or 0)
+                target['bounceRate'] = um_m.get('bounceRate', m_br)
+
+    site_currencies = {}
     all_missing_exchange_rates = set()
+    known_domain_list = sorted(known_domains)
     for source, source_data in orders_data.items():
         site_name = None
         norm_source = normalize_domain(source)
-        
-        if norm_source in site_mask_map:
+        if norm_source in excluded_retired:
+            continue
+
+        if norm_source in known_domains:
             site_name = norm_source
         else:
-            for name in site_mask_map.keys():
+            for name in known_domain_list:
                 if name in norm_source:
                     site_name = name
                     break
-        
+
         if not site_name:
             site_name = norm_source
-        
-        # Save currency for this site
+
         if 'currency' in source_data:
             site_currencies[site_name] = source_data['currency']
-        
+
         if site_name not in combined:
             combined[site_name] = {}
-        
-        # Get periods from the new structure
-        periods_data = source_data.get('periods', source_data)  # Fallback for old structure
-        
+
+        periods_data = source_data.get('periods', source_data)
+
         for period, data in periods_data.items():
-            if period == 'currency':  # Skip the currency field
+            if period == 'currency':
                 continue
             all_periods.add(period)
             if period not in combined[site_name]:
                 combined[site_name][period] = {}
-            
+
             current = combined[site_name][period]
             current['order_count'] = current.get('order_count', 0) + data['order_count']
             current['total_amount'] = current.get('total_amount', 0) + data['total_amount']
@@ -23426,8 +23662,7 @@ def api_report_data():
             else:
                 current['gmv_cny'] = current.get('gmv_cny', 0) + (data.get('gmv_cny') or 0)
                 current['net_cny'] = current.get('net_cny', 0) + (data.get('net_cny') or 0)
-    
-    # Calculate derived metrics
+
     for site_name, periods in combined.items():
         for period, data in periods.items():
             uv = data.get('uv', 0)
@@ -23441,31 +23676,27 @@ def api_report_data():
                 gmv_cny = round(data.get('gmv_cny', 0), 2)
                 data['gmv_cny'] = gmv_cny
                 data['net_cny'] = round(data.get('net_cny', 0), 2)
-                # AOV uses the same gross-order population as GMV/order_count.
                 data['aov_cny'] = round(gmv_cny / orders, 2) if orders > 0 else None
-    
+
     sorted_periods = sorted(all_periods)
-    
+
     final_result = {
         'success': True,
         'data': combined,
         'periods': sorted_periods,
-        'months': sorted_periods,   # Keep for backward compatibility
-        'sites': list(site_mask_map.keys()),
+        'months': sorted_periods,
+        'sites': known_domain_list,
         'site_meta': site_meta,
-        'site_currencies': site_currencies,  # Currency per site
+        'site_currencies': site_currencies,
         'date_range': {'start': start_date, 'end': end_date},
         'granularity': granularity,
         'cache_version': report_cache_version,
         'missing_exchange_rates': sorted(all_missing_exchange_rates),
-        'filters': {'country': country, 'manager': manager}
+        'filters': {'country': country, 'manager': manager},
     }
 
-    
-    # Save to server cache if we have traffic data (to avoid caching empty/failed API calls)
-    # Only cache if at least one site has traffic data
     has_traffic = any('uv' in m for s in combined.values() for m in s.values())
-    if has_traffic:
+    if has_traffic and not umami_warning:
         try:
             conn.execute('''
                 INSERT INTO report_cache (cache_key, cache_value, updated_at)
@@ -23475,10 +23706,9 @@ def api_report_data():
                     updated_at=excluded.updated_at
             ''', (cache_key, json.dumps(final_result)))
             conn.commit()
-            print(f"DEBUG: Updated server cache for {cache_key}")
         except Exception as e:
-            print(f"Cache write error: {e}")
-            
+            app.logger.warning('Report cache write error: %s', e)
+
     conn.close()
     return jsonify(final_result)
 
@@ -23506,7 +23736,7 @@ def report_cache_sync():
         if not start_date or not end_date or not traffic_data:
             return jsonify({'success': False, 'error': '数据不完整'}), 400
             
-        cache_key = f"traffic_v7_{start_date}_{end_date}_{granularity}_{country}_{manager}"
+        cache_key = f"traffic_v8_{start_date}_{end_date}_{granularity}_{country}_{manager}"
         
         # Verify structure roughly
         if 'data' not in traffic_data or 'months' not in traffic_data:

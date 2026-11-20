@@ -1,0 +1,15 @@
+[Unit]
+Description=Sync HK order site owners & order status to CZ1 Umami overview
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/www/wwwroot/woo-analysis
+EnvironmentFile=/etc/woo-analysis/woo-analysis.env
+EnvironmentFile=/etc/woo-analysis/umami-sync.env
+ExecStart=/www/wwwroot/woo-analysis/venv/bin/python /www/wwwroot/woo-analysis/scripts/sync_umami_state.py
+TimeoutStartSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

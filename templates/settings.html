@@ -203,9 +203,16 @@
     <div class="card data-card mb-4">
         <div class="card-header border-bottom border-secondary border-opacity-25 bg-transparent py-3 d-flex justify-content-between align-items-center">
             <h5 class="card-title text-white mb-0">已连接站点</h5>
-            <button type="button" class="btn btn-sm btn-outline-info" id="sortSitesByManagerBtn" title="按站点负责人排序">
-                <i class="bi bi-sort-alpha-down me-1"></i>负责人排序
-            </button>
+            <div class="d-flex align-items-center gap-2">
+                {% if not site_sync_only %}
+                <button type="button" class="btn btn-sm btn-outline-success" id="syncAllUmamiBtn" title="与 CZ1 Umami 双向校准负责人、出单状态并自动回填 Website ID">
+                    <i class="bi bi-arrow-left-right me-1"></i>同步 Umami
+                </button>
+                {% endif %}
+                <button type="button" class="btn btn-sm btn-outline-info" id="sortSitesByManagerBtn" title="按站点负责人排序">
+                    <i class="bi bi-sort-alpha-down me-1"></i>负责人排序
+                </button>
+            </div>
         </div>
         <div class="card-body p-0">
             <div class="table-responsive">
@@ -215,7 +222,7 @@
                             <th class="ps-4">站点</th>
                             {% if not site_sync_only %}
                             <th>Consumer Key</th>
-                            <th>Mask ID</th>
+                            <th>Umami 统计</th>
                             {% endif %}
                             <th>上次同步时间</th>
                             {% if not site_sync_only %}
@@ -255,11 +262,16 @@
                             </td>
                             {% if not site_sync_only %}
                             <td class="text-white-50 font-monospace small">{{ site.consumer_key[:10] }}...</td>
-                            <td class="text-white-50 font-monospace small">
-                                {% if site.mask_id %}
-                                {{ site.mask_id }}
+                            <td class="text-white-50 small">
+                                {% if site.umami_website_id %}
+                                <div class="d-flex align-items-center gap-1 flex-wrap">
+                                    <span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 font-monospace" title="{{ site.umami_website_id }}">{{ site.umami_website_id[:8] }}…</span>
+                                    <button type="button" class="btn btn-sm btn-outline-info py-0 px-2 umami-provision-btn" style="font-size:0.75rem;" data-site-id="{{ site.id }}" title="查看/复制 Umami 统计代码">代码</button>
+                                </div>
                                 {% else %}
-                                <span class="text-muted">-</span>
+                                <button type="button" class="btn btn-sm btn-outline-warning py-0 px-2 umami-provision-btn" style="font-size:0.78rem;" data-site-id="{{ site.id }}" title="在 dash.cfworks.vip 一键创建站点并获取统计代码">
+                                    <i class="bi bi-plus-circle me-1"></i>一键接入
+                                </button>
                                 {% endif %}
                             </td>
                             {% endif %}
@@ -344,7 +356,7 @@
                                 <button class="btn btn-sm btn-outline-secondary me-2 edit-btn"
                                     data-site-id="{{ site.id }}" data-url="{{ site.url }}"
                                     data-key="{{ site.consumer_key }}" data-secret="{{ site.consumer_secret }}"
-                                    data-manager="{{ site.manager or '' }}" data-mask-id="{{ site.mask_id or '' }}"
+                                    data-manager="{{ site.manager or '' }}" data-mask-id="{{ site.mask_id or '' }}" data-umami-id="{{ site.umami_website_id or '' }}"
                                     data-country="{{ site.country or '' }}"
                                     data-cod-on-hold-is-shipped="{{ site.cod_on_hold_is_shipped or 0 }}"
                                     data-product-master-id="{{ site.product_master_id or '' }}"><i class="bi bi-pencil"></i></button>
@@ -1492,31 +1504,35 @@
             <div class="modal-body">
                 <form id="addSiteForm">
                     <div class="mb-3">
+                        <label class="form-label text-white-50">站点 URL</label>
+                        <div class="input-group">
+                            <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25"
+                                name="url" id="addSiteUrl" placeholder="https://example.com" required>
+                            <button type="button" class="btn btn-outline-info" id="lookupAddSiteUmamiBtn" title="从 dash.cfworks.vip 读取已设置的负责人、国家与 Website ID">
+                                <i class="bi bi-cloud-download me-1"></i>从 Umami 读取
+                            </button>
+                        </div>
+                        <div class="form-text text-muted" id="addSiteUmamiHint">请输入完整的店铺网址（包含 https://）；失焦或点击按钮将自动匹配 Umami 已有负责人与国家</div>
+                    </div>
+                    <div class="mb-3">
                         <label class="form-label text-white-50">负责人</label>
                         <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
-                            name="manager" list="siteManagerOptions" autocomplete="off"
+                            name="manager" id="addSiteManager" list="siteManagerOptions" autocomplete="off"
                             placeholder="请选择或输入负责人姓名">
                         <datalist id="siteManagerOptions">
                             {% for manager in site_managers %}
                             <option value="{{ manager }}"></option>
                             {% endfor %}
                         </datalist>
-                        <div class="form-text text-muted">可从现有负责人中选择，也可直接输入新姓名</div>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label text-white-50">51.la Mask ID</label>
-                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
-                            name="mask_id" placeholder="如：KqmtdhxdOsN9a7i7">
-                        <div class="form-text text-muted">可选：用于获取51.la流量数据</div>
+                        <div class="form-text text-muted">可从现有负责人中选择、直接输入新姓名，或通过上方 URL 自动从 Umami 读取</div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">国家/地区</label>
                         <select class="form-select bg-dark text-white border-secondary border-opacity-25"
-                            name="country">
+                            name="country" id="addSiteCountry">
                             <option value="">请选择国家</option>
                             <option value="PL">波兰 (Poland)</option>
                             <option value="AU">澳大利亚 (Australia)</option>
-                            <option value="AE">阿联酋 (UAE)</option>
                             <option value="HU">匈牙利 (Hungary)</option>
                             <option value="CZ">捷克 (Czechia)</option>
                             <option value="DE">德国 (Germany)</option>
@@ -1528,10 +1544,18 @@
                         </select>
                     </div>
                     <div class="mb-3">
-                        <label class="form-label text-white-50">站点 URL</label>
-                        <input type="url" class="form-control bg-dark text-white border-secondary border-opacity-25"
-                            name="url" placeholder="https://example.com" required>
-                        <div class="form-text text-muted">请输入完整的店铺网址，包含 https://</div>
+                        <label class="form-label text-white-50">Umami Website ID</label>
+                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25 font-monospace"
+                            name="umami_website_id" id="addSiteUmamiId" placeholder="可留空（勾选下方保存时自动一键创建并回填）">
+                        <div class="form-text text-muted">替代原 51.la；若该站已在 Umami 总览建站，此处会自动读取回填</div>
+                    </div>
+                    <div class="mb-3 p-2 rounded" style="background:rgba(13,110,253,0.08); border:1px solid rgba(13,110,253,0.25);">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="addSiteSyncUmami" name="sync_to_umami" checked>
+                            <label class="form-check-label text-info small" for="addSiteSyncUmami">
+                                <strong>保存时自动同步 / 一键接入 Umami</strong>（自动建站、识别负责人与国家，并立即生成统计代码）
+                            </label>
+                        </div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">Consumer Key</label>
@@ -1571,9 +1595,14 @@
                             placeholder="请选择或输入负责人姓名">
                     </div>
                     <div class="mb-3">
-                        <label class="form-label text-white-50">51.la Mask ID</label>
-                        <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25"
-                            name="mask_id" id="editSiteMaskId" placeholder="如：KqmtdhxdOsN9a7i7">
+                        <label class="form-label text-white-50">Umami Website ID</label>
+                        <div class="input-group">
+                            <input type="text" class="form-control bg-dark text-white border-secondary border-opacity-25 font-monospace"
+                                name="umami_website_id" id="editSiteUmamiId" placeholder="可留空，点击右侧一键接入生成">
+                            <button type="button" class="btn btn-outline-info" id="editSiteProvisionUmamiBtn">
+                                <i class="bi bi-magic me-1"></i>一键接入 / 查看代码
+                            </button>
+                        </div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-white-50">国家/地区</label>
@@ -1582,7 +1611,6 @@
                             <option value="">请选择国家</option>
                             <option value="PL">波兰 (Poland)</option>
                             <option value="AU">澳大利亚 (Australia)</option>
-                            <option value="AE">阿联酋 (UAE)</option>
                             <option value="HU">匈牙利 (Hungary)</option>
                             <option value="CZ">捷克 (Czechia)</option>
                             <option value="DE">德国 (Germany)</option>
@@ -1603,7 +1631,7 @@
                         <div class="text-muted small mt-2" style="line-height:1.5;">
                             波兰 COD 习惯：发货后单子置 on-hold，等司机收钱才完结。
                             勾选 → on-hold 计入<strong>成功销售/收入</strong>。<br>
-                            澳大利亚/阿联酋等没有 COD 的站请<strong>不要勾选</strong>，否则未付款的 on-hold 单会被算进收入。<br>
+                            澳大利亚等没有 COD 的站请<strong>不要勾选</strong>，否则未付款的 on-hold 单会被算进收入。<br>
                             <span class="text-info">默认：PL=勾选，其它国家=不勾选。</span>
                         </div>
                     </div>
@@ -1664,6 +1692,47 @@
             <div class="modal-footer border-top border-secondary border-opacity-25">
                 <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">取消</button>
                 <button type="button" class="btn btn-primary" id="updateSiteBtn">更新</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Umami Tracking Code Modal -->
+<div class="modal fade" id="umamiCodeModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content bg-dark border border-secondary border-opacity-25">
+            <div class="modal-header border-bottom border-secondary border-opacity-25">
+                <h5 class="modal-title text-white"><i class="bi bi-graph-up-arrow text-info me-2"></i>Umami 站点接入成功与统计代码</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="row g-2 mb-3 small text-white-50">
+                    <div class="col-md-6">站点域名：<strong class="text-white" id="umamiCodeDomain">-</strong></div>
+                    <div class="col-md-6">Website ID：<code class="text-info" id="umamiCodeWid">-</code></div>
+                    <div class="col-md-6">归属国家：<strong class="text-white" id="umamiCodeRegion">-</strong></div>
+                    <div class="col-md-6">站点负责人：<strong class="text-white" id="umamiCodeManager">-</strong></div>
+                </div>
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center mb-1">
+                        <label class="form-label text-info mb-0 small fw-bold">1. 标准 &lt;script&gt; 统计代码（通用 Head 粘贴）</label>
+                        <button type="button" class="btn btn-sm btn-outline-info copy-umami-btn" data-target="umamiCodeStandard">
+                            <i class="bi bi-clipboard me-1"></i>复制标准代码
+                        </button>
+                    </div>
+                    <textarea id="umamiCodeStandard" class="form-control bg-black text-light border-secondary border-opacity-25 font-monospace small" rows="2" readonly></textarea>
+                </div>
+                <div>
+                    <div class="d-flex justify-content-between align-items-center mb-1">
+                        <label class="form-label text-success mb-0 small fw-bold">2. 防爬虫前置过滤版配置（推荐用于 WordPress 独立站）</label>
+                        <button type="button" class="btn btn-sm btn-outline-success copy-umami-btn" data-target="umamiCodeBotGuard">
+                            <i class="bi bi-clipboard me-1"></i>复制防刷代码
+                        </button>
+                    </div>
+                    <textarea id="umamiCodeBotGuard" class="form-control bg-black text-light border-secondary border-opacity-25 font-monospace small" rows="5" readonly></textarea>
+                </div>
+            </div>
+            <div class="modal-footer border-top border-secondary border-opacity-25">
+                <button type="button" class="btn btn-primary" data-bs-dismiss="modal">完成</button>
             </div>
         </div>
     </div>
@@ -2505,6 +2574,143 @@
             return bootstrap.Modal.getOrCreateInstance(el);
         }
 
+        let reloadAfterUmamiModal = false;
+        function showUmamiCodeModal(info, shouldReload = false) {
+            reloadAfterUmamiModal = Boolean(shouldReload);
+            document.getElementById('umamiCodeDomain').textContent = info.domain || '-';
+            document.getElementById('umamiCodeWid').textContent = info.website_id || '-';
+            document.getElementById('umamiCodeRegion').textContent = info.region || '-';
+            document.getElementById('umamiCodeManager').textContent = info.manager || '未分配';
+            document.getElementById('umamiCodeStandard').value = info.script_standard || '';
+            document.getElementById('umamiCodeBotGuard').value = info.script_bot_guard || '';
+            const modal = getModal('umamiCodeModal');
+            if (modal) modal.show();
+        }
+        const umamiModalEl = document.getElementById('umamiCodeModal');
+        if (umamiModalEl) {
+            umamiModalEl.addEventListener('hidden.bs.modal', function () {
+                if (reloadAfterUmamiModal) {
+                    reloadAfterUmamiModal = false;
+                    location.reload();
+                }
+            });
+        }
+        document.querySelectorAll('.copy-umami-btn').forEach(btn => {
+            btn.addEventListener('click', function () {
+                const ta = document.getElementById(this.dataset.target);
+                if (!ta) return;
+                navigator.clipboard?.writeText(ta.value).catch(() => {});
+                ta.select();
+                const orig = this.innerHTML;
+                this.innerHTML = '<i class="bi bi-check2 me-1"></i>已复制';
+                setTimeout(() => { this.innerHTML = orig; }, 1500);
+            });
+        });
+
+        function lookupUmamiForAddModal(showFeedback = false) {
+            const urlInput = document.getElementById('addSiteUrl');
+            const hintEl = document.getElementById('addSiteUmamiHint');
+            const rawUrl = (urlInput?.value || '').trim();
+            if (!rawUrl || !rawUrl.includes('.')) return;
+            if (showFeedback && hintEl) {
+                hintEl.innerHTML = '<span class="text-info"><span class="spinner-border spinner-border-sm me-1"></span>正在查询 dash.cfworks.vip ...</span>';
+            }
+            fetch(`/api/umami/lookup?url=${encodeURIComponent(rawUrl)}`)
+                .then(r => r.json())
+                .then(res => {
+                    if (res.success && res.found) {
+                        const mgrEl = document.getElementById('addSiteManager');
+                        const countryEl = document.getElementById('addSiteCountry');
+                        const widEl = document.getElementById('addSiteUmamiId');
+                        if (res.website_id && widEl) widEl.value = res.website_id;
+                        if (res.manager && mgrEl && (!mgrEl.value.trim() || showFeedback)) mgrEl.value = res.manager;
+                        if (res.country_code && res.country_code !== 'OTHER' && countryEl && (!countryEl.value || showFeedback)) {
+                            countryEl.value = res.country_code;
+                        }
+                        if (hintEl) {
+                            hintEl.innerHTML = `<span class="text-success"><i class="bi bi-check-circle me-1"></i>已在 Umami 匹配到站点：ID <code>${res.website_id.slice(0, 8)}…</code> · 地区 ${res.region || '其他'} · 负责人 ${res.manager || '未设置'}</span>`;
+                        }
+                    } else if (showFeedback && hintEl) {
+                        hintEl.innerHTML = '<span class="text-warning">Umami 暂未收录该域名，勾选下方「保存时自动同步 / 一键接入 Umami」即可自动创建。</span>';
+                    }
+                })
+                .catch(err => {
+                    if (showFeedback && hintEl) {
+                        hintEl.innerHTML = `<span class="text-danger">读取失败: ${err.message}</span>`;
+                    }
+                });
+        }
+        const addSiteUrlEl = document.getElementById('addSiteUrl');
+        if (addSiteUrlEl) {
+            addSiteUrlEl.addEventListener('blur', () => lookupUmamiForAddModal(false));
+        }
+        const lookupUmamiBtn = document.getElementById('lookupAddSiteUmamiBtn');
+        if (lookupUmamiBtn) {
+            lookupUmamiBtn.addEventListener('click', () => lookupUmamiForAddModal(true));
+        }
+
+        const syncAllUmamiBtn = document.getElementById('syncAllUmamiBtn');
+        if (syncAllUmamiBtn) {
+            syncAllUmamiBtn.addEventListener('click', function () {
+                const orig = this.innerHTML;
+                this.disabled = true;
+                this.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>同步中...';
+                fetch('/api/umami/sync-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+                    .then(r => r.json())
+                    .then(d => {
+                        this.disabled = false;
+                        this.innerHTML = orig;
+                        if (d.success) {
+                            alert(`Umami 双向同步完成：匹配 ${d.matched_count || 0} 个站点，本次回填 ID ${d.backfilled_ids || 0} 个。`);
+                            location.reload();
+                        } else {
+                            alert('同步失败: ' + (d.error || '未知错误'));
+                        }
+                    })
+                    .catch(err => {
+                        this.disabled = false;
+                        this.innerHTML = orig;
+                        alert('请求失败: ' + err.message);
+                    });
+            });
+        }
+
+        const editProvisionBtn = document.getElementById('editSiteProvisionUmamiBtn');
+        if (editProvisionBtn) {
+            editProvisionBtn.addEventListener('click', function () {
+                const siteId = document.getElementById('editSiteId')?.value;
+                if (!siteId) return;
+                const orig = this.innerHTML;
+                this.disabled = true;
+                this.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>处理中...';
+                fetch(`/api/sites/${siteId}/umami-provision`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        manager: document.getElementById('editSiteManager')?.value || '',
+                        country: document.getElementById('editSiteCountry')?.value || '',
+                        umami_website_id: document.getElementById('editSiteUmamiId')?.value || ''
+                    })
+                })
+                    .then(r => r.json())
+                    .then(res => {
+                        this.disabled = false;
+                        this.innerHTML = orig;
+                        if (res.success && res.website_id) {
+                            document.getElementById('editSiteUmamiId').value = res.website_id;
+                            showUmamiCodeModal(res, false);
+                        } else {
+                            alert('接入失败: ' + (res.error || '未知错误'));
+                        }
+                    })
+                    .catch(err => {
+                        this.disabled = false;
+                        this.innerHTML = orig;
+                        alert('请求失败: ' + err.message);
+                    });
+            });
+        }
+
         // Add Site
         const saveBtn = document.getElementById('saveSiteBtn');
         if (saveBtn) {
@@ -2517,6 +2723,11 @@
 
                 const formData = new FormData(form);
                 const data = Object.fromEntries(formData.entries());
+                data.sync_to_umami = Boolean(document.getElementById('addSiteSyncUmami')?.checked);
+
+                const orig = saveBtn.innerHTML;
+                saveBtn.disabled = true;
+                saveBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>保存中...';
 
                 fetch('/api/sites', {
                     method: 'POST',
@@ -2525,13 +2736,28 @@
                 })
                     .then(response => response.json())
                     .then(result => {
+                        saveBtn.disabled = false;
+                        saveBtn.innerHTML = orig;
                         if (result.success) {
-                            location.reload();
+                            const addModal = getModal('addSiteModal');
+                            if (addModal) addModal.hide();
+                            if (result.umami && result.umami.website_id) {
+                                showUmamiCodeModal(result.umami, true);
+                            } else if (result.umami_warning) {
+                                alert('站点已保存，但自动接入 Umami 提示: ' + result.umami_warning);
+                                location.reload();
+                            } else {
+                                location.reload();
+                            }
                         } else {
                             alert('添加失败: ' + (result.error || '未知错误'));
                         }
                     })
-                    .catch(error => alert('发生错误: ' + error));
+                    .catch(error => {
+                        saveBtn.disabled = false;
+                        saveBtn.innerHTML = orig;
+                        alert('发生错误: ' + error);
+                    });
             });
         }
 
@@ -2663,7 +2889,7 @@
                 const key = editBtn.dataset.key;
                 const secret = editBtn.dataset.secret;
                 const manager = editBtn.dataset.manager || '';
-                const maskId = editBtn.dataset.maskId || '';
+                const umamiId = editBtn.dataset.umamiId || '';
                 const country = editBtn.dataset.country || '';
 
                 document.getElementById('editSiteId').value = siteId;
@@ -2671,7 +2897,7 @@
                 document.getElementById('editSiteKey').value = key;
                 document.getElementById('editSiteSecret').value = secret;
                 document.getElementById('editSiteManager').value = manager;
-                document.getElementById('editSiteMaskId').value = maskId;
+                document.getElementById('editSiteUmamiId').value = umamiId;
                 document.getElementById('editSiteCountry').value = country;
 
                 // on-hold-is-shipped toggle
@@ -2695,6 +2921,36 @@
 
                 const modal = getModal('editSiteModal');
                 if (modal) modal.show();
+            }
+
+            // Umami Provision / Code Button in Table Row
+            const umamiBtn = e.target.closest('.umami-provision-btn');
+            if (umamiBtn) {
+                const siteId = umamiBtn.dataset.siteId;
+                const origHtml = umamiBtn.innerHTML;
+                umamiBtn.disabled = true;
+                umamiBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+                fetch(`/api/sites/${siteId}/umami-provision`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: '{}'
+                })
+                    .then(r => r.json())
+                    .then(res => {
+                        umamiBtn.disabled = false;
+                        umamiBtn.innerHTML = origHtml;
+                        if (res.success && res.website_id) {
+                            showUmamiCodeModal(res, Boolean(res.created));
+                        } else {
+                            alert('操作失败: ' + (res.error || '未知错误'));
+                        }
+                    })
+                    .catch(err => {
+                        umamiBtn.disabled = false;
+                        umamiBtn.innerHTML = origHtml;
+                        alert('请求失败: ' + err.message);
+                    });
+                return;
             }
 
             // Delete Button
