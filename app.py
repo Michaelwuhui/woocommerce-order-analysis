@@ -703,25 +703,12 @@ def _build_risk_index(conn):
 _RISK_UNDELIVERED_THRESHOLD = 2
 
 
-def _assess_customer_risk(billing, shipping, idx, current_order_id=None):
+def _assess_customer_risk(billing, shipping, idx, current_order_id=None, *, extra_keys=None):
     """Look up this customer in the risk index across email/phone/addr and
     return a risk dict, or None if no prior risky history is found.
 
     The current order itself is excluded by id so a freshly-marked order
     doesn't flag its own self.
-
-    Returns:
-        {
-          'level': 'high' | 'medium',
-          'problem_count': int,            # distinct prior 问题退货 orders
-          'problem_loss': float,           # sum of product_loss_amount
-          'undeliv_count': int,            # distinct prior 未送达 orders
-          'undeliv_loss': float,           # sum of shipping_loss_amount
-          'matched_by': ['email', 'phone', 'address'],
-          'last_at': '2026-05-18 08:03',   # most recent of either
-          'last_number': '7914',
-          'types': ['swap', 'short', ...]  # problem-return types seen
-        }
     """
     if not idx:
         return None
@@ -734,6 +721,10 @@ def _assess_customer_risk(billing, shipping, idx, current_order_id=None):
     addr_key = _normalize_address(addr_d)
 
     keys = [('email', email), ('phone', phone), ('address', addr_key)]
+    if extra_keys:
+        for pair in extra_keys:
+            if pair and pair[1] and pair not in keys:
+                keys.append(pair)
 
     p_matched, p_via = _collect_in_indices(idx['problem'], keys, current_order_id)
     u_matched, u_via = _collect_in_indices(idx['undeliv'], keys, current_order_id)
@@ -2916,6 +2907,29 @@ def orders():
         except Exception:
             pass
 
+    # 提取当前页客户历史订单曾用过的所有电话与地址，穿透识别换马甲邮箱+换快递柜地址的两跳风险单
+    hist_keys_by_norm = {}
+    if norm_list and '_addr_for_order' in globals() and '_normalize_address' in globals():
+        try:
+            placeholders_hist = ', '.join(['?' for _ in norm_list])
+            for hrow in conn.execute(
+                f"SELECT LOWER(TRIM(json_extract(billing, '$.email'))) AS norm_email, billing, shipping "
+                f"FROM orders WHERE LOWER(TRIM(json_extract(billing, '$.email'))) IN ({placeholders_hist})",
+                tuple(norm_list),
+            ).fetchall():
+                hb = parse_json_field(hrow['billing']) or {}
+                hs = parse_json_field(hrow['shipping']) or {}
+                had = _addr_for_order(hb, hs)
+                hp = _normalize_phone(had.get('phone') or hb.get('phone'))
+                ha = _normalize_address(had)
+                klist = hist_keys_by_norm.setdefault(hrow['norm_email'], [])
+                if hp and ('phone', hp) not in klist:
+                    klist.append(('phone', hp))
+                if ha and ('address', ha) not in klist:
+                    klist.append(('address', ha))
+        except Exception:
+            pass
+
     for od in processed_orders:
         raw_email = od.get('customer_email') or ''
         norm_em = norm_map.get(raw_email, '')
@@ -2929,7 +2943,14 @@ def orders():
 
         b_obj = parse_json_field(od.get('billing')) or {}
         s_obj = parse_json_field(od.get('shipping')) or {}
-        full_risk = _assess_customer_risk(b_obj, s_obj, risk_idx, current_order_id=None)
+        extra_hist = hist_keys_by_norm.get(norm_em)
+        if extra_hist:
+            od['customer_risk'] = _assess_customer_risk(
+                b_obj, s_obj, risk_idx, current_order_id=od['id'], extra_keys=extra_hist
+            )
+        full_risk = _assess_customer_risk(
+            b_obj, s_obj, risk_idx, current_order_id=None, extra_keys=extra_hist
+        )
         if full_risk:
             prob_cnt = max(prob_cnt, int(full_risk.get('problem_count') or 0))
             undeliv_cnt = max(undeliv_cnt, int(full_risk.get('undeliv_count') or 0))
