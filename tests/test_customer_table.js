@@ -125,7 +125,7 @@ function mockNode(id) {
 
 function mountFixture(rows) {
     const nodes = Object.fromEntries(['customersTable', 'customerSearchBox', 'toggleLossOnlyBtn',
-        'toggleMultiSiteBtn', 'toggleMergedBtn'].map(id => [id, mockNode(id)]));
+        'toggleBadTierBtn', 'toggleMultiSiteBtn', 'toggleMergedBtn'].map(id => [id, mockNode(id)]));
     const filters = [];
     let options;
     const draws = [], orders = [];
@@ -220,4 +220,21 @@ test('delegated detail events pass literal quoted email without eval and reject 
         if (saved === undefined) delete globalThis.showCustomerDetail;
         else globalThis.showCustomerDetail = saved;
     }
+});
+
+test('bad tier badge, blocked indicator, and bad-tier filter render and filter accurately', () => {
+    const badRow = customer({tier: '劣质', is_blocked: true});
+    const tierHtml = table.renderCell(4, 'display', badRow, config);
+    assert.match(tierHtml, /bg-danger/);
+    assert.match(tierHtml, /劣质/);
+    const nameHtml = table.renderCell(0, 'display', badRow, config);
+    assert.match(nameHtml, /已拦截/);
+    assert.match(nameHtml, /bg-gradient-danger/);
+
+    const fixture = mountFixture([badRow, customer({tier: '普通'})]);
+    const predicate = fixture.filters[0];
+    const settings = {nTable: fixture.nodes.customersTable};
+    fixture.nodes.toggleBadTierBtn.handlers.click();
+    assert.equal(predicate(settings, [], 0, badRow), true);
+    assert.equal(predicate(settings, [], 1, customer({tier: '普通'})), false);
 });

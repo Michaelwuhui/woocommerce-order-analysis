@@ -22,6 +22,7 @@
     }
 
     function matchesCustomer(row, filters) {
+        if (filters.badTierOnly && text(row.tier) !== '劣质') return false;
         if (filters.lossOnly && !(number(row.total_loss) > 0)) return false;
         if (filters.multiSiteOnly && !(number(row.site_count || 1) >= 2)) return false;
         if (filters.mergedOnly && !(number(row.identity_email_count || 1) >= 2)) return false;
@@ -55,10 +56,13 @@
 
     function nameHtml(row) {
         const name = text(row.name);
-        const tierColor = {VIP: 'warning', '优质': 'success', '普通': 'primary'}[row.tier] || 'secondary';
+        const tierColor = {VIP: 'warning', '优质': 'success', '普通': 'primary', '劣质': 'danger'}[row.tier] || 'secondary';
+        const blockedBadge = row.is_blocked
+            ? ' <span class="badge bg-danger ms-1" style="font-size:0.7em;"><i class="bi bi-shield-fill-x me-1"></i>已拦截</span>'
+            : '';
         let html = '<div class="d-flex align-items-center"><div class="avatar-circle me-2 bg-gradient-' + tierColor + '">'
             + escapeHtml(name ? Array.from(name)[0].toUpperCase() : '?') + '</div><div>'
-            + '<div class="fw-bold text-white">' + escapeHtml(name || 'Unknown') + '</div>'
+            + '<div class="fw-bold text-white">' + escapeHtml(name || 'Unknown') + blockedBadge + '</div>'
             + '<small class="text-white-50">' + escapeHtml(row.email) + '</small>';
         const count = number(row.identity_email_count || 1);
         if (count > 1) {
@@ -97,8 +101,13 @@
     }
 
     function tierHtml(row) {
-        const tiers = {VIP: ['warning text-dark', 'star-fill'], '优质': ['success', 'gem'],
-            '普通': ['primary', 'person-check'], '新客': ['secondary', 'person']};
+        const tiers = {
+            VIP: ['warning text-dark', 'star-fill'],
+            '优质': ['success', 'gem'],
+            '普通': ['primary', 'person-check'],
+            '新客': ['secondary', 'person'],
+            '劣质': ['danger', 'x-circle']
+        };
         const tier = Object.prototype.hasOwnProperty.call(tiers, row.tier) ? row.tier : '新客';
         return '<span class="badge bg-' + tiers[tier][0] + '"><i class="bi bi-' + tiers[tier][1] + ' me-1"></i>' + tier + '</span>';
     }
@@ -218,7 +227,7 @@
                     button.style.background = filters[key] ? '#a78bfa' : '';
                     button.style.color = filters[key] ? '#fff' : '#a78bfa';
                 } else {
-                    const color = key === 'lossOnly' ? 'danger' : 'info';
+                    const color = (key === 'lossOnly' || key === 'badTierOnly') ? 'danger' : 'info';
                     button.classList.toggle('btn-' + color, filters[key]);
                     button.classList.toggle('btn-outline-' + color, !filters[key]);
                 }
@@ -229,6 +238,8 @@
         }
         bindToggle('toggleLossOnlyBtn', 'lossOnly', '<i class="bi bi-funnel-fill me-1"></i>显示全部客户',
             '<i class="bi bi-funnel me-1"></i>只看有损失的客户', 7);
+        bindToggle('toggleBadTierBtn', 'badTierOnly', '<i class="bi bi-funnel-fill me-1"></i>显示全部客户',
+            '<i class="bi bi-x-circle me-1"></i>只看劣质客户', 7);
         bindToggle('toggleMultiSiteBtn', 'multiSiteOnly', '<i class="bi bi-funnel-fill me-1"></i>显示全部客户',
             '<i class="bi bi-diagram-3 me-1"></i>只看多站客户', 2);
         bindToggle('toggleMergedBtn', 'mergedOnly', '<i class="bi bi-funnel-fill me-1"></i>显示全部客户',

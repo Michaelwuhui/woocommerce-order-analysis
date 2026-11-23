@@ -945,60 +945,30 @@ def extract_puffs_from_meta(item):
     return None
 
 
-def calculate_customer_tier(successful_orders, total_spending, avg_days_between,
-                            bad_orders=0, meaningful_orders=0):
-    """Calculate customer tier from orders, spending, frequency — then apply a
-    refusal/return-rate PENALTY so a serial refuser can't rank high just because
-    a few early orders + frequency padded the score.
+def calculate_customer_tier(
+    successful_orders,
+    total_spending,
+    avg_days_between,
+    bad_orders=0,
+    meaningful_orders=0,
+    *,
+    problem_return_orders=0,
+    undelivered_orders=0,
+    is_blocked=False,
+):
+    """统一的客户等级评定入口（委托至 customer_tier_service，严禁退货/拒收高风险客户获评优质或 VIP）。"""
+    from customer_tier_service import calculate_customer_tier as _calc_tier
 
-    bad_orders / meaningful_orders define the refusal rate (see _bad_order_case /
-    _meaningful_order_case). The base score (and the revenue numbers it's derived
-    from) is unchanged; the penalty only caps/downgrades the resulting tier.
-    """
-    quality_score = 0
-    quality_score += min(successful_orders * 10, 30)  # Max 30 for orders
-    quality_score += min(total_spending / 100, 40)    # Max 40 for spending
-
-    # Frequency bonus
-    if avg_days_between > 0:
-        if avg_days_between < 60:
-            quality_score += 30
-        elif avg_days_between < 120:
-            quality_score += 15
-
-    quality_score = min(quality_score, 100)
-
-    if quality_score >= 80:
-        tier = 'vip'
-    elif quality_score >= 60:
-        tier = 'good'
-    elif quality_score >= 40:
-        tier = 'normal'
-    else:
-        tier = 'new'
-
-    # ── Refusal / return-rate penalty ───────────────────────────────────────
-    # Denominator = meaningful orders (shipped/attempted/completed; excludes
-    # unpaid-cancelled). Fall back to bad+successful if not supplied.
-    try:
-        bad_orders = int(bad_orders or 0)
-    except (TypeError, ValueError):
-        bad_orders = 0
-    denom = meaningful_orders if meaningful_orders else (bad_orders + (successful_orders or 0))
-    bad_rate = (bad_orders / denom) if denom else 0.0
-
-    rank = ['new', 'normal', 'good', 'vip']
-
-    def _cap(t, ceiling):
-        return t if rank.index(t) <= rank.index(ceiling) else ceiling
-
-    if bad_orders >= 3 and bad_rate >= 0.5:
-        return 'bad'                 # 劣质：惯性拒收/退货
-    if bad_rate >= 0.5:
-        tier = _cap(tier, 'normal')  # 拒收率≥50%：最高普通
-    elif bad_rate >= 0.3:
-        tier = _cap(tier, 'good')    # 拒收率≥30%：不给 VIP
-    return tier
+    return _calc_tier(
+        successful_orders,
+        total_spending,
+        avg_days_between,
+        bad_orders=bad_orders,
+        meaningful_orders=meaningful_orders,
+        problem_return_orders=problem_return_orders,
+        undelivered_orders=undelivered_orders,
+        is_blocked=is_blocked,
+    )
 
 
 def get_full_product_name(item):
@@ -2205,80 +2175,107 @@ def dashboard():
         order['net_total'] = float(order['total'] or 0) - float(order.get('shipping_total') or 0)
         order['net_total_cny'] = round(order['net_total'] * rate, 2) if rate else None
     
-    # Get customer attributes for the recent orders
-    customer_emails = list(set(o['customer_email'] for o in processed_orders if o.get('customer_email')))
+    # 计算近期订单的客户等级（结合问题退货、拒收风险索引与黑名单统一降级熔断）
+    import customer_tier_service as _cts
+    customer_emails = list({o['customer_email'] for o in processed_orders if o.get('customer_email')})
     customer_attributes = {}
-    
+    dash_risk_idx = _build_risk_index(conn)
+    blocked_phones = set()
+    try:
+        blocked_phones = {
+            r[0] for r in conn.execute("SELECT phone FROM blocked_customers").fetchall() if r[0]
+        }
+    except Exception:
+        pass
+
     if customer_emails:
-        placeholders = ', '.join(['?' for _ in customer_emails])
-        
-        # Get manual quality settings
-        manual_settings = conn.execute(f'''
-            SELECT email, quality_tier FROM customer_settings 
-            WHERE email IN ({placeholders})
-        ''', customer_emails).fetchall()
-        
-        # Calculate attributes for each customer
+        norm_map = {raw: (raw or '').strip().lower() for raw in customer_emails if (raw or '').strip()}
+        norm_list = sorted(set(norm_map.values()))
+        manual_by_norm = {}
+        stats_by_norm = {}
+        if norm_list:
+            placeholders = ', '.join(['?' for _ in norm_list])
+            try:
+                for row in conn.execute(
+                    f"SELECT LOWER(TRIM(email)) AS norm_email, quality_tier FROM customer_settings "
+                    f"WHERE LOWER(TRIM(email)) IN ({placeholders})",
+                    tuple(norm_list),
+                ).fetchall():
+                    manual_by_norm[row['norm_email']] = row['quality_tier']
+            except Exception:
+                pass
+            try:
+                for row in conn.execute(
+                    f'''
+                    SELECT
+                        LOWER(TRIM(json_extract(billing, '$.email'))) as norm_email,
+                        COUNT(*) as total_orders,
+                        SUM({_success_status_case()}) as successful_orders,
+                        {_success_amount_case('total')} as total_spending,
+                        SUM({_bad_order_case()}) as bad_orders,
+                        SUM({_meaningful_order_case()}) as meaningful_orders,
+                        SUM(CASE WHEN COALESCE(is_problem_return, 0) = 1 THEN 1 ELSE 0 END) as problem_return_orders,
+                        SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 1 ELSE 0 END) as undelivered_orders,
+                        MAX(date_created) as last_order_date,
+                        MIN(date_created) as first_order_date
+                    FROM orders
+                    WHERE LOWER(TRIM(json_extract(billing, '$.email'))) IN ({placeholders})
+                    GROUP BY norm_email
+                    ''',
+                    tuple(norm_list),
+                ).fetchall():
+                    stats_by_norm[row['norm_email']] = dict(row)
+            except Exception:
+                pass
+
+        sample_order_by_email = {}
+        for od in processed_orders:
+            em = od.get('customer_email')
+            if em and em not in sample_order_by_email:
+                sample_order_by_email[em] = od
+
         for email in customer_emails:
-            if email not in customer_attributes:
-                customer_attributes[email] = {}
-            
-            # Check manual setting
-            manual_tier = 'auto'
-            for row in manual_settings:
-                if row['email'] == email:
-                    manual_tier = row['quality_tier']
-                    break
-            
-            # Get customer stats
-            stats_row = conn.execute(f'''
-                SELECT
-                    COUNT(*) as total_orders,
-                    SUM({_success_status_case()}) as successful_orders,
-                    {_success_amount_case('total')} as total_spending,
-                    SUM({_bad_order_case()}) as bad_orders,
-                    SUM({_meaningful_order_case()}) as meaningful_orders,
-                    MAX(date_created) as last_order_date,
-                    MIN(date_created) as first_order_date
-                FROM orders
-                WHERE json_extract(billing, '$.email') = ?
-            ''', (email,)).fetchone()
+            norm_em = norm_map.get(email, '')
+            st = stats_by_norm.get(norm_em, {})
+            total_orders = int(st.get('total_orders') or 0)
+            successful_orders = int(st.get('successful_orders') or 0)
+            total_spending = float(st.get('total_spending') or 0.0)
+            prob_cnt = int(st.get('problem_return_orders') or 0)
+            undeliv_cnt = int(st.get('undelivered_orders') or 0)
+            bad_cnt = int(st.get('bad_orders') or 0)
 
-            total_orders = stats_row['total_orders'] or 0
-            successful_orders = stats_row['successful_orders'] or 0
-            total_spending = stats_row['total_spending'] or 0
-            
-            customer_attributes[email]['order_count'] = total_orders
-            customer_attributes[email]['is_new'] = (total_orders <= 1)
-            
-            tier = manual_tier
-            if tier == 'auto':
-                avg_days_between = 0
-                if total_orders > 1 and stats_row['first_order_date'] and stats_row['last_order_date']:
-                    from datetime import datetime
-                    try:
-                        first_date = datetime.fromisoformat(stats_row['first_order_date'][:19])
-                        last_date = datetime.fromisoformat(stats_row['last_order_date'][:19])
-                        days_span = (last_date - first_date).days
-                        avg_days_between = days_span / (total_orders - 1)
-                    except:
-                        avg_days_between = 0
-                
-                tier = calculate_customer_tier(
-                    successful_orders, total_spending, avg_days_between,
-                    bad_orders=stats_row['bad_orders'] or 0,
-                    meaningful_orders=stats_row['meaningful_orders'] or 0)
+            sample_od = sample_order_by_email.get(email)
+            is_blk = False
+            if sample_od:
+                b_obj = parse_json_field(sample_od.get('billing')) or {}
+                s_obj = parse_json_field(sample_od.get('shipping')) or {}
+                full_risk = _assess_customer_risk(b_obj, s_obj, dash_risk_idx, current_order_id=None)
+                if full_risk:
+                    prob_cnt = max(prob_cnt, int(full_risk.get('problem_count') or 0))
+                    undeliv_cnt = max(undeliv_cnt, int(full_risk.get('undeliv_count') or 0))
+                    bad_cnt = max(bad_cnt, prob_cnt + undeliv_cnt)
+                ph_norm = _normalize_phone((_addr_for_order(b_obj, s_obj).get('phone')) or b_obj.get('phone'))
+                is_blk = bool(ph_norm and ph_norm in blocked_phones)
 
-            if tier == 'vip':
-                customer_attributes[email]['quality'] = {'label': 'VIP', 'class': 'text-warning', 'icon': 'star-fill'}
-            elif tier == 'good':
-                customer_attributes[email]['quality'] = {'label': '优质', 'class': 'text-success', 'icon': 'gem'}
-            elif tier == 'normal':
-                customer_attributes[email]['quality'] = {'label': '普通', 'class': 'text-primary', 'icon': 'person-check'}
-            elif tier == 'new':
-                customer_attributes[email]['quality'] = {'label': '新客', 'class': 'text-info', 'icon': 'stars'}
-            elif tier == 'bad':
-                customer_attributes[email]['quality'] = {'label': '劣质', 'class': 'text-danger', 'icon': 'x-circle'}
+            avg_days_between = _cts.compute_avg_days_between(
+                st.get('first_order_date'), st.get('last_order_date'), total_orders
+            )
+            tier, _ = _cts.resolve_final_tier(
+                manual_tier=manual_by_norm.get(norm_em, 'auto'),
+                successful_orders=successful_orders,
+                total_spending=total_spending,
+                avg_days_between=avg_days_between,
+                bad_orders=bad_cnt,
+                meaningful_orders=int(st.get('meaningful_orders') or 0),
+                problem_return_orders=prob_cnt,
+                undelivered_orders=undeliv_cnt,
+                is_blocked=is_blk,
+            )
+            customer_attributes[email] = {
+                'order_count': total_orders,
+                'is_new': (total_orders <= 1),
+                'quality': dict(_cts.ORDER_BADGE_META.get(tier, _cts.ORDER_BADGE_META['new'])),
+            }
 
     conn.close()
     
@@ -2865,101 +2862,112 @@ def orders():
         - displayed_totals['shipping_loss_cny']
         - displayed_totals['product_loss_cny'], 2)
 
-    # Get customer attributes for the displayed orders
-    customer_emails = list(set(o['customer_email'] for o in processed_orders if o.get('customer_email')))
+    # 为当前页订单计算统一的客户等级属性（综合单邮箱统计、跨手机/地址风险索引与手机黑名单）
+    import customer_tier_service as _cts
+    customer_emails = list({o['customer_email'] for o in processed_orders if o.get('customer_email')})
     customer_attributes = {}
-    
-    if customer_emails:
-        placeholders = ', '.join(['?' for _ in customer_emails])
-        
-        # 1. Get manual quality settings
-        manual_settings = conn.execute(f'''
-            SELECT email, quality_tier FROM customer_settings 
-            WHERE email IN ({placeholders})
-        ''', customer_emails).fetchall()
-        
-        # 2. Pre-calculate customer stats for all emails to avoid N+1 query locks
-        email_stats = {}
-        emails_list = list(customer_emails)
-        placeholders_stats = ', '.join(['?' for _ in emails_list])
-        
+    blocked_phones = set()
+    try:
+        blocked_phones = {
+            r[0] for r in conn.execute("SELECT phone FROM blocked_customers").fetchall() if r[0]
+        }
+    except Exception:
+        pass
+
+    norm_map = {raw: (raw or '').strip().lower() for raw in customer_emails if (raw or '').strip()}
+    norm_list = sorted(set(norm_map.values()))
+    manual_by_norm = {}
+    email_stats = {}
+
+    if norm_list:
+        placeholders_stats = ', '.join(['?' for _ in norm_list])
         try:
-            stats_results = conn.execute(f'''
+            for row in conn.execute(
+                f"SELECT LOWER(TRIM(email)) AS norm_email, quality_tier FROM customer_settings "
+                f"WHERE LOWER(TRIM(email)) IN ({placeholders_stats})",
+                tuple(norm_list),
+            ).fetchall():
+                manual_by_norm[row['norm_email']] = row['quality_tier']
+        except Exception:
+            pass
+
+        try:
+            stats_results = conn.execute(
+                f'''
                 SELECT
-                    json_extract(billing, '$.email') as current_email,
+                    LOWER(TRIM(json_extract(billing, '$.email'))) as norm_email,
                     COUNT(*) as total_orders,
                     SUM({_success_status_case()}) as successful_orders,
                     {_success_amount_case('total')} as total_spending,
                     SUM({_bad_order_case()}) as bad_orders,
                     SUM({_meaningful_order_case()}) as meaningful_orders,
+                    SUM(CASE WHEN COALESCE(is_problem_return, 0) = 1 THEN 1 ELSE 0 END) as problem_return_orders,
+                    SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 1 ELSE 0 END) as undelivered_orders,
                     MAX(date_created) as last_order_date,
                     MIN(date_created) as first_order_date
                 FROM orders
-                WHERE json_extract(billing, '$.email') IN ({placeholders_stats})
-                GROUP BY current_email
-            ''', tuple(emails_list)).fetchall()
-            
+                WHERE LOWER(TRIM(json_extract(billing, '$.email'))) IN ({placeholders_stats})
+                GROUP BY norm_email
+                ''',
+                tuple(norm_list),
+            ).fetchall()
             for r in stats_results:
-                email_stats[r['current_email']] = dict(r)
-        except Exception as e:
-            # Fallback if there is any issue with the bulk query
+                email_stats[r['norm_email']] = dict(r)
+        except Exception:
             pass
 
-        # 3. Calculate attributes for each customer
-        for email in customer_emails:
-            if email not in customer_attributes:
-                customer_attributes[email] = {}
-            
-            # Check manual setting
-            manual_tier = 'auto'
-            for row in manual_settings:
-                if row['email'] == email:
-                    manual_tier = row['quality_tier']
-                    break
-            
-            # Get customer stats from pre-calculated dictionary
-            stats = email_stats.get(email, {})
-            
-            total_orders = stats.get('total_orders') or 0
-            successful_orders = stats.get('successful_orders') or 0
-            total_spending = stats.get('total_spending') or 0
-            
-            # Store order count for display
-            customer_attributes[email]['order_count'] = total_orders
-            customer_attributes[email]['is_new'] = (total_orders <= 1)
-            
-            # Determine Tier
-            tier = manual_tier
-            
-            if tier == 'auto':
-                # Calculate auto tier using shared logic
-                avg_days_between = 0
-                if total_orders > 1 and stats['first_order_date'] and stats['last_order_date']:
-                    from datetime import datetime
-                    try:
-                        first_date = datetime.fromisoformat(stats['first_order_date'][:19])
-                        last_date = datetime.fromisoformat(stats['last_order_date'][:19])
-                        days_span = (last_date - first_date).days
-                        avg_days_between = days_span / (total_orders - 1)
-                    except:
-                        avg_days_between = 0
-                
-                tier = calculate_customer_tier(
-                    successful_orders, total_spending, avg_days_between,
-                    bad_orders=stats.get('bad_orders') or 0,
-                    meaningful_orders=stats.get('meaningful_orders') or 0)
+    for od in processed_orders:
+        raw_email = od.get('customer_email') or ''
+        norm_em = norm_map.get(raw_email, '')
+        stats = email_stats.get(norm_em, {}) if norm_em else {}
+        total_orders = int(stats.get('total_orders') or (1 if not norm_em else 0))
+        successful_orders = int(stats.get('successful_orders') or 0)
+        total_spending = float(stats.get('total_spending') or 0.0)
+        prob_cnt = int(stats.get('problem_return_orders') or 0)
+        undeliv_cnt = int(stats.get('undelivered_orders') or 0)
+        bad_cnt = int(stats.get('bad_orders') or 0)
 
-            # Set attributes based on tier
-            if tier == 'vip':
-                customer_attributes[email]['quality'] = {'label': 'VIP', 'class': 'text-warning', 'icon': 'star-fill'}
-            elif tier == 'good':
-                customer_attributes[email]['quality'] = {'label': '优质', 'class': 'text-success', 'icon': 'gem'}
-            elif tier == 'normal':
-                customer_attributes[email]['quality'] = {'label': '普通', 'class': 'text-primary', 'icon': 'person-check'}
-            elif tier == 'new':
-                customer_attributes[email]['quality'] = {'label': '新客', 'class': 'text-info', 'icon': 'stars'}
-            elif tier == 'bad':
-                customer_attributes[email]['quality'] = {'label': '劣质', 'class': 'text-danger', 'icon': 'x-circle'}
+        b_obj = parse_json_field(od.get('billing')) or {}
+        s_obj = parse_json_field(od.get('shipping')) or {}
+        full_risk = _assess_customer_risk(b_obj, s_obj, risk_idx, current_order_id=None)
+        if full_risk:
+            prob_cnt = max(prob_cnt, int(full_risk.get('problem_count') or 0))
+            undeliv_cnt = max(undeliv_cnt, int(full_risk.get('undeliv_count') or 0))
+            bad_cnt = max(bad_cnt, prob_cnt + undeliv_cnt)
+        if bool(od.get('is_problem_return')):
+            prob_cnt = max(prob_cnt, 1)
+            bad_cnt = max(bad_cnt, 1)
+        if bool(od.get('is_undelivered')):
+            undeliv_cnt = max(undeliv_cnt, 1)
+            bad_cnt = max(bad_cnt, 1)
+
+        addr_obj = _addr_for_order(b_obj, s_obj) if '_addr_for_order' in globals() else b_obj
+        ph_norm = _normalize_phone((addr_obj or {}).get('phone') or b_obj.get('phone')) if '_normalize_phone' in globals() else None
+        is_blk = bool(ph_norm and ph_norm in blocked_phones)
+
+        avg_days_between = _cts.compute_avg_days_between(
+            stats.get('first_order_date'), stats.get('last_order_date'), total_orders
+        )
+        tier, _ = _cts.resolve_final_tier(
+            manual_tier=manual_by_norm.get(norm_em, 'auto') if norm_em else 'auto',
+            successful_orders=successful_orders,
+            total_spending=total_spending,
+            avg_days_between=avg_days_between,
+            bad_orders=bad_cnt,
+            meaningful_orders=int(stats.get('meaningful_orders') or 0),
+            problem_return_orders=prob_cnt,
+            undelivered_orders=undeliv_cnt,
+            is_blocked=is_blk,
+        )
+        attr_entry = {
+            'order_count': total_orders,
+            'is_new': (total_orders <= 1),
+            'is_blocked': is_blk,
+            'quality': dict(_cts.ORDER_BADGE_META.get(tier, _cts.ORDER_BADGE_META['new'])),
+        }
+        od['customer_attrs'] = attr_entry
+        if raw_email:
+            customer_attributes[raw_email] = attr_entry
 
     conn.close()
     
@@ -4781,6 +4789,8 @@ def customers():
             COUNT(*) as total_orders,
             SUM({_success_status_case()}) as successful_orders,
             {_success_amount_case('total')} as total_spent,
+            SUM({_bad_order_case()}) as bad_orders,
+            SUM({_meaningful_order_case()}) as meaningful_orders,
             SUM(CASE WHEN COALESCE(is_undelivered, 0) = 1 THEN 1 ELSE 0 END) as undelivered_orders,
             SUM(CASE WHEN COALESCE(is_undelivered,0) = 1 OR COALESCE(is_problem_return,0) = 1
                      THEN COALESCE(shipping_loss_amount, 0) ELSE 0 END) as shipping_loss_total,
@@ -4823,45 +4833,54 @@ def customers():
     # matches (permissions / manager / source filters).
     email_to_cluster, cluster_meta = _resolve_identity_clusters(conn, where_clause, params)
 
+    manual_tier_by_email = {}
+    try:
+        for mrow in conn.execute(
+            "SELECT LOWER(TRIM(email)) AS norm_email, quality_tier FROM customer_settings "
+            "WHERE COALESCE(quality_tier, 'auto') != 'auto'"
+        ).fetchall():
+            if mrow['norm_email']:
+                manual_tier_by_email[mrow['norm_email']] = mrow['quality_tier']
+    except Exception:
+        pass
+
+    blocked_phone_set = set()
+    try:
+        blocked_phone_set = {
+            brow[0] for brow in conn.execute("SELECT phone FROM blocked_customers").fetchall() if brow[0]
+        }
+    except Exception:
+        pass
+
     conn.close()
 
     total_revenue_cny = 0
     repeat_customers = 0
     new_customers_month = 0
     new_customers_last_month = 0
-    # Repeat-rate numerators/denominators for the three switchable口径:
-    #   headcount = repeat_customers / total_customers
-    #   by_orders = repeat_success_orders / total_success_orders
-    #   by_revenue = repeat_spending / total_revenue
     total_success_orders = 0
     repeat_success_orders = 0
     repeat_spending_cny = 0.0
 
     import datetime
+    import customer_tier_service as _cts
     now = datetime.datetime.now()
     thirty_days_ago = (now - datetime.timedelta(days=30)).strftime('%Y-%m-%d')
     sixty_days_ago = (now - datetime.timedelta(days=60)).strftime('%Y-%m-%d')
     ninety_days_ago = (now - datetime.timedelta(days=90)).strftime('%Y-%m-%d')
 
-    tier_counts = {'VIP': 0, '优质': 0, '普通': 0, '新客': 0}
+    tier_counts = {'VIP': 0, '优质': 0, '普通': 0, '新客': 0, '劣质': 0}
 
-    # Aggregate loss bookkeeping so the page can headline "who's costing us money".
     loss_stats = {
-        'customers_with_loss': 0,        # distinct identities with any shipping/product loss
-        'undelivered_customers': 0,      # identities with ≥1 undelivered order
-        'problem_return_customers': 0,   # identities with ≥1 problem-return order
-        'shipping_loss_total': 0.0,      # summed across identities (native currency, see note)
+        'customers_with_loss': 0,
+        'undelivered_customers': 0,
+        'problem_return_customers': 0,
+        'shipping_loss_total': 0.0,
         'product_loss_total': 0.0,
-        # Per-currency breakdown so the overview strip can label amounts with
-        # their real currency instead of an ambiguous bare number. Single-country
-        # users get one bucket; admins viewing all countries get several.
-        'by_currency': {},               # {currency: {'shipping': x, 'product': y}}
+        'by_currency': {},
     }
 
     # ── Phase A: fold the per-email SQL rows into identity clusters ──
-    # Each SQL row is one raw email (GROUP BY email). We sum its numbers into the
-    # cluster that _resolve_identity_clusters assigned its normalized email to.
-    # Guest orders with no email never merge — each gets a unique singleton key.
     identities = {}
     _singleton_seq = 0
     for row in customers_data:
@@ -4880,6 +4899,7 @@ def customers():
                 'emails_by_spend': [], 'names_by_spend': [], 'phones': set(),
                 'total_orders': 0, 'successful_orders': 0, 'total_spent': 0.0,
                 'total_spent_cny': 0.0, 'missing_exchange_rates': set(),
+                'bad_orders': 0, 'meaningful_orders': 0,
                 'undelivered_orders': 0, 'shipping_loss_total': 0.0,
                 'problem_return_orders': 0, 'product_loss_total': 0.0,
                 'sources': set(), 'currencies': set(),
@@ -4899,6 +4919,8 @@ def customers():
         email_cny = spending_cny_by_email.get(norm, {})
         idn['total_spent_cny'] += float(email_cny.get('total_spent_cny') or 0)
         idn['missing_exchange_rates'].update(email_cny.get('missing_exchange_rates') or set())
+        idn['bad_orders'] += int(c.get('bad_orders') or 0)
+        idn['meaningful_orders'] += int(c.get('meaningful_orders') or 0)
         idn['undelivered_orders'] += int(c.get('undelivered_orders') or 0)
         idn['shipping_loss_total'] += float(c.get('shipping_loss_total') or 0)
         idn['problem_return_orders'] += int(c.get('problem_return_orders') or 0)
@@ -4923,19 +4945,30 @@ def customers():
         c = {}
         idn['emails_by_spend'].sort(reverse=True)
         idn['names_by_spend'].sort(reverse=True)
-        # Representative name + primary email = the highest-spending within the
-        # merged identity (so the "main" account leads the display).
         primary_email = idn['emails_by_spend'][0][1] if idn['emails_by_spend'] else ''
         c['email'] = primary_email
         c['name'] = idn['names_by_spend'][0][1] if idn['names_by_spend'] else (primary_email or 'Unknown')
         c['phone'] = next(iter(idn['phones'])) if idn['phones'] else ''
 
-        # Merged-identity surfacing: how many distinct emails/phones rolled up.
         distinct_emails = sorted({e for _, e in idn['emails_by_spend']}, key=str.lower)
         c['identity_emails'] = distinct_emails
         c['identity_email_count'] = len(distinct_emails)
         c['identity_phone_count'] = len(idn['phones'])
         c['identity_matched_by'] = sorted(cluster_meta.get(ck, {}).get('matched_by', set()))
+
+        # 判断合并身份下任一手机号是否在拦截黑名单、任一邮箱是否有手动指定等级
+        identity_norm_phones = {_normalize_phone(p) for p in idn['phones']}
+        identity_norm_phones.update(cluster_meta.get(ck, {}).get('phones', set()))
+        identity_norm_phones.discard(None)
+        is_blocked = bool(identity_norm_phones & blocked_phone_set)
+        c['is_blocked'] = is_blocked
+
+        manual_tier = 'auto'
+        for em in distinct_emails:
+            cand_m = manual_tier_by_email.get(em.strip().lower())
+            if cand_m and cand_m != 'auto':
+                manual_tier = cand_m
+                break
 
         c['total_orders'] = idn['total_orders']
         c['successful_orders'] = idn['successful_orders']
@@ -4947,7 +4980,9 @@ def customers():
         c['problem_return_orders'] = idn['problem_return_orders']
         c['product_loss_total'] = round(idn['product_loss_total'], 2)
         c['total_loss'] = round(c['shipping_loss_total'] + c['product_loss_total'], 2)
-        c['refusal_rate'] = round(c['undelivered_orders'] / c['total_orders'] * 100, 1) if c['total_orders'] else 0
+        denom_orders = idn['meaningful_orders'] if idn['meaningful_orders'] > 0 else c['total_orders']
+        eff_bad = max(idn['bad_orders'], c['undelivered_orders'] + c['problem_return_orders'])
+        c['refusal_rate'] = round(eff_bad / denom_orders * 100, 1) if denom_orders else 0
         c['first_order_date'] = idn['first_order_date']
         c['last_order_date'] = idn['last_order_date']
         cur_str = sorted(idn['currencies'])[0] if idn['currencies'] else 'N/A'
@@ -4979,39 +5014,37 @@ def customers():
         elif c['first_order_date'] and c['first_order_date'] >= sixty_days_ago:
             new_customers_last_month += 1
 
-        # Calculate Tier (same logic as API), now over the merged identity.
-        avg_days = 0
-        if c['successful_orders'] > 1 and c['first_order_date'] and c['last_order_date']:
-            first = datetime.datetime.fromisoformat(c['first_order_date'])
-            last = datetime.datetime.fromisoformat(c['last_order_date'])
-            days = (last - first).days or 1
-            avg_days = days / c['successful_orders']
-
-        score = min(c['successful_orders'] * 10, 30) + min(c['total_spent'] / 100, 40)
-        score += 30 if avg_days > 0 and avg_days < 60 else (15 if avg_days < 120 else 0)
-        score = min(score, 100)
-
-        if score >= 80: tier = 'VIP'
-        elif score >= 60: tier = '优质'
-        elif score >= 40: tier = '普通'
-        else: tier = '新客'
+        # 调用全站统一的权威客户等级算法（严格执行问题退货与高拒收熔断降级）
+        avg_days = _cts.compute_avg_days_between(
+            c['first_order_date'], c['last_order_date'], c['total_orders']
+        )
+        tier_code, _ = _cts.resolve_final_tier(
+            manual_tier=manual_tier,
+            successful_orders=c['successful_orders'],
+            total_spending=c['total_spent'],
+            avg_days_between=avg_days,
+            bad_orders=eff_bad,
+            meaningful_orders=idn['meaningful_orders'],
+            problem_return_orders=c['problem_return_orders'],
+            undelivered_orders=c['undelivered_orders'],
+            is_blocked=is_blocked,
+        )
+        tier = _cts.TIER_CODE_TO_CN.get(tier_code, '新客')
 
         c['tier'] = tier
-        tier_counts[tier] += 1
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
 
-        # Smart Actions
-        actions = []
-        if tier == 'VIP':
-            actions.append({'type': 'success', 'icon': 'gift', 'text': '专属礼遇'})
-            actions.append({'type': 'primary', 'icon': 'people', 'text': '邀请入群'})
-        elif c['last_order_date'] and c['last_order_date'] < ninety_days_ago:
-            actions.append({'type': 'warning', 'icon': 'ticket-perforated', 'text': '召回优惠券'})
-        elif c['successful_orders'] == 1 and c['first_order_date'] and c['first_order_date'] >= thirty_days_ago:
-            actions.append({'type': 'info', 'icon': 'book', 'text': '欢迎指南'})
-            actions.append({'type': 'info', 'icon': 'bag-plus', 'text': '关联推荐'})
-        elif c['successful_orders'] > 3:
-            actions.append({'type': 'primary', 'icon': 'arrow-repeat', 'text': '订阅服务'})
-        c['actions'] = actions
+        c['actions'] = _cts.build_smart_actions(
+            tier_cn=tier,
+            successful_orders=c['successful_orders'],
+            problem_return_orders=c['problem_return_orders'],
+            undelivered_orders=c['undelivered_orders'],
+            is_blocked=is_blocked,
+            first_order_date=c['first_order_date'],
+            last_order_date=c['last_order_date'],
+            thirty_days_ago=thirty_days_ago,
+            ninety_days_ago=ninety_days_ago,
+        )
 
         # Sources across the WHOLE identity (drives the 多站下单 column).
         sources = sorted(idn['sources'])
@@ -5552,7 +5585,8 @@ def get_customer_details(email):
         order_sql = f'''
             SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing,
                    payment_method, is_undelivered, shipping_loss_amount,
-                   is_problem_return, delivery_confirmed, undelivered_note, carrier_status
+                   is_problem_return, problem_return_type, product_loss_amount, problem_return_note,
+                   delivery_confirmed, undelivered_note, carrier_status
             FROM orders
             WHERE lower(trim(json_extract(billing, '$.email'))) IN ({ident_ph})
               AND {' AND '.join(scope_conditions)}
@@ -5563,7 +5597,8 @@ def get_customer_details(email):
         orders = conn.execute('''
             SELECT id, number, status, total, currency, shipping_total, date_created, source, line_items, billing,
                    payment_method, is_undelivered, shipping_loss_amount,
-                   is_problem_return, delivery_confirmed, undelivered_note, carrier_status
+                   is_problem_return, problem_return_type, product_loss_amount, problem_return_note,
+                   delivery_confirmed, undelivered_note, carrier_status
             FROM orders
             WHERE json_extract(billing, '$.email') = ? AND status NOT IN ('checkout-draft', 'trash')
             ORDER BY date_created DESC
@@ -5591,9 +5626,11 @@ def get_customer_details(email):
     failed_orders = 0
     cancelled_orders = 0
     undelivered_orders = 0
-    bad_orders = 0          # refused/returned/problem/COD-failed — drives the tier penalty
-    meaningful_orders = 0   # shipped/attempted/completed (excl. unpaid-cancelled) — tier denominator
+    problem_return_orders = 0
+    bad_orders = 0          # 拒收/物流退回/问题退货/COD失败 — 驱动客户等级惩罚
+    meaningful_orders = 0   # 实际发出或尝试履约订单（排除未付取消与草稿）
     shipping_loss_total = 0.0
+    product_loss_total = 0.0
     dates = []
     
     # Initialize customer details
@@ -5642,23 +5679,29 @@ def get_customer_details(email):
         else:
             site_spending[source] = {'orders': 1, 'amount': float(order['total'] or 0)}
         
-        # Status counting
+        # 统计各订单结果（问题退货与拒收未送达绝不计入成功订单和有效总消费）
         status = order['status']
         currency = order['currency'] or 'N/A'
         payment_method = order['payment_method'] or ''
         order_source = order['source'] or ''
         is_undelivered = bool(order['is_undelivered']) if 'is_undelivered' in order.keys() else False
+        is_problem = bool(order['is_problem_return']) if 'is_problem_return' in order.keys() else False
+        ship_loss_val = float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in order.keys() else 0.0
+        prod_loss_val = float(order['product_loss_amount'] or 0) if 'product_loss_amount' in order.keys() else 0.0
         on_hold_is_success = (status == 'on-hold'
                               and payment_method != 'bacs'
                               and order_source in on_hold_shipped_sources)
-        if is_undelivered:
-            undelivered_orders += 1
-            shipping_loss_total += float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in order.keys() else 0
+        if is_undelivered or is_problem:
+            if is_undelivered:
+                undelivered_orders += 1
+            if is_problem:
+                problem_return_orders += 1
+                product_loss_total += prod_loss_val
+            shipping_loss_total += ship_loss_val
         elif status in ['completed', 'shipped', 'delivered', 'partial-shipped'] or on_hold_is_success or (status == 'processing' and payment_method and payment_method != 'cod'):
             successful_orders += 1
             order_total = float(order['total'] or 0)
             total_spending += order_total
-            # Track by currency
             if currency not in spending_by_currency:
                 spending_by_currency[currency] = 0
             spending_by_currency[currency] += order_total
@@ -5667,10 +5710,8 @@ def get_customer_details(email):
         elif status == 'cancelled':
             cancelled_orders += 1
 
-        # Customer-quality penalty inputs (tier-only; not revenue):
-        # bad = refused/returned (manual) | carrier-returned | problem return | COD failed.
+        # 客户质量惩罚统计：拒收/物流退回/问题退货/COD失败均计入不良订单
         carrier_st = (order['carrier_status'] if 'carrier_status' in order.keys() else None)
-        is_problem = bool(order['is_problem_return']) if 'is_problem_return' in order.keys() else False
         if is_undelivered or carrier_st == 'returned' or is_problem \
                 or (status == 'failed' and (payment_method or 'cod') == 'cod'):
             bad_orders += 1
@@ -5692,13 +5733,14 @@ def get_customer_details(email):
             'product_count': order_qty,
             'products': order_products,
             'email': (billing.get('email') or '').strip(),
-            # Outcome / special status — so a suspicious customer's refused orders
-            # are visible at a glance (these live in local flags, NOT the WC status).
             'is_undelivered': is_undelivered,
-            'is_problem_return': bool(order['is_problem_return']) if 'is_problem_return' in order.keys() else False,
+            'is_problem_return': is_problem,
+            'problem_return_type': (order['problem_return_type'] or '') if 'problem_return_type' in order.keys() else '',
+            'problem_return_note': (order['problem_return_note'] or '') if 'problem_return_note' in order.keys() else '',
+            'product_loss_amount': prod_loss_val,
             'delivery_confirmed': bool(order['delivery_confirmed']) if 'delivery_confirmed' in order.keys() else False,
             'undelivered_note': (order['undelivered_note'] or '') if 'undelivered_note' in order.keys() else '',
-            'shipping_loss_amount': float(order['shipping_loss_amount'] or 0) if 'shipping_loss_amount' in order.keys() else 0,
+            'shipping_loss_amount': ship_loss_val,
             'carrier_status': (order['carrier_status'] if 'carrier_status' in order.keys() else None),
         })
     
@@ -5716,58 +5758,73 @@ def get_customer_details(email):
     # Sort products by quantity
     sorted_products = sorted(all_products.items(), key=lambda x: x[1]['quantity'], reverse=True)
     
-    # Customer quality score (simple algorithm)
-    quality_score = 0
-    quality_score += min(successful_orders * 10, 30)  # Max 30 for orders
-    quality_score += min(total_spending / 100, 40)    # Max 40 for spending
-    quality_score += 30 if avg_days_between > 0 and avg_days_between < 60 else (15 if avg_days_between < 120 else 0)  # Frequency bonus
-    quality_score = min(quality_score, 100)
-    
-    # Check for manual override — honor a tier set on ANY email in the identity.
-    conn = get_db_connection()
-    if identity_emails:
-        ms_ph = ','.join(['?'] * len(identity_emails))
-        manual_setting = conn.execute(
-            f"SELECT quality_tier FROM customer_settings "
-            f"WHERE lower(trim(email)) IN ({ms_ph}) AND COALESCE(quality_tier,'auto') != 'auto' LIMIT 1",
-            identity_emails
-        ).fetchone()
-    else:
-        manual_setting = conn.execute('SELECT quality_tier FROM customer_settings WHERE email = ?', (email,)).fetchone()
-    conn.close()
-    manual_tier = manual_setting['quality_tier'] if manual_setting else 'auto'
-    
-    # Determine customer tier
-    if manual_tier != 'auto':
-        if manual_tier == 'vip':
-            customer_tier = {'level': 'VIP', 'color': '#f59e0b', 'icon': 'star-fill', 'manual': True}
-        elif manual_tier == 'good':
-            customer_tier = {'level': '优质', 'color': '#10b981', 'icon': 'gem', 'manual': True}
-        elif manual_tier == 'normal':
-            customer_tier = {'level': '普通', 'color': '#3b82f6', 'icon': 'person-check', 'manual': True}
-        elif manual_tier == 'new':
-            customer_tier = {'level': '新客', 'color': '#0dcaf0', 'icon': 'stars', 'manual': True}
-        elif manual_tier == 'bad':
-            customer_tier = {'level': '劣质', 'color': '#ef4444', 'icon': 'x-circle', 'manual': True}
-        else:
-            # Fallback to auto if unknown
-            manual_tier = 'auto'
-            
-    if manual_tier == 'auto':
-        tier = calculate_customer_tier(successful_orders, total_spending, avg_days_between,
-                                       bad_orders=bad_orders, meaningful_orders=meaningful_orders)
-        if tier == 'vip':
-            customer_tier = {'level': 'VIP', 'color': '#f59e0b', 'icon': 'star-fill', 'manual': False}
-        elif tier == 'good':
-            customer_tier = {'level': '优质', 'color': '#10b981', 'icon': 'gem', 'manual': False}
-        elif tier == 'normal':
-            customer_tier = {'level': '普通', 'color': '#3b82f6', 'icon': 'person-check', 'manual': False}
-        elif tier == 'bad':
-            customer_tier = {'level': '劣质', 'color': '#ef4444', 'icon': 'x-circle', 'manual': False}
-        else:
-            customer_tier = {'level': '新客', 'color': '#0dcaf0', 'icon': 'stars', 'manual': False}
+    import customer_tier_service as _cts
+    quality_score = _cts.compute_base_quality_score(
+        successful_orders, total_spending, avg_days_between
+    )
 
-    customer_tier['value'] = manual_tier
+    # 先检查手机号拦截黑名单，以便等级评定自动熔断为「劣质」
+    norm_ph = _normalize_phone(customer_phone)
+    is_blocked = False
+    block_info = None
+    if norm_ph:
+        conn_b = get_db_connection()
+        try:
+            brow = conn_b.execute(
+                "SELECT * FROM blocked_customers WHERE phone = ?", (norm_ph,)
+            ).fetchone()
+            if brow:
+                is_blocked = True
+                block_info = {
+                    'phone': brow['phone'],
+                    'reason': brow['reason'],
+                    'auto_cancel': bool(brow['auto_cancel']),
+                    'cancelled_count': brow['cancelled_count'] or 0,
+                    'created_by': brow['created_by'],
+                    'created_at': brow['created_at'],
+                    'last_cancelled_at': brow['last_cancelled_at'],
+                }
+        finally:
+            conn_b.close()
+    
+    # 检查手动等级覆盖（支持同一合并身份下任意邮箱）
+    conn = get_db_connection()
+    try:
+        if identity_emails:
+            ms_ph = ','.join(['?'] * len(identity_emails))
+            manual_setting = conn.execute(
+                f"SELECT quality_tier FROM customer_settings "
+                f"WHERE lower(trim(email)) IN ({ms_ph}) AND COALESCE(quality_tier,'auto') != 'auto' LIMIT 1",
+                identity_emails
+            ).fetchone()
+        else:
+            manual_setting = conn.execute(
+                "SELECT quality_tier FROM customer_settings WHERE lower(trim(email)) = lower(trim(?))",
+                (email,),
+            ).fetchone()
+    finally:
+        conn.close()
+    manual_tier = manual_setting['quality_tier'] if manual_setting else 'auto'
+
+    final_tier_code, is_manual_tier = _cts.resolve_final_tier(
+        manual_tier=manual_tier,
+        successful_orders=successful_orders,
+        total_spending=total_spending,
+        avg_days_between=avg_days_between,
+        bad_orders=bad_orders,
+        meaningful_orders=meaningful_orders,
+        problem_return_orders=problem_return_orders,
+        undelivered_orders=undelivered_orders,
+        is_blocked=is_blocked,
+    )
+    meta = _cts.DETAIL_BADGE_META.get(final_tier_code, _cts.DETAIL_BADGE_META['new'])
+    customer_tier = {
+        'level': meta['level'],
+        'color': meta['color'],
+        'icon': meta['icon'],
+        'manual': is_manual_tier,
+        'value': final_tier_code if is_manual_tier else 'auto',
+    }
     
     # Calculate CNY total for customer spending
     from datetime import datetime
@@ -5778,33 +5835,11 @@ def get_customer_details(email):
         if rate:
             spending_cny += amount * rate
 
-    # Blocklist status (auto-cancel COD), matched by normalized phone.
-    norm_ph = _normalize_phone(customer_phone)
-    is_blocked = False
-    block_info = None
-    if norm_ph:
-        conn_b = get_db_connection()
-        brow = conn_b.execute(
-            "SELECT * FROM blocked_customers WHERE phone = ?", (norm_ph,)
-        ).fetchone()
-        conn_b.close()
-        if brow:
-            is_blocked = True
-            block_info = {
-                'phone': brow['phone'],
-                'reason': brow['reason'],
-                'auto_cancel': bool(brow['auto_cancel']),
-                'cancelled_count': brow['cancelled_count'] or 0,
-                'created_by': brow['created_by'],
-                'created_at': brow['created_at'],
-                'last_cancelled_at': brow['last_cancelled_at'],
-            }
-
+    denom_for_rate = meaningful_orders if meaningful_orders > 0 else len(order_list)
     result = {
         'email': email,
         'name': customer_name,
         'phone': customer_phone,
-        # Identity surfacing: which emails were merged + why.
         'identity_emails': identity_emails,
         'identity_email_count': len(identity_emails),
         'identity_matched_by': identity_matched_by,
@@ -5813,11 +5848,14 @@ def get_customer_details(email):
         'failed_orders': failed_orders,
         'cancelled_orders': cancelled_orders,
         'undelivered_orders': undelivered_orders,
+        'problem_return_orders': problem_return_orders,
+        'bad_orders': bad_orders,
         'shipping_loss_total': round(shipping_loss_total, 2),
-        'refusal_rate': round(undelivered_orders / len(order_list) * 100, 1) if order_list else 0,
+        'product_loss_total': round(product_loss_total, 2),
+        'refusal_rate': round(bad_orders / denom_for_rate * 100, 1) if denom_for_rate else 0,
         'total_spending': total_spending,
-        'spending_by_currency': spending_by_currency,  # New: currency breakdown
-        'spending_cny': round(spending_cny, 2),  # New: CNY total
+        'spending_by_currency': spending_by_currency,
+        'spending_cny': round(spending_cny, 2),
         'avg_order_value': total_spending / successful_orders if successful_orders > 0 else 0,
         'first_order_date': unique_dates[0] if unique_dates else None,
         'last_order_date': unique_dates[-1] if unique_dates else None,
@@ -5829,7 +5867,7 @@ def get_customer_details(email):
         'phone_normalized': norm_ph,
         'site_spending': [{'site': k.replace('https://www.', ''), 'orders': v['orders'], 'amount': v['amount']} for k, v in site_spending.items()],
         'top_products': [{'name': k, 'quantity': v['quantity'], 'total': v['total']} for k, v in sorted_products[:10]],
-        'orders': order_list[:20]  # Limit to 20 most recent
+        'orders': order_list[:20]
     }
     
     return jsonify(result)
