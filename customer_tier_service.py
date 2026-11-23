@@ -117,10 +117,8 @@ def calculate_customer_tier(
     denom = max(raw_meaningful, bad_cnt + succ_cnt)
     bad_rate = (bad_cnt / denom) if denom > 0 else 0.0
 
-    # 一级风控熔断：直接判定为劣质客户（bad）
-    if prob_cnt >= 2:
-        return "bad"
-    if prob_cnt >= 1 and (bad_cnt >= 2 or succ_cnt <= 1 or bad_rate >= 0.34):
+    # 一级风控熔断：凡存在问题退货（调包/少件/损坏/扣留货损，属高风险）或惯性拒收，直接判定为劣质客户（bad）
+    if prob_cnt >= 1:
         return "bad"
     if bad_cnt >= 3 and bad_rate >= 0.35:
         return "bad"

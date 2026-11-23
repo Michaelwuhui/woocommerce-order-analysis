@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_marta_kubiak_real_case_never_gets_good_or_vip():
-    """复现线上真实案例 Marta Kubiak：5 单中 4 单成功（945 PLN）、1 单问题退货，严禁评为优质或 VIP。"""
+    """复现线上真实案例 Marta Kubiak：存在问题退货（调包/扣留货损），一票否决判定为劣质（bad），严禁评为优质或 VIP。"""
     tier = cts.calculate_customer_tier(
         successful_orders=4,
         total_spending=945.10,
@@ -28,7 +28,7 @@ def test_marta_kubiak_real_case_never_gets_good_or_vip():
         problem_return_orders=1,
         undelivered_orders=0,
     )
-    assert tier == "normal"
+    assert tier == "bad"
 
 
 def test_repeat_problem_returns_or_combined_bad_orders_become_bad_tier():
@@ -204,4 +204,4 @@ def test_get_customer_details_excludes_problem_return_from_success_and_spending(
     assert round(data["total_spending"], 2) == 945.10
     assert data["product_loss_total"] == 204.0
     assert data["shipping_loss_total"] == 25.0
-    assert data["customer_tier"]["level"] == "普通"
+    assert data["customer_tier"]["level"] == "劣质"
