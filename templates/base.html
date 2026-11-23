@@ -2814,6 +2814,26 @@
                     html += '<div class="h4 text-warning mb-0">' + customer.avg_order_value.toFixed(2) + '</div>';
                     html += '</div></div></div>';
 
+                    if ((customer.problem_return_orders || 0) > 0 || (customer.undelivered_orders || 0) > 0) {
+                        html += '<div class="col-12">';
+                        html += '<div class="alert mb-0 py-2 px-3 d-flex flex-wrap align-items-center gap-3" style="background:rgba(220,53,69,0.14);border:1px solid rgba(220,53,69,0.45);color:#fca5a5;">';
+                        html += '<span><i class="bi bi-exclamation-octagon-fill text-danger me-1"></i><strong>退货与拒收风控记录：</strong></span>';
+                        if ((customer.problem_return_orders || 0) > 0) {
+                            html += '<span class="badge bg-danger">问题退货 ' + customer.problem_return_orders + ' 单</span>';
+                        }
+                        if ((customer.undelivered_orders || 0) > 0) {
+                            html += '<span class="badge" style="background:#7e22ce;">拒收/未送达 ' + customer.undelivered_orders + ' 单</span>';
+                        }
+                        if ((customer.product_loss_total || 0) > 0) {
+                            html += '<span class="small text-warning">累计货值损失：' + Number(customer.product_loss_total).toFixed(2) + '</span>';
+                        }
+                        if ((customer.shipping_loss_total || 0) > 0) {
+                            html += '<span class="small text-warning">累计运费损失：' + Number(customer.shipping_loss_total).toFixed(2) + '</span>';
+                        }
+                        html += '<span class="small text-white-50 ms-auto">不良订单率：' + (customer.refusal_rate || 0) + '%（系统已自动限制高等级评定）</span>';
+                        html += '</div></div>';
+                    }
+
                     // Detailed Info
                     html += '<div class="col-md-4">';
                     html += '<div class="info-card h-100"><div class="card-header"><h6><i class="bi bi-person me-2"></i>基本信息</h6></div>';

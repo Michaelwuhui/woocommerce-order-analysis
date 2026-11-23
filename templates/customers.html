@@ -259,6 +259,9 @@
                         style="width: 260px; padding-left: 30px;"
                         placeholder="搜索 姓名 / 邮箱 / 电话...">
                 </div>
+                <button class="btn btn-sm btn-outline-danger" id="toggleBadTierBtn">
+                    <i class="bi bi-x-circle me-1"></i>只看劣质客户
+                </button>
                 <button class="btn btn-sm btn-outline-purple" id="toggleMergedBtn"
                     style="color:#a78bfa;border-color:rgba(167,139,250,0.6);">
                     <i class="bi bi-people-fill me-1"></i>只看聚合客户
@@ -318,7 +321,7 @@
 
 <script type="application/json" id="customersTableData">{{ customers_payload | tojson }}</script>
 <script type="application/json" id="customersTableConfig">{{ {'siteManagers': site_managers, 'sourceDisplayMode': source_display_mode} | tojson }}</script>
-<script src="{{ url_for('static', filename='js/customer_table.js') }}?v=20261006"></script>
+<script src="{{ url_for('static', filename='js/customer_table.js') }}?v=20261123"></script>
 
 <style>
     /* DataTables Dark Mode Overrides */
@@ -499,10 +502,10 @@
     new Chart(ctxTier, {
         type: 'doughnut',
         data: {
-            labels: ['VIP', '优质', '普通', '新客'],
+            labels: ['VIP', '优质', '普通', '新客', '劣质'],
             datasets: [{
-                data: [{{ stats.tier_counts.VIP }}, {{ stats.tier_counts['优质'] }}, {{ stats.tier_counts['普通'] }}, {{ stats.tier_counts['新客'] }}],
-        backgroundColor: ['#f59e0b', '#10b981', '#3b82f6', '#6b7280'],
+                data: [{{ stats.tier_counts.VIP }}, {{ stats.tier_counts['优质'] }}, {{ stats.tier_counts['普通'] }}, {{ stats.tier_counts['新客'] }}, {{ stats.tier_counts['劣质'] }}],
+        backgroundColor: ['#f59e0b', '#10b981', '#3b82f6', '#6b7280', '#ef4444'],
         borderWidth: 0
             }]
         },

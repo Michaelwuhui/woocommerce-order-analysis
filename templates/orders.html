@@ -346,6 +346,15 @@
                                 %}</td>
                             <td><span class="status-badge {{ order.status|status_class(order.payment_method, order.is_undelivered) }}">{{ order.status|status_label(order.payment_method, order.is_undelivered)
                                     }}</span>
+                                {% if order.is_problem_return %}
+                                {% set pr_type_map = {'swap':'调包/假货','short':'少件/空盒','damaged':'损坏','other':'其它'} %}
+                                <div class="mt-1">
+                                    <span class="badge" style="background:rgba(220,53,69,0.2);color:#f87171;border:1px solid rgba(220,53,69,0.55);"
+                                          title="问题退货{% if order.problem_return_type %}（{{ pr_type_map.get(order.problem_return_type, order.problem_return_type) }}）{% endif %}{% if order.problem_return_note %}：{{ order.problem_return_note }}{% endif %}">
+                                        <i class="bi bi-exclamation-octagon-fill me-1"></i>问题退货
+                                    </span>
+                                </div>
+                                {% endif %}
                                 {% if order.fulfillment_state %}
                                 {% set fs = order.fulfillment_state %}
                                 <div class="mt-1">
@@ -359,13 +368,19 @@
                                 {% endif %}
                             </td>
                             <td class="customer-cell">
-                                {% if customer_attributes and order.customer_email in customer_attributes %}
-                                {% set attrs = customer_attributes[order.customer_email] %}
+                                {% set attrs = order.customer_attrs if order.customer_attrs is defined and order.customer_attrs else (customer_attributes[order.customer_email] if customer_attributes and order.customer_email in customer_attributes else None) %}
+                                {% if attrs %}
                                 <div class="customer-badges">
                                     {% if attrs.quality %}
                                     <span class="badge {{ attrs.quality.class }} bg-opacity-10 border border-opacity-25"
                                         style="font-size: 0.65em; padding: 2px 5px;">
                                         <i class="bi bi-{{ attrs.quality.icon }}"></i> {{ attrs.quality.label }}
+                                    </span>
+                                    {% endif %}
+                                    {% if attrs.is_blocked %}
+                                    <span class="badge bg-danger bg-opacity-25 text-danger border border-danger border-opacity-50"
+                                        style="font-size: 0.65em; padding: 2px 5px;">
+                                        <i class="bi bi-shield-fill-x"></i> 已拦截
                                     </span>
                                     {% endif %}
                                     {% if attrs.order_count and attrs.order_count >= 1 %}
@@ -393,6 +408,13 @@
                                         title="{% if risk.problem_count > 0 %}历史问题退货 {{ risk.problem_count }} 单 · 货值损失 {{ '%.2f'|format(risk.problem_loss) }}&#10;{% if risk.types %}类型: {% for t in risk.types %}{{ type_map.get(t, t) }}{% if not loop.last %} · {% endif %}{% endfor %}&#10;{% endif %}{% endif %}{% if risk.undeliv_count > 0 %}历史未送达 {{ risk.undeliv_count }} 单 · 运费损失 {{ '%.2f'|format(risk.undeliv_loss) }}&#10;{% endif %}{% if risk.matched_by %}命中: {% for m in risk.matched_by %}{{ matched_map.get(m, m) }}{% if not loop.last %}/{% endif %}{% endfor %}{% if risk.last_number %} · 最近 #{{ risk.last_number }}{% endif %}{% endif %}">
                                         <i class="bi {{ 'bi-exclamation-octagon-fill' if is_high else 'bi-exclamation-triangle-fill' }} me-1"></i>{{ '⚠ 高风险' if is_high else '可疑' }}
                                         · {% if risk.problem_count > 0 %}{{ risk.problem_count }} 问题退货{% else %}{{ risk.undeliv_count }} 拒收{% endif %}
+                                    </span>
+                                </div>
+                                {% elif order.is_problem_return %}
+                                <div class="mt-1">
+                                    <span class="badge" style="background:rgba(220,53,69,0.18);color:#f87171;border:1px solid rgba(220,53,69,0.55);cursor:help;"
+                                        title="本单标记为问题退货{% if order.problem_return_note %}：{{ order.problem_return_note }}{% endif %}">
+                                        <i class="bi bi-exclamation-octagon-fill me-1"></i>⚠ 高风险 · 本单问题退货
                                     </span>
                                 </div>
                                 {% endif %}
